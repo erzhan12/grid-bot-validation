@@ -1,0 +1,15 @@
+[project]
+name = "grid-bot-validation"
+version = "0.1.0"
+description = "Grid trading bot validation and backtesting framework"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+]

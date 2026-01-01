@@ -1,0 +1,13 @@
+[project]
+name = "gridcore"
+version = "0.1.0"
+description = "Pure grid trading strategy logic with zero exchange dependencies"
+requires-python = ">=3.11"
+dependencies = []  # NO EXTERNAL DEPENDENCIES
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gridcore"]

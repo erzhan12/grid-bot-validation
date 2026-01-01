@@ -1,0 +1,11 @@
+/pybit.log
+/misc/test.json
+/conf/server_config.yaml
+/db/greed.json
+/conf/keys.yaml
+/.idea
+/.venv
+__pycache__
+logs
+/misc/UNUSED_CODE_ANALYSIS.md
+/misc/PUBLIC_API.md

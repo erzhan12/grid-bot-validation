@@ -1,0 +1,63 @@
+intervals:
+  check: 0.1    # seconds
+check:
+  start: 3   # days
+  period: 1800    # seconds
+
+
+pair_timeframes:
+  - id: 1
+    strat: Strat50
+    symbol: ETHUSDT
+    greed_count: 20
+    greed_step: 0.45
+    max_margin: 8
+    long_koef: 1.0
+#    min_total_margin: 2
+  - id: 2
+    strat: Strat50
+    symbol: LTCUSDT
+    greed_count: 20
+    greed_step: 0.5
+    long_koef: 1.0
+    min_total_margin: 2
+  - id: 3
+    strat: Strat50
+    symbol: BTCUSDT
+    greed_count: 20
+    greed_step: 0.5
+    long_koef: 1.0
+#    min_total_margin: 2
+  - id: 4
+    strat: Strat50
+    symbol: SOLUSDT
+    greed_count: 20
+    greed_step: 0.75
+    long_koef: 1.0
+    min_total_margin: 1.0
+#    increase_same_position_on_low_margin: true
+#  - id: 5
+#    strat: Strat50
+#    symbol: LTCUSDT
+#    greed_count: 20
+#    greed_step: 0.4
+#    long_koef: 1.0
+#    min_total_margin: 3
+    increase_same_position_on_low_margin: true
+
+amounts:
+  - name: vezun_bb_eth
+    amount: x0.001
+    strat: 1
+  - name: vezun_bb_ltc
+    amount: x0.0015
+    strat: 2
+  - name: vezun_bb_btc
+    amount: x0.003
+    strat: 3
+  - name: vezun_bb_sol
+    amount: x0.0001
+    strat: 4
+#  - name: fastum_bb_ltc
+#    amount: x0.0015
+#    strat: 5

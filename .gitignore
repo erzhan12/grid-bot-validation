@@ -28,7 +28,7 @@ env/
 
 # UV
 .uv/
-uv.lock
+# Note: uv.lock should be committed to git for reproducible builds
 
 # IDE
 .vscode/

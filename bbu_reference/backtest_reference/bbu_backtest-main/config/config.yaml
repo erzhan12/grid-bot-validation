@@ -1,0 +1,22 @@
+pair_timeframes:
+  - id: 5
+    strat: Strat50
+    symbol: LTCUSDT
+    greed_count: 20
+    greed_step: 0.5
+    long_koef: 1.0
+    min_total_margin: 3
+
+amounts:
+  # - name: vezun_bb_eth
+  #   amount: x0.001
+  #   strat: 1
+  - name: vezun_bb_ltc
+    amount: x0.0015
+    strat: 5
+  # - name: vezun_bb_btc
+  #   amount: x0.3
+  #   strat: 3
+  # - name: vezun_bb_sol
+  #   amount: x0.0001
+  #   strat: 4

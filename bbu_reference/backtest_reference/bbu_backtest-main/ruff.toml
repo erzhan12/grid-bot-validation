@@ -1,0 +1,10 @@
+line-length = 140
+
+[lint.per-file-ignores]
+  # init modules can contain the local imports, logic, unused imports
+"__init__.py" = ["F401"]
+"controller.py" = ["F401"]
+
+[lint]
+preview = true
+select = ["E", "F", "I", "C90"]
