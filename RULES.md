@@ -28,19 +28,35 @@ Successfully extracted pure strategy logic from `bbu2-master` into `packages/gri
    - Returns intents (PlaceLimitIntent, CancelIntent), execution layer handles actual orders
    - File: `packages/gridcore/src/gridcore/engine.py`
 
-4. **Events and Intents**
+4. **Position Risk Management Module (`position.py`)**
+   - Extracted from: `bbu_reference/bbu2-master/position.py`
+   - Manages position sizing multipliers based on liquidation risk, margin levels, and position ratios
+   - **CRITICAL BUG FIX (2026-01-01)**: Reference code had incorrect liquidation risk logic for short positions
+     - Reference used `liq_ratio < 0.95 * max_liq_ratio` which is backwards
+     - Correct logic: `liq_ratio > 0.95 * max_liq_ratio` (higher ratio = closer to liquidation for shorts)
+   - **MISSING LOGIC FIX (2026-01-03)**: Added moderate liquidation risk logic for short positions
+     - Original bbu2 code at `position.py:81-86` handles moderate liq risk for shorts
+     - This logic was missing from initial gridcore extraction
+     - Added in `position.py:220-224` with correct priority ordering
+     - When short position has moderate liq risk, decreases short sells to increase long position
+   - **Rule Priority Order**: Specific conditions (low margin, position ratio) must be checked BEFORE general liquidation risk
+     - This prevents liquidation risk from masking intended position sizing adjustments
+     - Order: emergency liq → low margin → position ratio → moderate liq
+   - File: `packages/gridcore/src/gridcore/position.py`
+
+5. **Events and Intents**
    - Events (`events.py`): Immutable dataclasses representing market data and order updates
    - Intents (`intents.py`): Immutable dataclasses representing desired actions
    - **PITFALL**: All event dataclass fields that extend Event must have default values (Python dataclass inheritance requirement)
    - Files: `packages/gridcore/src/gridcore/events.py`, `packages/gridcore/src/gridcore/intents.py`
 
-5. **Testing**
+6. **Testing**
    - Must maintain ≥80% test coverage
-   - Run tests: `cd packages/gridcore && PYTHONPATH=./src pytest tests/ --cov=gridcore --cov-fail-under=80`
-   - Current coverage: 88%
+   - Run tests: `uv run pytest packages/gridcore/tests/ --cov=gridcore --cov-fail-under=80 -v`
+   - Current coverage: 93% (updated 2026-01-01)
    - Test files: `packages/gridcore/tests/test_*.py`
 
-6. **Package Structure**
+7. **Package Structure**
    ```
    packages/gridcore/
    ├── pyproject.toml           # Zero external dependencies
@@ -59,10 +75,11 @@ Successfully extracted pure strategy logic from `bbu2-master` into `packages/gri
        └── test_comparison.py   # Comparison with original (optional)
    ```
 
-7. **Reference Code Location**
+8. **Reference Code Location**
    - Original code: `bbu_reference/bbu2-master/`
    - Keep reference code for comparison tests
    - Never modify reference code
+   - **WARNING**: Reference code may contain bugs (e.g., short position liquidation risk logic)
 
 ## Package Management with uv
 
@@ -118,10 +135,13 @@ uv run pytest packages/gridcore/tests/test_grid.py -v
 3. **DO NOT** use BybitApiUsdt.round_price() - use Grid._round_price(tick_size) instead
 4. **DO NOT** forget default values in event dataclass fields (Python inheritance requirement)
 5. **DO NOT** make GridEngine.on_event() have side effects - it must be pure (except internal state)
-6. **ALWAYS** pass tick_size as Decimal parameter to Grid, never look it up from exchange
-7. **ALWAYS** run tests before committing changes to gridcore
-8. **Grid Rebuild**: `build_greed()` clears `self.greed = []` before building to prevent doubling on rebuilds
-9. **Duplicate Orders**: `PlaceLimitIntent.create()` uses deterministic `client_order_id` (SHA256 hash of symbol+side+price+grid_level+direction) so execution layer can detect/skip duplicates
+6. **DO NOT** blindly copy reference code - verify logic correctness (reference had bugs in position risk management)
+7. **ALWAYS** pass tick_size as Decimal parameter to Grid, never look it up from exchange
+8. **ALWAYS** run tests before committing changes to gridcore
+9. **Grid Rebuild**: `build_greed()` clears `self.greed = []` before building to prevent doubling on rebuilds
+10. **Duplicate Orders**: `PlaceLimitIntent.create()` uses deterministic `client_order_id` (SHA256 hash of symbol+side+price+grid_level+direction) so execution layer can detect/skip duplicates
+11. **Position Risk Management**: For SHORT positions, higher liquidation ratio means closer to liquidation (use `>` not `<` in conditions)
+12. **Risk Rule Priority**: Check specific conditions (low margin, position ratios) BEFORE general liquidation risk conditions
 
 ## Next Steps (Future Phases)
 

@@ -485,3 +485,44 @@ class TestPositionRiskManagerRules:
         # Should increase sell multiplier
         assert multipliers['Sell'] == 2.0
         assert multipliers['Buy'] == 1.0
+
+    def test_moderate_liquidation_ratio_short_increases_opposite(self):
+        """Moderate liquidation risk for short position increases opposite (long) position."""
+        risk_config = RiskConfig(
+            min_liq_ratio=0.8,
+            max_liq_ratio=1.2,
+            max_margin=5000.0,
+            min_total_margin=1000.0
+        )
+        manager = PositionRiskManager('short', risk_config)
+
+        # Moderate liquidation risk scenario
+        # liq_ratio = 108000 / 100000 = 1.08 (between 0 and 1.2)
+        # Not high enough to trigger emergency (< 0.95 * 1.2 = 1.14)
+        # But moderate risk exists
+        position = PositionState(
+            direction='short',
+            size=Decimal('1.0'),
+            entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('108000.0'),  # Moderate risk
+            margin=Decimal('1500.0'),
+            leverage=10
+        )
+
+        opposite = PositionState(
+            direction='long',
+            size=Decimal('1.0'),
+            entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('90000.0'),
+            margin=Decimal('1500.0'),
+            leverage=10
+        )
+
+        multipliers = manager.calculate_amount_multiplier(
+            position, opposite, last_close=100000.0, wallet_balance=Decimal('10000.0')
+        )
+
+        # Should decrease sell multiplier to increase opposite (long) position
+        # This is the NEWLY ADDED logic from bbu2-master/position.py:81-86
+        assert multipliers['Sell'] == 0.5
+        assert multipliers['Buy'] == 1.0

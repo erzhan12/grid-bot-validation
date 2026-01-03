@@ -18,19 +18,19 @@ class TestGridEngineBasic:
 
     def test_engine_initialization(self):
         """Engine initializes with correct state."""
-        config = GridConfig(greed_count=50, greed_step=0.2)
+        config = GridConfig(grid_count=50, grid_step=0.2)
         engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
 
         assert engine.symbol == 'BTCUSDT'
         assert engine.tick_size == Decimal('0.1')
-        assert engine.config.greed_count == 50
+        assert engine.config.grid_count == 50
         assert engine.last_close is None
         assert engine.last_filled_price is None
-        assert len(engine.grid.greed) == 0
+        assert len(engine.grid.grid) == 0
 
     def test_on_ticker_event_builds_grid(self):
         """First ticker event initializes grid."""
-        config = GridConfig(greed_count=50, greed_step=0.2)
+        config = GridConfig(grid_count=50, grid_step=0.2)
         engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
 
         event = TickerEvent(
@@ -48,12 +48,12 @@ class TestGridEngineBasic:
         intents = engine.on_event(event, {'long': [], 'short': []})
 
         # Grid should be built
-        assert len(engine.grid.greed) == 51
+        assert len(engine.grid.grid) == 51
         assert engine.last_close == 100000.0
 
     def test_on_ticker_event_returns_place_intents(self):
         """Ticker event returns PlaceLimitIntent for grid levels."""
-        config = GridConfig(greed_count=50, greed_step=0.2)
+        config = GridConfig(grid_count=50, grid_step=0.2)
         engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
 
         event = TickerEvent(
@@ -83,7 +83,7 @@ class TestGridEngineBasic:
 
     def test_on_execution_event_updates_last_filled(self):
         """ExecutionEvent updates last_filled_price."""
-        config = GridConfig(greed_count=50, greed_step=0.2)
+        config = GridConfig(grid_count=50, grid_step=0.2)
         engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
 
         # Build grid first
@@ -128,7 +128,7 @@ class TestGridEngineOrderPlacement:
 
     def test_place_order_eligibility_buy(self):
         """Verify Buy orders only placed below market."""
-        config = GridConfig(greed_count=50, greed_step=0.2)
+        config = GridConfig(grid_count=50, grid_step=0.2)
         engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
 
         event = TickerEvent(
@@ -152,7 +152,7 @@ class TestGridEngineOrderPlacement:
 
     def test_place_order_eligibility_sell(self):
         """Verify Sell orders only placed above market."""
-        config = GridConfig(greed_count=50, greed_step=0.2)
+        config = GridConfig(grid_count=50, grid_step=0.2)
         engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
 
         event = TickerEvent(
@@ -175,8 +175,8 @@ class TestGridEngineOrderPlacement:
             assert float(intent.price) > 100000.0
 
     def test_place_order_min_distance_check(self):
-        """Orders too close to market price (< greed_step/2) are not placed."""
-        config = GridConfig(greed_count=50, greed_step=0.2)
+        """Orders too close to market price (< grid_step/2) are not placed."""
+        config = GridConfig(grid_count=50, grid_step=0.2)
         engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
 
         event = TickerEvent(
@@ -193,7 +193,7 @@ class TestGridEngineOrderPlacement:
 
         intents = engine.on_event(event, {'long': [], 'short': []})
 
-        # All intents should be at least greed_step/2 away from market
+        # All intents should be at least grid_step/2 away from market
         # 0.2% / 2 = 0.1% minimum
         min_distance_pct = 0.1
         place_intents = [i for i in intents if isinstance(i, PlaceLimitIntent)]
@@ -208,7 +208,7 @@ class TestGridEngineCancellation:
 
     def test_cancel_intent_side_mismatch(self):
         """Wrong side order gets CancelIntent."""
-        config = GridConfig(greed_count=50, greed_step=0.2)
+        config = GridConfig(grid_count=50, grid_step=0.2)
         engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
 
         # Build grid
@@ -227,7 +227,7 @@ class TestGridEngineCancellation:
 
         # Create a limit order with wrong side (Sell at buy price)
         # Find a buy level price
-        buy_level = next(g for g in engine.grid.greed if g['side'] == 'Buy')
+        buy_level = next(g for g in engine.grid.grid if g['side'] == 'Buy')
         wrong_side_order = {
             'orderId': 'order123',
             'price': str(buy_level['price']),
@@ -245,7 +245,7 @@ class TestGridEngineCancellation:
 
     def test_cancel_intent_outside_grid(self):
         """Price outside grid range gets CancelIntent."""
-        config = GridConfig(greed_count=50, greed_step=0.2)
+        config = GridConfig(grid_count=50, grid_step=0.2)
         engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
 
         # Build grid
@@ -278,8 +278,8 @@ class TestGridEngineCancellation:
         assert any(i.order_id == 'outside123' for i in cancel_intents)
 
     def test_too_many_orders_triggers_rebuild(self):
-        """More than greed_count + 10 orders triggers rebuild (mass cancel and grid rebuild)."""
-        config = GridConfig(greed_count=50, greed_step=0.2)
+        """More than grid_count + 10 orders triggers rebuild (mass cancel and grid rebuild)."""
+        config = GridConfig(grid_count=50, grid_step=0.2)
         engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
 
         # Build grid first
@@ -297,8 +297,8 @@ class TestGridEngineCancellation:
         engine.on_event(event, {'long': [], 'short': []})
 
         # Store original grid state
-        original_grid_size = len(engine.grid.greed)
-        original_center_price = next((g['price'] for g in engine.grid.greed if g['side'] == engine.grid.WAIT), None)
+        original_grid_size = len(engine.grid.grid)
+        original_center_price = next((g['price'] for g in engine.grid.grid if g['side'] == engine.grid.WAIT), None)
 
         # Create too many orders (> 60)
         too_many_orders = [
@@ -330,12 +330,12 @@ class TestGridEngineCancellation:
         assert len(cancel_intents) == 70
 
         # Grid should be rebuilt (centered on new price)
-        new_center_price = next((g['price'] for g in engine.grid.greed if g['side'] == engine.grid.WAIT), None)
+        new_center_price = next((g['price'] for g in engine.grid.grid if g['side'] == engine.grid.WAIT), None)
         assert new_center_price is not None
         # Center should be near the new price (within a few steps)
         assert abs(new_center_price - 105000.0) / 105000.0 < 0.01
         # Grid size should remain the same
-        assert len(engine.grid.greed) == original_grid_size
+        assert len(engine.grid.grid) == original_grid_size
 
 
 class TestGridEngineOrderTracking:
@@ -343,7 +343,7 @@ class TestGridEngineOrderTracking:
 
     def test_order_update_event_tracks_orders(self):
         """OrderUpdateEvent tracks pending orders."""
-        config = GridConfig(greed_count=50, greed_step=0.2)
+        config = GridConfig(grid_count=50, grid_step=0.2)
         engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
 
         # New order
@@ -389,7 +389,7 @@ class TestGridEngineEdgeCases:
 
     def test_engine_handles_no_limit_orders(self):
         """Engine works when no existing limit orders."""
-        config = GridConfig(greed_count=50, greed_step=0.2)
+        config = GridConfig(grid_count=50, grid_step=0.2)
         engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
 
         event = TickerEvent(
@@ -413,10 +413,10 @@ class TestGridEngineEdgeCases:
 
     def test_engine_handles_empty_grid(self):
         """Engine builds grid on first ticker even when starting empty."""
-        config = GridConfig(greed_count=50, greed_step=0.2)
+        config = GridConfig(grid_count=50, grid_step=0.2)
         engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
 
-        assert len(engine.grid.greed) == 0
+        assert len(engine.grid.grid) == 0
 
         event = TickerEvent(
             event_type=EventType.TICKER,
@@ -432,7 +432,7 @@ class TestGridEngineEdgeCases:
 
         engine.on_event(event, {'long': [], 'short': []})
 
-        assert len(engine.grid.greed) == 51
+        assert len(engine.grid.grid) == 51
 
 
 class TestEventModelValidation:
