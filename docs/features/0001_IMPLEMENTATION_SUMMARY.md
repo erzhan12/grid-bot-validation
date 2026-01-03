@@ -85,7 +85,7 @@ packages/gridcore/
 **Purpose**: Configuration dataclasses for strategy parameters.
 
 **Classes**:
-- `GridConfig` - Grid trading configuration (greed_count, greed_step, rebalance_threshold)
+- `GridConfig` - Grid trading configuration (grid_count, grid_step, rebalance_threshold)
 
 **Key Features**:
 - Validation in `__post_init__`
@@ -128,7 +128,7 @@ packages/gridcore/
 - `_handle_execution_event()` - Handle fills
 - `_handle_order_update_event()` - Handle order status changes
 - `_check_and_place()` - Generate place/cancel intents
-- `_place_greed_orders()` - Generate intents for grid orders
+- `_place_grid_orders()` - Generate intents for grid orders
 
 #### 6. Position Module (`position.py`)
 
@@ -254,7 +254,7 @@ from datetime import datetime, UTC
 from gridcore import GridEngine, GridConfig, TickerEvent, EventType, PlaceLimitIntent, CancelIntent
 
 # Initialize engine
-config = GridConfig(greed_count=50, greed_step=0.2)
+config = GridConfig(grid_count=50, grid_step=0.2)
 engine = GridEngine(
     symbol='BTCUSDT',
     tick_size=Decimal('0.1'),

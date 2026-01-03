@@ -37,7 +37,7 @@ class GridEngine:
         self.symbol = symbol
         self.config = config
         self.tick_size = tick_size
-        self.grid = Grid(tick_size, config.greed_count, config.greed_step, config.rebalance_threshold)
+        self.grid = Grid(tick_size, config.grid_count, config.grid_step, config.rebalance_threshold)
         self.last_close: Optional[float] = None
         self.last_filled_price: Optional[float] = None
 
@@ -96,8 +96,8 @@ class GridEngine:
         self.last_close = float(event.last_price)
 
         # Build grid if empty
-        if len(self.grid.greed) <= 1:
-            self.grid.build_greed(self.last_close)
+        if len(self.grid.grid) <= 1:
+            self.grid.build_grid(self.last_close)
 
         # Check and place orders for both directions
         intents.extend(self._check_and_place('long', limit_orders.get('long', [])))
@@ -122,7 +122,7 @@ class GridEngine:
 
         # Update grid based on fill
         if self.last_close is not None:
-            self.grid.update_greed(self.last_filled_price, self.last_close)
+            self.grid.update_grid(self.last_filled_price, self.last_close)
 
         return []
 
@@ -160,10 +160,10 @@ class GridEngine:
         intents: list[PlaceLimitIntent | CancelIntent] = []
 
         # Too many orders → rebuild needed (return cancel intents)
-        if len(limits) > len(self.grid.greed) + 10:
+        if len(limits) > len(self.grid.grid) + 10:
             # Rebuild grid if we have a valid last_close (matches original behavior)
             if self.last_close is not None:
-                self.grid.build_greed(self.last_close)
+                self.grid.build_grid(self.last_close)
             for limit in limits:
                 intents.append(CancelIntent(
                     symbol=self.symbol,
@@ -175,12 +175,12 @@ class GridEngine:
             return intents
 
         # Update grid if we have some fills
-        if 0 < len(limits) < self.grid.greed_count:
+        if 0 < len(limits) < self.grid.grid_count:
             if self.last_filled_price is not None and self.last_close is not None:
-                self.grid.update_greed(self.last_filled_price, self.last_close)
+                self.grid.update_grid(self.last_filled_price, self.last_close)
 
         # Place grid orders
-        intents.extend(self._place_greed_orders(limits, direction))
+        intents.extend(self._place_grid_orders(limits, direction))
 
         return intents
 
@@ -193,16 +193,16 @@ class GridEngine:
         Returns:
             Index of center of grid
         """
-        wait_indices = [i for i, greed in enumerate(self.grid.greed) if greed['side'] == self.grid.WAIT]
+        wait_indices = [i for i, grid_item in enumerate(self.grid.grid) if grid_item['side'] == self.grid.WAIT]
         if wait_indices:
             # Use the middle of the WAIT region as center
             center_index = (wait_indices[0] + wait_indices[-1]) // 2
         else:
             # Fallback: use the middle of the entire list
-            center_index = len(self.grid.greed) // 2 if self.grid.greed else 0
+            center_index = len(self.grid.grid) // 2 if self.grid.grid else 0
         return center_index
 
-    def _place_greed_orders(self, limits: list[dict], direction: str) -> list[PlaceLimitIntent | CancelIntent]:
+    def _place_grid_orders(self, limits: list[dict], direction: str) -> list[PlaceLimitIntent | CancelIntent]:
         """
         Generate intents for placing/canceling grid orders.
 
@@ -225,18 +225,18 @@ class GridEngine:
 
         # Find center and create sorted grid items
         center_index = self._get_wait_indices()
-        indexed_greeds = [(i, greed) for i, greed in enumerate(self.grid.greed) if greed['side'] != self.grid.WAIT]
+        indexed_grids = [(i, grid_item) for i, grid_item in enumerate(self.grid.grid) if grid_item['side'] != self.grid.WAIT]
         # Sort by distance from center (primary) then by price (secondary)
-        sorted_greeds = sorted(indexed_greeds, key=lambda x: (abs(x[0] - center_index), x[1]['price']))
+        sorted_grids = sorted(indexed_grids, key=lambda x: (abs(x[0] - center_index), x[1]['price']))
 
         # Check each grid level
-        for index, greed in sorted_greeds:
-            # Check if limit exists for this greed price
-            limit = limit_prices.get(greed['price'])
+        for index, grid_item in sorted_grids:
+            # Check if limit exists for this grid price
+            limit = limit_prices.get(grid_item['price'])
 
             if limit:
                 # Cancel if side mismatch
-                if limit['side'] != greed['side']:
+                if limit['side'] != grid_item['side']:
                     intents.append(CancelIntent(
                         symbol=self.symbol,
                         order_id=limit['orderId'],
@@ -245,20 +245,20 @@ class GridEngine:
                         side=limit['side']
                     ))
                     # Then place correct order
-                    place_intent = self._create_place_intent(greed, direction, index)
+                    place_intent = self._create_place_intent(grid_item, direction, index)
                     if place_intent:
                         intents.append(place_intent)
             else:
                 # No limit exists, place order
-                place_intent = self._create_place_intent(greed, direction, index)
+                place_intent = self._create_place_intent(grid_item, direction, index)
                 if place_intent:
                     intents.append(place_intent)
 
         # Cancel limits outside grid range
-        greed_price_set = {round(greed['price'], 8) for greed in self.grid.greed}
+        grid_price_set = {round(grid_item['price'], 8) for grid_item in self.grid.grid}
         for limit in sorted_limits:
             limit_price = round(float(limit['price']), 8)
-            if limit_price not in greed_price_set:
+            if limit_price not in grid_price_set:
                 intents.append(CancelIntent(
                     symbol=self.symbol,
                     order_id=limit['orderId'],
@@ -269,44 +269,44 @@ class GridEngine:
 
         return intents
 
-    def _create_place_intent(self, greed: dict, direction: str, grid_level: int) -> Optional[PlaceLimitIntent]:
+    def _create_place_intent(self, grid: dict, direction: str, grid_level: int) -> Optional[PlaceLimitIntent]:
         """
         Create a PlaceLimitIntent for a grid level.
 
         Reference: bbu2-master/strat.py:162-182
 
         Args:
-            greed: Grid level dict with 'side' and 'price'
+            grid: Grid level dict with 'side' and 'price'
             direction: 'long' or 'short'
             grid_level: Grid level index
 
         Returns:
             PlaceLimitIntent or None if order shouldn't be placed
         """
-        if greed['side'] == self.grid.WAIT:
+        if grid['side'] == self.grid.WAIT:
             return None
 
         if self.last_close is None:
             return None
 
         # Check if price is eligible
-        diff_p = (self.last_close - greed['price']) / self.last_close * 100
+        diff_p = (self.last_close - grid['price']) / self.last_close * 100
 
         # Buy orders must be below market, sell orders above market
-        if (greed['side'] == self.grid.BUY and diff_p <= 0) or \
-           (greed['side'] == self.grid.SELL and diff_p >= 0):
+        if (grid['side'] == self.grid.BUY and diff_p <= 0) or \
+           (grid['side'] == self.grid.SELL and diff_p >= 0):
             return None
 
         # Must be far enough from current price
-        if abs(diff_p) <= self.grid.greed_step / 2:
+        if abs(diff_p) <= self.grid.grid_step / 2:
             return None
 
         # Create the intent
         # Note: qty calculation would come from execution layer based on risk management
         return PlaceLimitIntent.create(
             symbol=self.symbol,
-            side=greed['side'],
-            price=Decimal(str(greed['price'])),
+            side=grid['side'],
+            price=Decimal(str(grid['price'])),
             qty=Decimal('0'),  # Qty determined by execution layer
             grid_level=grid_level,
             direction=direction,

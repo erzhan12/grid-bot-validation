@@ -156,17 +156,13 @@ class PositionRiskManager:
         Apply risk management rules for long positions.
 
         Reference: bbu2-master/position.py:58-74
+        
+        Priority order:
+        1. Check specific position sizing conditions first
+        2. Then check liquidation risk as general safety measure
         """
-        # High liquidation risk → decrease long position
-        if liq_ratio > 1.05 * self.risk_config.min_liq_ratio:
-            self.amount_multiplier[self.SIDE_SELL] = 1.5
-
-        # Moderate liquidation risk → increase opposite (short) position
-        elif liq_ratio > self.risk_config.min_liq_ratio:
-            self.amount_multiplier[self.SIDE_BUY] = 0.5  # Decrease long buys (increases short)
-
-        # Positions equal but low total margin → adjust
-        elif is_position_equal and total_margin < self.risk_config.min_total_margin:
+        # Positions equal but low total margin → adjust (highest priority for specific condition)
+        if is_position_equal and total_margin < self.risk_config.min_total_margin:
             self._adjust_position_for_low_margin()
 
         # Long position too small and losing → increase long
@@ -176,6 +172,14 @@ class PositionRiskManager:
         # Long position very small → increase long
         elif self.position_ratio < 0.20:
             self.amount_multiplier[self.SIDE_BUY] = 2.0
+
+        # High liquidation risk → decrease long position (checked after specific conditions)
+        elif liq_ratio > 1.05 * self.risk_config.min_liq_ratio:
+            self.amount_multiplier[self.SIDE_SELL] = 1.5
+
+        # Moderate liquidation risk → increase opposite (short) position
+        elif liq_ratio > self.risk_config.min_liq_ratio:
+            self.amount_multiplier[self.SIDE_BUY] = 0.5  # Decrease long buys (increases short)
 
     def _apply_short_position_rules(
         self,
@@ -188,14 +192,18 @@ class PositionRiskManager:
         Apply risk management rules for short positions.
 
         Reference: bbu2-master/position.py:76-92
-        """
-        # High liquidation risk (short) → decrease short position
-        if 0.0 < liq_ratio < 0.95 * self.risk_config.max_liq_ratio:
-            self.amount_multiplier[self.SIDE_BUY] = 1.5
 
-        # Moderate liquidation risk → increase opposite (long) position
-        elif 0.0 < liq_ratio < self.risk_config.max_liq_ratio:
-            self.amount_multiplier[self.SIDE_SELL] = 0.5  # Decrease short sells (increases long)
+        Priority order (INTENTIONALLY REORDERED from original):
+        1. High liquidation risk (emergency)
+        2. Specific position sizing conditions
+        3. Moderate liquidation risk (safety)
+
+        This prevents moderate liq risk from masking intentional position adjustments.
+        """
+        # High liquidation risk (short) → decrease short position (EMERGENCY)
+        # When liq_ratio is high and close to max, liquidation is imminent
+        if liq_ratio > 0.95 * self.risk_config.max_liq_ratio:
+            self.amount_multiplier[self.SIDE_BUY] = 1.5
 
         # Positions equal but low total margin → adjust
         elif is_position_equal and total_margin < self.risk_config.min_total_margin:
@@ -208,6 +216,12 @@ class PositionRiskManager:
         # Short position very large → increase short
         elif self.position_ratio > 5.0:
             self.amount_multiplier[self.SIDE_SELL] = 2.0
+
+        # Moderate liquidation risk → increase opposite (long) position
+        # Reference: bbu2-master/position.py:81-86
+        # Checked AFTER position ratio checks to not mask sizing adjustments
+        elif 0.0 < liq_ratio < self.risk_config.max_liq_ratio:
+            self.amount_multiplier[self.SIDE_SELL] = 0.5  # Decrease short sells (increases long)
 
     def _adjust_position_for_low_margin(self) -> None:
         """

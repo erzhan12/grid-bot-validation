@@ -22,20 +22,20 @@ class Grid:
     the original greed.py when given the same inputs.
     """
 
-    def __init__(self, tick_size: Decimal, greed_count: int = 50, greed_step: float = 0.2, rebalance_threshold: float = 0.3):
+    def __init__(self, tick_size: Decimal, grid_count: int = 50, grid_step: float = 0.2, rebalance_threshold: float = 0.3):
         """
         Initialize Grid calculator.
 
         Args:
             tick_size: Minimum price increment for the symbol (e.g., 0.1 for BTCUSDT)
-            greed_count: Number of grid levels (default 50 = 25 buy + 1 wait + 25 sell)
-            greed_step: Step size in percentage (default 0.2 = 0.2% between levels)
+            grid_count: Number of grid levels (default 50 = 25 buy + 1 wait + 25 sell)
+            grid_step: Step size in percentage (default 0.2 = 0.2% between levels)
             rebalance_threshold: Threshold for rebalancing grid when imbalanced (default 0.3 = 30%)
         """
-        self.greed: list[dict] = []
+        self.grid: list[dict] = []
         self.tick_size = tick_size
-        self.greed_count = greed_count
-        self.greed_step = greed_step
+        self.grid_count = grid_count
+        self.grid_step = grid_step
         self.BUY = 'Buy'
         self.SELL = 'Sell'
         self.WAIT = 'wait'
@@ -58,11 +58,11 @@ class Grid:
         # Format to avoid floating-point artifacts
         return float(f'{rounded:.10f}')
 
-    def build_greed(self, last_close: float) -> None:
+    def build_grid(self, last_close: float) -> None:
         """
         Build initial grid centered on last_close price.
 
-        Creates greed_count grid levels:
+        Creates grid_count grid levels:
         - Bottom half: BUY orders
         - Middle: WAIT zone (no orders)
         - Top half: SELL orders
@@ -76,39 +76,39 @@ class Grid:
             return
 
         # Clear existing grid before building (prevents doubling on rebuild)
-        self.greed = []
+        self.grid = []
 
-        half_greed = self.greed_count // 2
-        step = self.greed_step / 100
+        half_grid = self.grid_count // 2
+        step = self.grid_step / 100
 
         # Middle line = actual price (WAIT zone)
-        self.greed.append({
+        self.grid.append({
             'side': self.WAIT,
             'price': self._round_price(last_close)
         })
 
         # Build upper half (SELL orders)
         price = last_close
-        for _ in range(half_greed):
+        for _ in range(half_grid):
             price = self._round_price(price * (1 + step))
-            self.greed.append({'side': self.SELL, 'price': price})
+            self.grid.append({'side': self.SELL, 'price': price})
 
         # Build lower half (BUY orders)
         price = last_close
-        for _ in range(half_greed):
+        for _ in range(half_grid):
             price = self._round_price(price * (1 - step))
-            self.greed.insert(0, {'side': self.BUY, 'price': price})
+            self.grid.insert(0, {'side': self.BUY, 'price': price})
 
-    def __rebuild_greed(self, last_close: float) -> None:
+    def __rebuild_grid(self, last_close: float) -> None:
         """
         Rebuild grid from scratch.
 
         Reference: bbu2-master/greed.py:43-45
         """
-        self.greed = []
-        self.build_greed(last_close)
+        self.grid = []
+        self.build_grid(last_close)
 
-    def update_greed(self, last_filled_price: Optional[float], last_close: Optional[float]) -> None:
+    def update_grid(self, last_filled_price: Optional[float], last_close: Optional[float]) -> None:
         """
         Update grid after an order fill.
 
@@ -129,22 +129,22 @@ class Grid:
             return
 
         # Rebuild if price moved outside grid bounds
-        if not (self.__min_greed < last_close < self.__max_greed):
-            self.__rebuild_greed(last_close)
+        if not (self.__min_grid < last_close < self.__max_grid):
+            self.__rebuild_grid(last_close)
             # Continue to apply side assignment logic after rebuild (matches original behavior)
 
         # Update grid sides
-        for greed in self.greed:
-            if self.__is_too_close(greed['price'], last_filled_price):
-                greed['side'] = self.WAIT
-            elif last_close < greed['price']:
-                greed['side'] = self.SELL
-            elif last_close > greed['price']:
-                greed['side'] = self.BUY
+        for grid in self.grid:
+            if self.__is_too_close(grid['price'], last_filled_price):
+                grid['side'] = self.WAIT
+            elif last_close < grid['price']:
+                grid['side'] = self.SELL
+            elif last_close > grid['price']:
+                grid['side'] = self.BUY
 
-        self.__center_greed()
+        self.__center_grid()
 
-    def __center_greed(self) -> None:
+    def __center_grid(self) -> None:
         """
         Rebalance grid if buy/sell ratio becomes too imbalanced.
 
@@ -156,16 +156,16 @@ class Grid:
         buy_count = 0
         sell_count = 0
         highest_sell_price = 0
-        lowest_buy_price = self.greed[0]['price'] if self.greed else 0
-        step = self.greed_step / 100
+        lowest_buy_price = self.grid[0]['price'] if self.grid else 0
+        step = self.grid_step / 100
 
         # Single pass to count and find prices
-        for greed in self.greed:
-            if greed['side'] == self.BUY:
+        for grid in self.grid:
+            if grid['side'] == self.BUY:
                 buy_count += 1
-            elif greed['side'] == self.SELL:
+            elif grid['side'] == self.SELL:
                 sell_count += 1
-                highest_sell_price = greed['price']
+                highest_sell_price = grid['price']
 
         total_count = buy_count + sell_count
         if total_count == 0:
@@ -173,15 +173,15 @@ class Grid:
 
         # Too many buys → shift grid upward
         if (buy_count - sell_count) / total_count > self.REBALANCE_THRESHOLD:
-            self.greed.pop(0)  # Delete the bottom line
+            self.grid.pop(0)  # Delete the bottom line
             price = self._round_price(highest_sell_price * (1 + step))
-            self.greed.append({'side': self.SELL, 'price': price})
+            self.grid.append({'side': self.SELL, 'price': price})
 
         # Too many sells → shift grid downward
         elif (sell_count - buy_count) / total_count > self.REBALANCE_THRESHOLD:
-            self.greed.pop()  # Delete the top line
+            self.grid.pop()  # Delete the top line
             price = self._round_price(lowest_buy_price * (1 - step))
-            self.greed.insert(0, {'side': self.BUY, 'price': price})
+            self.grid.insert(0, {'side': self.BUY, 'price': price})
 
     def __is_too_close(self, price1: float, price2: float) -> bool:
         """
@@ -194,9 +194,9 @@ class Grid:
             price2: Second price
 
         Returns:
-            True if prices are within greed_step/4 of each other
+            True if prices are within grid_step/4 of each other
         """
-        return abs(price1 - price2) / price1 * 100 < self.greed_step / 4
+        return abs(price1 - price2) / price1 * 100 < self.grid_step / 4
 
     def is_price_sorted(self) -> bool:
         """
@@ -209,14 +209,14 @@ class Grid:
         """
         last_price = float('-inf')
 
-        for greed in self.greed:
-            if greed['price'] < last_price:
+        for grid in self.grid:
+            if grid['price'] < last_price:
                 return False
-            last_price = greed['price']
+            last_price = grid['price']
 
         return True
 
-    def is_greed_correct(self) -> bool:
+    def is_grid_correct(self) -> bool:
         """
         Validate that grid has correct BUY→WAIT→SELL sequence.
 
@@ -231,8 +231,8 @@ class Grid:
         if not self.is_price_sorted():
             return False
 
-        for greed in self.greed:
-            side = greed['side']
+        for grid in self.grid:
+            side = grid['side']
 
             # Check if side matches the expected state
             if side == expected_sequence[current_state]:
@@ -251,39 +251,39 @@ class Grid:
         return current_state == 2
 
     @property
-    def __greed_count_sell(self) -> int:
+    def __grid_count_sell(self) -> int:
         """
         Count number of SELL levels.
 
         Reference: bbu2-master/greed.py:143-149
         """
-        return sum(1 for step in self.greed if step['side'] == self.SELL)
+        return sum(1 for step in self.grid if step['side'] == self.SELL)
 
     @property
-    def __greed_count_buy(self) -> int:
+    def __grid_count_buy(self) -> int:
         """
         Count number of BUY levels.
 
         Reference: bbu2-master/greed.py:151-157
         """
-        return sum(1 for step in self.greed if step['side'] == self.BUY)
+        return sum(1 for step in self.grid if step['side'] == self.BUY)
 
     @property
-    def __min_greed(self) -> float:
+    def __min_grid(self) -> float:
         """
         Get minimum grid price.
 
         Reference: bbu2-master/greed.py:159-162
         """
-        prices = [step['price'] for step in self.greed]
+        prices = [step['price'] for step in self.grid]
         return min(prices) if prices else 0.0
 
     @property
-    def __max_greed(self) -> float:
+    def __max_grid(self) -> float:
         """
         Get maximum grid price.
 
         Reference: bbu2-master/greed.py:164-167
         """
-        prices = [step['price'] for step in self.greed]
+        prices = [step['price'] for step in self.grid]
         return max(prices) if prices else 0.0

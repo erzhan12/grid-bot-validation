@@ -47,14 +47,14 @@ from decimal import Decimal
 from gridcore import Grid, GridConfig
 
 # Create grid calculator
-config = GridConfig(greed_count=50, greed_step=0.2)
-grid = Grid(tick_size=Decimal('0.1'), greed_count=50, greed_step=0.2)
+config = GridConfig(grid_count=50, grid_step=0.2)
+grid = Grid(tick_size=Decimal('0.1'), grid_count=50, grid_step=0.2)
 
 # Build grid around current price
 grid.build_greed(100000.0)
 
 # After a fill, update grid
-grid.update_greed(last_filled_price=99800.0, last_close=100000.0)
+grid.update_grid(last_filled_price=99800.0, last_close=100000.0)
 ```
 
 ### Event-Driven Strategy
@@ -65,7 +65,7 @@ from decimal import Decimal
 from gridcore import GridEngine, GridConfig, TickerEvent, EventType
 
 # Initialize engine
-config = GridConfig(greed_count=50, greed_step=0.2)
+config = GridConfig(grid_count=50, grid_step=0.2)
 engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
 
 # Process ticker event
@@ -172,7 +172,7 @@ The comparison tests in `test_comparison.py` verify that `gridcore` produces ide
 
 1. ✅ `gridcore` package imports successfully with zero exchange-specific dependencies
 2. ✅ `Grid.build_greed()` produces identical price/side lists as original `Greed.build_greed()`
-3. ✅ `Grid.update_greed()` produces identical results as original
+3. ✅ `Grid.update_grid()` produces identical results as original
 4. ✅ `Grid.center_greed()` produces identical results as original `__center_greed()`
 5. ✅ All unit tests pass with 88% coverage (exceeds 80% requirement)
 6. ✅ CI validation confirms no `pybit` or `BybitApi` imports in gridcore
