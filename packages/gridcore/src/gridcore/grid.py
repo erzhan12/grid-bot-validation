@@ -40,6 +40,7 @@ class Grid:
         self.SELL = 'Sell'
         self.WAIT = 'wait'
         self.REBALANCE_THRESHOLD = rebalance_threshold
+        self._original_anchor_price: Optional[float] = None
 
     def _round_price(self, price: float) -> float:
         """
@@ -82,9 +83,12 @@ class Grid:
         step = self.grid_step / 100
 
         # Middle line = actual price (WAIT zone)
+        # Store the original anchor price for persistence
+        rounded_price = self._round_price(last_close)
+        self._original_anchor_price = rounded_price
         self.grid.append({
             'side': self.WAIT,
-            'price': self._round_price(last_close)
+            'price': rounded_price
         })
 
         # Build upper half (SELL orders)
@@ -305,12 +309,10 @@ class Grid:
         Get anchor price (WAIT zone center price).
 
         The anchor price is the price around which the grid was built.
-        This is the WAIT zone price - the center of the grid.
+        This is the original center WAIT zone price, not any WAIT zones
+        created after order fills.
 
         Returns:
-            The WAIT zone price, or None if no WAIT zone exists
+            The original WAIT zone center price, or None if grid was never built
         """
-        for item in self.grid:
-            if item['side'] == self.WAIT:
-                return item['price']
-        return None
+        return self._original_anchor_price

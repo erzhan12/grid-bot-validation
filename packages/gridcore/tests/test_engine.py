@@ -786,3 +786,71 @@ class TestAnchorPricePersistence:
         # Grid should be centered at saved anchor (100k), not market price (105k)
         assert engine2.get_anchor_price() == saved_anchor
         assert engine2.get_anchor_price() == 100000.0
+
+    def test_anchor_price_returns_original_center_after_fills(self):
+        """
+        Test that anchor_price returns the original center, not filled WAIT levels.
+        
+        After order fills, update_grid() marks filled levels as WAIT, creating
+        multiple WAIT items. anchor_price should return the original center,
+        not the first WAIT item found (which could be a filled level at lower price).
+        """
+        config = GridConfig(grid_count=50, grid_step=0.2)
+        engine = GridEngine(
+            symbol='BTCUSDT',
+            tick_size=Decimal('0.1'),
+            config=config,
+            strat_id='btcusdt_test'
+        )
+
+        # Build grid at 100k
+        ticker_event = TickerEvent(
+            event_type=EventType.TICKER,
+            symbol='BTCUSDT',
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            last_price=Decimal('100000.0'),
+            mark_price=Decimal('100000.0'),
+            bid1_price=Decimal('99999.0'),
+            ask1_price=Decimal('100001.0'),
+            funding_rate=Decimal('0.0001')
+        )
+        engine.on_event(ticker_event, {'long': [], 'short': []})
+
+        # Verify anchor is 100k
+        original_anchor = engine.get_anchor_price()
+        assert original_anchor == 100000.0
+
+        # Simulate fill at lower price (99800) - this will create a WAIT item at 99800
+        execution_event = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol='BTCUSDT',
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            price=Decimal('99800.0'),
+            qty=Decimal('0.01'),
+            side='Buy'
+        )
+        engine.on_event(execution_event)
+
+        # Update grid - this marks items near 99800 as WAIT
+        engine.on_event(ticker_event, {'long': [], 'short': []})
+
+        # Verify anchor_price still returns original center (100k), not filled price (99800)
+        anchor_after_fill = engine.get_anchor_price()
+        assert anchor_after_fill == 100000.0, \
+            f"Expected anchor_price to remain 100000.0 after fill, got {anchor_after_fill}"
+        assert anchor_after_fill != 99800.0, \
+            "anchor_price should not return filled price, should return original center"
+
+        # Verify there are multiple WAIT items (original center + filled level)
+        wait_items = [g for g in engine.grid.grid if g['side'] == 'wait']
+        assert len(wait_items) > 1, "Should have multiple WAIT items after fill"
+        
+        # Verify the first WAIT item (by price) is the filled level, not the center
+        wait_prices = sorted([g['price'] for g in wait_items])
+        first_wait_price = wait_prices[0]
+        assert first_wait_price < 100000.0, "First WAIT item should be at filled price (lower)"
+        
+        # But anchor_price should still be the original center
+        assert anchor_after_fill == 100000.0
