@@ -5,7 +5,7 @@ Extracted from bbu2-master/greed.py with the following key transformations:
 - Removed BybitApiUsdt.round_price() dependency → implemented internal _round_price()
 - Removed database calls (read_from_db(), write_to_db())
 - Pass tick_size as parameter instead of from BybitApiUsdt
-- Added validation methods (is_price_sorted(), is_greed_correct())
+- Added validation methods (__is_price_sorted(), is_greed_correct())
 - Removed strat dependency, made self-contained
 """
 
@@ -128,8 +128,8 @@ class Grid:
         if last_close is None:
             return
 
-        # Rebuild if price moved outside grid bounds
-        if not (self.__min_grid < last_close < self.__max_grid):
+        # Rebuild if grid is empty or price moved outside grid bounds
+        if not self.grid or not (self.__min_grid < last_close < self.__max_grid):
             self.__rebuild_grid(last_close)
             # Continue to apply side assignment logic after rebuild (matches original behavior)
 
@@ -198,7 +198,7 @@ class Grid:
         """
         return abs(price1 - price2) / price1 * 100 < self.grid_step / 4
 
-    def is_price_sorted(self) -> bool:
+    def __is_price_sorted(self) -> bool:
         """
         Validate that grid prices are in ascending order.
 
@@ -207,12 +207,13 @@ class Grid:
         Returns:
             True if all prices are sorted ascending
         """
-        last_price = float('-inf')
+        # Initialize with negative infinity to start the comparison
+        previous_price = float('-inf')
 
         for grid in self.grid:
-            if grid['price'] < last_price:
+            if grid['price'] < previous_price:
                 return False
-            last_price = grid['price']
+            previous_price = grid['price']
 
         return True
 
@@ -228,7 +229,7 @@ class Grid:
         expected_sequence = [self.BUY, self.WAIT, self.SELL]
         current_state = 0
 
-        if not self.is_price_sorted():
+        if not self.__is_price_sorted():
             return False
 
         for grid in self.grid:
@@ -274,9 +275,14 @@ class Grid:
         Get minimum grid price.
 
         Reference: bbu2-master/greed.py:159-162
+
+        Raises:
+            ValueError: If grid is empty (should not happen if called after empty check)
         """
+        if not self.grid:
+            raise ValueError("Cannot get min_grid from empty grid")
         prices = [step['price'] for step in self.grid]
-        return min(prices) if prices else 0.0
+        return min(prices)
 
     @property
     def __max_grid(self) -> float:
@@ -284,6 +290,27 @@ class Grid:
         Get maximum grid price.
 
         Reference: bbu2-master/greed.py:164-167
+
+        Raises:
+            ValueError: If grid is empty (should not happen if called after empty check)
         """
+        if not self.grid:
+            raise ValueError("Cannot get max_grid from empty grid")
         prices = [step['price'] for step in self.grid]
-        return max(prices) if prices else 0.0
+        return max(prices)
+
+    @property
+    def anchor_price(self) -> float | None:
+        """
+        Get anchor price (WAIT zone center price).
+
+        The anchor price is the price around which the grid was built.
+        This is the WAIT zone price - the center of the grid.
+
+        Returns:
+            The WAIT zone price, or None if no WAIT zone exists
+        """
+        for item in self.grid:
+            if item['side'] == self.WAIT:
+                return item['price']
+        return None

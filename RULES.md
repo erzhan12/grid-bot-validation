@@ -67,11 +67,13 @@ Successfully extracted pure strategy logic from `bbu2-master` into `packages/gri
    │   ├── config.py            # GridConfig
    │   ├── grid.py              # Grid calculations (from greed.py)
    │   ├── engine.py            # GridEngine (from strat.py)
-   │   └── position.py          # Position risk management
+   │   ├── position.py          # Position risk management
+   │   └── persistence.py       # Grid anchor persistence
    └── tests/
-       ├── test_grid.py         # 17 tests
-       ├── test_engine.py       # 13 tests
-       ├── test_position.py     # 7 tests
+       ├── test_grid.py         # Grid calculation tests
+       ├── test_engine.py       # Engine event processing tests
+       ├── test_position.py     # Position risk tests
+       ├── test_persistence.py  # Anchor persistence tests
        └── test_comparison.py   # Comparison with original (optional)
    ```
 
@@ -142,6 +144,77 @@ uv run pytest packages/gridcore/tests/test_grid.py -v
 10. **Duplicate Orders**: `PlaceLimitIntent.create()` uses deterministic `client_order_id` (SHA256 hash of symbol+side+price+grid_level+direction) so execution layer can detect/skip duplicates
 11. **Position Risk Management**: For SHORT positions, higher liquidation ratio means closer to liquidation (use `>` not `<` in conditions)
 12. **Risk Rule Priority**: Check specific conditions (low margin, position ratios) BEFORE general liquidation risk conditions
+
+## Grid Anchor Persistence
+
+Grid levels can be preserved across restarts using the `GridAnchorStore` and `anchor_price` parameter.
+
+### Problem Solved
+When restarting the app after non-grid-related code changes, the grid normally rebuilds from the current market price, losing the original grid levels.
+
+### How It Works
+1. **On startup**: Load saved anchor data for the `strat_id`
+2. **Check config match**: If `grid_step` AND `grid_count` match saved values → use saved anchor price
+3. **Config changed**: If either changed → rebuild fresh from market price
+4. **After grid build**: Save new anchor data
+
+### Usage Pattern
+```python
+from gridcore import GridEngine, GridConfig, GridAnchorStore
+from decimal import Decimal
+
+strat_id = "btcusdt_main"
+config = GridConfig(grid_step=0.2, grid_count=50)
+store = GridAnchorStore('db/grid_anchor.json')
+
+# Load anchor if config matches
+anchor_data = store.load(strat_id)
+use_anchor = (
+    anchor_data
+    and anchor_data['grid_step'] == config.grid_step
+    and anchor_data['grid_count'] == config.grid_count
+)
+
+engine = GridEngine(
+    symbol='BTCUSDT',
+    tick_size=Decimal('0.1'),
+    config=config,
+    strat_id=strat_id,
+    anchor_price=anchor_data['anchor_price'] if use_anchor else None
+)
+
+# After first grid build (after first ticker event), save anchor:
+# (typically in your event loop after grid is built)
+store.save(
+    strat_id=strat_id,
+    anchor_price=engine.get_anchor_price(),
+    grid_step=config.grid_step,
+    grid_count=config.grid_count
+)
+```
+
+### Storage Format
+File: `db/grid_anchor.json`
+```json
+{
+  "btcusdt_main": {
+    "anchor_price": 100000.0,
+    "grid_step": 0.2,
+    "grid_count": 50
+  },
+  "ethusdt_main": {
+    "anchor_price": 3500.0,
+    "grid_step": 0.2,
+    "grid_count": 50
+  }
+}
+```
+
+### Key Notes
+- `strat_id` identifies each strategy instance (supports multiple currencies/accounts)
+- Grid is only rebuilt from anchor if both `grid_step` AND `grid_count` match
+- If config changes, grid rebuilds fresh from market price (intentional)
+- `GridEngine` now requires `strat_id` parameter
 
 ## Next Steps (Future Phases)
 

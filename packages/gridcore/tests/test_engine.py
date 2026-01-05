@@ -19,11 +19,12 @@ class TestGridEngineBasic:
     def test_engine_initialization(self):
         """Engine initializes with correct state."""
         config = GridConfig(grid_count=50, grid_step=0.2)
-        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
 
         assert engine.symbol == 'BTCUSDT'
         assert engine.tick_size == Decimal('0.1')
         assert engine.config.grid_count == 50
+        assert engine.strat_id == 'btcusdt_test'
         assert engine.last_close is None
         assert engine.last_filled_price is None
         assert len(engine.grid.grid) == 0
@@ -31,7 +32,7 @@ class TestGridEngineBasic:
     def test_on_ticker_event_builds_grid(self):
         """First ticker event initializes grid."""
         config = GridConfig(grid_count=50, grid_step=0.2)
-        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
 
         event = TickerEvent(
             event_type=EventType.TICKER,
@@ -45,7 +46,7 @@ class TestGridEngineBasic:
             funding_rate=Decimal('0.0001')
         )
 
-        intents = engine.on_event(event, {'long': [], 'short': []})
+        engine.on_event(event, {'long': [], 'short': []})
 
         # Grid should be built
         assert len(engine.grid.grid) == 51
@@ -54,7 +55,7 @@ class TestGridEngineBasic:
     def test_on_ticker_event_returns_place_intents(self):
         """Ticker event returns PlaceLimitIntent for grid levels."""
         config = GridConfig(grid_count=50, grid_step=0.2)
-        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
 
         event = TickerEvent(
             event_type=EventType.TICKER,
@@ -84,7 +85,7 @@ class TestGridEngineBasic:
     def test_on_execution_event_updates_last_filled(self):
         """ExecutionEvent updates last_filled_price."""
         config = GridConfig(grid_count=50, grid_step=0.2)
-        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
 
         # Build grid first
         ticker_event = TickerEvent(
@@ -129,7 +130,7 @@ class TestGridEngineOrderPlacement:
     def test_place_order_eligibility_buy(self):
         """Verify Buy orders only placed below market."""
         config = GridConfig(grid_count=50, grid_step=0.2)
-        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
 
         event = TickerEvent(
             event_type=EventType.TICKER,
@@ -153,7 +154,7 @@ class TestGridEngineOrderPlacement:
     def test_place_order_eligibility_sell(self):
         """Verify Sell orders only placed above market."""
         config = GridConfig(grid_count=50, grid_step=0.2)
-        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
 
         event = TickerEvent(
             event_type=EventType.TICKER,
@@ -177,7 +178,7 @@ class TestGridEngineOrderPlacement:
     def test_place_order_min_distance_check(self):
         """Orders too close to market price (< grid_step/2) are not placed."""
         config = GridConfig(grid_count=50, grid_step=0.2)
-        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
 
         event = TickerEvent(
             event_type=EventType.TICKER,
@@ -209,7 +210,7 @@ class TestGridEngineCancellation:
     def test_cancel_intent_side_mismatch(self):
         """Wrong side order gets CancelIntent."""
         config = GridConfig(grid_count=50, grid_step=0.2)
-        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
 
         # Build grid
         event = TickerEvent(
@@ -246,7 +247,7 @@ class TestGridEngineCancellation:
     def test_cancel_intent_outside_grid(self):
         """Price outside grid range gets CancelIntent."""
         config = GridConfig(grid_count=50, grid_step=0.2)
-        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
 
         # Build grid
         event = TickerEvent(
@@ -280,7 +281,7 @@ class TestGridEngineCancellation:
     def test_too_many_orders_triggers_rebuild(self):
         """More than grid_count + 10 orders triggers rebuild (mass cancel and grid rebuild)."""
         config = GridConfig(grid_count=50, grid_step=0.2)
-        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
 
         # Build grid first
         event = TickerEvent(
@@ -298,7 +299,7 @@ class TestGridEngineCancellation:
 
         # Store original grid state
         original_grid_size = len(engine.grid.grid)
-        original_center_price = next((g['price'] for g in engine.grid.grid if g['side'] == engine.grid.WAIT), None)
+        # original_center_price = next((g['price'] for g in engine.grid.grid if g['side'] == engine.grid.WAIT), None)
 
         # Create too many orders (> 60)
         too_many_orders = [
@@ -344,7 +345,7 @@ class TestGridEngineOrderTracking:
     def test_order_update_event_tracks_orders(self):
         """OrderUpdateEvent tracks pending orders."""
         config = GridConfig(grid_count=50, grid_step=0.2)
-        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
 
         # New order
         order_event = OrderUpdateEvent(
@@ -390,7 +391,7 @@ class TestGridEngineEdgeCases:
     def test_engine_handles_no_limit_orders(self):
         """Engine works when no existing limit orders."""
         config = GridConfig(grid_count=50, grid_step=0.2)
-        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
 
         event = TickerEvent(
             event_type=EventType.TICKER,
@@ -414,7 +415,7 @@ class TestGridEngineEdgeCases:
     def test_engine_handles_empty_grid(self):
         """Engine builds grid on first ticker even when starting empty."""
         config = GridConfig(grid_count=50, grid_step=0.2)
-        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
 
         assert len(engine.grid.grid) == 0
 
@@ -609,3 +610,179 @@ class TestDeterministicClientOrderId:
 
         # IDs should be the same - qty doesn't affect idempotency
         assert intent1.client_order_id == intent2.client_order_id
+
+
+class TestAnchorPricePersistence:
+    """Tests for anchor price persistence functionality."""
+
+    def test_engine_initialization_with_anchor_price(self):
+        """Engine initializes with anchor price parameter."""
+        config = GridConfig(grid_count=50, grid_step=0.2)
+        engine = GridEngine(
+            symbol='BTCUSDT',
+            tick_size=Decimal('0.1'),
+            config=config,
+            strat_id='btcusdt_test',
+            anchor_price=100000.0
+        )
+
+        assert engine._anchor_price == 100000.0
+        assert engine.strat_id == 'btcusdt_test'
+
+    def test_engine_builds_grid_from_anchor_price(self):
+        """Grid is built from anchor price instead of market price when provided."""
+        config = GridConfig(grid_count=50, grid_step=0.2)
+        engine = GridEngine(
+            symbol='BTCUSDT',
+            tick_size=Decimal('0.1'),
+            config=config,
+            strat_id='btcusdt_test',
+            anchor_price=100000.0  # Build around 100k
+        )
+
+        # Send ticker event with different market price
+        event = TickerEvent(
+            event_type=EventType.TICKER,
+            symbol='BTCUSDT',
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            last_price=Decimal('105000.0'),  # Market at 105k
+            mark_price=Decimal('105000.0'),
+            bid1_price=Decimal('104999.0'),
+            ask1_price=Decimal('105001.0'),
+            funding_rate=Decimal('0.0001')
+        )
+
+        engine.on_event(event, {'long': [], 'short': []})
+
+        # Grid should be built around anchor price (100k), not market price (105k)
+        anchor = engine.get_anchor_price()
+        assert anchor == 100000.0  # Should be exactly the anchor price
+
+    def test_engine_builds_grid_from_market_when_no_anchor(self):
+        """Grid is built from market price when no anchor provided."""
+        config = GridConfig(grid_count=50, grid_step=0.2)
+        engine = GridEngine(
+            symbol='BTCUSDT',
+            tick_size=Decimal('0.1'),
+            config=config,
+            strat_id='btcusdt_test'
+            # No anchor_price
+        )
+
+        # Send ticker event
+        event = TickerEvent(
+            event_type=EventType.TICKER,
+            symbol='BTCUSDT',
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            last_price=Decimal('105000.0'),
+            mark_price=Decimal('105000.0'),
+            bid1_price=Decimal('104999.0'),
+            ask1_price=Decimal('105001.0'),
+            funding_rate=Decimal('0.0001')
+        )
+
+        engine.on_event(event, {'long': [], 'short': []})
+
+        # Grid should be built around market price
+        anchor = engine.get_anchor_price()
+        assert anchor == 105000.0
+
+    def test_get_anchor_price_returns_wait_zone_price(self):
+        """get_anchor_price returns the WAIT zone center price."""
+        config = GridConfig(grid_count=50, grid_step=0.2)
+        engine = GridEngine(
+            symbol='BTCUSDT',
+            tick_size=Decimal('0.1'),
+            config=config,
+            strat_id='btcusdt_test'
+        )
+
+        # Build grid
+        event = TickerEvent(
+            event_type=EventType.TICKER,
+            symbol='BTCUSDT',
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            last_price=Decimal('100000.0'),
+            mark_price=Decimal('100000.0'),
+            bid1_price=Decimal('99999.0'),
+            ask1_price=Decimal('100001.0'),
+            funding_rate=Decimal('0.0001')
+        )
+
+        engine.on_event(event, {'long': [], 'short': []})
+
+        # get_anchor_price should return the center (WAIT zone) price
+        anchor = engine.get_anchor_price()
+        assert anchor is not None
+        assert anchor == 100000.0
+
+    def test_get_anchor_price_returns_none_when_grid_empty(self):
+        """get_anchor_price returns None when grid is empty."""
+        config = GridConfig(grid_count=50, grid_step=0.2)
+        engine = GridEngine(
+            symbol='BTCUSDT',
+            tick_size=Decimal('0.1'),
+            config=config,
+            strat_id='btcusdt_test'
+        )
+
+        # Don't build grid
+        anchor = engine.get_anchor_price()
+        assert anchor is None
+
+    def test_anchor_price_preserves_grid_levels_on_restart(self):
+        """Simulates restart scenario: anchor price preserves grid levels."""
+        config = GridConfig(grid_count=50, grid_step=0.2)
+
+        # First run: build grid at 100k
+        engine1 = GridEngine(
+            symbol='BTCUSDT',
+            tick_size=Decimal('0.1'),
+            config=config,
+            strat_id='btcusdt_test'
+        )
+
+        event1 = TickerEvent(
+            event_type=EventType.TICKER,
+            symbol='BTCUSDT',
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            last_price=Decimal('100000.0'),
+            mark_price=Decimal('100000.0'),
+            bid1_price=Decimal('99999.0'),
+            ask1_price=Decimal('100001.0'),
+            funding_rate=Decimal('0.0001')
+        )
+        engine1.on_event(event1, {'long': [], 'short': []})
+
+        # Save anchor price (simulate persistence)
+        saved_anchor = engine1.get_anchor_price()
+
+        # Second run: "restart" with market at different price
+        engine2 = GridEngine(
+            symbol='BTCUSDT',
+            tick_size=Decimal('0.1'),
+            config=config,
+            strat_id='btcusdt_test',
+            anchor_price=saved_anchor  # Use saved anchor
+        )
+
+        event2 = TickerEvent(
+            event_type=EventType.TICKER,
+            symbol='BTCUSDT',
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            last_price=Decimal('105000.0'),  # Market moved to 105k
+            mark_price=Decimal('105000.0'),
+            bid1_price=Decimal('104999.0'),
+            ask1_price=Decimal('105001.0'),
+            funding_rate=Decimal('0.0001')
+        )
+        engine2.on_event(event2, {'long': [], 'short': []})
+
+        # Grid should be centered at saved anchor (100k), not market price (105k)
+        assert engine2.get_anchor_price() == saved_anchor
+        assert engine2.get_anchor_price() == 100000.0
