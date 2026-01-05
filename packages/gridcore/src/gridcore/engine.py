@@ -25,7 +25,8 @@ class GridEngine:
     The execution layer (live trading or backtest) handles actual order placement.
     """
 
-    def __init__(self, symbol: str, tick_size: Decimal, config: GridConfig):
+    def __init__(self, symbol: str, tick_size: Decimal, config: GridConfig,
+                 strat_id: str, anchor_price: Optional[float] = None):
         """
         Initialize grid trading engine.
 
@@ -33,10 +34,15 @@ class GridEngine:
             symbol: Trading pair symbol (e.g., 'BTCUSDT')
             tick_size: Minimum price increment for the symbol
             config: Grid configuration parameters
+            strat_id: Strategy identifier for this engine instance
+            anchor_price: Optional anchor price to build grid from instead of market price.
+                         Used to restore grid levels after restart.
         """
         self.symbol = symbol
         self.config = config
         self.tick_size = tick_size
+        self.strat_id = strat_id
+        self._anchor_price = anchor_price
         self.grid = Grid(tick_size, config.grid_count, config.grid_step, config.rebalance_threshold)
         self.last_close: Optional[float] = None
         self.last_filled_price: Optional[float] = None
@@ -97,7 +103,10 @@ class GridEngine:
 
         # Build grid if empty
         if len(self.grid.grid) <= 1:
-            self.grid.build_grid(self.last_close)
+            # Use anchor price if provided (for grid restoration after restart)
+            # Otherwise use current market price
+            build_price = self._anchor_price if self._anchor_price else self.last_close
+            self.grid.build_grid(build_price)
 
         # Check and place orders for both directions
         intents.extend(self._check_and_place('long', limit_orders.get('long', [])))
@@ -143,6 +152,18 @@ class GridEngine:
             self.pending_orders.pop(event.order_link_id, None)
 
         return []
+
+    def get_anchor_price(self) -> float | None:
+        """
+        Get the current grid anchor price.
+
+        The anchor price is the center price (WAIT zone) that the grid
+        was built around. Use this to save the anchor for persistence.
+
+        Returns:
+            The WAIT zone price, or None if grid is empty
+        """
+        return self.grid.anchor_price
 
     def _check_and_place(self, direction: str, limits: list[dict]) -> list[PlaceLimitIntent | CancelIntent]:
         """

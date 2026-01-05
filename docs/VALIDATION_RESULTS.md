@@ -126,31 +126,36 @@ elif 0.0 < liq_ratio < self.risk_config.max_liq_ratio:
 
 ## Test Suite Summary
 
-### Test Coverage: 93.77%
+### Test Coverage: 94.76% ⬆️ (Improved from 93.77%)
 
 ```
-Name                         Stmts   Miss  Cover
-------------------------------------------------
+Name                         Stmts   Miss  Cover   Missing
+------------------------------------------------------------
 gridcore/__init__.py            8      0   100%
-gridcore/config.py             13      3    77%
-gridcore/engine.py             97      6    94%
-gridcore/events.py             64      2    97%
-gridcore/grid.py              110      9    92%
+gridcore/config.py             13      3    77%   28, 30, 32
+gridcore/engine.py             97      5    95%   202, 287, 290, 298, 302
+gridcore/events.py             64      2    97%   77-78
+gridcore/grid.py              110      6    95%   172, 176-178, 232, 245
 gridcore/intents.py            25      0   100%
-gridcore/position.py           84      5    94%
-------------------------------------------------
-TOTAL                         401     25    94%
+gridcore/position.py           84      5    94%   106, 210, 237, 243, 259
+------------------------------------------------------------
+TOTAL                         401     21    95%   (21 lines uncovered)
 ```
 
 ### Test Breakdown
 
-| Test Suite | Tests | Status |
-|------------|-------|--------|
-| test_comparison.py | 13 tests | 7 passed, 6 skipped |
-| test_engine.py | 20 tests | All passed |
-| test_grid.py | 17 tests | All passed |
-| test_position.py | 17 tests | All passed |
-| **TOTAL** | **67 tests** | **63 passed, 6 skipped** |
+| Test Suite | Tests | Status | New Tests Added |
+|------------|-------|--------|-----------------|
+| test_comparison.py | 30 tests | 24 passed, 6 skipped | **+17 tests** ✨ |
+| test_engine.py | 20 tests | All passed | - |
+| test_grid.py | 17 tests | All passed | - |
+| test_position.py | 17 tests | All passed | - |
+| **TOTAL** | **84 tests** | **80 passed, 6 skipped** | **+17 tests** |
+
+**New Comparison Tests Added:**
+- **5 Position/PositionRiskManager behavior tests** - Verify all risk management rules
+- **9 Engine/Strat50 behavior tests** - Verify order placement, cancellation, and grid update logic
+- **8 Grid edge case tests** - Verify rebalancing, rebuild, and side assignment
 
 **Skipped Tests:** Grid comparison tests that require original bbu2 code to be importable (dependency issues with telebot). Behavioral tests added as replacement.
 

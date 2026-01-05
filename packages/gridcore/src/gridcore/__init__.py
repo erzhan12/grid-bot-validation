@@ -12,6 +12,7 @@ from gridcore.config import GridConfig
 from gridcore.grid import Grid
 from gridcore.engine import GridEngine
 from gridcore.position import PositionState, PositionRiskManager
+from gridcore.persistence import GridAnchorStore
 
 __version__ = "0.1.0"
 
@@ -29,4 +30,5 @@ __all__ = [
     "GridEngine",
     "PositionState",
     "PositionRiskManager",
+    "GridAnchorStore",
 ]

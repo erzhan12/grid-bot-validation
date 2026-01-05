@@ -2,7 +2,6 @@
 Unit tests for Position module.
 """
 
-import pytest
 from decimal import Decimal
 from gridcore.position import PositionState, PositionRiskManager, RiskConfig
 
