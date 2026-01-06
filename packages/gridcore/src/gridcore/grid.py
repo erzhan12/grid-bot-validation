@@ -9,8 +9,11 @@ Extracted from bbu2-master/greed.py with the following key transformations:
 - Removed strat dependency, made self-contained
 """
 
+import logging
 from decimal import Decimal
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class Grid:
@@ -134,6 +137,7 @@ class Grid:
 
         # Rebuild if grid is empty or price moved outside grid bounds
         if not self.grid or not (self.__min_grid < last_close < self.__max_grid):
+            logger.info('Rebuild grid: Out of bounds (price=%s)', last_close)
             self.__rebuild_grid(last_close)
             # Continue to apply side assignment logic after rebuild (matches original behavior)
 

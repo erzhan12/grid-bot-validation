@@ -4,9 +4,12 @@ Position state tracking and risk management.
 Extracted from bbu2-master/position.py with exchange-specific dependencies removed.
 """
 
+import logging
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -143,6 +146,19 @@ class PositionRiskManager:
                 float(opposite_position.margin)
             )
 
+        # Log position state (matches reference position.py:24-31)
+        logger.debug(
+            '%s margin=%.2f liq_ratio=%.2f unrealized_pnl=%.2f%% '
+            'multiplier=%s position_ratio=%.2f total_margin=%.2f',
+            self.direction,
+            float(position.margin),
+            liq_ratio,
+            self.unrealized_pnl_pct,
+            self.amount_multiplier,
+            self.position_ratio,
+            total_margin
+        )
+
         return self.amount_multiplier
 
     def _apply_long_position_rules(
@@ -163,22 +179,27 @@ class PositionRiskManager:
         """
         # Positions equal but low total margin → adjust (highest priority for specific condition)
         if is_position_equal and total_margin < self.risk_config.min_total_margin:
+            logger.info('Position adjustment: %s low_margin (total=%.2f)', self.direction, total_margin)
             self._adjust_position_for_low_margin()
 
         # Long position too small and losing → increase long
         elif self.position_ratio < 0.5 and self.unrealized_pnl_pct < 0:
+            logger.info('Position adjustment: %s ratio=%.2f increasing buys', self.direction, self.position_ratio)
             self.amount_multiplier[self.SIDE_BUY] = 2.0
 
         # Long position very small → increase long
         elif self.position_ratio < 0.20:
+            logger.info('Position adjustment: %s ratio=%.2f increasing buys', self.direction, self.position_ratio)
             self.amount_multiplier[self.SIDE_BUY] = 2.0
 
         # High liquidation risk → decrease long position (checked after specific conditions)
         elif liq_ratio > 1.05 * self.risk_config.min_liq_ratio:
+            logger.info('Position adjustment: %s high_liq_risk (ratio=%.2f)', self.direction, liq_ratio)
             self.amount_multiplier[self.SIDE_SELL] = 1.5
 
         # Moderate liquidation risk → increase opposite (short) position
         elif liq_ratio > self.risk_config.min_liq_ratio:
+            logger.info('Position adjustment: %s moderate_liq_risk (ratio=%.2f)', self.direction, liq_ratio)
             self.amount_multiplier[self.SIDE_BUY] = 0.5  # Decrease long buys (increases short)
 
     def _apply_short_position_rules(
@@ -203,24 +224,29 @@ class PositionRiskManager:
         # High liquidation risk (short) → decrease short position (EMERGENCY)
         # When liq_ratio is high and close to max, liquidation is imminent
         if liq_ratio > 0.95 * self.risk_config.max_liq_ratio:
+            logger.info('Position adjustment: %s EMERGENCY high_liq_risk (ratio=%.2f)', self.direction, liq_ratio)
             self.amount_multiplier[self.SIDE_BUY] = 1.5
 
         # Positions equal but low total margin → adjust
         elif is_position_equal and total_margin < self.risk_config.min_total_margin:
+            logger.info('Position adjustment: %s low_margin (total=%.2f)', self.direction, total_margin)
             self._adjust_position_for_low_margin()
 
         # Short position too large and losing → increase short
         elif self.position_ratio > 2.0 and self.unrealized_pnl_pct < 0:
+            logger.info('Position adjustment: %s ratio=%.2f increasing sells', self.direction, self.position_ratio)
             self.amount_multiplier[self.SIDE_SELL] = 2.0
 
         # Short position very large → increase short
         elif self.position_ratio > 5.0:
+            logger.info('Position adjustment: %s ratio=%.2f increasing sells', self.direction, self.position_ratio)
             self.amount_multiplier[self.SIDE_SELL] = 2.0
 
         # Moderate liquidation risk → increase opposite (long) position
         # Reference: bbu2-master/position.py:81-86
         # Checked AFTER position ratio checks to not mask sizing adjustments
         elif 0.0 < liq_ratio < self.risk_config.max_liq_ratio:
+            logger.info('Position adjustment: %s moderate_liq_risk (ratio=%.2f)', self.direction, liq_ratio)
             self.amount_multiplier[self.SIDE_SELL] = 0.5  # Decrease short sells (increases long)
 
     def _adjust_position_for_low_margin(self) -> None:
