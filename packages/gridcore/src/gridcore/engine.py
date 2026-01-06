@@ -8,13 +8,17 @@ Extracted from bbu2-master/strat.py Strat50 class with the following transformat
 - Removed all exchange and database dependencies
 """
 
+import logging
 from decimal import Decimal
 from typing import Optional
 
 from gridcore.config import GridConfig
+
 from gridcore.events import Event, TickerEvent, ExecutionEvent, OrderUpdateEvent
 from gridcore.grid import Grid
 from gridcore.intents import PlaceLimitIntent, CancelIntent
+
+logger = logging.getLogger(__name__)
 
 
 class GridEngine:
@@ -106,6 +110,10 @@ class GridEngine:
             # Use anchor price if provided (for grid restoration after restart)
             # Otherwise use current market price
             build_price = self._anchor_price if self._anchor_price else self.last_close
+            if self._anchor_price:
+                logger.info('%s: Building grid from anchor price %s', self.symbol, build_price)
+            else:
+                logger.info('%s: Building grid from market price %s', self.symbol, build_price)
             self.grid.build_grid(build_price)
 
         # Check and place orders for both directions
@@ -182,6 +190,7 @@ class GridEngine:
 
         # Too many orders → rebuild needed (return cancel intents)
         if len(limits) > len(self.grid.grid) + 10:
+            logger.info('%s: Rebuild grid - too many orders (%d)', self.symbol, len(limits))
             # Rebuild grid if we have a valid last_close (matches original behavior)
             if self.last_close is not None:
                 self.grid.build_grid(self.last_close)

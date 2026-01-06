@@ -216,6 +216,30 @@ File: `db/grid_anchor.json`
 - If config changes, grid rebuilds fresh from market price (intentional)
 - `GridEngine` now requires `strat_id` parameter
 
+## Logging Configuration
+
+Gridcore uses Python's standard library `logging` module. Loggers are named after their modules (`gridcore.grid`, `gridcore.engine`, `gridcore.position`).
+
+### Log Levels
+- `INFO` - Important events: grid rebuild, position adjustments
+- `DEBUG` - Detailed state info: position calculations
+
+### Configuration Example
+```python
+import logging
+
+# Configure gridcore logging
+logging.getLogger('gridcore').setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter('%(asctime)s %(name)s %(levelname)s: %(message)s'))
+logging.getLogger('gridcore').addHandler(handler)
+```
+
+### Logged Events
+- **grid.py**: Grid rebuild when price moves out of bounds
+- **engine.py**: Grid build from anchor/market price, rebuild due to too many orders
+- **position.py**: Position ratio adjustments, risk management triggers
+
 ## Next Steps (Future Phases)
 
 - Phase C: Backtesting Framework Integration
