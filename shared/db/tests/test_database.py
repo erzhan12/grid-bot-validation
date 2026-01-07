@@ -42,6 +42,51 @@ class TestDatabaseSettings:
         url = settings.get_database_url()
         assert url == "postgresql+psycopg2://gridbot:secret@localhost:5432/gridbot_db"
 
+    def test_postgresql_url_with_special_characters(self):
+        """PostgreSQL URL generation with special characters in password."""
+        from urllib.parse import quote_plus
+        
+        settings = DatabaseSettings(
+            db_type="postgresql",
+            db_host="localhost",
+            db_port="5432",
+            db_user="gridbot",
+            db_password="p@ss:w#rd/123%",
+            db_name="gridbot_db",
+        )
+        url = settings.get_database_url()
+        # Password should be URL-encoded
+        expected_password = quote_plus("p@ss:w#rd/123%")
+        assert f":{expected_password}@" in url
+        assert url.startswith("postgresql+psycopg2://")
+        assert url.endswith("/gridbot_db")
+        # Verify the password is properly encoded (not raw special chars)
+        assert "@" not in url.split("@")[0].split(":")[-1]  # Password part before @
+        assert ":" not in url.split("@")[0].split(":")[-1]  # Password part before @
+        assert "/" not in url.split("@")[0].split(":")[-1]  # Password part before @
+
+    def test_postgresql_url_with_special_characters_in_all_fields(self):
+        """PostgreSQL URL generation with special characters in all fields."""
+        from urllib.parse import quote_plus
+        
+        settings = DatabaseSettings(
+            db_type="postgresql",
+            db_host="host@example.com",
+            db_port="5432",
+            db_user="user@domain",
+            db_password="p@ss#w:rd",
+            db_name="db-name_test",
+        )
+        url = settings.get_database_url()
+        # All components should be URL-encoded
+        assert quote_plus("user@domain") in url
+        assert quote_plus("p@ss#w:rd") in url
+        assert quote_plus("host@example.com") in url
+        assert quote_plus("db-name_test") in url
+        # Verify URL structure is correct
+        assert url.startswith("postgresql+psycopg2://")
+        assert "/" in url  # Should have database name separator
+
     def test_postgresql_missing_fields(self):
         """PostgreSQL requires all connection fields."""
         settings = DatabaseSettings(

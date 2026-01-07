@@ -1,6 +1,7 @@
 """Database configuration with dual-database support (SQLite/PostgreSQL)."""
 
 from typing import Optional
+from urllib.parse import quote_plus
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -56,9 +57,15 @@ class DatabaseSettings(BaseSettings):
                 raise ValueError(
                     "PostgreSQL requires db_host, db_port, db_user, and db_password"
                 )
+            # URL-encode components to handle special characters (e.g., @, :, /, #, % in passwords)
+            encoded_user = quote_plus(self.db_user)
+            encoded_password = quote_plus(self.db_password)
+            encoded_host = quote_plus(self.db_host)
+            encoded_port = quote_plus(self.db_port)
+            encoded_db_name = quote_plus(self.db_name)
             return (
-                f"postgresql+psycopg2://{self.db_user}:{self.db_password}"
-                f"@{self.db_host}:{self.db_port}/{self.db_name}"
+                f"postgresql+psycopg2://{encoded_user}:{encoded_password}"
+                f"@{encoded_host}:{encoded_port}/{encoded_db_name}"
             )
 
         raise ValueError(f"Unsupported database type: {self.db_type}")
