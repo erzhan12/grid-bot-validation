@@ -298,6 +298,15 @@ Successfully implemented a multi-tenant database layer supporting SQLite (develo
    - `BaseRepository` does NOT expose `get_by_id`/`get_all` (removed for safety)
    - `UserRepository` explicitly implements admin-style access methods
 
+7. **Cascade Deletes**
+   - All foreign keys have `ondelete="CASCADE"` to ensure referential integrity
+   - ORM relationships use `cascade="all, delete-orphan"` for automatic cleanup
+   - **Run model**: Foreign keys (`user_id`, `account_id`, `strategy_id`) cascade on parent deletion
+   - **PrivateExecution model**: `run_id` foreign key cascades when Run is deleted
+   - Deleting a User/BybitAccount/Strategy automatically deletes associated Runs
+   - Deleting a Run automatically deletes associated PrivateExecution records
+   - Tests verify cascade behavior: `test_*_cascade_delete` in `shared/db/tests/test_models.py`
+
 ### Usage Example
 ```python
 from grid_db import DatabaseFactory, DatabaseSettings

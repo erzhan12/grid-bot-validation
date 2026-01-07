@@ -256,6 +256,63 @@ class TestRunModel:
         assert run.account == sample_account
         assert run.strategy == sample_strategy
 
+    def test_run_cascade_delete_from_user(
+        self, session, sample_user, sample_account, sample_strategy
+    ):
+        """Deleting user cascades to runs."""
+        run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="backtest",
+        )
+        session.add(run)
+        session.flush()
+        run_id = run.run_id
+
+        session.delete(sample_user)
+        session.flush()
+
+        assert session.get(Run, run_id) is None
+
+    def test_run_cascade_delete_from_account(
+        self, session, sample_user, sample_account, sample_strategy
+    ):
+        """Deleting account cascades to runs."""
+        run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="live",
+        )
+        session.add(run)
+        session.flush()
+        run_id = run.run_id
+
+        session.delete(sample_account)
+        session.flush()
+
+        assert session.get(Run, run_id) is None
+
+    def test_run_cascade_delete_from_strategy(
+        self, session, sample_user, sample_account, sample_strategy
+    ):
+        """Deleting strategy cascades to runs."""
+        run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="shadow",
+        )
+        session.add(run)
+        session.flush()
+        run_id = run.run_id
+
+        session.delete(sample_strategy)
+        session.flush()
+
+        assert session.get(Run, run_id) is None
+
 
 class TestPublicTradeModel:
     """Tests for PublicTrade model."""
@@ -368,3 +425,37 @@ class TestPrivateExecutionModel:
         session.expire(execution)
         assert execution.raw_json["isMaker"] is True
         assert execution.raw_json["extra"]["field"] == "value"
+
+    def test_private_execution_cascade_delete_from_run(
+        self, session, sample_user, sample_account, sample_strategy
+    ):
+        """Deleting run cascades to private executions."""
+        run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="live",
+        )
+        session.add(run)
+        session.flush()
+
+        now = datetime.now(UTC)
+        execution = PrivateExecution(
+            run_id=run.run_id,
+            account_id=sample_account.account_id,
+            symbol="BTCUSDT",
+            exec_id="exec125",
+            order_id="order458",
+            exchange_ts=now,
+            side="Buy",
+            exec_price=Decimal("50000.00"),
+            exec_qty=Decimal("0.01"),
+        )
+        session.add(execution)
+        session.flush()
+        execution_id = execution.id
+
+        session.delete(run)
+        session.flush()
+
+        assert session.get(PrivateExecution, execution_id) is None
