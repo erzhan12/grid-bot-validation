@@ -58,14 +58,14 @@ class DatabaseSettings(BaseSettings):
                     "PostgreSQL requires db_host, db_port, db_user, and db_password"
                 )
             # URL-encode components to handle special characters (e.g., @, :, /, #, % in passwords)
+            # Note: Port is NOT encoded per RFC 3986 (numeric-only URI component)
             encoded_user = quote_plus(self.db_user)
             encoded_password = quote_plus(self.db_password)
             encoded_host = quote_plus(self.db_host)
-            encoded_port = quote_plus(self.db_port)
             encoded_db_name = quote_plus(self.db_name)
             return (
                 f"postgresql+psycopg2://{encoded_user}:{encoded_password}"
-                f"@{encoded_host}:{encoded_port}/{encoded_db_name}"
+                f"@{encoded_host}:{self.db_port}/{encoded_db_name}"
             )
 
         raise ValueError(f"Unsupported database type: {self.db_type}")

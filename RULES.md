@@ -281,7 +281,7 @@ Successfully implemented a multi-tenant database layer supporting SQLite (develo
    - SQLite requires `PRAGMA foreign_keys=ON` on every connection
    - JSON type works as text in SQLite, native JSONB in PostgreSQL
    - SQLite connection pooling must use `StaticPool` ONLY for `:memory:` databases
-   - **PostgreSQL URL encoding**: All connection components (user, password, host, port, db_name) are URL-encoded using `urllib.parse.quote_plus()` to handle special characters (e.g., `@`, `:`, `/`, `#`, `%` in passwords). Without encoding, passwords with special characters would break the connection string parsing.
+   - **PostgreSQL URL encoding**: Connection components (user, password, host, db_name) are URL-encoded using `urllib.parse.quote_plus()` to handle special characters (e.g., `@`, `:`, `/`, `#`, `%` in passwords). The port is NOT encoded per RFC 3986 (ports are numeric-only URI components). Without encoding, passwords with special characters would break the connection string parsing.
 
 4. **Testing**
    - Run tests: `uv run pytest shared/db/tests/ --cov=grid_db -v`
