@@ -6,7 +6,7 @@ requires-python = ">=3.11"
 dependencies = []
 
 [tool.uv.workspace]
-members = ["packages/*"]
+members = ["packages/*", "shared/*"]
 
 [tool.uv]
 dev-dependencies = [
@@ -16,5 +16,5 @@ dev-dependencies = [
 ]
 
 [tool.pytest.ini_options]
-pythonpath = ["packages/gridcore/src"]
-testpaths = ["packages/gridcore/tests"]
+pythonpath = ["packages/gridcore/src", "shared/db/src"]
+testpaths = ["packages/gridcore/tests", "shared/db/tests"]
