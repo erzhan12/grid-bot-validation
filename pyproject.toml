@@ -3,10 +3,7 @@ name = "grid-bot-validation"
 version = "0.1.0"
 description = "Grid trading bot validation and backtesting framework"
 requires-python = ">=3.11"
-dependencies = [
-    "sqlalchemy>=2.0",
-    "pydantic-settings>=2.0",
-]
+dependencies = []
 
 [tool.uv.workspace]
 members = ["packages/*", "shared/*"]

@@ -64,7 +64,9 @@ class User(Base):
     accounts: Mapped[List["BybitAccount"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
-    runs: Mapped[List["Run"]] = relationship(back_populates="user")
+    runs: Mapped[List["Run"]] = relationship(
+        back_populates="user"
+    )
 
 
 class BybitAccount(Base):
@@ -95,7 +97,9 @@ class BybitAccount(Base):
     strategies: Mapped[List["Strategy"]] = relationship(
         back_populates="account", cascade="all, delete-orphan"
     )
-    runs: Mapped[List["Run"]] = relationship(back_populates="account")
+    runs: Mapped[List["Run"]] = relationship(
+        back_populates="account", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         UniqueConstraint("user_id", "account_name", name="uq_user_account_name"),
@@ -156,7 +160,9 @@ class Strategy(Base):
 
     # Relationships
     account: Mapped["BybitAccount"] = relationship(back_populates="strategies")
-    runs: Mapped[List["Run"]] = relationship(back_populates="strategy")
+    runs: Mapped[List["Run"]] = relationship(
+        back_populates="strategy", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         UniqueConstraint("account_id", "symbol", name="uq_account_symbol"),
@@ -172,13 +178,13 @@ class Run(Base):
         String(36), primary_key=True, default=generate_uuid
     )
     user_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("users.user_id"), nullable=False
+        String(36), ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False
     )
     account_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("bybit_accounts.account_id"), nullable=False
+        String(36), ForeignKey("bybit_accounts.account_id", ondelete="CASCADE"), nullable=False
     )
     strategy_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("strategies.strategy_id"), nullable=False
+        String(36), ForeignKey("strategies.strategy_id", ondelete="CASCADE"), nullable=False
     )
     run_type: Mapped[str] = mapped_column(
         String(20), nullable=False
@@ -195,7 +201,9 @@ class Run(Base):
     user: Mapped["User"] = relationship(back_populates="runs")
     account: Mapped["BybitAccount"] = relationship(back_populates="runs")
     strategy: Mapped["Strategy"] = relationship(back_populates="runs")
-    executions: Mapped[List["PrivateExecution"]] = relationship(back_populates="run")
+    executions: Mapped[List["PrivateExecution"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         Index("ix_runs_user_id", "user_id"),
@@ -238,7 +246,7 @@ class PrivateExecution(Base):
         autoincrement=True,
     )
     run_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("runs.run_id"), nullable=False
+        String(36), ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False
     )
     account_id: Mapped[str] = mapped_column(String(36), nullable=False)
     symbol: Mapped[str] = mapped_column(String(20), nullable=False)
