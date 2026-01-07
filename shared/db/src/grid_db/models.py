@@ -65,7 +65,7 @@ class User(Base):
         back_populates="user", cascade="all, delete-orphan"
     )
     runs: Mapped[List["Run"]] = relationship(
-        back_populates="user"
+        back_populates="user", cascade="all, delete-orphan"
     )
 
 
