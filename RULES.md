@@ -240,8 +240,105 @@ logging.getLogger('gridcore').addHandler(handler)
 - **engine.py**: Grid build from anchor/market price, rebuild due to too many orders
 - **position.py**: Position ratio adjustments, risk management triggers
 
+## Phase C: Multi-Tenant Database Layer (grid_db)
+
+### Completed: 2026-01-07
+
+Successfully implemented a multi-tenant database layer supporting SQLite (development) and PostgreSQL (production).
+
+### Key Implementation Notes
+
+1. **Package Structure**
+   ```
+   shared/db/
+   ├── pyproject.toml           # Dependencies: sqlalchemy, pydantic-settings
+   ├── src/grid_db/
+   │   ├── __init__.py          # Package exports
+   │   ├── settings.py          # DatabaseSettings (Pydantic)
+   │   ├── models.py            # SQLAlchemy ORM models (7 tables)
+   │   ├── database.py          # DatabaseFactory
+   │   ├── repositories.py      # CRUD with multi-tenant filtering
+   │   └── init_db.py           # CLI initialization script
+   └── tests/
+       ├── conftest.py          # Test fixtures
+       ├── test_models.py
+       ├── test_database.py
+       └── test_repositories.py
+   ```
+
+2. **Database Tables**
+   - `users` - User accounts for multi-tenant access control
+   - `bybit_accounts` - Exchange accounts per user
+   - `api_credentials` - API keys (plaintext for now)
+   - `strategies` - Grid strategy configurations (JSON config)
+   - `runs` - Live/backtest/shadow run tracking
+   - `public_trades` - Market trade data for fill simulation
+   - `private_executions` - Ground truth execution data
+
+3. **SQLite/PostgreSQL Compatibility**
+   - Use `String(36)` for UUIDs (not native UUID type)
+   - Use `BigInteger().with_variant(Integer, "sqlite")` for high-volume primary keys (trades/executions)
+   - SQLite requires `PRAGMA foreign_keys=ON` on every connection
+   - JSON type works as text in SQLite, native JSONB in PostgreSQL
+   - SQLite connection pooling must use `StaticPool` ONLY for `:memory:` databases
+
+4. **Testing**
+   - Run tests: `uv run pytest shared/db/tests/ --cov=grid_db -v`
+   - Test fixtures use in-memory SQLite (`:memory:`)
+
+5. **Session Management**
+   - Use `DatabaseFactory.get_session()` context manager for auto commit/rollback
+   - For tests expecting IntegrityError, session fixture uses manual rollback
+
+6. **Multi-Tenant Access Control**
+   - **CRITICAL**: All queries MUST filter by `user_id` to enforce data isolation
+   - `RunRepository` enforces `user_id` filtering on all methods
+   - `ApiCredentialRepository` and `StrategyRepository` enforce `user_id` filtering (join via `BybitAccount`)
+   - `BaseRepository` does NOT expose `get_by_id`/`get_all` (removed for safety)
+   - `UserRepository` explicitly implements admin-style access methods
+
+### Usage Example
+```python
+from grid_db import DatabaseFactory, DatabaseSettings
+from grid_db import User, BybitAccount, Strategy, Run
+from grid_db import UserRepository, RunRepository
+
+# Initialize database
+# Env vars loaded with GRIDBOT_ prefix (e.g. GRIDBOT_DB_TYPE)
+settings = DatabaseSettings()
+db = DatabaseFactory(settings)
+db.create_tables()
+
+# Use session context manager
+with db.get_session() as session:
+    # Create user
+    user = User(username="trader1", email="trader@example.com")
+    session.add(user)
+    session.flush()
+
+    # Create account
+    account = BybitAccount(
+        user_id=user.user_id,
+        account_name="main",
+        environment="testnet"
+    )
+    session.add(account)
+
+# Use repositories for multi-tenant queries
+with db.get_session() as session:
+    repo = RunRepository(session)
+    runs = repo.get_by_user_id(user_id)  # Only returns user's runs
+```
+
+### Environment Variables
+- `GRIDBOT_DB_TYPE` - "sqlite" or "postgresql"
+- `GRIDBOT_DB_NAME` - Database name or file path
+- `GRIDBOT_DB_HOST`, `GRIDBOT_DB_PORT`, `GRIDBOT_DB_USER`, `GRIDBOT_DB_PASSWORD` - PostgreSQL config
+
 ## Next Steps (Future Phases)
 
-- Phase C: Backtesting Framework Integration
-- Phase D: Live Trading Integration
-- Phase E: Multi-Tenant Support
+- Phase D: Data Capture (public trades + private streams)
+- Phase E: Live Bot Rewrite (multi-tenant orchestrator)
+- Phase F: Backtest Rewrite (trade-through fill model)
+- Phase G: Comparator (validation metrics)
+- Phase H: Testing & Validation
