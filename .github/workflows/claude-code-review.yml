@@ -81,5 +81,5 @@ jobs:
           # or https://code.claude.com/docs/en/cli-reference for available options
           claude_args: |
             --model claude-4-5-sonnet-latest
-            --allowed-tools "Bash(ls:*),Bash(cat:*),Bash(find:*),Bash(git:*),Bash(grep:*),Bash(gh pr:*),Bash(gh issue:*)"
+            --allowed-tools "Bash(*)"
 
