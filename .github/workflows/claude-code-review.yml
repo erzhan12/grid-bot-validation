@@ -80,6 +80,6 @@ jobs:
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
           claude_args: |
-            --model claude-4-5-sonnet-latest
+            --model claude-sonnet-4-5-20250929
             --allowed-tools "Bash(*)"
 
