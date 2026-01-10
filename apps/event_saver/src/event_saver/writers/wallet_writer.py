@@ -190,14 +190,14 @@ class WalletWriter:
         for msg in messages:
             data = msg.get("data", [])
             for wallet_data in data:
-                # Parse timestamp
-                update_time_ms = int(wallet_data.get("updateTime", 0))
-                exchange_ts = datetime.fromtimestamp(update_time_ms / 1000, tz=UTC)
+                try:
+                    # Parse timestamp
+                    update_time_ms = int(wallet_data.get("updateTime", 0))
+                    exchange_ts = datetime.fromtimestamp(update_time_ms / 1000, tz=UTC)
 
-                # Parse coin balances
-                coins = wallet_data.get("coin", [])
-                for coin_data in coins:
-                    try:
+                    # Parse coin balances
+                    coins = wallet_data.get("coin", [])
+                    for coin_data in coins:
                         snapshots.append(
                             WalletSnapshot(
                                 account_id=str(account_id),
@@ -213,9 +213,9 @@ class WalletWriter:
                                 raw_json=coin_data,
                             )
                         )
-                    except Exception as e:
-                        logger.warning(f"Error parsing wallet snapshot: {e}")
-                        continue
+                except Exception as e:
+                    logger.warning(f"Error parsing wallet snapshot: {e}")
+                    continue
 
         return snapshots
 

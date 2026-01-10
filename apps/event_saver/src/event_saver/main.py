@@ -44,7 +44,7 @@ class EventSaver:
         saver = EventSaver(config=config, db=db)
 
         # Add accounts for private data collection
-        saver.add_account(AccountContext(...))
+        await saver.add_account(AccountContext(...))
 
         await saver.start()
         # ... runs until shutdown signal
@@ -81,8 +81,11 @@ class EventSaver:
         self._running = False
         self._shutdown_event = asyncio.Event()
 
-    def add_account(self, context: AccountContext) -> None:
+    async def add_account(self, context: AccountContext) -> None:
         """Add an account for private data collection.
+
+        If EventSaver is already running, the collector will be started immediately.
+        Otherwise, it will be started when start() is called.
 
         Args:
             context: AccountContext with credentials and settings.
@@ -108,7 +111,19 @@ class EventSaver:
             ),
         )
         self._private_collectors[context.account_id] = collector
-        logger.info(f"Added account {context.account_id} for private data collection")
+
+        # If EventSaver is already running, start the collector immediately
+        # Otherwise, it will be started when start() is called
+        if self._running:
+            await collector.start()
+            logger.info(
+                f"Added and started account {context.account_id} for private data collection"
+            )
+        else:
+            logger.info(
+                f"Added account {context.account_id} for private data collection "
+                f"(will start when EventSaver.start() is called)"
+            )
 
     def remove_account(self, account_id: UUID) -> None:
         """Remove an account from private data collection.
@@ -472,7 +487,7 @@ async def main():
 
     # Note: Private accounts would be added here based on configuration
     # Example:
-    # saver.add_account(AccountContext(...))
+    # await saver.add_account(AccountContext(...))
 
     await saver.start()
     await saver.run_until_shutdown()
