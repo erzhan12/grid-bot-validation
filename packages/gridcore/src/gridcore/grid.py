@@ -227,15 +227,20 @@ class Grid:
 
     def is_grid_correct(self) -> bool:
         """
-        Validate that grid has correct BUY→WAIT→SELL sequence.
+        Validate that grid has correct BUY→WAIT→SELL or BUY→SELL sequence.
+
+        Accepts two valid patterns:
+        - BUY→WAIT→SELL: Traditional pattern with WAIT zone between BUY and SELL
+        - BUY→SELL: Direct transition from BUY to SELL (no WAIT state)
 
         Reference: bbu2-master/greed.py:79-104 (commented out validation)
 
         Returns:
-            True if grid follows expected BUY→WAIT→SELL pattern
+            True if grid follows expected BUY→WAIT→SELL or BUY→SELL pattern
         """
         expected_sequence = [self.BUY, self.WAIT, self.SELL]
         current_state = 0
+        has_seen_buy = False
 
         if not self.__is_price_sorted():
             return False
@@ -245,11 +250,17 @@ class Grid:
 
             # Check if side matches the expected state
             if side == expected_sequence[current_state]:
+                if side == self.BUY:
+                    has_seen_buy = True
                 continue
-            # If it encounters a 'wait', move to the 'Sell' state
-            elif side == self.WAIT and current_state == 0:
+            # If it encounters a 'wait', move to the 'Sell' state (only if we've seen BUY)
+            elif side == self.WAIT and current_state == 0 and has_seen_buy:
                 current_state = 2
-            # If a 'Sell' is found after 'Buy', it should have found a 'wait' first
+            # If a 'Sell' is found after 'Buy' (direct transition, no WAIT)
+            # Only allow if we've actually seen BUY levels
+            elif side == self.SELL and current_state == 0 and has_seen_buy:
+                current_state = 2
+            # If a 'Sell' is found after 'Wait'
             elif side == self.SELL and current_state == 1:
                 current_state = 2
             else:
