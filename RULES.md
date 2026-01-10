@@ -454,7 +454,14 @@ await saver.run_until_shutdown()
 
 **IMPORTANT**: When initializing components in event_saver, avoid these errors:
 
-1. **DatabaseFactory Requires Settings Object**
+1. **WebSocket Handler Thread Safety (2026-01-08)**
+   - **Issue**: Handler methods (`_handle_ticker`, `_handle_trades`, etc.) called `asyncio.create_task()` but are invoked from pybit's WebSocket background thread (not asyncio event loop thread)
+   - **Error**: `RuntimeError: no running event loop` when WebSocket messages arrive
+   - **Fix**: Store event loop reference in `EventSaver.start()`, use `asyncio.run_coroutine_threadsafe()` instead of `asyncio.create_task()` in all handlers
+   - **Pattern**: When callbacks come from non-asyncio threads, use `run_coroutine_threadsafe(coro, loop)` to schedule work on the event loop
+   - **Files**: `apps/event_saver/src/event_saver/main.py:83,154-155,296-427`
+
+2. **DatabaseFactory Requires Settings Object**
    - `DatabaseFactory` expects `DatabaseSettings` object, NOT a raw string
    - **WRONG**: `db = DatabaseFactory(config.database_url)` ❌
    - **CORRECT**: `db = DatabaseFactory(DatabaseSettings(database_url=config.database_url))` ✅

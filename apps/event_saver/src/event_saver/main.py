@@ -80,6 +80,7 @@ class EventSaver:
         # State
         self._running = False
         self._shutdown_event = asyncio.Event()
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
 
     async def add_account(self, context: AccountContext) -> None:
         """Add an account for private data collection.
@@ -133,8 +134,12 @@ class EventSaver:
         """
         if account_id in self._private_collectors:
             collector = self._private_collectors.pop(account_id)
-            if collector.is_running():
-                asyncio.create_task(collector.stop())
+            if collector.is_running() and self._event_loop:
+                # Schedule stop from any thread (may be called from WebSocket thread)
+                asyncio.run_coroutine_threadsafe(
+                    collector.stop(),
+                    self._event_loop
+                )
             logger.info(f"Removed account {account_id} from private data collection")
 
     async def start(self) -> None:
@@ -145,6 +150,10 @@ class EventSaver:
 
         logger.info("Starting EventSaver...")
         self._running = True
+        
+        # Store event loop reference for thread-safe coroutine scheduling
+        # Handlers are called from pybit's WebSocket thread, not the asyncio event loop
+        self._event_loop = asyncio.get_running_loop()
 
         # Initialize REST client for reconciliation
         # Note: Public endpoints work with empty credentials
@@ -292,8 +301,11 @@ class EventSaver:
         Args:
             event: TickerEvent from collector.
         """
-        if self._ticker_writer:
-            asyncio.create_task(self._ticker_writer.write([event]))
+        if self._ticker_writer and self._event_loop:
+            asyncio.run_coroutine_threadsafe(
+                self._ticker_writer.write([event]),
+                self._event_loop
+            )
         logger.debug(f"Ticker: {event.symbol} price={event.last_price}")
 
     def _handle_trades(self, events: list[PublicTradeEvent]) -> None:
@@ -302,9 +314,12 @@ class EventSaver:
         Args:
             events: List of PublicTradeEvent from collector.
         """
-        if self._trade_writer and events:
-            # Schedule async write
-            asyncio.create_task(self._trade_writer.write(events))
+        if self._trade_writer and events and self._event_loop:
+            # Schedule async write from WebSocket thread to event loop
+            asyncio.run_coroutine_threadsafe(
+                self._trade_writer.write(events),
+                self._event_loop
+            )
 
     def _handle_execution(self, event: ExecutionEvent) -> None:
         """Handle incoming execution event.
@@ -312,8 +327,11 @@ class EventSaver:
         Args:
             event: ExecutionEvent from collector.
         """
-        if self._execution_writer:
-            asyncio.create_task(self._execution_writer.write([event]))
+        if self._execution_writer and self._event_loop:
+            asyncio.run_coroutine_threadsafe(
+                self._execution_writer.write([event]),
+                self._event_loop
+            )
 
     def _handle_order(self, account_id: UUID, event) -> None:
         """Handle incoming order update event.
@@ -324,8 +342,11 @@ class EventSaver:
             account_id: Account ID for tagging.
             event: OrderUpdateEvent from collector.
         """
-        if self._order_writer:
-            asyncio.create_task(self._order_writer.write(account_id, [event]))
+        if self._order_writer and self._event_loop:
+            asyncio.run_coroutine_threadsafe(
+                self._order_writer.write(account_id, [event]),
+                self._event_loop
+            )
 
         # Also log for visibility
         logger.debug(f"Order update: {event.order_id} {event.status}")
@@ -339,8 +360,11 @@ class EventSaver:
             account_id: Account ID for tagging.
             message: Raw position message from collector.
         """
-        if self._position_writer:
-            asyncio.create_task(self._position_writer.write(account_id, [message]))
+        if self._position_writer and self._event_loop:
+            asyncio.run_coroutine_threadsafe(
+                self._position_writer.write(account_id, [message]),
+                self._event_loop
+            )
 
         # Also log for visibility
         data = message.get("data", [])
@@ -359,8 +383,11 @@ class EventSaver:
             account_id: Account ID for tagging.
             message: Raw wallet message from collector.
         """
-        if self._wallet_writer:
-            asyncio.create_task(self._wallet_writer.write(account_id, [message]))
+        if self._wallet_writer and self._event_loop:
+            asyncio.run_coroutine_threadsafe(
+                self._wallet_writer.write(account_id, [message]),
+                self._event_loop
+            )
 
         # Also log for visibility
         data = message.get("data", [])
@@ -385,13 +412,14 @@ class EventSaver:
             gap_start: Start of gap (disconnect time).
             gap_end: End of gap (reconnect time).
         """
-        if self._reconciler:
-            asyncio.create_task(
+        if self._reconciler and self._event_loop:
+            asyncio.run_coroutine_threadsafe(
                 self._reconciler.reconcile_public_trades(
                     symbol=symbol,
                     gap_start=gap_start,
                     gap_end=gap_end,
-                )
+                ),
+                self._event_loop
             )
 
     def _handle_private_gap(
@@ -407,11 +435,11 @@ class EventSaver:
             gap_start: Start of gap (disconnect time).
             gap_end: End of gap (reconnect time).
         """
-        if self._reconciler:
+        if self._reconciler and self._event_loop:
             # Reconcile for each symbol
             testnet = context.environment == "testnet"
             for symbol in context.symbols or self._config.get_symbols():
-                asyncio.create_task(
+                asyncio.run_coroutine_threadsafe(
                     self._reconciler.reconcile_executions(
                         user_id=context.user_id,
                         account_id=context.account_id,
@@ -422,7 +450,8 @@ class EventSaver:
                         api_key=context.api_key,
                         api_secret=context.api_secret,
                         testnet=testnet,
-                    )
+                    ),
+                    self._event_loop
                 )
 
     def get_stats(self) -> dict:
