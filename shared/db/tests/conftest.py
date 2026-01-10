@@ -1,10 +1,11 @@
 """Test fixtures for database tests."""
 
 import pytest
+from datetime import datetime, UTC
 
 from grid_db.database import DatabaseFactory
 from grid_db.settings import DatabaseSettings
-from grid_db.models import User, BybitAccount, ApiCredential, Strategy
+from grid_db.models import User, BybitAccount, ApiCredential, Strategy, Run
 
 
 @pytest.fixture
@@ -88,3 +89,19 @@ def sample_strategy(session, sample_account):
     session.add(strategy)
     session.flush()
     return strategy
+
+
+@pytest.fixture
+def sample_run(session, sample_user, sample_account, sample_strategy):
+    """Create a sample run for testing."""
+    run = Run(
+        user_id=sample_user.user_id,
+        account_id=sample_account.account_id,
+        strategy_id=sample_strategy.strategy_id,
+        run_type="live",
+        status="running",
+        start_ts=datetime.now(UTC),
+    )
+    session.add(run)
+    session.flush()
+    return run

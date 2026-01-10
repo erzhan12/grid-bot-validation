@@ -13,8 +13,12 @@ from grid_db.models import (
     ApiCredential,
     Strategy,
     Run,
+    TickerSnapshot,
     PublicTrade,
     PrivateExecution,
+    Order,
+    PositionSnapshot,
+    WalletSnapshot,
 )
 from grid_db.repositories import (
     BaseRepository,
@@ -23,6 +27,12 @@ from grid_db.repositories import (
     ApiCredentialRepository,
     StrategyRepository,
     RunRepository,
+    TickerSnapshotRepository,
+    PublicTradeRepository,
+    PrivateExecutionRepository,
+    OrderRepository,
+    PositionSnapshotRepository,
+    WalletSnapshotRepository,
 )
 
 __all__ = [
@@ -39,8 +49,12 @@ __all__ = [
     "ApiCredential",
     "Strategy",
     "Run",
+    "TickerSnapshot",
     "PublicTrade",
     "PrivateExecution",
+    "Order",
+    "PositionSnapshot",
+    "WalletSnapshot",
     # Repositories
     "BaseRepository",
     "UserRepository",
@@ -48,4 +62,10 @@ __all__ = [
     "ApiCredentialRepository",
     "StrategyRepository",
     "RunRepository",
+    "TickerSnapshotRepository",
+    "PublicTradeRepository",
+    "PrivateExecutionRepository",
+    "OrderRepository",
+    "PositionSnapshotRepository",
+    "WalletSnapshotRepository",
 ]

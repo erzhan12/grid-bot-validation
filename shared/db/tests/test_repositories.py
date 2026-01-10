@@ -1,6 +1,7 @@
 """Tests for repository pattern with multi-tenant filtering."""
 
 import pytest
+from datetime import datetime, UTC
 
 from grid_db.repositories import (
     BaseRepository,
@@ -9,8 +10,10 @@ from grid_db.repositories import (
     ApiCredentialRepository,
     StrategyRepository,
     RunRepository,
+    PublicTradeRepository,
+    PrivateExecutionRepository,
 )
-from grid_db.models import User, BybitAccount, ApiCredential, Strategy, Run
+from grid_db.models import User, BybitAccount, ApiCredential, Strategy, Run, PublicTrade, PrivateExecution
 
 
 class TestBaseRepository:
@@ -448,3 +451,691 @@ class TestRunRepository:
         # Most recent first
         assert runs[0].run_type == "live"
         assert runs[1].run_type == "backtest"
+
+
+class TestPublicTradeRepository:
+    """Tests for PublicTradeRepository bulk operations."""
+
+    def test_bulk_insert_new_trades(self, session):
+        """Bulk insert inserts all trades when none exist."""
+        from datetime import datetime, UTC
+        from decimal import Decimal
+
+        repo = PublicTradeRepository(session)
+        trades = [
+            PublicTrade(
+                symbol="BTCUSDT",
+                trade_id="trade_1",
+                exchange_ts=datetime.now(UTC),
+                local_ts=datetime.now(UTC),
+                side="Buy",
+                price=Decimal("50000.00"),
+                size=Decimal("0.001"),
+            ),
+            PublicTrade(
+                symbol="BTCUSDT",
+                trade_id="trade_2",
+                exchange_ts=datetime.now(UTC),
+                local_ts=datetime.now(UTC),
+                side="Sell",
+                price=Decimal("50001.00"),
+                size=Decimal("0.002"),
+            ),
+        ]
+
+        count = repo.bulk_insert(trades)
+        assert count == 2
+
+    def test_bulk_insert_skips_duplicates(self, session):
+        """Bulk insert skips duplicates via ON CONFLICT DO NOTHING."""
+        from datetime import datetime, UTC
+        from decimal import Decimal
+
+        repo = PublicTradeRepository(session)
+
+        # Insert initial trade
+        trade1 = PublicTrade(
+            symbol="BTCUSDT",
+            trade_id="trade_1",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            side="Buy",
+            price=Decimal("50000.00"),
+            size=Decimal("0.001"),
+        )
+        repo.bulk_insert([trade1])
+
+        # Try to insert duplicate + new trade
+        trades = [
+            PublicTrade(
+                symbol="BTCUSDT",
+                trade_id="trade_1",  # DUPLICATE
+                exchange_ts=datetime.now(UTC),
+                local_ts=datetime.now(UTC),
+                side="Buy",
+                price=Decimal("50000.00"),
+                size=Decimal("0.001"),
+            ),
+            PublicTrade(
+                symbol="BTCUSDT",
+                trade_id="trade_2",  # NEW
+                exchange_ts=datetime.now(UTC),
+                local_ts=datetime.now(UTC),
+                side="Sell",
+                price=Decimal("50001.00"),
+                size=Decimal("0.002"),
+            ),
+        ]
+
+        count = repo.bulk_insert(trades)
+        assert count == 1  # Only new trade inserted
+
+    def test_bulk_insert_empty_list(self, session):
+        """Bulk insert with empty list returns 0."""
+        repo = PublicTradeRepository(session)
+        count = repo.bulk_insert([])
+        assert count == 0
+
+
+class TestPrivateExecutionRepository:
+    """Tests for PrivateExecutionRepository bulk operations."""
+
+    def test_bulk_insert_new_executions(self, session, sample_user, sample_account):
+        """Bulk insert inserts all executions when none exist."""
+        from datetime import datetime, UTC
+        from decimal import Decimal
+        from uuid import uuid4
+
+        # Create a run first (required foreign key)
+        sample_strategy = Strategy(
+            account_id=sample_account.account_id,
+            strategy_type="GridStrategy",
+            symbol="BTCUSDT",
+            config_json={},
+        )
+        session.add(sample_strategy)
+        session.flush()
+
+        run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="live",
+            start_ts=datetime.now(UTC),
+        )
+        session.add(run)
+        session.flush()
+
+        repo = PrivateExecutionRepository(session)
+        executions = [
+            PrivateExecution(
+                run_id=run.run_id,
+                account_id=sample_account.account_id,
+                symbol="BTCUSDT",
+                exec_id="exec_1",
+                order_id="order_1",
+                order_link_id="link_1",
+                exchange_ts=datetime.now(UTC),
+                side="Buy",
+                exec_price=Decimal("50000.00"),
+                exec_qty=Decimal("0.001"),
+                exec_fee=Decimal("0.01"),
+                closed_pnl=Decimal("0"),
+                raw_json={},
+            ),
+            PrivateExecution(
+                run_id=run.run_id,
+                account_id=sample_account.account_id,
+                symbol="BTCUSDT",
+                exec_id="exec_2",
+                order_id="order_2",
+                order_link_id="link_2",
+                exchange_ts=datetime.now(UTC),
+                side="Sell",
+                exec_price=Decimal("50001.00"),
+                exec_qty=Decimal("0.002"),
+                exec_fee=Decimal("0.02"),
+                closed_pnl=Decimal("0"),
+                raw_json={},
+            ),
+        ]
+
+        count = repo.bulk_insert(executions)
+        assert count == 2
+
+    def test_bulk_insert_skips_duplicates(self, session, sample_user, sample_account):
+        """Bulk insert skips duplicates via ON CONFLICT DO NOTHING."""
+        from datetime import datetime, UTC
+        from decimal import Decimal
+
+        # Create a run first
+        sample_strategy = Strategy(
+            account_id=sample_account.account_id,
+            strategy_type="GridStrategy",
+            symbol="BTCUSDT",
+            config_json={},
+        )
+        session.add(sample_strategy)
+        session.flush()
+
+        run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="live",
+            start_ts=datetime.now(UTC),
+        )
+        session.add(run)
+        session.flush()
+
+        repo = PrivateExecutionRepository(session)
+
+        # Insert initial execution
+        exec1 = PrivateExecution(
+            run_id=run.run_id,
+            account_id=sample_account.account_id,
+            symbol="BTCUSDT",
+            exec_id="exec_1",
+            order_id="order_1",
+            order_link_id="link_1",
+            exchange_ts=datetime.now(UTC),
+            side="Buy",
+            exec_price=Decimal("50000.00"),
+            exec_qty=Decimal("0.001"),
+            exec_fee=Decimal("0.01"),
+            closed_pnl=Decimal("0"),
+            raw_json={},
+        )
+        repo.bulk_insert([exec1])
+
+        # Try to insert duplicate + new execution
+        executions = [
+            PrivateExecution(
+                run_id=run.run_id,
+                account_id=sample_account.account_id,
+                symbol="BTCUSDT",
+                exec_id="exec_1",  # DUPLICATE
+                order_id="order_1",
+                order_link_id="link_1",
+                exchange_ts=datetime.now(UTC),
+                side="Buy",
+                exec_price=Decimal("50000.00"),
+                exec_qty=Decimal("0.001"),
+                exec_fee=Decimal("0.01"),
+                closed_pnl=Decimal("0"),
+                raw_json={},
+            ),
+            PrivateExecution(
+                run_id=run.run_id,
+                account_id=sample_account.account_id,
+                symbol="BTCUSDT",
+                exec_id="exec_2",  # NEW
+                order_id="order_2",
+                order_link_id="link_2",
+                exchange_ts=datetime.now(UTC),
+                side="Sell",
+                exec_price=Decimal("50001.00"),
+                exec_qty=Decimal("0.002"),
+                exec_fee=Decimal("0.02"),
+                closed_pnl=Decimal("0"),
+                raw_json={},
+            ),
+        ]
+
+        count = repo.bulk_insert(executions)
+        assert count == 1  # Only new execution inserted
+
+    def test_bulk_insert_empty_list(self, session):
+        """Bulk insert with empty list returns 0."""
+        repo = PrivateExecutionRepository(session)
+        count = repo.bulk_insert([])
+        assert count == 0
+
+class TestOrderRepository:
+    """Test OrderRepository bulk insert and conflict handling."""
+
+    def test_bulk_insert_new_orders(self, session, sample_user, sample_account, sample_run):
+        """Test bulk insert creates new order records."""
+        from grid_db import OrderRepository, Order
+        from decimal import Decimal
+
+        repo = OrderRepository(session)
+        models = [
+            Order(
+                account_id=str(sample_account.account_id),
+                run_id=str(sample_run.run_id),
+                order_id="order1",
+                order_link_id="link1",
+                symbol="BTCUSDT",
+                exchange_ts=datetime.now(UTC),
+                local_ts=datetime.now(UTC),
+                status="New",
+                side="Buy",
+                price=Decimal("50000.0"),
+                qty=Decimal("1.0"),
+                leaves_qty=Decimal("1.0"),
+            ),
+            Order(
+                account_id=str(sample_account.account_id),
+                run_id=str(sample_run.run_id),
+                order_id="order2",
+                order_link_id="link2",
+                symbol="ETHUSDT",
+                exchange_ts=datetime.now(UTC),
+                local_ts=datetime.now(UTC),
+                status="New",
+                side="Sell",
+                price=Decimal("3000.0"),
+                qty=Decimal("2.0"),
+                leaves_qty=Decimal("2.0"),
+            ),
+        ]
+        count = repo.bulk_insert(models)
+        assert count == 2
+
+        # Verify orders exist
+        orders = session.query(Order).all()
+        assert len(orders) == 2
+
+    def test_bulk_insert_updates_existing(self, session, sample_user, sample_account, sample_run):
+        """Test bulk insert updates existing orders with same account_id/order_id/exchange_ts."""
+        from grid_db import OrderRepository, Order
+        from decimal import Decimal
+
+        repo = OrderRepository(session)
+        ts = datetime.now(UTC)
+
+        # Insert initial order
+        initial = Order(
+            account_id=str(sample_account.account_id),
+            run_id=str(sample_run.run_id),
+            order_id="order1",
+            order_link_id="link1",
+            symbol="BTCUSDT",
+            exchange_ts=ts,
+            local_ts=datetime.now(UTC),
+            status="New",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("1.0"),
+            leaves_qty=Decimal("1.0"),
+        )
+        repo.bulk_insert([initial])
+
+        # Update with same account_id/order_id/exchange_ts but different status
+        updated = Order(
+            account_id=str(sample_account.account_id),
+            run_id=str(sample_run.run_id),
+            order_id="order1",
+            order_link_id="link1",
+            symbol="BTCUSDT",
+            exchange_ts=ts,  # Same timestamp
+            local_ts=datetime.now(UTC),
+            status="Filled",  # Changed status
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("1.0"),
+            leaves_qty=Decimal("0.0"),  # Changed leaves_qty
+        )
+        count = repo.bulk_insert([updated])
+        assert count == 1  # Upsert should update 1 row
+
+        # Verify status and leaves_qty were updated
+        orders = session.query(Order).filter_by(order_id="order1").all()
+        assert len(orders) == 1
+        assert orders[0].status == "Filled"
+        assert orders[0].leaves_qty == Decimal("0.0")
+
+    def test_bulk_insert_different_accounts_no_conflict(self, session, sample_user, sample_run):
+        """Test same order_id on different accounts doesn't conflict."""
+        from grid_db import OrderRepository, Order, BybitAccount
+        from decimal import Decimal
+
+        # Create two different accounts
+        account1 = BybitAccount(
+            user_id=sample_user.user_id,
+            account_name="account1",
+            environment="testnet",
+        )
+        account2 = BybitAccount(
+            user_id=sample_user.user_id,
+            account_name="account2",
+            environment="testnet",
+        )
+        session.add_all([account1, account2])
+        session.flush()
+
+        repo = OrderRepository(session)
+        ts = datetime.now(UTC)
+
+        # Insert same order_id for both accounts
+        models = [
+            Order(
+                account_id=str(account1.account_id),
+                run_id=str(sample_run.run_id),
+                order_id="order1",  # Same order_id
+                order_link_id="link1",
+                symbol="BTCUSDT",
+                exchange_ts=ts,
+                local_ts=datetime.now(UTC),
+                status="New",
+                side="Buy",
+                price=Decimal("50000.0"),
+                qty=Decimal("1.0"),
+                leaves_qty=Decimal("1.0"),
+            ),
+            Order(
+                account_id=str(account2.account_id),  # Different account
+                run_id=str(sample_run.run_id),
+                order_id="order1",  # Same order_id
+                order_link_id="link1",
+                symbol="BTCUSDT",
+                exchange_ts=ts,
+                local_ts=datetime.now(UTC),
+                status="New",
+                side="Sell",
+                price=Decimal("50000.0"),
+                qty=Decimal("1.0"),
+                leaves_qty=Decimal("1.0"),
+            ),
+        ]
+        count = repo.bulk_insert(models)
+        assert count == 2  # Both should be inserted
+
+        # Verify both orders exist
+        orders = session.query(Order).filter_by(order_id="order1").all()
+        assert len(orders) == 2
+
+
+class TestPositionSnapshotRepository:
+    """Test PositionSnapshotRepository bulk insert and queries."""
+
+    def test_bulk_insert_positions(self, session, sample_account):
+        """Test bulk insert creates position snapshots."""
+        from grid_db import PositionSnapshotRepository, PositionSnapshot
+        from decimal import Decimal
+
+        repo = PositionSnapshotRepository(session)
+        models = [
+            PositionSnapshot(
+                account_id=str(sample_account.account_id),
+                symbol="BTCUSDT",
+                exchange_ts=datetime.now(UTC),
+                local_ts=datetime.now(UTC),
+                side="Buy",
+                size=Decimal("1.0"),
+                entry_price=Decimal("50000.0"),
+                liq_price=Decimal("45000.0"),
+                unrealised_pnl=Decimal("100.50"),
+            ),
+        ]
+        count = repo.bulk_insert(models)
+        assert count == 1
+
+        # Verify position exists
+        positions = session.query(PositionSnapshot).all()
+        assert len(positions) == 1
+        assert positions[0].symbol == "BTCUSDT"
+        assert positions[0].size == Decimal("1.0")
+
+    def test_get_latest_by_account_symbol(self, session, sample_account):
+        """Test retrieval of most recent position."""
+        from grid_db import PositionSnapshotRepository, PositionSnapshot
+        from decimal import Decimal
+        import time
+
+        repo = PositionSnapshotRepository(session)
+
+        # Insert 3 positions at different timestamps
+        ts1 = datetime.now(UTC)
+        time.sleep(0.01)  # Ensure different timestamps
+        ts2 = datetime.now(UTC)
+        time.sleep(0.01)
+        ts3 = datetime.now(UTC)
+
+        models = [
+            PositionSnapshot(
+                account_id=str(sample_account.account_id),
+                symbol="BTCUSDT",
+                exchange_ts=ts1,
+                local_ts=datetime.now(UTC),
+                side="Buy",
+                size=Decimal("1.0"),
+                entry_price=Decimal("50000.0"),
+            ),
+            PositionSnapshot(
+                account_id=str(sample_account.account_id),
+                symbol="BTCUSDT",
+                exchange_ts=ts2,
+                local_ts=datetime.now(UTC),
+                side="Buy",
+                size=Decimal("1.5"),
+                entry_price=Decimal("51000.0"),
+            ),
+            PositionSnapshot(
+                account_id=str(sample_account.account_id),
+                symbol="BTCUSDT",
+                exchange_ts=ts3,  # Latest
+                local_ts=datetime.now(UTC),
+                side="Buy",
+                size=Decimal("2.0"),
+                entry_price=Decimal("52000.0"),
+            ),
+        ]
+        repo.bulk_insert(models)
+
+        # Query latest
+        latest = repo.get_latest_by_account_symbol(
+            str(sample_account.account_id),
+            "BTCUSDT"
+        )
+
+        assert latest is not None
+        assert latest.size == Decimal("2.0")
+        assert latest.entry_price == Decimal("52000.0")
+        # Compare timestamps (may lose timezone info in SQLite)
+        assert latest.exchange_ts.replace(tzinfo=None) == ts3.replace(tzinfo=None)
+
+
+class TestWalletSnapshotRepository:
+    """Test WalletSnapshotRepository bulk insert and queries."""
+
+    def test_bulk_insert_wallets(self, session, sample_account):
+        """Test bulk insert creates wallet snapshots."""
+        from grid_db import WalletSnapshotRepository, WalletSnapshot
+        from decimal import Decimal
+
+        repo = WalletSnapshotRepository(session)
+        models = [
+            WalletSnapshot(
+                account_id=str(sample_account.account_id),
+                coin="USDT",
+                exchange_ts=datetime.now(UTC),
+                local_ts=datetime.now(UTC),
+                wallet_balance=Decimal("10000.00"),
+                available_balance=Decimal("9500.00"),
+            ),
+        ]
+        count = repo.bulk_insert(models)
+        assert count == 1
+
+        # Verify wallet exists
+        wallets = session.query(WalletSnapshot).all()
+        assert len(wallets) == 1
+        assert wallets[0].coin == "USDT"
+        assert wallets[0].wallet_balance == Decimal("10000.00")
+
+    def test_get_latest_by_account_coin(self, session, sample_account):
+        """Test retrieval of most recent wallet balance."""
+        from grid_db import WalletSnapshotRepository, WalletSnapshot
+        from decimal import Decimal
+        import time
+
+        repo = WalletSnapshotRepository(session)
+
+        # Insert 3 snapshots for USDT
+        ts1 = datetime.now(UTC)
+        time.sleep(0.01)
+        ts2 = datetime.now(UTC)
+        time.sleep(0.01)
+        ts3 = datetime.now(UTC)
+
+        models = [
+            WalletSnapshot(
+                account_id=str(sample_account.account_id),
+                coin="USDT",
+                exchange_ts=ts1,
+                local_ts=datetime.now(UTC),
+                wallet_balance=Decimal("10000.00"),
+                available_balance=Decimal("9500.00"),
+            ),
+            WalletSnapshot(
+                account_id=str(sample_account.account_id),
+                coin="USDT",
+                exchange_ts=ts2,
+                local_ts=datetime.now(UTC),
+                wallet_balance=Decimal("10500.00"),
+                available_balance=Decimal("10000.00"),
+            ),
+            WalletSnapshot(
+                account_id=str(sample_account.account_id),
+                coin="USDT",
+                exchange_ts=ts3,  # Latest
+                local_ts=datetime.now(UTC),
+                wallet_balance=Decimal("11000.00"),
+                available_balance=Decimal("10500.00"),
+            ),
+        ]
+        repo.bulk_insert(models)
+
+        # Query latest
+        latest = repo.get_latest_by_account_coin(
+            str(sample_account.account_id),
+            "USDT"
+        )
+
+        assert latest is not None
+        assert latest.wallet_balance == Decimal("11000.00")
+        assert latest.available_balance == Decimal("10500.00")
+        # Compare timestamps (may lose timezone info in SQLite)
+        assert latest.exchange_ts.replace(tzinfo=None) == ts3.replace(tzinfo=None)
+
+
+class TestTickerSnapshotRepository:
+    """Test TickerSnapshotRepository bulk insert and queries."""
+
+    def test_bulk_insert_tickers(self, session):
+        """Test bulk insert creates ticker snapshots."""
+        from grid_db import TickerSnapshotRepository, TickerSnapshot
+        from decimal import Decimal
+        from datetime import datetime, UTC
+
+        repo = TickerSnapshotRepository(session)
+        models = [
+            TickerSnapshot(
+                symbol="BTCUSDT",
+                exchange_ts=datetime.now(UTC),
+                local_ts=datetime.now(UTC),
+                last_price=Decimal("50000.00"),
+                mark_price=Decimal("50001.00"),
+                bid1_price=Decimal("49999.00"),
+                ask1_price=Decimal("50002.00"),
+                funding_rate=Decimal("0.0001"),
+            )
+        ]
+
+        count = repo.bulk_insert(models)
+        assert count == 1
+
+        rows = session.query(TickerSnapshot).all()
+        assert len(rows) == 1
+        assert rows[0].symbol == "BTCUSDT"
+
+    def test_bulk_insert_skips_duplicates(self, session):
+        """Duplicate (symbol, exchange_ts) is skipped via ON CONFLICT DO NOTHING."""
+        from grid_db import TickerSnapshotRepository, TickerSnapshot
+        from decimal import Decimal
+        from datetime import datetime, UTC
+
+        repo = TickerSnapshotRepository(session)
+        ts = datetime.now(UTC)
+        first = TickerSnapshot(
+            symbol="BTCUSDT",
+            exchange_ts=ts,
+            local_ts=datetime.now(UTC),
+            last_price=Decimal("50000.00"),
+            mark_price=Decimal("50001.00"),
+            bid1_price=Decimal("49999.00"),
+            ask1_price=Decimal("50002.00"),
+            funding_rate=Decimal("0.0001"),
+        )
+        repo.bulk_insert([first])
+
+        dup_and_new = [
+            TickerSnapshot(
+                symbol="BTCUSDT",
+                exchange_ts=ts,  # duplicate ts
+                local_ts=datetime.now(UTC),
+                last_price=Decimal("50010.00"),
+                mark_price=Decimal("50011.00"),
+                bid1_price=Decimal("50009.00"),
+                ask1_price=Decimal("50012.00"),
+                funding_rate=Decimal("0.0002"),
+            ),
+            TickerSnapshot(
+                symbol="BTCUSDT",
+                exchange_ts=datetime.now(UTC),
+                local_ts=datetime.now(UTC),
+                last_price=Decimal("50020.00"),
+                mark_price=Decimal("50021.00"),
+                bid1_price=Decimal("50019.00"),
+                ask1_price=Decimal("50022.00"),
+                funding_rate=Decimal("0.0003"),
+            ),
+        ]
+
+        count = repo.bulk_insert(dup_and_new)
+        assert count == 1
+
+    def test_get_latest_by_symbol(self, session):
+        """Latest snapshot by exchange_ts is returned."""
+        from grid_db import TickerSnapshotRepository, TickerSnapshot
+        from decimal import Decimal
+        from datetime import datetime, UTC
+        import time
+
+        repo = TickerSnapshotRepository(session)
+
+        ts1 = datetime.now(UTC)
+        time.sleep(0.01)
+        ts2 = datetime.now(UTC)
+
+        repo.bulk_insert(
+            [
+                TickerSnapshot(
+                    symbol="BTCUSDT",
+                    exchange_ts=ts1,
+                    local_ts=datetime.now(UTC),
+                    last_price=Decimal("50000.00"),
+                    mark_price=Decimal("50001.00"),
+                    bid1_price=Decimal("49999.00"),
+                    ask1_price=Decimal("50002.00"),
+                    funding_rate=Decimal("0.0001"),
+                ),
+                TickerSnapshot(
+                    symbol="BTCUSDT",
+                    exchange_ts=ts2,
+                    local_ts=datetime.now(UTC),
+                    last_price=Decimal("51000.00"),
+                    mark_price=Decimal("51001.00"),
+                    bid1_price=Decimal("50999.00"),
+                    ask1_price=Decimal("51002.00"),
+                    funding_rate=Decimal("0.0002"),
+                ),
+            ]
+        )
+
+        latest = repo.get_latest_by_symbol("BTCUSDT")
+        assert latest is not None
+        assert latest.last_price == Decimal("51000.00")
+        assert latest.exchange_ts.replace(tzinfo=None) == ts2.replace(tzinfo=None)

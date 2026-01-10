@@ -1,8 +1,9 @@
 """SQLAlchemy ORM models for multi-tenant grid bot database.
 
-Supports 7 tables:
+Supports 10 tables:
 - Core entities: users, bybit_accounts, api_credentials, strategies, runs
-- Data tables: public_trades, private_executions
+- Data tables: ticker_snapshots, public_trades, private_executions, orders,
+  position_snapshots, wallet_snapshots
 """
 
 from datetime import datetime, UTC
@@ -204,6 +205,9 @@ class Run(Base):
     executions: Mapped[List["PrivateExecution"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
     )
+    orders: Mapped[List["Order"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         Index("ix_runs_user_id", "user_id"),
@@ -232,6 +236,33 @@ class PublicTrade(Base):
 
     __table_args__ = (
         Index("ix_public_trades_symbol_exchange_ts", "symbol", "exchange_ts"),
+        Index("ix_public_trades_trade_id", "trade_id", unique=True),
+    )
+
+
+class TickerSnapshot(Base):
+    """Public ticker snapshots from WebSocket tickers.{symbol} stream."""
+
+    __tablename__ = "ticker_snapshots"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    exchange_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    local_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_price: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
+    mark_price: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
+    bid1_price: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
+    ask1_price: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
+    funding_rate: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
+    raw_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+
+    __table_args__ = (
+        Index("ix_ticker_snapshots_symbol_exchange_ts", "symbol", "exchange_ts"),
+        UniqueConstraint("symbol", "exchange_ts", name="uq_ticker_symbol_ts"),
     )
 
 
@@ -269,4 +300,105 @@ class PrivateExecution(Base):
     __table_args__ = (
         Index("ix_private_executions_account_exchange_ts", "account_id", "exchange_ts"),
         Index("ix_private_executions_run_id", "run_id"),
+        Index("ix_private_executions_exec_id", "exec_id", unique=True),
+    )
+
+
+class Order(Base):
+    """Order state snapshots from WebSocket order stream.
+
+    Captures order state changes (New, PartiallyFilled, Filled, Cancelled, etc.)
+    for each account. Used for order tracking and validation.
+    """
+
+    __tablename__ = "orders"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("runs.run_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    account_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    order_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    order_link_id: Mapped[Optional[str]] = mapped_column(String(100))
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    exchange_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    local_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    side: Mapped[str] = mapped_column(String(4), nullable=False)  # 'Buy' or 'Sell'
+    price: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
+    qty: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
+    leaves_qty: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
+    raw_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+
+    # Relationships
+    run: Mapped["Run"] = relationship(back_populates="orders")
+
+    __table_args__ = (
+        Index("ix_orders_account_exchange_ts", "account_id", "exchange_ts"),
+        Index("ix_orders_run_id", "run_id"),
+        UniqueConstraint("account_id", "order_id", "exchange_ts",
+                        name="uq_orders_account_order_ts"),
+    )
+
+
+class PositionSnapshot(Base):
+    """Position state snapshots from WebSocket position stream.
+
+    Captures position state changes for each account/symbol combination.
+    Used for position tracking and validation.
+    """
+
+    __tablename__ = "position_snapshots"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    account_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    exchange_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    local_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    side: Mapped[str] = mapped_column(String(4), nullable=False)  # 'Buy' or 'Sell'
+    size: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
+    entry_price: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
+    liq_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8))
+    unrealised_pnl: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8))
+    raw_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+
+    __table_args__ = (
+        Index("ix_position_snapshots_account_ts", "account_id", "exchange_ts"),
+    )
+
+
+class WalletSnapshot(Base):
+    """Wallet balance snapshots from WebSocket wallet stream.
+
+    Captures wallet balance changes for each account.
+    Used for balance reconciliation and validation.
+    """
+
+    __tablename__ = "wallet_snapshots"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    account_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    exchange_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    local_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    coin: Mapped[str] = mapped_column(String(20), nullable=False)  # e.g., 'USDT'
+    wallet_balance: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
+    available_balance: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
+    raw_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
+
+    __table_args__ = (
+        Index("ix_wallet_snapshots_account_ts", "account_id", "exchange_ts"),
     )
