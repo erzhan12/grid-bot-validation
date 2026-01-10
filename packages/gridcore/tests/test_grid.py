@@ -192,15 +192,52 @@ class TestGridCorrectness:
         assert grid.is_grid_correct() is False
 
     def test_sequence_without_wait(self):
-        """Grid with BUY→SELL but no WAIT should return False."""
+        """Grid with BUY→SELL but no WAIT should return True (valid pattern)."""
         grid = Grid(tick_size=Decimal('0.1'), grid_count=50, grid_step=0.2)
         grid.build_grid(100000.0)
 
         # Remove WAIT items
         grid.grid = [g for g in grid.grid if g['side'] != grid.WAIT]
 
-        # Should return False because sequence requires WAIT
-        assert grid.is_grid_correct() is False
+        # Should return True because BUY→SELL is a valid pattern
+        assert grid.is_grid_correct() is True
+
+    def test_sequence_buy_wait_sell(self):
+        """Grid with BUY→WAIT→SELL pattern should return True."""
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=50, grid_step=0.2)
+        grid.build_grid(100000.0)
+
+        # Grid built with build_grid() has BUY→WAIT→SELL pattern
+        assert grid.is_grid_correct() is True
+
+    def test_sequence_buy_sell_direct(self):
+        """Grid with BUY→SELL pattern (no WAIT) should return True."""
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=50, grid_step=0.2)
+        grid.build_grid(100000.0)
+
+        # Remove WAIT items to create BUY→SELL pattern
+        grid.grid = [g for g in grid.grid if g['side'] != grid.WAIT]
+
+        # Should return True - BUY→SELL is valid
+        assert grid.is_grid_correct() is True
+
+    def test_sequence_invalid_sell_buy(self):
+        """Grid with SELL→BUY (wrong order) should return False."""
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=50, grid_step=0.2)
+        grid.build_grid(100000.0)
+
+        # Break sequence by putting SELL before BUY (but keep prices sorted)
+        if len(grid.grid) > 10:
+            # Find a BUY and a SELL
+            buy_item = next((g for g in grid.grid if g['side'] == grid.BUY), None)
+            sell_item = next((g for g in grid.grid if g['side'] == grid.SELL), None)
+            
+            if buy_item and sell_item and buy_item['price'] < sell_item['price']:
+                # Swap sides but keep prices sorted - this creates invalid SELL→BUY sequence
+                buy_item['side'] = grid.SELL
+                sell_item['side'] = grid.BUY
+                # Should return False because SELL comes before BUY in sequence
+                assert grid.is_grid_correct() is False
 
 
 class TestGridUpdate:

@@ -19,6 +19,7 @@ Successfully extracted pure strategy logic from `bbu2-master` into `packages/gri
    - **IMPORTANT**: `tick_size` must be passed as `Decimal` parameter, not looked up from exchange
    - Removed: `read_from_db()`, `write_to_db()`, `strat` dependency
    - Added: `is_price_sorted()`, `is_greed_correct()` validation methods
+   - **is_grid_correct() Pattern Support (2026-01-10)**: Method accepts both BUY→WAIT→SELL and BUY→SELL patterns. Sometimes there's no WAIT state between BUY and SELL levels, which is now considered valid.
    - File: `packages/gridcore/src/gridcore/grid.py`
 
 3. **Engine Module (`engine.py`)**
