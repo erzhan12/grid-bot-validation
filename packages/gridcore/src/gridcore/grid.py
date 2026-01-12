@@ -208,18 +208,18 @@ class Grid:
 
     def __is_price_sorted(self) -> bool:
         """
-        Validate that grid prices are in ascending order.
+        Validate that grid prices are in strictly ascending order (no duplicates).
 
         Reference: bbu2-master/greed.py:68-77 (commented out validation)
 
         Returns:
-            True if all prices are sorted ascending
+            True if all prices are sorted in strictly ascending order (no duplicates)
         """
         # Initialize with negative infinity to start the comparison
         previous_price = float('-inf')
 
         for grid in self.grid:
-            if grid['price'] < previous_price:
+            if grid['price'] <= previous_price:
                 return False
             previous_price = grid['price']
 
@@ -229,46 +229,66 @@ class Grid:
         """
         Validate that grid has correct BUY→WAIT→SELL or BUY→SELL sequence.
 
-        Accepts two valid patterns:
-        - BUY→WAIT→SELL: Traditional pattern with WAIT zone between BUY and SELL
-        - BUY→SELL: Direct transition from BUY to SELL (no WAIT state)
+        Accepts valid patterns:
+        - BUY...BUY → WAIT...WAIT → SELL...SELL: Traditional pattern with WAIT zone (multiple WAITs allowed)
+        - BUY...BUY → SELL...SELL: Direct transition from BUY to SELL (no WAIT state)
 
         Reference: bbu2-master/greed.py:79-104 (commented out validation)
 
         Returns:
             True if grid follows expected BUY→WAIT→SELL or BUY→SELL pattern
         """
-        expected_sequence = [self.BUY, self.WAIT, self.SELL]
-        current_state = 0
-        has_seen_buy = False
-
         if not self.__is_price_sorted():
             return False
+
+        # Track which phase we're in: 0=BUY, 1=WAIT, 2=SELL
+        current_state = 0
+        has_seen_buy = False
+        has_seen_sell = False
 
         for grid in self.grid:
             side = grid['side']
 
-            # Check if side matches the expected state
-            if side == expected_sequence[current_state]:
-                if side == self.BUY:
+            if side == self.BUY:
+                # BUY is only valid in BUY phase (state 0)
+                if current_state == 0:
                     has_seen_buy = True
-                continue
-            # If it encounters a 'wait', move to the 'Sell' state (only if we've seen BUY)
-            elif side == self.WAIT and current_state == 0 and has_seen_buy:
-                current_state = 2
-            # If a 'Sell' is found after 'Buy' (direct transition, no WAIT)
-            # Only allow if we've actually seen BUY levels
-            elif side == self.SELL and current_state == 0 and has_seen_buy:
-                current_state = 2
-            # If a 'Sell' is found after 'Wait'
-            elif side == self.SELL and current_state == 1:
-                current_state = 2
-            else:
-                # If the sequence is not in order, return False
-                return False
+                    continue
+                else:
+                    # Can't go back to BUY after WAIT or SELL
+                    return False
+            elif side == self.WAIT:
+                # WAIT is valid after BUY (state 0) or after other WAITs (state 1)
+                if current_state == 0 and has_seen_buy:
+                    # Transition from BUY to WAIT phase
+                    current_state = 1
+                    continue
+                elif current_state == 1:
+                    # Multiple WAITs in a row are allowed
+                    continue
+                else:
+                    # WAIT not allowed after SELL
+                    return False
+            elif side == self.SELL:
+                # SELL is valid after BUY (state 0), WAIT (state 1), or other SELLs (state 2)
+                if current_state == 0 and has_seen_buy:
+                    # Direct transition from BUY to SELL (no WAIT)
+                    current_state = 2
+                    has_seen_sell = True
+                    continue
+                elif current_state == 1:
+                    # Transition from WAIT to SELL
+                    current_state = 2
+                    has_seen_sell = True
+                    continue
+                elif current_state == 2:
+                    # Multiple SELLs in a row are allowed
+                    continue
+                else:
+                    return False
 
-        # Check if 'Sell' was the last state to confirm the sequence completed correctly
-        return current_state == 2
+        # Grid is correct if we've seen both BUY and SELL, and ended in SELL phase
+        return has_seen_buy and has_seen_sell and current_state == 2
 
     @property
     def __grid_count_sell(self) -> int:
