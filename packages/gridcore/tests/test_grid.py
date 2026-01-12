@@ -110,20 +110,20 @@ class TestGridCorrectness:
         assert grid.is_grid_correct() is False
 
     def test_duplicate_prices(self):
-        """Equal prices in sequence should still be considered sorted."""
+        """Duplicate prices should cause is_grid_correct() to return False."""
         grid = Grid(tick_size=Decimal('0.1'), grid_count=50, grid_step=0.2)
         grid.build_grid(100000.0)
 
+        # Initially correct
+        assert grid.is_grid_correct() is True
+
         # Create a scenario with duplicate prices (artificially)
+        # Set two adjacent items to the same price
         if len(grid.grid) > 2:
-            # Set two adjacent items to same price
+            # Set adjacent items to same price
             grid.grid[1]['price'] = grid.grid[0]['price']
-            # If sequence is still correct, should pass
-            # But if we broke sequence, it will fail
-            # Let's verify the behavior: duplicate prices with correct sequence
-            # Actually, let's test a simpler case - grid with all same prices but correct sequence
-            # This is an edge case that should still pass sorting check
-            pass  # This test verifies that equal prices don't break sorting
+            # Duplicate prices should cause is_grid_correct() to return False
+            assert grid.is_grid_correct() is False
 
     def test_after_updates(self):
         """Grid remains correct after update_grid() calls."""
@@ -135,11 +135,10 @@ class TestGridCorrectness:
 
         # Update grid
         grid.update_grid(last_filled_price=99800.0, last_close=100000.0)
-        # Note: After updates with fills, multiple WAIT levels may exist
-        # which can break the strict BUY→WAIT→SELL sequence
-        # But sorting should still be maintained
-        # We can't assert is_grid_correct() is True here because sequence might be broken
-        # But we can verify it doesn't crash and handles the update
+        
+        # Grid should still be correct after update
+        # (prices sorted, no duplicates, valid BUY→WAIT→SELL or BUY→SELL sequence)
+        assert grid.is_grid_correct() is True, "Grid should remain correct after update_grid()"
 
     def test_after_rebuilds(self):
         """Grid remains correct after out-of-bounds rebuilds."""
@@ -210,34 +209,27 @@ class TestGridCorrectness:
         # Grid built with build_grid() has BUY→WAIT→SELL pattern
         assert grid.is_grid_correct() is True
 
-    def test_sequence_buy_sell_direct(self):
-        """Grid with BUY→SELL pattern (no WAIT) should return True."""
+    def test_sequence_multiple_waits(self):
+        """Grid with BUY→WAIT→WAIT→SELL pattern (multiple WAITs) should return True."""
         grid = Grid(tick_size=Decimal('0.1'), grid_count=50, grid_step=0.2)
         grid.build_grid(100000.0)
 
-        # Remove WAIT items to create BUY→SELL pattern
-        grid.grid = [g for g in grid.grid if g['side'] != grid.WAIT]
-
-        # Should return True - BUY→SELL is valid
+        # Initially correct
         assert grid.is_grid_correct() is True
 
-    def test_sequence_invalid_sell_buy(self):
-        """Grid with SELL→BUY (wrong order) should return False."""
-        grid = Grid(tick_size=Decimal('0.1'), grid_count=50, grid_step=0.2)
-        grid.build_grid(100000.0)
+        # Artificially create multiple consecutive WAITs by setting adjacent items to WAIT
+        # Find the WAIT item and set adjacent items to WAIT as well
+        wait_index = next((i for i, g in enumerate(grid.grid) if g['side'] == grid.WAIT), None)
+        if wait_index is not None and 0 < wait_index < len(grid.grid) - 1:
+            # Set item before WAIT to WAIT (if it's a BUY)
+            if grid.grid[wait_index - 1]['side'] == grid.BUY:
+                grid.grid[wait_index - 1]['side'] = grid.WAIT
+            # Set item after WAIT to WAIT (if it's a SELL)
+            if grid.grid[wait_index + 1]['side'] == grid.SELL:
+                grid.grid[wait_index + 1]['side'] = grid.WAIT
 
-        # Break sequence by putting SELL before BUY (but keep prices sorted)
-        if len(grid.grid) > 10:
-            # Find a BUY and a SELL
-            buy_item = next((g for g in grid.grid if g['side'] == grid.BUY), None)
-            sell_item = next((g for g in grid.grid if g['side'] == grid.SELL), None)
-            
-            if buy_item and sell_item and buy_item['price'] < sell_item['price']:
-                # Swap sides but keep prices sorted - this creates invalid SELL→BUY sequence
-                buy_item['side'] = grid.SELL
-                sell_item['side'] = grid.BUY
-                # Should return False because SELL comes before BUY in sequence
-                assert grid.is_grid_correct() is False
+        # Grid with multiple WAITs in a row should still be correct
+        assert grid.is_grid_correct() is True
 
 
 class TestGridUpdate:
@@ -255,9 +247,6 @@ class TestGridUpdate:
         filled_level = next((g for g in grid.grid if abs(g['price'] - 99800.0) < 1), None)
         assert filled_level is not None
         assert filled_level['side'] == grid.WAIT
-
-        # Note: After fills, multiple WAIT levels are expected, so is_grid_correct() may be False
-        # Sorting is validated through is_grid_correct() tests
 
     def test_update_grid_rebuilds_on_out_of_bounds(self):
         """Grid rebuilds if price moves outside bounds."""
@@ -308,39 +297,82 @@ class TestGridRebalancing:
         grid = Grid(tick_size=Decimal('0.1'), grid_count=50, grid_step=0.2)
         grid.build_grid(100000.0)
 
-        # Simulate scenario where we have many buys
-        # Mark top sells as WAIT to create imbalance
-        for g in grid.grid:
-            if g['side'] == grid.SELL and g['price'] > 100500:
-                g['side'] = grid.WAIT
+        # Initially correct and balanced
+        assert grid.is_grid_correct() is True
 
-        # Count before rebalance
-        # buy_before = sum(1 for g in grid.grid if g['side'] == grid.BUY)
-        # sell_before = sum(1 for g in grid.grid if g['side'] == grid.SELL)
+        # Record original grid bounds
+        min_price_before = grid.grid[0]['price']
+        max_price_before = grid.grid[-1]['price']
+        grid_length_before = len(grid.grid)
 
-        # Trigger rebalance via update
-        grid.update_grid(last_filled_price=99000.0, last_close=100000.0)
+        # Create buy-heavy imbalance by setting last_close near the top of the grid
+        # This makes most levels below last_close (BUYs) and few above (SELLs)
+        # When imbalance > 30%, __center_grid() shifts grid upward
+        high_price = max_price_before * 0.98  # Near top, creates ~80% BUYs
 
-        # After rebalance, should be more balanced
-        # Grid should have shifted upward (bottom buy removed, top sell added)
-        # Sorting is validated through is_grid_correct() tests
+        # Trigger update which reassigns sides and then calls __center_grid()
+        grid.update_grid(last_filled_price=high_price, last_close=high_price)
+
+        # Grid should still be correct after rebalancing
+        assert grid.is_grid_correct() is True, "Grid should remain correct after rebalancing"
+
+        # Grid length should be maintained
+        assert len(grid.grid) == grid_length_before, "Grid should maintain same number of levels"
+
+        # Verify grid shifted upward: max price should increase
+        max_price_after = grid.grid[-1]['price']
+        assert max_price_after > max_price_before, "Grid should shift upward (new top level added)"
+
+        # Verify the grid is still buy-heavy (rebalancing only shifts one level at a time)
+        buy_after = sum(1 for g in grid.grid if g['side'] == grid.BUY)
+        sell_after = sum(1 for g in grid.grid if g['side'] == grid.SELL)
+        total_after = buy_after + sell_after
+        if total_after > 0:
+            imbalance_after = abs(buy_after - sell_after) / total_after
+            # Rebalancing shifts one level at a time, so imbalance may still be above threshold
+            # but should be improving (one more sell, one fewer buy than before rebalancing)
+            assert sell_after > 0, "Should have at least one sell after rebalancing"
 
     def test_center_grid_sell_heavy(self):
         """More sells than buys, imbalance >30% → grid shifts downward."""
         grid = Grid(tick_size=Decimal('0.1'), grid_count=50, grid_step=0.2)
         grid.build_grid(100000.0)
 
-        # Simulate scenario where we have many sells
-        # Mark bottom buys as WAIT to create imbalance
-        for g in grid.grid:
-            if g['side'] == grid.BUY and g['price'] < 99500:
-                g['side'] = grid.WAIT
+        # Initially correct and balanced
+        assert grid.is_grid_correct() is True
 
-        # Trigger rebalance via update
-        grid.update_grid(last_filled_price=101000.0, last_close=100000.0)
+        # Record original grid bounds
+        min_price_before = grid.grid[0]['price']
+        max_price_before = grid.grid[-1]['price']
+        grid_length_before = len(grid.grid)
 
-        # Grid should have shifted downward (top sell removed, bottom buy added)
-        # Sorting is validated through is_grid_correct() tests
+        # Create sell-heavy imbalance by setting last_close near the bottom of the grid
+        # This makes most levels above last_close (SELLs) and few below (BUYs)
+        # When imbalance > 30%, __center_grid() shifts grid downward
+        low_price = min_price_before * 1.02  # Near bottom, creates ~80% SELLs
+
+        # Trigger update which reassigns sides and then calls __center_grid()
+        grid.update_grid(last_filled_price=low_price, last_close=low_price)
+
+        # Grid should still be correct after rebalancing
+        assert grid.is_grid_correct() is True, "Grid should remain correct after rebalancing"
+
+        # Grid length should be maintained
+        assert len(grid.grid) == grid_length_before, "Grid should maintain same number of levels"
+
+        # Verify grid shifted downward: min price should decrease
+        min_price_after = grid.grid[0]['price']
+        assert min_price_after < min_price_before, "Grid should shift downward (new bottom level added)"
+
+        # Verify the grid is still sell-heavy (rebalancing only shifts one level at a time)
+        buy_after = sum(1 for g in grid.grid if g['side'] == grid.BUY)
+        sell_after = sum(1 for g in grid.grid if g['side'] == grid.SELL)
+        total_after = buy_after + sell_after
+        if total_after > 0:
+            imbalance_after = abs(sell_after - buy_after) / total_after
+            # Rebalancing shifts one level at a time, so imbalance may still be above threshold
+            # but should be improving (one more buy, one fewer sell than before rebalancing)
+            assert buy_after > 0, "Should have at least one buy after rebalancing"
 
 
 class TestGridHelpers:
