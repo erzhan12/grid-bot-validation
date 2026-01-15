@@ -61,8 +61,13 @@ class Position:
     Reference: bbu2-master/position.py:4-159
     """
 
+    # Order side constants
     SIDE_BUY = 'Buy'
     SIDE_SELL = 'Sell'
+
+    # Direction constants
+    DIRECTION_LONG = 'long'
+    DIRECTION_SHORT = 'short'
 
     def __init__(self, direction: str, risk_config: RiskConfig):
         """
@@ -139,6 +144,10 @@ class Position:
         This method resets multipliers for BOTH this position AND the opposite
         position, then applies risk management rules that may modify either.
 
+        IMPORTANT: The opposite position must be linked via set_opposite() before
+        calling this method. Without linking, moderate liquidation risk adjustments
+        (which modify the opposite position's multipliers) will fail.
+
         Reference: bbu2-master/position.py:52-92, 101-108
 
         Args:
@@ -149,7 +158,18 @@ class Position:
 
         Returns:
             Dictionary with 'Buy' and 'Sell' multipliers for this position
+
+        Raises:
+            ValueError: If opposite position is not linked via set_opposite()
         """
+        # Validate that opposite position is linked
+        if self._opposite is None:
+            raise ValueError(
+                f"Position {self.direction} requires opposite position to be linked. "
+                f"Call set_opposite() before calculate_amount_multiplier() or use "
+                f"Position.create_linked_pair() to create properly linked positions."
+            )
+
         # Reset both positions' multipliers
         self.reset_amount_multiplier()
         if self._opposite:
@@ -163,7 +183,7 @@ class Position:
         leverage = position.leverage
 
         # Calculate unrealized PnL percentage
-        if self.direction == 'long':
+        if self.direction == self.DIRECTION_LONG:
             self.unrealized_pnl_pct = (1 / entry_price - 1 / last_close) * entry_price * 100 * leverage
         else:  # short
             self.unrealized_pnl_pct = (1 / last_close - 1 / entry_price) * entry_price * 100 * leverage
@@ -182,7 +202,7 @@ class Position:
         is_position_equal = 0.94 < self.position_ratio < 1.05
 
         # Apply risk management rules
-        if self.direction == 'long':
+        if self.direction == self.DIRECTION_LONG:
             self._apply_long_position_rules(
                 liq_ratio,
                 is_position_equal,
@@ -316,13 +336,13 @@ class Position:
         """
         if self.risk_config.increase_same_position_on_low_margin:
             # Increase same position by doubling order size
-            if self.direction == 'long':
+            if self.direction == self.DIRECTION_LONG:
                 self.set_amount_multiplier(self.SIDE_BUY, 2.0)
             else:  # short
                 self.set_amount_multiplier(self.SIDE_SELL, 2.0)
         else:
             # Increase position by reducing opposite side order size
-            if self.direction == 'long':
+            if self.direction == self.DIRECTION_LONG:
                 self.set_amount_multiplier(self.SIDE_SELL, 0.5)
             else:  # short
                 self.set_amount_multiplier(self.SIDE_BUY, 0.5)
@@ -343,6 +363,45 @@ class Position:
         if last_close == 0:
             return 0.0
         return float(liq_price) / last_close
+
+    @staticmethod
+    def create_linked_pair(
+        long_config: RiskConfig,
+        short_config: Optional[RiskConfig] = None
+    ) -> tuple['Position', 'Position']:
+        """
+        Create and link long/short position managers.
+
+        This is the recommended way to create Position objects as it ensures
+        they are properly linked for cross-position risk adjustments.
+
+        Args:
+            long_config: Risk configuration for long position
+            short_config: Risk configuration for short position (defaults to long_config if not provided)
+
+        Returns:
+            Tuple of (long_position, short_position) with opposite references set
+
+        Example:
+            >>> risk_config = RiskConfig(
+            ...     min_liq_ratio=0.8,
+            ...     max_liq_ratio=1.2,
+            ...     max_margin=5000.0,
+            ...     min_total_margin=1000.0
+            ... )
+            >>> long_mgr, short_mgr = Position.create_linked_pair(risk_config)
+            >>> # Now both positions can modify each other during risk management
+        """
+        if short_config is None:
+            short_config = long_config
+
+        long_mgr = Position(Position.DIRECTION_LONG, long_config)
+        short_mgr = Position(Position.DIRECTION_SHORT, short_config)
+
+        long_mgr.set_opposite(short_mgr)
+        short_mgr.set_opposite(long_mgr)
+
+        return long_mgr, short_mgr
 
 
 # Backward compatibility alias

@@ -420,18 +420,18 @@ class TestPositionRiskManagerBehavior:
         if self.get_liquidation_ratio(last_close) > 1.05 * self.__min_liq_ratio:
             self.set_amount_multiplier(Position.SIDE_SELL, 1.5)
         """
-        from gridcore.position import PositionRiskManager, PositionState, RiskConfig
+        from gridcore.position import PositionRiskManager, PositionState, RiskConfig, Position
 
         risk_config = RiskConfig(min_liq_ratio=0.8, max_liq_ratio=1.2, max_margin=5000.0, min_total_margin=1000.0)
-        manager = PositionRiskManager('long', risk_config)
+        manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
         # liq_ratio = 88000 / 100000 = 0.88 > 1.05 * 0.8 = 0.84 ✓
         position = PositionState(
-            direction='long', size=Decimal('0.02'), entry_price=Decimal('100000.0'),
+            direction=Position.DIRECTION_LONG, size=Decimal('0.02'), entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('88000.0'), margin=Decimal('2000.0'), leverage=10
         )
         opposite = PositionState(
-            direction='short', size=Decimal('0.01'), entry_price=Decimal('100000.0'),
+            direction=Position.DIRECTION_SHORT, size=Decimal('0.01'), entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('110000.0'), margin=Decimal('1000.0'), leverage=10
         )
 
@@ -448,7 +448,7 @@ class TestPositionRiskManagerBehavior:
 
         Gridcore uses two-position architecture: short modifies opposite (long) multipliers
         """
-        from gridcore.position import PositionRiskManager, PositionState, RiskConfig
+        from gridcore.position import PositionRiskManager, PositionState, RiskConfig, Position
 
         risk_config = RiskConfig(min_liq_ratio=0.8, max_liq_ratio=1.2, max_margin=5000.0, min_total_margin=1000.0)
         short_manager = PositionRiskManager('short', risk_config)
@@ -460,11 +460,11 @@ class TestPositionRiskManagerBehavior:
 
         # liq_ratio = 108000 / 100000 = 1.08 (0.0 < 1.08 < 1.2) ✓
         position = PositionState(
-            direction='short', size=Decimal('0.015'), entry_price=Decimal('100000.0'),
+            direction=Position.DIRECTION_SHORT, size=Decimal('0.015'), entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('108000.0'), margin=Decimal('1500.0'), leverage=10
         )
         opposite = PositionState(
-            direction='long', size=Decimal('0.015'), entry_price=Decimal('100000.0'),
+            direction=Position.DIRECTION_LONG, size=Decimal('0.015'), entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('92000.0'), margin=Decimal('1500.0'), leverage=10
         )
 
@@ -487,19 +487,19 @@ class TestPositionRiskManagerBehavior:
         elif self.position_ratio < 0.20:
             self.set_amount_multiplier(Position.SIDE_BUY, 2)
         """
-        from gridcore.position import PositionRiskManager, PositionState, RiskConfig
+        from gridcore.position import PositionRiskManager, PositionState, RiskConfig, Position
 
         risk_config = RiskConfig(min_liq_ratio=0.8, max_liq_ratio=1.2, max_margin=5000.0, min_total_margin=1000.0)
-        manager = PositionRiskManager('long', risk_config)
+        manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
         # position_ratio = 100 / 3000 = 0.033 < 0.20 ✓
         # liq_ratio = 70000 / 100000 = 0.7 (below min 0.8, safe)
         position = PositionState(
-            direction='long', size=Decimal('0.001'), entry_price=Decimal('100000.0'),
+            direction=Position.DIRECTION_LONG, size=Decimal('0.001'), entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('70000.0'), margin=Decimal('100.0'), leverage=10
         )
         opposite = PositionState(
-            direction='short', size=Decimal('0.03'), entry_price=Decimal('100000.0'),
+            direction=Position.DIRECTION_SHORT, size=Decimal('0.03'), entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('130000.0'), margin=Decimal('3000.0'), leverage=10
         )
 
@@ -514,19 +514,19 @@ class TestPositionRiskManagerBehavior:
         elif self.position_ratio > 2.0 and self.__upnl < 0:
             self.set_amount_multiplier(Position.SIDE_SELL, 2)
         """
-        from gridcore.position import PositionRiskManager, PositionState, RiskConfig
+        from gridcore.position import PositionRiskManager, PositionState, RiskConfig, Position
 
         risk_config = RiskConfig(min_liq_ratio=0.8, max_liq_ratio=1.2, max_margin=5000.0, min_total_margin=1000.0)
-        manager = PositionRiskManager('short', risk_config)
+        _, manager = PositionRiskManager.create_linked_pair(risk_config)
 
         # position_ratio = 2000 / 500 = 4.0 > 2.0 ✓
         # Price above entry (105000 > 100000) means short is losing
         position = PositionState(
-            direction='short', size=Decimal('2.0'), entry_price=Decimal('100000.0'),
+            direction=Position.DIRECTION_SHORT, size=Decimal('2.0'), entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('110000.0'), margin=Decimal('2000.0'), leverage=10
         )
         opposite = PositionState(
-            direction='long', size=Decimal('0.5'), entry_price=Decimal('100000.0'),
+            direction=Position.DIRECTION_LONG, size=Decimal('0.5'), entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('90000.0'), margin=Decimal('500.0'), leverage=10
         )
 
@@ -541,24 +541,24 @@ class TestPositionRiskManagerBehavior:
         elif self.is_position_equal() and self.get_total_margin() < self.__min_total_margin:
             self._adjust_position_for_low_margin()
         """
-        from gridcore.position import PositionRiskManager, PositionState, RiskConfig
+        from gridcore.position import PositionRiskManager, PositionState, RiskConfig, Position
 
         risk_config = RiskConfig(
             min_liq_ratio=0.8, max_liq_ratio=1.2,
             max_margin=5000.0, min_total_margin=1000.0,
             increase_same_position_on_low_margin=False
         )
-        manager = PositionRiskManager('long', risk_config)
+        manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
         # position_ratio = 400 / 400 = 1.0 (is_equal ✓)
         # total_margin = 800 < 1000 ✓
         # liq_ratio = 70000 / 100000 = 0.7 (below min 0.8, safe)
         position = PositionState(
-            direction='long', size=Decimal('1.0'), entry_price=Decimal('100000.0'),
+            direction=Position.DIRECTION_LONG, size=Decimal('1.0'), entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('70000.0'), margin=Decimal('400.0'), leverage=10
         )
         opposite = PositionState(
-            direction='short', size=Decimal('1.0'), entry_price=Decimal('100000.0'),
+            direction=Position.DIRECTION_SHORT, size=Decimal('1.0'), entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('130000.0'), margin=Decimal('400.0'), leverage=10
         )
 
@@ -895,6 +895,7 @@ class TestEngineStrat50Behavior:
         Reference: PlaceLimitIntent.create() using SHA256 hash
         """
         from gridcore.intents import PlaceLimitIntent
+        from gridcore.position import Position
 
         # Create two intents with same parameters
         intent1 = PlaceLimitIntent.create(
@@ -903,7 +904,7 @@ class TestEngineStrat50Behavior:
             price=Decimal('99800.0'),
             qty=Decimal('0.01'),
             grid_level=5,
-            direction='long'
+            direction=Position.DIRECTION_LONG
         )
 
         intent2 = PlaceLimitIntent.create(
@@ -912,7 +913,7 @@ class TestEngineStrat50Behavior:
             price=Decimal('99800.0'),
             qty=Decimal('0.01'),
             grid_level=5,
-            direction='long'
+            direction=Position.DIRECTION_LONG
         )
 
         # Should have identical client_order_id
@@ -926,7 +927,7 @@ class TestEngineStrat50Behavior:
             price=Decimal('99800.0'),
             qty=Decimal('0.01'),
             grid_level=6,  # Different level
-            direction='long'
+            direction=Position.DIRECTION_LONG
         )
 
         assert intent1.client_order_id != intent3.client_order_id, \

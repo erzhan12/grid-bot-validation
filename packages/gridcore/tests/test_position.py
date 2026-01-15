@@ -3,7 +3,7 @@ Unit tests for Position module.
 """
 
 from decimal import Decimal
-from gridcore.position import PositionState, PositionRiskManager, RiskConfig
+from gridcore.position import PositionState, PositionRiskManager, RiskConfig, Position
 
 
 class TestPositionState:
@@ -11,7 +11,7 @@ class TestPositionState:
 
     def test_position_state_initialization(self):
         """PositionState initializes with correct defaults."""
-        pos = PositionState(direction='long')
+        pos = PositionState(direction=Position.DIRECTION_LONG)
         assert pos.direction == 'long'
         assert pos.size == Decimal('0')
         assert pos.entry_price is None
@@ -20,7 +20,7 @@ class TestPositionState:
     def test_position_state_with_values(self):
         """PositionState holds position data."""
         pos = PositionState(
-            direction='short',
+            direction=Position.DIRECTION_SHORT,
             size=Decimal('1.5'),
             entry_price=Decimal('100000.0'),
             unrealized_pnl=Decimal('50.0'),
@@ -76,10 +76,10 @@ class TestPositionRiskManager:
             max_margin=5000.0,
             min_total_margin=1000.0
         )
-        manager = PositionRiskManager('long', risk_config)
+        long_manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
         position = PositionState(
-            direction='long',
+            direction=Position.DIRECTION_LONG,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('50000.0'),
@@ -88,7 +88,7 @@ class TestPositionRiskManager:
         )
 
         opposite = PositionState(
-            direction='short',
+            direction=Position.DIRECTION_SHORT,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('150000.0'),
@@ -96,7 +96,7 @@ class TestPositionRiskManager:
             leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(
+        multipliers = long_manager.calculate_amount_multiplier(
             position,
             opposite,
             last_close=100000.0,
@@ -117,10 +117,10 @@ class TestPositionRiskManager:
             max_margin=5000.0,
             min_total_margin=1000.0
         )
-        manager = PositionRiskManager('short', risk_config)
+        _, short_manager = PositionRiskManager.create_linked_pair(risk_config)
 
         position = PositionState(
-            direction='short',
+            direction=Position.DIRECTION_SHORT,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('150000.0'),
@@ -129,7 +129,7 @@ class TestPositionRiskManager:
         )
 
         opposite = PositionState(
-            direction='long',
+            direction=Position.DIRECTION_LONG,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('50000.0'),
@@ -137,7 +137,7 @@ class TestPositionRiskManager:
             leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(
+        multipliers = short_manager.calculate_amount_multiplier(
             position,
             opposite,
             last_close=100000.0,
@@ -172,6 +172,91 @@ class TestRiskConfig:
 class TestPositionRiskManagerRules:
     """Rule-level tests for PositionRiskManager risk management logic."""
 
+    def test_calculate_amount_multiplier_without_opposite_raises_error(self):
+        """Calling calculate_amount_multiplier without set_opposite raises ValueError."""
+        risk_config = RiskConfig(
+            min_liq_ratio=0.8,
+            max_liq_ratio=1.2,
+            max_margin=5000.0,
+            min_total_margin=1000.0
+        )
+        manager = PositionRiskManager('long', risk_config)
+        # Don't set opposite - should raise error
+
+        position = PositionState(
+            direction=Position.DIRECTION_LONG,
+            size=Decimal('1.0'),
+            entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('50000.0'),
+            margin=Decimal('1000.0'),
+            leverage=10
+        )
+
+        opposite = PositionState(
+            direction=Position.DIRECTION_SHORT,
+            size=Decimal('1.0'),
+            entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('150000.0'),
+            margin=Decimal('1000.0'),
+            leverage=10
+        )
+
+        # Should raise ValueError with helpful message
+        try:
+            manager.calculate_amount_multiplier(
+                position, opposite, last_close=100000.0, wallet_balance=Decimal('10000.0')
+            )
+            assert False, "Expected ValueError but none was raised"
+        except ValueError as e:
+            assert "requires opposite position to be linked" in str(e)
+            assert "set_opposite()" in str(e)
+            assert "create_linked_pair()" in str(e)
+
+    def test_create_linked_pair_helper(self):
+        """create_linked_pair creates properly linked positions."""
+        risk_config = RiskConfig(
+            min_liq_ratio=0.8,
+            max_liq_ratio=1.2,
+            max_margin=5000.0,
+            min_total_margin=1000.0
+        )
+
+        long_mgr, short_mgr = PositionRiskManager.create_linked_pair(risk_config)
+
+        # Verify directions
+        assert long_mgr.direction == 'long'
+        assert short_mgr.direction == 'short'
+
+        # Verify both have references to each other
+        assert long_mgr._opposite is short_mgr
+        assert short_mgr._opposite is long_mgr
+
+        # Verify both can be used without errors
+        position = PositionState(
+            direction=Position.DIRECTION_LONG,
+            size=Decimal('1.0'),
+            entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('50000.0'),
+            margin=Decimal('1000.0'),
+            leverage=10
+        )
+
+        opposite = PositionState(
+            direction=Position.DIRECTION_SHORT,
+            size=Decimal('1.0'),
+            entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('150000.0'),
+            margin=Decimal('1000.0'),
+            leverage=10
+        )
+
+        # Should not raise error
+        multipliers = long_mgr.calculate_amount_multiplier(
+            position, opposite, last_close=100000.0, wallet_balance=Decimal('10000.0')
+        )
+        assert 'Buy' in multipliers
+        assert 'Sell' in multipliers
+
     def test_high_liquidation_ratio_long_decreases_position(self):
         """High liquidation ratio for long position decreases long (increases sell multiplier)."""
         risk_config = RiskConfig(
@@ -180,11 +265,11 @@ class TestPositionRiskManagerRules:
             max_margin=5000.0,
             min_total_margin=1000.0
         )
-        manager = PositionRiskManager('long', risk_config)
+        manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
         # High liquidation risk: liq_ratio > 1.05 * min_liq_ratio (0.84)
         position = PositionState(
-            direction='long',
+            direction=Position.DIRECTION_LONG,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('85000.0'),  # liq_ratio = 0.85
@@ -192,7 +277,15 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
 
-        opposite = PositionState(direction='short', size=Decimal('0'), margin=Decimal('0'))
+        # Short position exists (realistic hedged scenario)
+        opposite = PositionState(
+            direction=Position.DIRECTION_SHORT,
+            size=Decimal('0.5'),
+            entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('115000.0'),
+            margin=Decimal('500.0'),
+            leverage=10
+        )
         multipliers = manager.calculate_amount_multiplier(
             position, opposite, last_close=100000.0, wallet_balance=Decimal('10000.0')
         )
@@ -209,17 +302,13 @@ class TestPositionRiskManagerRules:
             max_margin=5000.0,
             min_total_margin=1000.0
         )
-        long_manager = PositionRiskManager('long', risk_config)
-        short_manager = PositionRiskManager('short', risk_config)
-
-        # Link the two positions (critical for cross-position adjustments)
-        long_manager.set_opposite(short_manager)
-        short_manager.set_opposite(long_manager)
+        # Use helper to create properly linked positions
+        long_manager, short_manager = PositionRiskManager.create_linked_pair(risk_config)
 
         # Moderate liquidation risk: liq_ratio > min_liq_ratio (0.8) but <= 1.05 * min_liq_ratio
         # Long position with moderate liquidation risk
         position = PositionState(
-            direction='long',
+            direction=Position.DIRECTION_LONG,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('81000.0'),  # liq_ratio = 0.81
@@ -229,7 +318,7 @@ class TestPositionRiskManagerRules:
 
         # Short position exists but is smaller (realistic hedged scenario)
         opposite = PositionState(
-            direction='short',
+            direction=Position.DIRECTION_SHORT,
             size=Decimal('0.5'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('115000.0'),  # Safe liq ratio for short
@@ -257,11 +346,11 @@ class TestPositionRiskManagerRules:
             max_margin=5000.0,
             min_total_margin=1000.0
         )
-        manager = PositionRiskManager('short', risk_config)
+        _, manager = PositionRiskManager.create_linked_pair(risk_config)
 
         # High liquidation risk: liq_ratio < 0.95 * max_liq_ratio (1.14)
         position = PositionState(
-            direction='short',
+            direction=Position.DIRECTION_SHORT,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('115000.0'),  # liq_ratio = 1.15
@@ -269,7 +358,15 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
 
-        opposite = PositionState(direction='long', size=Decimal('0'), margin=Decimal('0'))
+        # Long position exists (realistic hedged scenario)
+        opposite = PositionState(
+            direction=Position.DIRECTION_LONG,
+            size=Decimal('0.5'),
+            entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('90000.0'),
+            margin=Decimal('500.0'),
+            leverage=10
+        )
         multipliers = manager.calculate_amount_multiplier(
             position, opposite, last_close=100000.0, wallet_balance=Decimal('10000.0')
         )
@@ -287,12 +384,12 @@ class TestPositionRiskManagerRules:
             min_total_margin=1000.0,
             increase_same_position_on_low_margin=False
         )
-        manager = PositionRiskManager('long', risk_config)
+        manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
         # Equal positions (ratio ~1.0) but low total margin
         # liq_ratio = 70000 / 100000 = 0.7 (below min 0.8, safe)
         position = PositionState(
-            direction='long',
+            direction=Position.DIRECTION_LONG,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('70000.0'),  # Safe liq ratio
@@ -301,7 +398,7 @@ class TestPositionRiskManagerRules:
         )
 
         opposite = PositionState(
-            direction='short',
+            direction=Position.DIRECTION_SHORT,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('130000.0'),  # Safe liq ratio
@@ -326,12 +423,12 @@ class TestPositionRiskManagerRules:
             min_total_margin=1000.0,
             increase_same_position_on_low_margin=True
         )
-        manager = PositionRiskManager('long', risk_config)
+        manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
         # Equal positions but low total margin
         # liq_ratio = 70000 / 100000 = 0.7 (below min 0.8, safe)
         position = PositionState(
-            direction='long',
+            direction=Position.DIRECTION_LONG,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('70000.0'),  # Safe liq ratio
@@ -340,7 +437,7 @@ class TestPositionRiskManagerRules:
         )
 
         opposite = PositionState(
-            direction='short',
+            direction=Position.DIRECTION_SHORT,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('130000.0'),  # Safe liq ratio
@@ -364,12 +461,12 @@ class TestPositionRiskManagerRules:
             max_margin=5000.0,
             min_total_margin=1000.0
         )
-        manager = PositionRiskManager('long', risk_config)
+        manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
         # Small position (ratio < 0.5) and losing (price below entry)
         # liq_ratio = 70000 / 95000 = 0.737 (below min 0.8, safe)
         position = PositionState(
-            direction='long',
+            direction=Position.DIRECTION_LONG,
             size=Decimal('0.5'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('70000.0'),  # Safe liq ratio
@@ -378,7 +475,7 @@ class TestPositionRiskManagerRules:
         )
 
         opposite = PositionState(
-            direction='short',
+            direction=Position.DIRECTION_SHORT,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('125000.0'),  # Safe liq ratio
@@ -403,12 +500,12 @@ class TestPositionRiskManagerRules:
             max_margin=5000.0,
             min_total_margin=1000.0
         )
-        manager = PositionRiskManager('long', risk_config)
+        manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
         # Very small position (ratio < 0.20)
         # liq_ratio = 70000 / 100000 = 0.7 (below min 0.8, safe)
         position = PositionState(
-            direction='long',
+            direction=Position.DIRECTION_LONG,
             size=Decimal('0.1'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('70000.0'),  # Safe liq ratio
@@ -417,7 +514,7 @@ class TestPositionRiskManagerRules:
         )
 
         opposite = PositionState(
-            direction='short',
+            direction=Position.DIRECTION_SHORT,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('130000.0'),  # Safe liq ratio
@@ -441,11 +538,11 @@ class TestPositionRiskManagerRules:
             max_margin=5000.0,
             min_total_margin=1000.0
         )
-        manager = PositionRiskManager('short', risk_config)
+        _, manager = PositionRiskManager.create_linked_pair(risk_config)
 
         # Large position (ratio > 2.0) and losing (price above entry)
         position = PositionState(
-            direction='short',
+            direction=Position.DIRECTION_SHORT,
             size=Decimal('2.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('110000.0'),
@@ -454,7 +551,7 @@ class TestPositionRiskManagerRules:
         )
 
         opposite = PositionState(
-            direction='long',
+            direction=Position.DIRECTION_LONG,
             size=Decimal('0.5'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('90000.0'),
@@ -479,11 +576,11 @@ class TestPositionRiskManagerRules:
             max_margin=5000.0,
             min_total_margin=1000.0
         )
-        manager = PositionRiskManager('short', risk_config)
+        _, manager = PositionRiskManager.create_linked_pair(risk_config)
 
         # Very large position (ratio > 5.0)
         position = PositionState(
-            direction='short',
+            direction=Position.DIRECTION_SHORT,
             size=Decimal('5.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('110000.0'),
@@ -492,7 +589,7 @@ class TestPositionRiskManagerRules:
         )
 
         opposite = PositionState(
-            direction='long',
+            direction=Position.DIRECTION_LONG,
             size=Decimal('0.5'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('90000.0'),
@@ -516,19 +613,15 @@ class TestPositionRiskManagerRules:
             max_margin=5000.0,
             min_total_margin=1000.0
         )
-        short_manager = PositionRiskManager('short', risk_config)
-        long_manager = PositionRiskManager('long', risk_config)
-
-        # Link the two positions (critical for cross-position adjustments)
-        short_manager.set_opposite(long_manager)
-        long_manager.set_opposite(short_manager)
+        # Use helper to create properly linked positions
+        long_manager, short_manager = PositionRiskManager.create_linked_pair(risk_config)
 
         # Moderate liquidation risk scenario
         # liq_ratio = 108000 / 100000 = 1.08 (between 0 and 1.2)
         # Not high enough to trigger emergency (< 0.95 * 1.2 = 1.14)
         # But moderate risk exists
         position = PositionState(
-            direction='short',
+            direction=Position.DIRECTION_SHORT,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('108000.0'),  # Moderate risk
@@ -537,7 +630,7 @@ class TestPositionRiskManagerRules:
         )
 
         opposite = PositionState(
-            direction='long',
+            direction=Position.DIRECTION_LONG,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('90000.0'),

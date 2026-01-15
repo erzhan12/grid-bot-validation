@@ -158,9 +158,23 @@ uv run pytest packages/gridcore/tests/test_grid.py -v
 11. **Position Risk Management**: For SHORT positions, higher liquidation ratio means closer to liquidation (use `>` not `<` in conditions)
 12. **Two-Position Architecture (CRITICAL)**: Always create BOTH Position objects and link with `set_opposite()`
     - Each trading pair requires two Position objects: one for long, one for short
-    - Link them: `long.set_opposite(short)` and `short.set_opposite(long)`
+    - **RECOMMENDED**: Use `Position.create_linked_pair(risk_config)` helper to create properly linked positions
+    - **Manual linking**: Call `long.set_opposite(short)` and `short.set_opposite(long)` before using
+    - **Validation (2026-01-15)**: `calculate_amount_multiplier()` now validates that opposite is linked and raises `ValueError` if not
+    - **String Constants (2026-01-15)**: Use `Position.DIRECTION_LONG`, `Position.DIRECTION_SHORT`, `Position.SIDE_BUY`, `Position.SIDE_SELL` instead of hardcoded strings
     - Moderate liquidation risk triggers cross-position adjustments (modifying opposite's multipliers)
-    - Without linking, moderate liq risk logic will fail silently (no opposite to modify)
+    - Without linking, the method will fail with a clear error message instead of silently doing nothing
+    - Example:
+      ```python
+      # RECOMMENDED approach
+      long_mgr, short_mgr = Position.create_linked_pair(risk_config)
+
+      # Manual approach (if different configs needed)
+      long_mgr = Position(Position.DIRECTION_LONG, long_config)
+      short_mgr = Position(Position.DIRECTION_SHORT, short_config)
+      long_mgr.set_opposite(short_mgr)
+      short_mgr.set_opposite(long_mgr)
+      ```
 13. **Risk Rule Priority (CRITICAL)**: ALWAYS check liquidation risk BEFORE position sizing strategies
     - Liquidation = total loss (100%), missed trade opportunity = no loss (0%)
     - Long: High liq → Moderate liq (modifies opposite) → Low margin → Position ratios
