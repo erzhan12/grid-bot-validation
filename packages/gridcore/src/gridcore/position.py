@@ -2,6 +2,10 @@
 Position state tracking and risk management.
 
 Extracted from bbu2-master/position.py with exchange-specific dependencies removed.
+
+ARCHITECTURE: This module implements the two-position architecture from Bybit.
+Each trading pair has TWO separate Position objects (long and short) that can
+reference and modify each other's multipliers via set_opposite().
 """
 
 import logging
@@ -44,15 +48,17 @@ class RiskConfig:
     increase_same_position_on_low_margin: bool = False
 
 
-class PositionRiskManager:
+class Position:
     """
     Position risk management and amount multiplier calculation.
 
-    Extracted from bbu2-master/position.py Position class, specifically
-    the __calc_amount_multiplier logic (lines 52-92).
+    Extracted from bbu2-master/position.py Position class.
 
-    This class calculates order size multipliers based on position state,
-    liquidation risk, and margin levels.
+    CRITICAL: This class represents ONE position direction (long OR short).
+    For proper risk management, create TWO Position objects and link them
+    with set_opposite() so they can modify each other's multipliers.
+
+    Reference: bbu2-master/position.py:4-159
     """
 
     SIDE_BUY = 'Buy'
@@ -60,17 +66,56 @@ class PositionRiskManager:
 
     def __init__(self, direction: str, risk_config: RiskConfig):
         """
-        Initialize position risk manager.
+        Initialize position manager for one direction.
 
         Args:
             direction: 'long' or 'short'
             risk_config: Risk management parameters
+
+        Reference: bbu2-master/position.py:8-22
         """
         self.direction = direction
         self.risk_config = risk_config
         self.amount_multiplier = {self.SIDE_BUY: 1.0, self.SIDE_SELL: 1.0}
         self.position_ratio = 1.0
         self.unrealized_pnl_pct = 0.0
+        self._opposite: Optional['Position'] = None
+
+    def set_opposite(self, opposite: 'Position') -> None:
+        """
+        Link this position to its opposite direction position.
+
+        This allows cross-position multiplier adjustments during risk management.
+
+        Args:
+            opposite: The opposite direction Position object
+
+        Reference: bbu2-master/position.py:110-111
+        """
+        self._opposite = opposite
+
+    def set_amount_multiplier(self, side: str, mult: float) -> None:
+        """
+        Set order size multiplier for a specific side.
+
+        Args:
+            side: 'Buy' or 'Sell'
+            mult: Multiplier value
+
+        Reference: bbu2-master/position.py:95-96
+        """
+        self.amount_multiplier[side] = mult
+
+    def get_amount_multiplier(self) -> dict[str, float]:
+        """
+        Get current amount multipliers.
+
+        Returns:
+            Dictionary with 'Buy' and 'Sell' multipliers
+
+        Reference: bbu2-master/position.py:98-99
+        """
+        return self.amount_multiplier
 
     def reset_amount_multiplier(self) -> None:
         """
@@ -78,8 +123,8 @@ class PositionRiskManager:
 
         Reference: bbu2-master/position.py:33-35
         """
-        self.amount_multiplier[self.SIDE_BUY] = 1.0
-        self.amount_multiplier[self.SIDE_SELL] = 1.0
+        self.set_amount_multiplier(self.SIDE_BUY, 1.0)
+        self.set_amount_multiplier(self.SIDE_SELL, 1.0)
 
     def calculate_amount_multiplier(
         self,
@@ -91,7 +136,10 @@ class PositionRiskManager:
         """
         Calculate order size multipliers based on position state.
 
-        Reference: bbu2-master/position.py:52-92
+        This method resets multipliers for BOTH this position AND the opposite
+        position, then applies risk management rules that may modify either.
+
+        Reference: bbu2-master/position.py:52-92, 101-108
 
         Args:
             position: Current position state
@@ -100,9 +148,12 @@ class PositionRiskManager:
             wallet_balance: Total wallet balance
 
         Returns:
-            Dictionary with 'Buy' and 'Sell' multipliers
+            Dictionary with 'Buy' and 'Sell' multipliers for this position
         """
+        # Reset both positions' multipliers
         self.reset_amount_multiplier()
+        if self._opposite:
+            self._opposite.reset_amount_multiplier()
 
         # Calculate position metrics
         if position.entry_price is None or position.entry_price == 0:
@@ -172,35 +223,40 @@ class PositionRiskManager:
         Apply risk management rules for long positions.
 
         Reference: bbu2-master/position.py:58-74
-        
-        Priority order:
-        1. Check specific position sizing conditions first
-        2. Then check liquidation risk as general safety measure
+
+        Priority order (SAFER - liquidation-first):
+        1. High liquidation risk (emergency) - prevents total loss
+        2. Moderate liquidation risk (safety) - hedging via opposite position
+        3. Specific position sizing conditions - strategic adjustments
+
+        Capital preservation > strategy optimization.
         """
-        # Positions equal but low total margin → adjust (highest priority for specific condition)
-        if is_position_equal and total_margin < self.risk_config.min_total_margin:
+        # High liquidation risk → decrease long position (HIGHEST PRIORITY)
+        if liq_ratio > 1.05 * self.risk_config.min_liq_ratio:
+            logger.info('Position adjustment: %s high_liq_risk (ratio=%.2f)', self.direction, liq_ratio)
+            self.set_amount_multiplier(self.SIDE_SELL, 1.5)
+
+        # Moderate liquidation risk → increase opposite (short) position as hedge
+        elif liq_ratio > self.risk_config.min_liq_ratio:
+            logger.info('Position adjustment: %s moderate_liq_risk (ratio=%.2f)', self.direction, liq_ratio)
+            if self._opposite:
+                # Reduce short's buy orders → allows short to grow as hedge
+                self._opposite.set_amount_multiplier(self.SIDE_BUY, 0.5)
+
+        # Positions equal but low total margin → adjust
+        elif is_position_equal and total_margin < self.risk_config.min_total_margin:
             logger.info('Position adjustment: %s low_margin (total=%.2f)', self.direction, total_margin)
             self._adjust_position_for_low_margin()
 
         # Long position too small and losing → increase long
         elif self.position_ratio < 0.5 and self.unrealized_pnl_pct < 0:
             logger.info('Position adjustment: %s ratio=%.2f increasing buys', self.direction, self.position_ratio)
-            self.amount_multiplier[self.SIDE_BUY] = 2.0
+            self.set_amount_multiplier(self.SIDE_BUY, 2.0)
 
         # Long position very small → increase long
         elif self.position_ratio < 0.20:
             logger.info('Position adjustment: %s ratio=%.2f increasing buys', self.direction, self.position_ratio)
-            self.amount_multiplier[self.SIDE_BUY] = 2.0
-
-        # High liquidation risk → decrease long position (checked after specific conditions)
-        elif liq_ratio > 1.05 * self.risk_config.min_liq_ratio:
-            logger.info('Position adjustment: %s high_liq_risk (ratio=%.2f)', self.direction, liq_ratio)
-            self.amount_multiplier[self.SIDE_SELL] = 1.5
-
-        # Moderate liquidation risk → increase opposite (short) position
-        elif liq_ratio > self.risk_config.min_liq_ratio:
-            logger.info('Position adjustment: %s moderate_liq_risk (ratio=%.2f)', self.direction, liq_ratio)
-            self.amount_multiplier[self.SIDE_BUY] = 0.5  # Decrease long buys (increases short)
+            self.set_amount_multiplier(self.SIDE_BUY, 2.0)
 
     def _apply_short_position_rules(
         self,
@@ -214,18 +270,19 @@ class PositionRiskManager:
 
         Reference: bbu2-master/position.py:76-92
 
-        Priority order (INTENTIONALLY REORDERED from original):
-        1. High liquidation risk (emergency)
-        2. Specific position sizing conditions
-        3. Moderate liquidation risk (safety)
+        Priority order (SAFER - liquidation-first):
+        1. High liquidation risk (emergency) - prevents total loss
+        2. Specific position sizing conditions - strategic adjustments
+        3. Moderate liquidation risk (safety) - hedging via opposite position
 
-        This prevents moderate liq risk from masking intentional position adjustments.
+        Note: High liquidation checked first, moderate checked last.
+        Capital preservation > strategy optimization.
         """
         # High liquidation risk (short) → decrease short position (EMERGENCY)
-        # When liq_ratio is high and close to max, liquidation is imminent
+        # For shorts: liq_ratio > max means liquidation is imminent (corrected from original bug)
         if liq_ratio > 0.95 * self.risk_config.max_liq_ratio:
             logger.info('Position adjustment: %s EMERGENCY high_liq_risk (ratio=%.2f)', self.direction, liq_ratio)
-            self.amount_multiplier[self.SIDE_BUY] = 1.5
+            self.set_amount_multiplier(self.SIDE_BUY, 1.5)
 
         # Positions equal but low total margin → adjust
         elif is_position_equal and total_margin < self.risk_config.min_total_margin:
@@ -235,19 +292,21 @@ class PositionRiskManager:
         # Short position too large and losing → increase short
         elif self.position_ratio > 2.0 and self.unrealized_pnl_pct < 0:
             logger.info('Position adjustment: %s ratio=%.2f increasing sells', self.direction, self.position_ratio)
-            self.amount_multiplier[self.SIDE_SELL] = 2.0
+            self.set_amount_multiplier(self.SIDE_SELL, 2.0)
 
         # Short position very large → increase short
         elif self.position_ratio > 5.0:
             logger.info('Position adjustment: %s ratio=%.2f increasing sells', self.direction, self.position_ratio)
-            self.amount_multiplier[self.SIDE_SELL] = 2.0
+            self.set_amount_multiplier(self.SIDE_SELL, 2.0)
 
-        # Moderate liquidation risk → increase opposite (long) position
+        # Moderate liquidation risk → increase opposite (long) position as hedge
         # Reference: bbu2-master/position.py:81-86
-        # Checked AFTER position ratio checks to not mask sizing adjustments
+        # Checked AFTER position ratio checks (per original sequence)
         elif 0.0 < liq_ratio < self.risk_config.max_liq_ratio:
             logger.info('Position adjustment: %s moderate_liq_risk (ratio=%.2f)', self.direction, liq_ratio)
-            self.amount_multiplier[self.SIDE_SELL] = 0.5  # Decrease short sells (increases long)
+            if self._opposite:
+                # Reduce long's sell orders → allows long to grow as hedge
+                self._opposite.set_amount_multiplier(self.SIDE_SELL, 0.5)
 
     def _adjust_position_for_low_margin(self) -> None:
         """
@@ -258,15 +317,15 @@ class PositionRiskManager:
         if self.risk_config.increase_same_position_on_low_margin:
             # Increase same position by doubling order size
             if self.direction == 'long':
-                self.amount_multiplier[self.SIDE_BUY] = 2.0
+                self.set_amount_multiplier(self.SIDE_BUY, 2.0)
             else:  # short
-                self.amount_multiplier[self.SIDE_SELL] = 2.0
+                self.set_amount_multiplier(self.SIDE_SELL, 2.0)
         else:
             # Increase position by reducing opposite side order size
             if self.direction == 'long':
-                self.amount_multiplier[self.SIDE_SELL] = 0.5
+                self.set_amount_multiplier(self.SIDE_SELL, 0.5)
             else:  # short
-                self.amount_multiplier[self.SIDE_BUY] = 0.5
+                self.set_amount_multiplier(self.SIDE_BUY, 0.5)
 
     def _get_liquidation_ratio(self, liq_price: Decimal, last_close: float) -> float:
         """
@@ -284,3 +343,7 @@ class PositionRiskManager:
         if last_close == 0:
             return 0.0
         return float(liq_price) / last_close
+
+
+# Backward compatibility alias
+PositionRiskManager = Position

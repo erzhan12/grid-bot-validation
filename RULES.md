@@ -32,17 +32,29 @@ Successfully extracted pure strategy logic from `bbu2-master` into `packages/gri
 4. **Position Risk Management Module (`position.py`)**
    - Extracted from: `bbu_reference/bbu2-master/position.py`
    - Manages position sizing multipliers based on liquidation risk, margin levels, and position ratios
+   - **TWO-POSITION ARCHITECTURE (2026-01-14)**: Matches Bybit's dual-position model
+     - Each trading pair has TWO separate Position objects (one for long, one for short)
+     - Positions are linked via `set_opposite()` to enable cross-position multiplier adjustments
+     - Example: Long position with moderate liq risk calls `opposite.set_amount_multiplier()` to modify SHORT multipliers
+     - **Usage pattern**:
+       ```python
+       long = Position('long', risk_config)
+       short = Position('short', risk_config)
+       long.set_opposite(short)
+       short.set_opposite(long)
+       ```
+     - `PositionRiskManager` is backward-compatibility alias for `Position`
    - **CRITICAL BUG FIX (2026-01-01)**: Reference code had incorrect liquidation risk logic for short positions
      - Reference used `liq_ratio < 0.95 * max_liq_ratio` which is backwards
      - Correct logic: `liq_ratio > 0.95 * max_liq_ratio` (higher ratio = closer to liquidation for shorts)
    - **MISSING LOGIC FIX (2026-01-03)**: Added moderate liquidation risk logic for short positions
-     - Original bbu2 code at `position.py:81-86` handles moderate liq risk for shorts
-     - This logic was missing from initial gridcore extraction
-     - Added in `position.py:220-224` with correct priority ordering
-     - When short position has moderate liq risk, decreases short sells to increase long position
-   - **Rule Priority Order**: Specific conditions (low margin, position ratio) must be checked BEFORE general liquidation risk
-     - This prevents liquidation risk from masking intended position sizing adjustments
-     - Order: emergency liq → low margin → position ratio → moderate liq
+     - Original bbu2 code at `position.py:81-86` handles moderate liq risk for shorts via opposite position
+     - When short has moderate liq risk, modifies opposite (long) position's SELL multiplier to 0.5
+   - **SAFER PRIORITY ORDER (2026-01-14)**: Changed to liquidation-first approach matching original bbu2
+     - **Long positions**: High liq risk → Moderate liq risk (modifies opposite) → Low margin → Position ratio checks
+     - **Short positions**: High liq risk → Position ratio/margin → Moderate liq risk (modifies opposite)
+     - **Rationale**: Capital preservation > strategy optimization. Liquidation = 100% loss, missed trade = 0% loss
+     - Prevents position sizing strategies from executing during liquidation danger
    - File: `packages/gridcore/src/gridcore/position.py`
 
 5. **Events and Intents**
@@ -144,7 +156,16 @@ uv run pytest packages/gridcore/tests/test_grid.py -v
 9. **Grid Rebuild**: `build_greed()` clears `self.greed = []` before building to prevent doubling on rebuilds
 10. **Duplicate Orders**: `PlaceLimitIntent.create()` uses deterministic `client_order_id` (SHA256 hash of symbol+side+price+grid_level+direction) so execution layer can detect/skip duplicates
 11. **Position Risk Management**: For SHORT positions, higher liquidation ratio means closer to liquidation (use `>` not `<` in conditions)
-12. **Risk Rule Priority**: Check specific conditions (low margin, position ratios) BEFORE general liquidation risk conditions
+12. **Two-Position Architecture (CRITICAL)**: Always create BOTH Position objects and link with `set_opposite()`
+    - Each trading pair requires two Position objects: one for long, one for short
+    - Link them: `long.set_opposite(short)` and `short.set_opposite(long)`
+    - Moderate liquidation risk triggers cross-position adjustments (modifying opposite's multipliers)
+    - Without linking, moderate liq risk logic will fail silently (no opposite to modify)
+13. **Risk Rule Priority (CRITICAL)**: ALWAYS check liquidation risk BEFORE position sizing strategies
+    - Liquidation = total loss (100%), missed trade opportunity = no loss (0%)
+    - Long: High liq → Moderate liq (modifies opposite) → Low margin → Position ratios
+    - Short: High liq → Position ratios/margin → Moderate liq (modifies opposite)
+    - Test scenarios must have SAFE liquidation ratios when testing position sizing logic
 
 ## Grid Anchor Persistence
 

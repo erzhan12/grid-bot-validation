@@ -446,12 +446,17 @@ class TestPositionRiskManagerBehavior:
         elif 0.0 < self.get_liquidation_ratio(last_close) < self.__max_liq_ratio:
             self.__opposite.set_amount_multiplier(Position.SIDE_SELL, 0.5)
 
-        Gridcore equivalent: sets own SIDE_SELL = 0.5 to decrease short exposure
+        Gridcore uses two-position architecture: short modifies opposite (long) multipliers
         """
         from gridcore.position import PositionRiskManager, PositionState, RiskConfig
 
         risk_config = RiskConfig(min_liq_ratio=0.8, max_liq_ratio=1.2, max_margin=5000.0, min_total_margin=1000.0)
-        manager = PositionRiskManager('short', risk_config)
+        short_manager = PositionRiskManager('short', risk_config)
+        long_manager = PositionRiskManager('long', risk_config)
+
+        # Link the two positions
+        short_manager.set_opposite(long_manager)
+        long_manager.set_opposite(short_manager)
 
         # liq_ratio = 108000 / 100000 = 1.08 (0.0 < 1.08 < 1.2) ✓
         position = PositionState(
@@ -463,8 +468,16 @@ class TestPositionRiskManagerBehavior:
             liquidation_price=Decimal('92000.0'), margin=Decimal('1500.0'), leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(position, opposite, 100000.0, Decimal('10000.0'))
-        assert multipliers['Sell'] == 0.5, "Should decrease short sells to increase long"
+        short_multipliers = short_manager.calculate_amount_multiplier(position, opposite, 100000.0, Decimal('10000.0'))
+
+        # Short position should not modify itself
+        assert short_multipliers['Sell'] == 1.0
+        assert short_multipliers['Buy'] == 1.0
+
+        # Instead, it should modify the opposite (long) position's multipliers
+        long_multipliers = long_manager.get_amount_multiplier()
+        assert long_multipliers['Sell'] == 0.5, "Should decrease long sells to increase long"
+        assert long_multipliers['Buy'] == 1.0
 
     def test_small_long_position_increases_long(self):
         """
@@ -480,13 +493,14 @@ class TestPositionRiskManagerBehavior:
         manager = PositionRiskManager('long', risk_config)
 
         # position_ratio = 100 / 3000 = 0.033 < 0.20 ✓
+        # liq_ratio = 70000 / 100000 = 0.7 (below min 0.8, safe)
         position = PositionState(
             direction='long', size=Decimal('0.001'), entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('95000.0'), margin=Decimal('100.0'), leverage=10
+            liquidation_price=Decimal('70000.0'), margin=Decimal('100.0'), leverage=10
         )
         opposite = PositionState(
             direction='short', size=Decimal('0.03'), entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('110000.0'), margin=Decimal('3000.0'), leverage=10
+            liquidation_price=Decimal('130000.0'), margin=Decimal('3000.0'), leverage=10
         )
 
         multipliers = manager.calculate_amount_multiplier(position, opposite, 100000.0, Decimal('10000.0'))
@@ -538,13 +552,14 @@ class TestPositionRiskManagerBehavior:
 
         # position_ratio = 400 / 400 = 1.0 (is_equal ✓)
         # total_margin = 800 < 1000 ✓
+        # liq_ratio = 70000 / 100000 = 0.7 (below min 0.8, safe)
         position = PositionState(
             direction='long', size=Decimal('1.0'), entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('90000.0'), margin=Decimal('400.0'), leverage=10
+            liquidation_price=Decimal('70000.0'), margin=Decimal('400.0'), leverage=10
         )
         opposite = PositionState(
             direction='short', size=Decimal('1.0'), entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('110000.0'), margin=Decimal('400.0'), leverage=10
+            liquidation_price=Decimal('130000.0'), margin=Decimal('400.0'), leverage=10
         )
 
         multipliers = manager.calculate_amount_multiplier(position, opposite, 100000.0, Decimal('10000.0'))

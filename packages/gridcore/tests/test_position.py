@@ -209,9 +209,15 @@ class TestPositionRiskManagerRules:
             max_margin=5000.0,
             min_total_margin=1000.0
         )
-        manager = PositionRiskManager('long', risk_config)
+        long_manager = PositionRiskManager('long', risk_config)
+        short_manager = PositionRiskManager('short', risk_config)
+
+        # Link the two positions (critical for cross-position adjustments)
+        long_manager.set_opposite(short_manager)
+        short_manager.set_opposite(long_manager)
 
         # Moderate liquidation risk: liq_ratio > min_liq_ratio (0.8) but <= 1.05 * min_liq_ratio
+        # Long position with moderate liquidation risk
         position = PositionState(
             direction='long',
             size=Decimal('1.0'),
@@ -221,14 +227,27 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
 
-        opposite = PositionState(direction='short', size=Decimal('0'), margin=Decimal('0'))
-        multipliers = manager.calculate_amount_multiplier(
+        # Short position exists but is smaller (realistic hedged scenario)
+        opposite = PositionState(
+            direction='short',
+            size=Decimal('0.5'),
+            entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('115000.0'),  # Safe liq ratio for short
+            margin=Decimal('500.0'),
+            leverage=10
+        )
+        long_multipliers = long_manager.calculate_amount_multiplier(
             position, opposite, last_close=100000.0, wallet_balance=Decimal('10000.0')
         )
 
-        # Should decrease buy multiplier (which increases short position)
-        assert multipliers['Buy'] == 0.5
-        assert multipliers['Sell'] == 1.0
+        # Long position should not modify itself
+        assert long_multipliers['Buy'] == 1.0
+        assert long_multipliers['Sell'] == 1.0
+
+        # Instead, it should modify the opposite (short) position's multipliers
+        short_multipliers = short_manager.get_amount_multiplier()
+        assert short_multipliers['Buy'] == 0.5  # Reduces short closing (increases short)
+        assert short_multipliers['Sell'] == 1.0
 
     def test_high_liquidation_ratio_short_decreases_position(self):
         """High liquidation risk for short position decreases short (increases buy multiplier)."""
@@ -271,11 +290,12 @@ class TestPositionRiskManagerRules:
         manager = PositionRiskManager('long', risk_config)
 
         # Equal positions (ratio ~1.0) but low total margin
+        # liq_ratio = 70000 / 100000 = 0.7 (below min 0.8, safe)
         position = PositionState(
             direction='long',
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('90000.0'),
+            liquidation_price=Decimal('70000.0'),  # Safe liq ratio
             margin=Decimal('400.0'),  # Low margin
             leverage=10
         )
@@ -284,7 +304,7 @@ class TestPositionRiskManagerRules:
             direction='short',
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('110000.0'),
+            liquidation_price=Decimal('130000.0'),  # Safe liq ratio
             margin=Decimal('400.0'),  # Equal margin (ratio = 1.0)
             leverage=10
         )
@@ -309,11 +329,12 @@ class TestPositionRiskManagerRules:
         manager = PositionRiskManager('long', risk_config)
 
         # Equal positions but low total margin
+        # liq_ratio = 70000 / 100000 = 0.7 (below min 0.8, safe)
         position = PositionState(
             direction='long',
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('90000.0'),
+            liquidation_price=Decimal('70000.0'),  # Safe liq ratio
             margin=Decimal('400.0'),
             leverage=10
         )
@@ -322,7 +343,7 @@ class TestPositionRiskManagerRules:
             direction='short',
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('110000.0'),
+            liquidation_price=Decimal('130000.0'),  # Safe liq ratio
             margin=Decimal('400.0'),
             leverage=10
         )
@@ -346,11 +367,12 @@ class TestPositionRiskManagerRules:
         manager = PositionRiskManager('long', risk_config)
 
         # Small position (ratio < 0.5) and losing (price below entry)
+        # liq_ratio = 70000 / 95000 = 0.737 (below min 0.8, safe)
         position = PositionState(
             direction='long',
             size=Decimal('0.5'),
             entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('90000.0'),
+            liquidation_price=Decimal('70000.0'),  # Safe liq ratio
             margin=Decimal('200.0'),
             leverage=10
         )
@@ -359,7 +381,7 @@ class TestPositionRiskManagerRules:
             direction='short',
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('110000.0'),
+            liquidation_price=Decimal('125000.0'),  # Safe liq ratio
             margin=Decimal('1000.0'),  # Much larger (ratio = 0.2)
             leverage=10
         )
@@ -384,11 +406,12 @@ class TestPositionRiskManagerRules:
         manager = PositionRiskManager('long', risk_config)
 
         # Very small position (ratio < 0.20)
+        # liq_ratio = 70000 / 100000 = 0.7 (below min 0.8, safe)
         position = PositionState(
             direction='long',
             size=Decimal('0.1'),
             entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('90000.0'),
+            liquidation_price=Decimal('70000.0'),  # Safe liq ratio
             margin=Decimal('100.0'),
             leverage=10
         )
@@ -397,7 +420,7 @@ class TestPositionRiskManagerRules:
             direction='short',
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('110000.0'),
+            liquidation_price=Decimal('130000.0'),  # Safe liq ratio
             margin=Decimal('1000.0'),  # Much larger (ratio = 0.1)
             leverage=10
         )
@@ -493,7 +516,12 @@ class TestPositionRiskManagerRules:
             max_margin=5000.0,
             min_total_margin=1000.0
         )
-        manager = PositionRiskManager('short', risk_config)
+        short_manager = PositionRiskManager('short', risk_config)
+        long_manager = PositionRiskManager('long', risk_config)
+
+        # Link the two positions (critical for cross-position adjustments)
+        short_manager.set_opposite(long_manager)
+        long_manager.set_opposite(short_manager)
 
         # Moderate liquidation risk scenario
         # liq_ratio = 108000 / 100000 = 1.08 (between 0 and 1.2)
@@ -517,11 +545,16 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(
+        short_multipliers = short_manager.calculate_amount_multiplier(
             position, opposite, last_close=100000.0, wallet_balance=Decimal('10000.0')
         )
 
-        # Should decrease sell multiplier to increase opposite (long) position
-        # This is the NEWLY ADDED logic from bbu2-master/position.py:81-86
-        assert multipliers['Sell'] == 0.5
-        assert multipliers['Buy'] == 1.0
+        # Short position should not modify itself
+        assert short_multipliers['Sell'] == 1.0
+        assert short_multipliers['Buy'] == 1.0
+
+        # Instead, it should modify the opposite (long) position's multipliers
+        # This is the logic from bbu2-master/position.py:81-86
+        long_multipliers = long_manager.get_amount_multiplier()
+        assert long_multipliers['Sell'] == 0.5  # Reduces long closing (increases long)
+        assert long_multipliers['Buy'] == 1.0
