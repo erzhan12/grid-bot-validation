@@ -391,6 +391,9 @@ class Position:
             ... )
             >>> long_mgr, short_mgr = Position.create_linked_pair(risk_config)
             >>> # Now both positions can modify each other during risk management
+
+            >>> # Or with separate configs:
+            >>> long_mgr, short_mgr = Position.create_linked_pair(long_config, short_config)
         """
         if short_config is None:
             short_config = long_config

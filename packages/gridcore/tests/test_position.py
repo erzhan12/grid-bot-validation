@@ -651,3 +651,29 @@ class TestPositionRiskManagerRules:
         long_multipliers = long_manager.get_amount_multiplier()
         assert long_multipliers['Sell'] == 0.5  # Reduces long closing (increases long)
         assert long_multipliers['Buy'] == 1.0
+
+
+    def test_create_linked_pair_with_separate_configs(self):
+        """create_linked_pair works with separate long and short configs."""
+        long_config = RiskConfig(
+            min_liq_ratio=0.7,
+            max_liq_ratio=1.3,
+            max_margin=5000.0,
+            min_total_margin=1000.0
+        )
+        short_config = RiskConfig(
+            min_liq_ratio=0.8,
+            max_liq_ratio=1.2,
+            max_margin=6000.0,
+            min_total_margin=1200.0
+        )
+
+        long_mgr, short_mgr = PositionRiskManager.create_linked_pair(long_config, short_config)
+
+        # Verify configs were applied
+        assert long_mgr.risk_config is long_config
+        assert short_mgr.risk_config is short_config
+
+        # Verify they're still linked
+        assert long_mgr._opposite is short_mgr
+        assert short_mgr._opposite is long_mgr
