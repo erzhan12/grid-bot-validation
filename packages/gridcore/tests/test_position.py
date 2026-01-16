@@ -41,7 +41,7 @@ class TestPositionRiskManager:
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
-            max_margin=5000.0,
+            max_margin=5.0,
             min_total_margin=1.0
         )
         manager = PositionRiskManager('long', risk_config)
@@ -54,7 +54,7 @@ class TestPositionRiskManager:
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
-            max_margin=5000.0,
+            max_margin=5.0,
             min_total_margin=1.0
         )
         manager = PositionRiskManager('long', risk_config)
@@ -73,7 +73,7 @@ class TestPositionRiskManager:
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
-            max_margin=5000.0,
+            max_margin=5.0,
             min_total_margin=1.0
         )
         long_manager, _ = PositionRiskManager.create_linked_pair(risk_config)
@@ -114,7 +114,7 @@ class TestPositionRiskManager:
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
-            max_margin=5000.0,
+            max_margin=5.0,
             min_total_margin=1.0
         )
         _, short_manager = PositionRiskManager.create_linked_pair(risk_config)
@@ -157,14 +157,14 @@ class TestRiskConfig:
         config = RiskConfig(
             min_liq_ratio=0.7,
             max_liq_ratio=1.3,
-            max_margin=10000.0,
+            max_margin=5.0,
             min_total_margin=1.0,
             increase_same_position_on_low_margin=True
         )
 
         assert config.min_liq_ratio == 0.7
         assert config.max_liq_ratio == 1.3
-        assert config.max_margin == 10000.0
+        assert config.max_margin == 5.0
         assert config.min_total_margin == 1.0
         assert config.increase_same_position_on_low_margin is True
 
@@ -177,7 +177,7 @@ class TestPositionRiskManagerRules:
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
-            max_margin=5000.0,
+            max_margin=5.0,
             min_total_margin=1.0
         )
         manager = PositionRiskManager('long', risk_config)
@@ -217,7 +217,7 @@ class TestPositionRiskManagerRules:
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
-            max_margin=5000.0,
+            max_margin=5.0,
             min_total_margin=1.0
         )
 
@@ -262,7 +262,7 @@ class TestPositionRiskManagerRules:
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
-            max_margin=5000.0,
+            max_margin=5.0,
             min_total_margin=1.0
         )
         manager, _ = PositionRiskManager.create_linked_pair(risk_config)
@@ -299,7 +299,7 @@ class TestPositionRiskManagerRules:
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
-            max_margin=5000.0,
+            max_margin=5.0,
             min_total_margin=1.0
         )
         # Use helper to create properly linked positions
@@ -343,7 +343,7 @@ class TestPositionRiskManagerRules:
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
-            max_margin=5000.0,
+            max_margin=5.0,
             min_total_margin=1.0
         )
         _, manager = PositionRiskManager.create_linked_pair(risk_config)
@@ -380,7 +380,7 @@ class TestPositionRiskManagerRules:
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
-            max_margin=5000.0,
+            max_margin=5.0,
             min_total_margin=1000.0,
             increase_same_position_on_low_margin=False
         )
@@ -419,7 +419,7 @@ class TestPositionRiskManagerRules:
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
-            max_margin=5000.0,
+            max_margin=5.0,
             min_total_margin=1000.0,
             increase_same_position_on_low_margin=True
         )
@@ -458,7 +458,7 @@ class TestPositionRiskManagerRules:
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
-            max_margin=5000.0,
+            max_margin=5.0,
             min_total_margin=1.0
         )
         manager, _ = PositionRiskManager.create_linked_pair(risk_config)
@@ -497,7 +497,7 @@ class TestPositionRiskManagerRules:
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
-            max_margin=5000.0,
+            max_margin=5.0,
             min_total_margin=1.0
         )
         manager, _ = PositionRiskManager.create_linked_pair(risk_config)
@@ -535,7 +535,7 @@ class TestPositionRiskManagerRules:
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
-            max_margin=5000.0,
+            max_margin=5.0,
             min_total_margin=1.0
         )
         _, manager = PositionRiskManager.create_linked_pair(risk_config)
@@ -573,7 +573,7 @@ class TestPositionRiskManagerRules:
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
-            max_margin=5000.0,
+            max_margin=5.0,
             min_total_margin=1.0
         )
         _, manager = PositionRiskManager.create_linked_pair(risk_config)
@@ -610,7 +610,7 @@ class TestPositionRiskManagerRules:
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
-            max_margin=5000.0,
+            max_margin=5.0,
             min_total_margin=1.0
         )
         # Use helper to create properly linked positions
@@ -658,13 +658,13 @@ class TestPositionRiskManagerRules:
         long_config = RiskConfig(
             min_liq_ratio=0.7,
             max_liq_ratio=1.3,
-            max_margin=5000.0,
+            max_margin=5.0,
             min_total_margin=1.0
         )
         short_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
-            max_margin=6000.0,
+            max_margin=5.0,
             min_total_margin=1.0
         )
 
