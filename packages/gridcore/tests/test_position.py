@@ -42,7 +42,7 @@ class TestPositionRiskManager:
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
             max_margin=5000.0,
-            min_total_margin=1000.0
+            min_total_margin=1.0
         )
         manager = PositionRiskManager('long', risk_config)
         assert manager.direction == 'long'
@@ -55,7 +55,7 @@ class TestPositionRiskManager:
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
             max_margin=5000.0,
-            min_total_margin=1000.0
+            min_total_margin=1.0
         )
         manager = PositionRiskManager('long', risk_config)
 
@@ -74,7 +74,7 @@ class TestPositionRiskManager:
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
             max_margin=5000.0,
-            min_total_margin=1000.0
+            min_total_margin=1.0
         )
         long_manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
@@ -83,7 +83,7 @@ class TestPositionRiskManager:
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('50000.0'),
-            margin=Decimal('1000.0'),
+            margin=Decimal('2.0'),
             leverage=10
         )
 
@@ -92,7 +92,7 @@ class TestPositionRiskManager:
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('150000.0'),
-            margin=Decimal('1000.0'),
+            margin=Decimal('2.0'),
             leverage=10
         )
 
@@ -115,7 +115,7 @@ class TestPositionRiskManager:
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
             max_margin=5000.0,
-            min_total_margin=1000.0
+            min_total_margin=1.0
         )
         _, short_manager = PositionRiskManager.create_linked_pair(risk_config)
 
@@ -124,7 +124,7 @@ class TestPositionRiskManager:
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('150000.0'),
-            margin=Decimal('1000.0'),
+            margin=Decimal('2.0'),
             leverage=10
         )
 
@@ -133,7 +133,7 @@ class TestPositionRiskManager:
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('50000.0'),
-            margin=Decimal('1000.0'),
+            margin=Decimal('2.0'),
             leverage=10
         )
 
@@ -158,14 +158,14 @@ class TestRiskConfig:
             min_liq_ratio=0.7,
             max_liq_ratio=1.3,
             max_margin=10000.0,
-            min_total_margin=2000.0,
+            min_total_margin=1.0,
             increase_same_position_on_low_margin=True
         )
 
         assert config.min_liq_ratio == 0.7
         assert config.max_liq_ratio == 1.3
         assert config.max_margin == 10000.0
-        assert config.min_total_margin == 2000.0
+        assert config.min_total_margin == 1.0
         assert config.increase_same_position_on_low_margin is True
 
 
@@ -178,7 +178,7 @@ class TestPositionRiskManagerRules:
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
             max_margin=5000.0,
-            min_total_margin=1000.0
+            min_total_margin=1.0
         )
         manager = PositionRiskManager('long', risk_config)
         # Don't set opposite - should raise error
@@ -188,7 +188,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('50000.0'),
-            margin=Decimal('1000.0'),
+            margin=Decimal('2.0'),
             leverage=10
         )
 
@@ -197,7 +197,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('150000.0'),
-            margin=Decimal('1000.0'),
+            margin=Decimal('2.0'),
             leverage=10
         )
 
@@ -218,7 +218,7 @@ class TestPositionRiskManagerRules:
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
             max_margin=5000.0,
-            min_total_margin=1000.0
+            min_total_margin=1.0
         )
 
         long_mgr, short_mgr = PositionRiskManager.create_linked_pair(risk_config)
@@ -237,7 +237,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('50000.0'),
-            margin=Decimal('1000.0'),
+            margin=Decimal('2.0'),
             leverage=10
         )
 
@@ -246,7 +246,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('150000.0'),
-            margin=Decimal('1000.0'),
+            margin=Decimal('2.0'),
             leverage=10
         )
 
@@ -263,7 +263,7 @@ class TestPositionRiskManagerRules:
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
             max_margin=5000.0,
-            min_total_margin=1000.0
+            min_total_margin=1.0
         )
         manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
@@ -273,7 +273,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('85000.0'),  # liq_ratio = 0.85
-            margin=Decimal('1000.0'),
+            margin=Decimal('2.0'),
             leverage=10
         )
 
@@ -283,7 +283,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('0.5'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('115000.0'),
-            margin=Decimal('500.0'),
+            margin=Decimal('1.0'),
             leverage=10
         )
         multipliers = manager.calculate_amount_multiplier(
@@ -300,7 +300,7 @@ class TestPositionRiskManagerRules:
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
             max_margin=5000.0,
-            min_total_margin=1000.0
+            min_total_margin=1.0
         )
         # Use helper to create properly linked positions
         long_manager, short_manager = PositionRiskManager.create_linked_pair(risk_config)
@@ -312,7 +312,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('81000.0'),  # liq_ratio = 0.81
-            margin=Decimal('1000.0'),
+            margin=Decimal('2.0'),
             leverage=10
         )
 
@@ -322,7 +322,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('0.5'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('115000.0'),  # Safe liq ratio for short
-            margin=Decimal('500.0'),
+            margin=Decimal('1.0'),
             leverage=10
         )
         long_multipliers = long_manager.calculate_amount_multiplier(
@@ -344,7 +344,7 @@ class TestPositionRiskManagerRules:
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
             max_margin=5000.0,
-            min_total_margin=1000.0
+            min_total_margin=1.0
         )
         _, manager = PositionRiskManager.create_linked_pair(risk_config)
 
@@ -354,7 +354,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('115000.0'),  # liq_ratio = 1.15
-            margin=Decimal('1000.0'),
+            margin=Decimal('2.0'),
             leverage=10
         )
 
@@ -364,7 +364,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('0.5'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('90000.0'),
-            margin=Decimal('500.0'),
+            margin=Decimal('1.0'),
             leverage=10
         )
         multipliers = manager.calculate_amount_multiplier(
@@ -393,7 +393,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('70000.0'),  # Safe liq ratio
-            margin=Decimal('400.0'),  # Low margin
+            margin=Decimal('0.8'),  # Low margin
             leverage=10
         )
 
@@ -402,7 +402,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('130000.0'),  # Safe liq ratio
-            margin=Decimal('400.0'),  # Equal margin (ratio = 1.0)
+            margin=Decimal('0.8'),  # Equal margin (ratio = 1.0)
             leverage=10
         )
 
@@ -432,7 +432,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('70000.0'),  # Safe liq ratio
-            margin=Decimal('400.0'),
+            margin=Decimal('0.8'),
             leverage=10
         )
 
@@ -441,7 +441,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('130000.0'),  # Safe liq ratio
-            margin=Decimal('400.0'),
+            margin=Decimal('0.8'),
             leverage=10
         )
 
@@ -459,7 +459,7 @@ class TestPositionRiskManagerRules:
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
             max_margin=5000.0,
-            min_total_margin=1000.0
+            min_total_margin=1.0
         )
         manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
@@ -470,7 +470,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('0.5'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('70000.0'),  # Safe liq ratio
-            margin=Decimal('200.0'),
+            margin=Decimal('0.4'),
             leverage=10
         )
 
@@ -479,7 +479,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('125000.0'),  # Safe liq ratio
-            margin=Decimal('1000.0'),  # Much larger (ratio = 0.2)
+            margin=Decimal('2.0'),  # Much larger (ratio = 0.2)
             leverage=10
         )
 
@@ -498,7 +498,7 @@ class TestPositionRiskManagerRules:
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
             max_margin=5000.0,
-            min_total_margin=1000.0
+            min_total_margin=1.0
         )
         manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
@@ -509,7 +509,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('0.1'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('70000.0'),  # Safe liq ratio
-            margin=Decimal('100.0'),
+            margin=Decimal('0.2'),
             leverage=10
         )
 
@@ -518,7 +518,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('130000.0'),  # Safe liq ratio
-            margin=Decimal('1000.0'),  # Much larger (ratio = 0.1)
+            margin=Decimal('2.0'),  # Much larger (ratio = 0.1)
             leverage=10
         )
 
@@ -536,7 +536,7 @@ class TestPositionRiskManagerRules:
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
             max_margin=5000.0,
-            min_total_margin=1000.0
+            min_total_margin=1.0
         )
         _, manager = PositionRiskManager.create_linked_pair(risk_config)
 
@@ -546,7 +546,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('2.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('110000.0'),
-            margin=Decimal('2000.0'),
+            margin=Decimal('4.0'),
             leverage=10
         )
 
@@ -555,7 +555,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('0.5'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('90000.0'),
-            margin=Decimal('500.0'),  # Much smaller (ratio = 4.0)
+            margin=Decimal('1.0'),  # Much smaller (ratio = 4.0)
             leverage=10
         )
 
@@ -574,7 +574,7 @@ class TestPositionRiskManagerRules:
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
             max_margin=5000.0,
-            min_total_margin=1000.0
+            min_total_margin=1.0
         )
         _, manager = PositionRiskManager.create_linked_pair(risk_config)
 
@@ -584,7 +584,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('5.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('110000.0'),
-            margin=Decimal('5000.0'),
+            margin=Decimal('4.0'),
             leverage=10
         )
 
@@ -593,7 +593,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('0.5'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('90000.0'),
-            margin=Decimal('500.0'),  # Much smaller (ratio = 10.0)
+            margin=Decimal('0.4'),  # Much smaller (ratio = 10.0)
             leverage=10
         )
 
@@ -611,7 +611,7 @@ class TestPositionRiskManagerRules:
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
             max_margin=5000.0,
-            min_total_margin=1000.0
+            min_total_margin=1.0
         )
         # Use helper to create properly linked positions
         long_manager, short_manager = PositionRiskManager.create_linked_pair(risk_config)
@@ -625,7 +625,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('108000.0'),  # Moderate risk
-            margin=Decimal('1500.0'),
+            margin=Decimal('3.0'),
             leverage=10
         )
 
@@ -634,7 +634,7 @@ class TestPositionRiskManagerRules:
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('90000.0'),
-            margin=Decimal('1500.0'),
+            margin=Decimal('3.0'),
             leverage=10
         )
 
@@ -659,13 +659,13 @@ class TestPositionRiskManagerRules:
             min_liq_ratio=0.7,
             max_liq_ratio=1.3,
             max_margin=5000.0,
-            min_total_margin=1000.0
+            min_total_margin=1.0
         )
         short_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
             max_margin=6000.0,
-            min_total_margin=1200.0
+            min_total_margin=1.0
         )
 
         long_mgr, short_mgr = PositionRiskManager.create_linked_pair(long_config, short_config)
