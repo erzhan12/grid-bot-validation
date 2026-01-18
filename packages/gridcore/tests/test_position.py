@@ -185,19 +185,19 @@ class TestPositionRiskManagerRules:
 
         position = PositionState(
             direction=Position.DIRECTION_LONG,
-            size=Decimal('1.0'),
-            entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('50000.0'),
-            margin=Decimal('2.0'),
+            size=Decimal('3.37'),
+            entry_price=Decimal('3100.0'),
+            liquidation_price=Decimal('0.0'),
+            margin=Decimal('0.51'),
             leverage=10
         )
 
         opposite = PositionState(
             direction=Position.DIRECTION_SHORT,
-            size=Decimal('1.0'),
-            entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('150000.0'),
-            margin=Decimal('2.0'),
+            size=Decimal('4.62'),
+            entry_price=Decimal('3102.0'),
+            liquidation_price=Decimal('17553.0'),
+            margin=Decimal('0.71'),
             leverage=10
         )
 
@@ -234,25 +234,25 @@ class TestPositionRiskManagerRules:
         # Verify both can be used without errors
         position = PositionState(
             direction=Position.DIRECTION_LONG,
-            size=Decimal('1.0'),
-            entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('50000.0'),
-            margin=Decimal('2.0'),
+            size=Decimal('3.36'),
+            entry_price=Decimal('3100.0'),
+            liquidation_price=Decimal('0.0'),
+            margin=Decimal('0.51'),
             leverage=10
         )
 
         opposite = PositionState(
             direction=Position.DIRECTION_SHORT,
-            size=Decimal('1.0'),
-            entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('150000.0'),
-            margin=Decimal('2.0'),
+            size=Decimal('4.62'),
+            entry_price=Decimal('3102.0'),
+            liquidation_price=Decimal('17553.0'),
+            margin=Decimal('0.71'),
             leverage=10
         )
 
         # Should not raise error
         multipliers = long_mgr.calculate_amount_multiplier(
-            position, opposite, last_close=100000.0, wallet_balance=Decimal('10000.0')
+            position, opposite, last_close=3300.0, wallet_balance=Decimal('10000.0')
         )
         assert 'Buy' in multipliers
         assert 'Sell' in multipliers
@@ -270,24 +270,25 @@ class TestPositionRiskManagerRules:
         # High liquidation risk: liq_ratio > 1.05 * min_liq_ratio (0.84)
         position = PositionState(
             direction=Position.DIRECTION_LONG,
-            size=Decimal('1.0'),
-            entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('85000.0'),  # liq_ratio = 0.85
-            margin=Decimal('2.0'),
+            size=Decimal('2.5'),
+            entry_price=Decimal('3300.0'),
+            liquidation_price=Decimal('2635.0'),
+            margin=Decimal('0.39'),
             leverage=10
         )
 
         # Short position exists (realistic hedged scenario)
         opposite = PositionState(
             direction=Position.DIRECTION_SHORT,
-            size=Decimal('0.5'),
-            entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('115000.0'),
-            margin=Decimal('1.0'),
+            size=Decimal('4.62'),
+            entry_price=Decimal('3102.0'),
+            liquidation_price=Decimal('17553.0'),
+            margin=Decimal('0.71'),
             leverage=10
         )
+
         multipliers = manager.calculate_amount_multiplier(
-            position, opposite, last_close=100000.0, wallet_balance=Decimal('10000.0')
+            position, opposite, last_close=3100.0, wallet_balance=Decimal('10000.0')
         )
 
         # Should increase sell multiplier to decrease long position

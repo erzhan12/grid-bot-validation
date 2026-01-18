@@ -386,8 +386,8 @@ class Position:
             >>> risk_config = RiskConfig(
             ...     min_liq_ratio=0.8,
             ...     max_liq_ratio=1.2,
-            ...     max_margin=5000.0,
-            ...     min_total_margin=1000.0
+            ...     max_margin=5.0,
+            ...     min_total_margin=1.0
             ... )
             >>> long_mgr, short_mgr = Position.create_linked_pair(risk_config)
             >>> # Now both positions can modify each other during risk management
