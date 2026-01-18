@@ -99,8 +99,7 @@ class TestPositionRiskManager:
         multipliers = long_manager.calculate_amount_multiplier(
             position,
             opposite,
-            last_close=100000.0,
-            wallet_balance=Decimal('10000.0')
+            last_close=100000.0
         )
 
         # Should return multipliers dict
@@ -140,8 +139,7 @@ class TestPositionRiskManager:
         multipliers = short_manager.calculate_amount_multiplier(
             position,
             opposite,
-            last_close=100000.0,
-            wallet_balance=Decimal('10000.0')
+            last_close=100000.0
         )
 
         # Should return multipliers dict
@@ -204,7 +202,7 @@ class TestPositionRiskManagerRules:
         # Should raise ValueError with helpful message
         try:
             manager.calculate_amount_multiplier(
-                position, opposite, last_close=100000.0, wallet_balance=Decimal('10000.0')
+                position, opposite, last_close=100000.0
             )
             assert False, "Expected ValueError but none was raised"
         except ValueError as e:
@@ -252,7 +250,7 @@ class TestPositionRiskManagerRules:
 
         # Should not raise error
         multipliers = long_mgr.calculate_amount_multiplier(
-            position, opposite, last_close=3300.0, wallet_balance=Decimal('10000.0')
+            position, opposite, last_close=3300.0
         )
         assert 'Buy' in multipliers
         assert 'Sell' in multipliers
@@ -288,7 +286,7 @@ class TestPositionRiskManagerRules:
         )
 
         multipliers = manager.calculate_amount_multiplier(
-            position, opposite, last_close=3100.0, wallet_balance=Decimal('10000.0')
+            position, opposite, last_close=3100.0
         )
 
         # Should increase sell multiplier to decrease long position
@@ -310,24 +308,24 @@ class TestPositionRiskManagerRules:
         # Long position with moderate liquidation risk
         position = PositionState(
             direction=Position.DIRECTION_LONG,
-            size=Decimal('1.0'),
-            entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('81000.0'),  # liq_ratio = 0.81
-            margin=Decimal('2.0'),
+            size=Decimal('2.5'),
+            entry_price=Decimal('3200.0'),
+            liquidation_price=Decimal('2511.0'),  # liq_ratio = 0.81
+            margin=Decimal('0.45'),
             leverage=10
         )
 
         # Short position exists but is smaller (realistic hedged scenario)
         opposite = PositionState(
             direction=Position.DIRECTION_SHORT,
-            size=Decimal('0.5'),
-            entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('115000.0'),  # Safe liq ratio for short
-            margin=Decimal('1.0'),
+            size=Decimal('1.8'),
+            entry_price=Decimal('3102.0'),
+            liquidation_price=Decimal('3565.0'),  # Safe liq ratio for short
+            margin=Decimal('0.28'),
             leverage=10
         )
         long_multipliers = long_manager.calculate_amount_multiplier(
-            position, opposite, last_close=100000.0, wallet_balance=Decimal('10000.0')
+            position, opposite, last_close=3100.0
         )
 
         # Long position should not modify itself
@@ -349,27 +347,27 @@ class TestPositionRiskManagerRules:
         )
         _, manager = PositionRiskManager.create_linked_pair(risk_config)
 
-        # High liquidation risk: liq_ratio < 0.95 * max_liq_ratio (1.14)
+        # High liquidation risk: liq_ratio > 0.95 * max_liq_ratio (1.14)
         position = PositionState(
             direction=Position.DIRECTION_SHORT,
-            size=Decimal('1.0'),
-            entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('115000.0'),  # liq_ratio = 1.15
-            margin=Decimal('2.0'),
+            size=Decimal('4.2'),
+            entry_price=Decimal('3102.0'),
+            liquidation_price=Decimal('3565.0'),  # liq_ratio = 1.15
+            margin=Decimal('0.65'),
             leverage=10
         )
 
         # Long position exists (realistic hedged scenario)
         opposite = PositionState(
             direction=Position.DIRECTION_LONG,
-            size=Decimal('0.5'),
-            entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('90000.0'),
-            margin=Decimal('1.0'),
+            size=Decimal('2.1'),
+            entry_price=Decimal('3200.0'),
+            liquidation_price=Decimal('2480.0'),
+            margin=Decimal('0.33'),
             leverage=10
         )
         multipliers = manager.calculate_amount_multiplier(
-            position, opposite, last_close=100000.0, wallet_balance=Decimal('10000.0')
+            position, opposite, last_close=3100.0
         )
 
         # Should increase buy multiplier to decrease short position
@@ -408,7 +406,7 @@ class TestPositionRiskManagerRules:
         )
 
         multipliers = manager.calculate_amount_multiplier(
-            position, opposite, last_close=100000.0, wallet_balance=Decimal('10000.0')
+            position, opposite, last_close=100000.0
         )
 
         # Should reduce opposite side (sell) to increase long position
@@ -447,7 +445,7 @@ class TestPositionRiskManagerRules:
         )
 
         multipliers = manager.calculate_amount_multiplier(
-            position, opposite, last_close=100000.0, wallet_balance=Decimal('10000.0')
+            position, opposite, last_close=100000.0
         )
 
         # Should double buy multiplier to increase long position
@@ -486,8 +484,7 @@ class TestPositionRiskManagerRules:
 
         multipliers = manager.calculate_amount_multiplier(
             position, opposite, last_close=95000.0,  # Price below entry (losing)
-            wallet_balance=Decimal('10000.0')
-        )
+                    )
 
         # Should increase buy multiplier
         assert multipliers['Buy'] == 2.0
@@ -524,7 +521,7 @@ class TestPositionRiskManagerRules:
         )
 
         multipliers = manager.calculate_amount_multiplier(
-            position, opposite, last_close=100000.0, wallet_balance=Decimal('10000.0')
+            position, opposite, last_close=100000.0
         )
 
         # Should increase buy multiplier
@@ -562,8 +559,7 @@ class TestPositionRiskManagerRules:
 
         multipliers = manager.calculate_amount_multiplier(
             position, opposite, last_close=105000.0,  # Price above entry (losing)
-            wallet_balance=Decimal('10000.0')
-        )
+                    )
 
         # Should increase sell multiplier
         assert multipliers['Sell'] == 2.0
@@ -599,7 +595,7 @@ class TestPositionRiskManagerRules:
         )
 
         multipliers = manager.calculate_amount_multiplier(
-            position, opposite, last_close=100000.0, wallet_balance=Decimal('10000.0')
+            position, opposite, last_close=100000.0
         )
 
         # Should increase sell multiplier
@@ -640,7 +636,7 @@ class TestPositionRiskManagerRules:
         )
 
         short_multipliers = short_manager.calculate_amount_multiplier(
-            position, opposite, last_close=100000.0, wallet_balance=Decimal('10000.0')
+            position, opposite, last_close=100000.0
         )
 
         # Short position should not modify itself

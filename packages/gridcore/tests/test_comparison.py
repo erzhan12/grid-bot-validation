@@ -435,7 +435,7 @@ class TestPositionRiskManagerBehavior:
             liquidation_price=Decimal('110000.0'), margin=Decimal('1000.0'), leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(position, opposite, 100000.0, Decimal('10000.0'))
+        multipliers = manager.calculate_amount_multiplier(position, opposite, 100000.0)
         assert multipliers['Sell'] == 1.5, "Should decrease long position with Sell=1.5"
 
     def test_short_moderate_liq_risk_increases_opposite(self):
@@ -468,7 +468,7 @@ class TestPositionRiskManagerBehavior:
             liquidation_price=Decimal('92000.0'), margin=Decimal('1500.0'), leverage=10
         )
 
-        short_multipliers = short_manager.calculate_amount_multiplier(position, opposite, 100000.0, Decimal('10000.0'))
+        short_multipliers = short_manager.calculate_amount_multiplier(position, opposite, 100000.0)
 
         # Short position should not modify itself
         assert short_multipliers['Sell'] == 1.0
@@ -503,7 +503,7 @@ class TestPositionRiskManagerBehavior:
             liquidation_price=Decimal('130000.0'), margin=Decimal('3000.0'), leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(position, opposite, 100000.0, Decimal('10000.0'))
+        multipliers = manager.calculate_amount_multiplier(position, opposite, 100000.0)
         assert multipliers['Buy'] == 2.0, "Should increase long position with Buy=2.0"
 
     def test_large_short_position_losing_increases_short(self):
@@ -530,7 +530,7 @@ class TestPositionRiskManagerBehavior:
             liquidation_price=Decimal('90000.0'), margin=Decimal('500.0'), leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(position, opposite, 105000.0, Decimal('10000.0'))
+        multipliers = manager.calculate_amount_multiplier(position, opposite, 105000.0)
         assert multipliers['Sell'] == 2.0, "Should increase short position with Sell=2.0"
 
     def test_low_total_margin_adjusts_position(self):
@@ -562,7 +562,7 @@ class TestPositionRiskManagerBehavior:
             liquidation_price=Decimal('130000.0'), margin=Decimal('400.0'), leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(position, opposite, 100000.0, Decimal('10000.0'))
+        multipliers = manager.calculate_amount_multiplier(position, opposite, 100000.0)
         # Should reduce opposite side (Sell=0.5) to increase this position
         assert multipliers['Sell'] == 0.5, "Should adjust for low margin"
 

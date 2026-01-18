@@ -83,7 +83,6 @@ class Position:
         self.risk_config = risk_config
         self.amount_multiplier = {self.SIDE_BUY: 1.0, self.SIDE_SELL: 1.0}
         self.position_ratio = 1.0
-        self.unrealized_pnl_pct = 0.0
         self._opposite: Optional['Position'] = None
 
     def set_opposite(self, opposite: 'Position') -> None:
@@ -135,8 +134,7 @@ class Position:
         self,
         position: PositionState,
         opposite_position: PositionState,
-        last_close: float,
-        wallet_balance: Decimal
+        last_close: float
     ) -> dict[str, float]:
         """
         Calculate order size multipliers based on position state.
@@ -154,7 +152,6 @@ class Position:
             position: Current position state
             opposite_position: Opposite direction position state
             last_close: Current market price
-            wallet_balance: Total wallet balance
 
         Returns:
             Dictionary with 'Buy' and 'Sell' multipliers for this position
@@ -184,9 +181,9 @@ class Position:
 
         # Calculate unrealized PnL percentage
         if self.direction == self.DIRECTION_LONG:
-            self.unrealized_pnl_pct = (1 / entry_price - 1 / last_close) * entry_price * 100 * leverage
+            unrealized_pnl_pct = (1 / entry_price - 1 / last_close) * entry_price * 100 * leverage
         else:  # short
-            self.unrealized_pnl_pct = (1 / last_close - 1 / entry_price) * entry_price * 100 * leverage
+            unrealized_pnl_pct = (1 / last_close - 1 / entry_price) * entry_price * 100 * leverage
 
         # Calculate liquidation ratio
         liq_ratio = self._get_liquidation_ratio(position.liquidation_price, last_close)
@@ -207,14 +204,14 @@ class Position:
                 liq_ratio,
                 is_position_equal,
                 total_margin,
-                float(opposite_position.margin)
+                unrealized_pnl_pct
             )
         else:  # short
             self._apply_short_position_rules(
                 liq_ratio,
                 is_position_equal,
                 total_margin,
-                float(opposite_position.margin)
+                unrealized_pnl_pct
             )
 
         # Log position state (matches reference position.py:24-31)
@@ -224,7 +221,7 @@ class Position:
             self.direction,
             float(position.margin),
             liq_ratio,
-            self.unrealized_pnl_pct,
+            unrealized_pnl_pct,
             self.amount_multiplier,
             self.position_ratio,
             total_margin
@@ -237,7 +234,7 @@ class Position:
         liq_ratio: float,
         is_position_equal: bool,
         total_margin: float,
-        opposite_margin: float
+        unrealized_pnl_pct: float
     ) -> None:
         """
         Apply risk management rules for long positions.
@@ -269,7 +266,7 @@ class Position:
             self._adjust_position_for_low_margin()
 
         # Long position too small and losing → increase long
-        elif self.position_ratio < 0.5 and self.unrealized_pnl_pct < 0:
+        elif self.position_ratio < 0.5 and unrealized_pnl_pct < 0:
             logger.info('Position adjustment: %s ratio=%.2f increasing buys', self.direction, self.position_ratio)
             self.set_amount_multiplier(self.SIDE_BUY, 2.0)
 
@@ -283,7 +280,7 @@ class Position:
         liq_ratio: float,
         is_position_equal: bool,
         total_margin: float,
-        opposite_margin: float
+        unrealized_pnl_pct: float
     ) -> None:
         """
         Apply risk management rules for short positions.
@@ -310,7 +307,7 @@ class Position:
             self._adjust_position_for_low_margin()
 
         # Short position too large and losing → increase short
-        elif self.position_ratio > 2.0 and self.unrealized_pnl_pct < 0:
+        elif self.position_ratio > 2.0 and unrealized_pnl_pct < 0:
             logger.info('Position adjustment: %s ratio=%.2f increasing sells', self.direction, self.position_ratio)
             self.set_amount_multiplier(self.SIDE_SELL, 2.0)
 
