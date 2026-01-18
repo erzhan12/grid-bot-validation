@@ -380,33 +380,33 @@ class TestPositionRiskManagerRules:
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
             max_margin=5.0,
-            min_total_margin=1000.0,
+            min_total_margin=1.5,
             increase_same_position_on_low_margin=False
         )
         manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
         # Equal positions (ratio ~1.0) but low total margin
-        # liq_ratio = 70000 / 100000 = 0.7 (below min 0.8, safe)
+        # liq_ratio = 2325 / 3100 = 0.75 (below min 0.8, safe)
         position = PositionState(
             direction=Position.DIRECTION_LONG,
-            size=Decimal('1.0'),
-            entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('70000.0'),  # Safe liq ratio
-            margin=Decimal('0.8'),  # Low margin
+            size=Decimal('2.0'),
+            entry_price=Decimal('3200.0'),
+            liquidation_price=Decimal('2325.0'),  # Safe liq ratio
+            margin=Decimal('0.4'),  # Low margin
             leverage=10
         )
 
         opposite = PositionState(
             direction=Position.DIRECTION_SHORT,
-            size=Decimal('1.0'),
-            entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('130000.0'),  # Safe liq ratio
-            margin=Decimal('0.8'),  # Equal margin (ratio = 1.0)
+            size=Decimal('2.0'),
+            entry_price=Decimal('3100.0'),
+            liquidation_price=Decimal('4030.0'),  # Safe liq ratio
+            margin=Decimal('0.4'),  # Equal margin (ratio = 1.0), total = 0.8 < 1.5
             leverage=10
         )
 
         multipliers = manager.calculate_amount_multiplier(
-            position, opposite, last_close=100000.0
+            position, opposite, last_close=3100.0
         )
 
         # Should reduce opposite side (sell) to increase long position
@@ -419,33 +419,33 @@ class TestPositionRiskManagerRules:
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
             max_margin=5.0,
-            min_total_margin=1000.0,
+            min_total_margin=1.5,
             increase_same_position_on_low_margin=True
         )
         manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
         # Equal positions but low total margin
-        # liq_ratio = 70000 / 100000 = 0.7 (below min 0.8, safe)
+        # liq_ratio = 2325 / 3100 = 0.75 (below min 0.8, safe)
         position = PositionState(
             direction=Position.DIRECTION_LONG,
-            size=Decimal('1.0'),
-            entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('70000.0'),  # Safe liq ratio
-            margin=Decimal('0.8'),
+            size=Decimal('2.0'),
+            entry_price=Decimal('3200.0'),
+            liquidation_price=Decimal('2325.0'),  # Safe liq ratio
+            margin=Decimal('0.4'),
             leverage=10
         )
 
         opposite = PositionState(
             direction=Position.DIRECTION_SHORT,
-            size=Decimal('1.0'),
-            entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('130000.0'),  # Safe liq ratio
-            margin=Decimal('0.8'),
+            size=Decimal('2.0'),
+            entry_price=Decimal('3100.0'),
+            liquidation_price=Decimal('4030.0'),  # Safe liq ratio
+            margin=Decimal('0.4'),  # Equal margin (ratio = 1.0), total = 0.8 < 1.5
             leverage=10
         )
 
         multipliers = manager.calculate_amount_multiplier(
-            position, opposite, last_close=100000.0
+            position, opposite, last_close=3100.0
         )
 
         # Should double buy multiplier to increase long position
