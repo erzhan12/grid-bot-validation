@@ -1,4 +1,4 @@
-"""Test fixtures for bybit_adapter tests1."""
+"""Test fixtures for bybit_adapter tests."""
 
 import pytest
 from uuid import uuid4

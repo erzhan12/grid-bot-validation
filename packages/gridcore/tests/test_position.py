@@ -44,10 +44,10 @@ class TestPositionRiskManager:
             max_margin=5.0,
             min_total_margin=1.0
         )
-        manager = PositionRiskManager('long', risk_config)
-        assert manager.direction == 'long'
-        assert manager.amount_multiplier['Buy'] == 1.0
-        assert manager.amount_multiplier['Sell'] == 1.0
+        long_manager = PositionRiskManager('long', risk_config)
+        assert long_manager.direction == 'long'
+        assert long_manager.amount_multiplier['Buy'] == 1.0
+        assert long_manager.amount_multiplier['Sell'] == 1.0
 
     def test_reset_amount_multiplier(self):
         """Reset multiplier returns to 1.0."""
@@ -57,16 +57,16 @@ class TestPositionRiskManager:
             max_margin=5.0,
             min_total_margin=1.0
         )
-        manager = PositionRiskManager('long', risk_config)
+        long_manager = PositionRiskManager('long', risk_config)
 
         # Modify multipliers
-        manager.amount_multiplier['Buy'] = 2.0
-        manager.amount_multiplier['Sell'] = 0.5
+        long_manager.amount_multiplier['Buy'] = 2.0
+        long_manager.amount_multiplier['Sell'] = 0.5
 
         # Reset
-        manager.reset_amount_multiplier()
-        assert manager.amount_multiplier['Buy'] == 1.0
-        assert manager.amount_multiplier['Sell'] == 1.0
+        long_manager.reset_amount_multiplier()
+        assert long_manager.amount_multiplier['Buy'] == 1.0
+        assert long_manager.amount_multiplier['Sell'] == 1.0
 
     def test_calculate_amount_multiplier_long_position(self):
         """Calculate multipliers for long position."""
@@ -96,17 +96,17 @@ class TestPositionRiskManager:
             leverage=10
         )
 
-        multipliers = long_manager.calculate_amount_multiplier(
+        long_multipliers = long_manager.calculate_amount_multiplier(
             position,
             opposite,
             last_close=100000.0
         )
 
         # Should return multipliers dict
-        assert 'Buy' in multipliers
-        assert 'Sell' in multipliers
-        assert isinstance(multipliers['Buy'], float)
-        assert isinstance(multipliers['Sell'], float)
+        assert 'Buy' in long_multipliers
+        assert 'Sell' in long_multipliers
+        assert isinstance(long_multipliers['Buy'], float)
+        assert isinstance(long_multipliers['Sell'], float)
 
     def test_calculate_amount_multiplier_short_position(self):
         """Calculate multipliers for short position."""
@@ -118,7 +118,7 @@ class TestPositionRiskManager:
         )
         _, short_manager = PositionRiskManager.create_linked_pair(risk_config)
 
-        position = PositionState(
+        short_position_state = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
@@ -127,7 +127,7 @@ class TestPositionRiskManager:
             leverage=10
         )
 
-        opposite = PositionState(
+        long_position_state = PositionState(
             direction=Position.DIRECTION_LONG,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
@@ -136,15 +136,15 @@ class TestPositionRiskManager:
             leverage=10
         )
 
-        multipliers = short_manager.calculate_amount_multiplier(
-            position,
-            opposite,
+        short_multipliers = short_manager.calculate_amount_multiplier(
+            short_position_state,
+            long_position_state,
             last_close=100000.0
         )
 
         # Should return multipliers dict
-        assert 'Buy' in multipliers
-        assert 'Sell' in multipliers
+        assert 'Buy' in short_multipliers
+        assert 'Sell' in short_multipliers
 
 
 class TestRiskConfig:
@@ -178,10 +178,10 @@ class TestPositionRiskManagerRules:
             max_margin=5.0,
             min_total_margin=1.0
         )
-        manager = PositionRiskManager('long', risk_config)
+        long_manager = PositionRiskManager('long', risk_config)
         # Don't set opposite - should raise error
 
-        position = PositionState(
+        long_position_state = PositionState(
             direction=Position.DIRECTION_LONG,
             size=Decimal('3.37'),
             entry_price=Decimal('3100.0'),
@@ -190,7 +190,7 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
 
-        opposite = PositionState(
+        short_position_state = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('4.62'),
             entry_price=Decimal('3102.0'),
@@ -201,8 +201,8 @@ class TestPositionRiskManagerRules:
 
         # Should raise ValueError with helpful message
         try:
-            manager.calculate_amount_multiplier(
-                position, opposite, last_close=100000.0
+            long_manager.calculate_amount_multiplier(
+                long_position_state, short_position_state, last_close=100000.0
             )
             assert False, "Expected ValueError but none was raised"
         except ValueError as e:
@@ -230,7 +230,7 @@ class TestPositionRiskManagerRules:
         assert short_mgr._opposite is long_mgr
 
         # Verify both can be used without errors
-        position = PositionState(
+        long_position_state = PositionState(
             direction=Position.DIRECTION_LONG,
             size=Decimal('3.36'),
             entry_price=Decimal('3100.0'),
@@ -239,7 +239,7 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
 
-        opposite = PositionState(
+        short_position_state = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('4.62'),
             entry_price=Decimal('3102.0'),
@@ -249,11 +249,11 @@ class TestPositionRiskManagerRules:
         )
 
         # Should not raise error
-        multipliers = long_mgr.calculate_amount_multiplier(
-            position, opposite, last_close=3300.0
+        long_multipliers = long_mgr.calculate_amount_multiplier(
+            long_position_state, short_position_state, last_close=3300.0
         )
-        assert 'Buy' in multipliers
-        assert 'Sell' in multipliers
+        assert 'Buy' in long_multipliers
+        assert 'Sell' in long_multipliers
 
     def test_high_liquidation_ratio_long_decreases_position(self):
         """High liquidation ratio for long position decreases long (increases sell multiplier)."""
@@ -263,10 +263,10 @@ class TestPositionRiskManagerRules:
             max_margin=5.0,
             min_total_margin=1.0
         )
-        manager, _ = PositionRiskManager.create_linked_pair(risk_config)
+        long_manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
         # High liquidation risk: liq_ratio > 1.05 * min_liq_ratio (0.84)
-        position = PositionState(
+        long_position_state = PositionState(
             direction=Position.DIRECTION_LONG,
             size=Decimal('2.5'),
             entry_price=Decimal('3300.0'),
@@ -276,7 +276,7 @@ class TestPositionRiskManagerRules:
         )
 
         # Short position exists (realistic hedged scenario)
-        opposite = PositionState(
+        short_position_state = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('4.62'),
             entry_price=Decimal('3102.0'),
@@ -285,13 +285,13 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(
-            position, opposite, last_close=3100.0
+        long_multipliers = long_manager.calculate_amount_multiplier(
+            long_position_state, short_position_state, last_close=3100.0
         )
 
         # Should increase sell multiplier to decrease long position
-        assert multipliers['Sell'] == 1.5
-        assert multipliers['Buy'] == 1.0
+        assert long_multipliers['Sell'] == 1.5
+        assert long_multipliers['Buy'] == 1.0
 
     def test_moderate_liquidation_ratio_long_increases_opposite(self):
         """Moderate liquidation risk for long increases opposite (short) position."""
@@ -306,7 +306,7 @@ class TestPositionRiskManagerRules:
 
         # Moderate liquidation risk: liq_ratio > min_liq_ratio (0.8) but <= 1.05 * min_liq_ratio
         # Long position with moderate liquidation risk
-        position = PositionState(
+        long_position_state = PositionState(
             direction=Position.DIRECTION_LONG,
             size=Decimal('2.5'),
             entry_price=Decimal('3200.0'),
@@ -316,7 +316,7 @@ class TestPositionRiskManagerRules:
         )
 
         # Short position exists but is smaller (realistic hedged scenario)
-        opposite = PositionState(
+        short_position_state = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('1.8'),
             entry_price=Decimal('3102.0'),
@@ -325,7 +325,7 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
         long_multipliers = long_manager.calculate_amount_multiplier(
-            position, opposite, last_close=3100.0
+            long_position_state, short_position_state, last_close=3100.0
         )
 
         # Long position should not modify itself
@@ -345,10 +345,10 @@ class TestPositionRiskManagerRules:
             max_margin=5.0,
             min_total_margin=1.0
         )
-        _, manager = PositionRiskManager.create_linked_pair(risk_config)
+        _, short_manager = PositionRiskManager.create_linked_pair(risk_config)
 
         # High liquidation risk: liq_ratio > 0.95 * max_liq_ratio (1.14)
-        position = PositionState(
+        short_position_state = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('4.2'),
             entry_price=Decimal('3102.0'),
@@ -358,7 +358,7 @@ class TestPositionRiskManagerRules:
         )
 
         # Long position exists (realistic hedged scenario)
-        opposite = PositionState(
+        long_position_state = PositionState(
             direction=Position.DIRECTION_LONG,
             size=Decimal('2.1'),
             entry_price=Decimal('3200.0'),
@@ -366,13 +366,13 @@ class TestPositionRiskManagerRules:
             margin=Decimal('0.33'),
             leverage=10
         )
-        multipliers = manager.calculate_amount_multiplier(
-            position, opposite, last_close=3100.0
+        short_multipliers = short_manager.calculate_amount_multiplier(
+            short_position_state, long_position_state, last_close=3100.0
         )
 
         # Should increase buy multiplier to decrease short position
-        assert multipliers['Buy'] == 1.5
-        assert multipliers['Sell'] == 1.0
+        assert short_multipliers['Buy'] == 1.5
+        assert short_multipliers['Sell'] == 1.0
 
     def test_low_total_margin_with_equal_positions(self):
         """Low total margin with equal positions triggers adjustment."""
@@ -383,11 +383,11 @@ class TestPositionRiskManagerRules:
             min_total_margin=1.5,
             increase_same_position_on_low_margin=False
         )
-        manager, _ = PositionRiskManager.create_linked_pair(risk_config)
+        long_manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
         # Equal positions (ratio ~1.0) but low total margin
         # liq_ratio = 2325 / 3100 = 0.75 (below min 0.8, safe)
-        position = PositionState(
+        long_position_state = PositionState(
             direction=Position.DIRECTION_LONG,
             size=Decimal('2.0'),
             entry_price=Decimal('3200.0'),
@@ -396,7 +396,7 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
 
-        opposite = PositionState(
+        short_position_state = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('2.0'),
             entry_price=Decimal('3100.0'),
@@ -405,13 +405,13 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(
-            position, opposite, last_close=3100.0
+        long_multipliers = long_manager.calculate_amount_multiplier(
+            long_position_state, short_position_state, last_close=3100.0
         )
 
         # Should reduce opposite side (sell) to increase long position
-        assert multipliers['Sell'] == 0.5
-        assert multipliers['Buy'] == 1.0
+        assert long_multipliers['Sell'] == 0.5
+        assert long_multipliers['Buy'] == 1.0
 
     def test_low_total_margin_increase_same_position(self):
         """Low total margin with increase_same_position_on_low_margin=True doubles same side."""
@@ -422,11 +422,11 @@ class TestPositionRiskManagerRules:
             min_total_margin=1.5,
             increase_same_position_on_low_margin=True
         )
-        manager, _ = PositionRiskManager.create_linked_pair(risk_config)
+        long_manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
         # Equal positions but low total margin
         # liq_ratio = 2325 / 3100 = 0.75 (below min 0.8, safe)
-        position = PositionState(
+        long_position_state = PositionState(
             direction=Position.DIRECTION_LONG,
             size=Decimal('2.0'),
             entry_price=Decimal('3200.0'),
@@ -435,7 +435,7 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
 
-        opposite = PositionState(
+        short_position_state = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('2.0'),
             entry_price=Decimal('3100.0'),
@@ -444,13 +444,13 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(
-            position, opposite, last_close=3100.0
+        long_multipliers = long_manager.calculate_amount_multiplier(
+            long_position_state, short_position_state, last_close=3100.0
         )
 
         # Should double buy multiplier to increase long position
-        assert multipliers['Buy'] == 2.0
-        assert multipliers['Sell'] == 1.0
+        assert long_multipliers['Buy'] == 2.0
+        assert long_multipliers['Sell'] == 1.0
 
     def test_small_long_position_losing_increases_long(self):
         """Small long position that's losing increases long multiplier."""
@@ -460,11 +460,11 @@ class TestPositionRiskManagerRules:
             max_margin=5.0,
             min_total_margin=1.0
         )
-        manager, _ = PositionRiskManager.create_linked_pair(risk_config)
+        long_manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
         # Small position (ratio < 0.5) and losing (price below entry)
         # liq_ratio = 70000 / 95000 = 0.737 (below min 0.8, safe)
-        position = PositionState(
+        long_position_state = PositionState(
             direction=Position.DIRECTION_LONG,
             size=Decimal('0.5'),
             entry_price=Decimal('100000.0'),
@@ -473,7 +473,7 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
 
-        opposite = PositionState(
+        short_position_state = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
@@ -482,13 +482,13 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(
-            position, opposite, last_close=95000.0,  # Price below entry (losing)
-                    )
+        long_multipliers = long_manager.calculate_amount_multiplier(
+            long_position_state, short_position_state, last_close=95000.0,  # Price below entry (losing)
+        )
 
         # Should increase buy multiplier
-        assert multipliers['Buy'] == 2.0
-        assert multipliers['Sell'] == 1.0
+        assert long_multipliers['Buy'] == 2.0
+        assert long_multipliers['Sell'] == 1.0
 
     def test_very_small_long_position_increases_long(self):
         """Very small long position (ratio < 0.20) increases long multiplier."""
@@ -498,11 +498,11 @@ class TestPositionRiskManagerRules:
             max_margin=5.0,
             min_total_margin=1.0
         )
-        manager, _ = PositionRiskManager.create_linked_pair(risk_config)
+        long_manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
         # Very small position (ratio < 0.20)
         # liq_ratio = 70000 / 100000 = 0.7 (below min 0.8, safe)
-        position = PositionState(
+        long_position_state = PositionState(
             direction=Position.DIRECTION_LONG,
             size=Decimal('0.1'),
             entry_price=Decimal('100000.0'),
@@ -511,7 +511,7 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
 
-        opposite = PositionState(
+        short_position_state = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
@@ -520,13 +520,13 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(
-            position, opposite, last_close=100000.0
+        long_multipliers = long_manager.calculate_amount_multiplier(
+            long_position_state, short_position_state, last_close=100000.0
         )
 
         # Should increase buy multiplier
-        assert multipliers['Buy'] == 2.0
-        assert multipliers['Sell'] == 1.0
+        assert long_multipliers['Buy'] == 2.0
+        assert long_multipliers['Sell'] == 1.0
 
     def test_large_short_position_losing_increases_short(self):
         """Large short position that's losing increases short multiplier."""
@@ -536,10 +536,10 @@ class TestPositionRiskManagerRules:
             max_margin=5.0,
             min_total_margin=1.0
         )
-        _, manager = PositionRiskManager.create_linked_pair(risk_config)
+        _, short_manager = PositionRiskManager.create_linked_pair(risk_config)
 
         # Large position (ratio > 2.0) and losing (price above entry)
-        position = PositionState(
+        short_position_state = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('2.0'),
             entry_price=Decimal('100000.0'),
@@ -548,7 +548,7 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
 
-        opposite = PositionState(
+        long_position_state = PositionState(
             direction=Position.DIRECTION_LONG,
             size=Decimal('0.5'),
             entry_price=Decimal('100000.0'),
@@ -557,13 +557,13 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(
-            position, opposite, last_close=105000.0,  # Price above entry (losing)
+        short_multipliers = short_manager.calculate_amount_multiplier(
+            short_position_state, long_position_state, last_close=105000.0,  # Price above entry (losing)
                     )
 
         # Should increase sell multiplier
-        assert multipliers['Sell'] == 2.0
-        assert multipliers['Buy'] == 1.0
+        assert short_multipliers['Sell'] == 2.0
+        assert short_multipliers['Buy'] == 1.0
 
     def test_very_large_short_position_increases_short(self):
         """Very large short position (ratio > 5.0) increases short multiplier."""
@@ -573,10 +573,10 @@ class TestPositionRiskManagerRules:
             max_margin=5.0,
             min_total_margin=1.0
         )
-        _, manager = PositionRiskManager.create_linked_pair(risk_config)
+        _, short_manager = PositionRiskManager.create_linked_pair(risk_config)
 
         # Very large position (ratio > 5.0)
-        position = PositionState(
+        short_position_state = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('5.0'),
             entry_price=Decimal('100000.0'),
@@ -585,7 +585,7 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
 
-        opposite = PositionState(
+        long_position_state = PositionState(
             direction=Position.DIRECTION_LONG,
             size=Decimal('0.5'),
             entry_price=Decimal('100000.0'),
@@ -594,13 +594,13 @@ class TestPositionRiskManagerRules:
             leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(
-            position, opposite, last_close=100000.0
+        short_multipliers = short_manager.calculate_amount_multiplier(
+            short_position_state, long_position_state, last_close=100000.0
         )
 
         # Should increase sell multiplier
-        assert multipliers['Sell'] == 2.0
-        assert multipliers['Buy'] == 1.0
+        assert short_multipliers['Sell'] == 2.0
+        assert short_multipliers['Buy'] == 1.0
 
     def test_moderate_liquidation_ratio_short_increases_opposite(self):
         """Moderate liquidation risk for short position increases opposite (long) position."""
