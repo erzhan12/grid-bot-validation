@@ -1161,3 +1161,401 @@ class TestGridEdgeCaseBehavior:
             # Should have WAIT items near filled prices
             wait_items = [g for g in grid.grid if g['side'] == 'wait']
             assert len(wait_items) > 0, f"Should have WAIT items after fill at {filled_price}"
+
+
+class TestGridComparisonExtended:
+    """
+    Extended comparison tests for edge cases and parameter variations.
+
+    These tests ensure complete behavioral parity between gridcore.Grid and
+    original bbu2-master Greed implementation for scenarios not covered by
+    existing comparison tests.
+    """
+
+    def test_sell_heavy_rebalancing_matches_original(self):
+        """
+        Sell-heavy grid rebalancing produces identical results.
+
+        Tests grid shift when too many sell orders exist (>30% imbalance).
+        Original shifts grid downward by removing top sell and adding bottom buy.
+
+        Rationale: Existing tests only cover buy-heavy rebalancing. This validates
+        the opposite direction to ensure __center_grid logic is symmetric.
+
+        Reference: bbu2-master/greed.py:91-94
+        """
+        try:
+            from greed import Greed as OriginalGreed
+        except ImportError:
+            pytest.skip("Original bbu2-master code not available")
+
+        symbol = 'BTCUSDT'
+        last_close = 100000.0
+        tick_size = 0.1
+
+        # Build grids
+        MockBybitApiUsdt.ticksizes[symbol] = tick_size
+        mock_strat = MockStrat()
+        original_greed = OriginalGreed(mock_strat, symbol, n=50, step=0.2)
+        original_greed.build_greed(last_close)
+
+        new_grid = Grid(tick_size=Decimal(str(tick_size)), grid_count=50, grid_step=0.2)
+        new_grid.build_grid(last_close)
+
+        # Artificially create sell-heavy scenario by marking many buys as WAIT
+        for g in original_greed.greed:
+            if g['side'] == original_greed.BUY and g['price'] < 99500:
+                g['side'] = original_greed.WAIT
+
+        for g in new_grid.grid:
+            if g['side'] == new_grid.BUY and g['price'] < 99500:
+                g['side'] = new_grid.WAIT
+
+        # Trigger centering via update (price moved up)
+        last_filled = 101000.0
+        original_greed.update_greed(last_filled, last_close)
+        new_grid.update_grid(last_filled, last_close)
+
+        # Compare results after sell-heavy rebalancing
+        assert len(original_greed.greed) == len(new_grid.grid), \
+            f"Length mismatch: original={len(original_greed.greed)}, new={len(new_grid.grid)}"
+
+        for i, (orig, new) in enumerate(zip(original_greed.greed, new_grid.grid)):
+            assert abs(orig['price'] - new['price']) < 0.00001, \
+                f"Price mismatch at {i} after sell-heavy centering: {orig['price']} vs {new['price']}"
+            assert orig['side'] == new['side'], \
+                f"Side mismatch at {i} after sell-heavy centering: {orig['side']} vs {new['side']}"
+
+    @pytest.mark.parametrize("grid_count", [10, 20])
+    def test_small_grid_counts_match_original(self, grid_count):
+        """
+        Small grid_count values produce identical results.
+
+        Tests grid building with smaller grids to ensure algorithm works
+        correctly at edge of practical usage (minimum viable grid sizes).
+
+        Rationale: Default tests use grid_count=50. Small grids test edge cases
+        where integer division and rounding might behave differently.
+        """
+        try:
+            from greed import Greed as OriginalGreed
+        except ImportError:
+            pytest.skip("Original bbu2-master code not available")
+
+        symbol = 'BTCUSDT'
+        last_close = 100000.0
+        tick_size = 0.1
+
+        # Original
+        MockBybitApiUsdt.ticksizes[symbol] = tick_size
+        mock_strat = MockStrat()
+        original_greed = OriginalGreed(mock_strat, symbol, n=grid_count, step=0.2)
+        original_greed.build_greed(last_close)
+
+        # New
+        new_grid = Grid(tick_size=Decimal(str(tick_size)), grid_count=grid_count, grid_step=0.2)
+        new_grid.build_grid(last_close)
+
+        # Compare
+        assert len(original_greed.greed) == len(new_grid.grid), \
+            f"Length mismatch for grid_count={grid_count}: original={len(original_greed.greed)}, new={len(new_grid.grid)}"
+
+        for i, (orig, new) in enumerate(zip(original_greed.greed, new_grid.grid)):
+            assert abs(orig['price'] - new['price']) < 0.00001, \
+                f"Price mismatch at {i} for grid_count={grid_count}: {orig['price']} vs {new['price']}"
+            assert orig['side'] == new['side'], \
+                f"Side mismatch at {i} for grid_count={grid_count}: {orig['side']} vs {new['side']}"
+
+    @pytest.mark.parametrize("grid_count", [100, 200])
+    def test_large_grid_counts_match_original(self, grid_count):
+        """
+        Large grid_count values produce identical results.
+
+        Tests grid building with larger grids to ensure algorithm scales
+        correctly and doesn't have hidden issues with more levels.
+
+        Rationale: Large grids stress-test floating-point precision in price
+        calculations over many iterations. Ensures no accumulation errors.
+        """
+        try:
+            from greed import Greed as OriginalGreed
+        except ImportError:
+            pytest.skip("Original bbu2-master code not available")
+
+        symbol = 'BTCUSDT'
+        last_close = 100000.0
+        tick_size = 0.1
+
+        # Original
+        MockBybitApiUsdt.ticksizes[symbol] = tick_size
+        mock_strat = MockStrat()
+        original_greed = OriginalGreed(mock_strat, symbol, n=grid_count, step=0.2)
+        original_greed.build_greed(last_close)
+
+        # New
+        new_grid = Grid(tick_size=Decimal(str(tick_size)), grid_count=grid_count, grid_step=0.2)
+        new_grid.build_grid(last_close)
+
+        # Compare
+        assert len(original_greed.greed) == len(new_grid.grid), \
+            f"Length mismatch for grid_count={grid_count}: original={len(original_greed.greed)}, new={len(new_grid.grid)}"
+
+        for i, (orig, new) in enumerate(zip(original_greed.greed, new_grid.grid)):
+            assert abs(orig['price'] - new['price']) < 0.00001, \
+                f"Price mismatch at {i} for grid_count={grid_count}: {orig['price']} vs {new['price']}"
+            assert orig['side'] == new['side'], \
+                f"Side mismatch at {i} for grid_count={grid_count}: {orig['side']} vs {new['side']}"
+
+    @pytest.mark.parametrize("grid_step", [0.05, 0.1, 0.5, 1.0])
+    def test_various_grid_steps_match_original(self, grid_step):
+        """
+        Different grid_step percentage values produce identical spacing.
+
+        Tests various grid step sizes (0.05% to 1.0%) to ensure price
+        spacing calculations match original implementation exactly.
+
+        Rationale: Grid step affects price calculations throughout the grid.
+        Tests that percentage-to-price conversion is identical across implementations.
+        """
+        try:
+            from greed import Greed as OriginalGreed
+        except ImportError:
+            pytest.skip("Original bbu2-master code not available")
+
+        symbol = 'ETHUSDT'
+        last_close = 3000.0
+        tick_size = 0.01
+
+        # Original
+        MockBybitApiUsdt.ticksizes[symbol] = tick_size
+        mock_strat = MockStrat()
+        original_greed = OriginalGreed(mock_strat, symbol, n=50, step=grid_step)
+        original_greed.build_greed(last_close)
+
+        # New
+        new_grid = Grid(tick_size=Decimal(str(tick_size)), grid_count=50, grid_step=grid_step)
+        new_grid.build_grid(last_close)
+
+        # Compare
+        assert len(original_greed.greed) == len(new_grid.grid), \
+            f"Length mismatch for grid_step={grid_step}: original={len(original_greed.greed)}, new={len(new_grid.grid)}"
+
+        for i, (orig, new) in enumerate(zip(original_greed.greed, new_grid.grid)):
+            assert abs(orig['price'] - new['price']) < 0.00001, \
+                f"Price mismatch at {i} for grid_step={grid_step}: {orig['price']} vs {new['price']}"
+            assert orig['side'] == new['side'], \
+                f"Side mismatch at {i} for grid_step={grid_step}: {orig['side']} vs {new['side']}"
+
+    @pytest.mark.parametrize("price,tick_size", [
+        (0.0001, 0.00001),  # Very small altcoin (SHIB-like)
+        (1.5, 0.001),       # Low-price crypto (XRP-like)
+        (100000.0, 0.1),    # BTC-like
+        (999999.0, 1.0),    # Extreme high price
+    ])
+    def test_extreme_prices_match_original(self, price, tick_size):
+        """
+        Extreme price values produce identical results with realistic tick sizes.
+
+        Tests grid building at price extremes to ensure rounding and calculation
+        precision matches original across full range of real-world crypto prices.
+
+        Rationale: Price rounding (_round_price) is used throughout grid calculations.
+        Testing extreme values ensures floating-point precision is handled identically.
+        """
+        try:
+            from greed import Greed as OriginalGreed
+        except ImportError:
+            pytest.skip("Original bbu2-master code not available")
+
+        symbol = 'TESTUSDT'
+
+        # Original
+        MockBybitApiUsdt.ticksizes[symbol] = tick_size
+        mock_strat = MockStrat()
+        original_greed = OriginalGreed(mock_strat, symbol, n=50, step=0.2)
+        original_greed.build_greed(price)
+
+        # New
+        new_grid = Grid(tick_size=Decimal(str(tick_size)), grid_count=50, grid_step=0.2)
+        new_grid.build_grid(price)
+
+        # Compare
+        assert len(original_greed.greed) == len(new_grid.grid), \
+            f"Length mismatch for price={price}: original={len(original_greed.greed)}, new={len(new_grid.grid)}"
+
+        for i, (orig, new) in enumerate(zip(original_greed.greed, new_grid.grid)):
+            # Use relative tolerance for extreme prices
+            tolerance = max(0.00001, abs(orig['price']) * 0.0000001)
+            assert abs(orig['price'] - new['price']) < tolerance, \
+                f"Price mismatch at {i} for price={price}, tick_size={tick_size}: {orig['price']} vs {new['price']}"
+            assert orig['side'] == new['side'], \
+                f"Side mismatch at {i} for price={price}: {orig['side']} vs {new['side']}"
+
+    def test_none_handling_matches_original(self):
+        """
+        None input handling matches original behavior.
+
+        Tests that None inputs to build_grid and update_grid are handled
+        identically (skip silently, leave grid unchanged).
+
+        Rationale: Defensive edge case testing. Ensures both implementations
+        handle missing data gracefully without crashing or corrupting state.
+
+        Reference: bbu2-master/greed.py:19-20 (build), 49-52 (update)
+        """
+        try:
+            from greed import Greed as OriginalGreed
+        except ImportError:
+            pytest.skip("Original bbu2-master code not available")
+
+        symbol = 'BTCUSDT'
+        tick_size = 0.1
+
+        # Test 1: build_grid(None) - should leave grid empty
+        MockBybitApiUsdt.ticksizes[symbol] = tick_size
+        mock_strat = MockStrat()
+        original_greed = OriginalGreed(mock_strat, symbol, n=50, step=0.2)
+        original_greed.build_greed(None)
+
+        new_grid = Grid(tick_size=Decimal(str(tick_size)), grid_count=50, grid_step=0.2)
+        new_grid.build_grid(None)
+
+        assert len(original_greed.greed) == len(new_grid.grid) == 0, \
+            "build_grid(None) should leave grid empty"
+
+        # Test 2: Build valid grid first
+        original_greed.build_greed(100000.0)
+        new_grid.build_grid(100000.0)
+
+        original_grid_copy = [dict(g) for g in original_greed.greed]
+        new_grid_copy = [dict(g) for g in new_grid.grid]
+
+        # Test 3: update_grid(None, x) - should leave grid unchanged
+        original_greed.update_greed(None, 100000.0)
+        new_grid.update_grid(None, 100000.0)
+
+        assert len(original_greed.greed) == len(original_grid_copy), \
+            "update_grid(None, x) should not change grid length"
+        assert len(new_grid.grid) == len(new_grid_copy), \
+            "update_grid(None, x) should not change grid length"
+
+        # Test 4: update_grid(x, None) - should leave grid unchanged
+        original_greed.update_greed(99800.0, None)
+        new_grid.update_grid(99800.0, None)
+
+        assert len(original_greed.greed) == len(original_grid_copy), \
+            "update_grid(x, None) should not change grid length"
+        assert len(new_grid.grid) == len(new_grid_copy), \
+            "update_grid(x, None) should not change grid length"
+
+    def test_rebuild_clears_grid_like_original(self):
+        """
+        Rebuild clears grid before rebuilding to prevent doubling.
+
+        Critical test: ensures both implementations clear self.grid/self.greed
+        before building new grid, preventing duplicate levels on rebuild.
+
+        Rationale: Bug prevention test. Without clearing, rebuilds would
+        continuously append to existing grid, causing exponential growth.
+
+        Reference: bbu2-master/greed.py:43-45
+        """
+        try:
+            from greed import Greed as OriginalGreed
+        except ImportError:
+            pytest.skip("Original bbu2-master code not available")
+
+        symbol = 'BTCUSDT'
+        tick_size = 0.1
+
+        MockBybitApiUsdt.ticksizes[symbol] = tick_size
+        mock_strat = MockStrat()
+        original_greed = OriginalGreed(mock_strat, symbol, n=50, step=0.2)
+        new_grid = Grid(tick_size=Decimal(str(tick_size)), grid_count=50, grid_step=0.2)
+
+        # Build initial grid
+        original_greed.build_greed(100000.0)
+        new_grid.build_grid(100000.0)
+
+        initial_orig_len = len(original_greed.greed)
+        initial_new_len = len(new_grid.grid)
+
+        # Rebuild should clear and rebuild, not append
+        original_greed.rebuild_greed(100000.0)
+        new_grid.build_grid(100000.0)  # Grid.build_grid clears internally
+
+        assert len(original_greed.greed) == initial_orig_len, \
+            f"Rebuild should maintain grid size, got {len(original_greed.greed)} vs {initial_orig_len}"
+        assert len(new_grid.grid) == initial_new_len, \
+            f"Rebuild should maintain grid size, got {len(new_grid.grid)} vs {initial_new_len}"
+
+        # Multiple rebuilds should still maintain size
+        for _ in range(3):
+            original_greed.rebuild_greed(100000.0)
+            new_grid.build_grid(100000.0)
+
+        assert len(original_greed.greed) == initial_orig_len, \
+            "Multiple rebuilds should not accumulate grid levels"
+        assert len(new_grid.grid) == initial_new_len, \
+            "Multiple rebuilds should not accumulate grid levels"
+
+    def test_boundary_and_consecutive_rebuilds_match_original(self):
+        """
+        Grid boundary conditions and consecutive rebuilds match original.
+
+        Tests:
+        1. Price exactly at min_grid or max_grid boundaries
+        2. Multiple consecutive out-of-bounds updates trigger identical rebuilds
+
+        Rationale: Boundary conditions often expose off-by-one errors.
+        Consecutive rebuilds test that rebuild state is clean and repeatable.
+
+        Reference: bbu2-master/greed.py:53-55 (boundary check)
+        """
+        try:
+            from greed import Greed as OriginalGreed
+        except ImportError:
+            pytest.skip("Original bbu2-master code not available")
+
+        symbol = 'BTCUSDT'
+        tick_size = 0.1
+
+        MockBybitApiUsdt.ticksizes[symbol] = tick_size
+        mock_strat = MockStrat()
+        original_greed = OriginalGreed(mock_strat, symbol, n=50, step=0.2)
+        new_grid = Grid(tick_size=Decimal(str(tick_size)), grid_count=50, grid_step=0.2)
+
+        # Build initial grid
+        original_greed.build_greed(100000.0)
+        new_grid.build_grid(100000.0)
+
+        # Get grid boundaries
+        orig_min = min(g['price'] for g in original_greed.greed)
+        orig_max = max(g['price'] for g in original_greed.greed)
+        new_min = min(g['price'] for g in new_grid.grid)
+        new_max = max(g['price'] for g in new_grid.grid)
+
+        # Test 1: Price at boundary (should NOT rebuild)
+        original_greed.update_greed(99800.0, orig_min + 100)  # Just inside
+        new_grid.update_grid(99800.0, new_min + 100)
+
+        # Should still have same grid structure (not rebuilt)
+        assert len(original_greed.greed) == len(new_grid.grid), \
+            "Grid should not rebuild when price is just inside boundary"
+
+        # Test 2: Consecutive out-of-bounds rebuilds
+        rebuild_prices = [120000.0, 85000.0, 150000.0, 70000.0]
+
+        for rebuild_price in rebuild_prices:
+            original_greed.update_greed(99800.0, rebuild_price)
+            new_grid.update_grid(99800.0, rebuild_price)
+
+            # Both should rebuild and produce identical grids
+            assert len(original_greed.greed) == len(new_grid.grid), \
+                f"Length mismatch after rebuild at price={rebuild_price}"
+
+            for i, (orig, new) in enumerate(zip(original_greed.greed, new_grid.grid)):
+                assert abs(orig['price'] - new['price']) < 0.00001, \
+                    f"Price mismatch at {i} after rebuild at {rebuild_price}: {orig['price']} vs {new['price']}"
+                assert orig['side'] == new['side'], \
+                    f"Side mismatch at {i} after rebuild at {rebuild_price}: {orig['side']} vs {new['side']}"
