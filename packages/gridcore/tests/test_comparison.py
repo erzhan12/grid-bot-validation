@@ -420,22 +420,22 @@ class TestPositionRiskManagerBehavior:
         if self.get_liquidation_ratio(last_close) > 1.05 * self.__min_liq_ratio:
             self.set_amount_multiplier(Position.SIDE_SELL, 1.5)
         """
-        from gridcore.position import PositionRiskManager, PositionState, RiskConfig
+        from gridcore.position import PositionRiskManager, PositionState, RiskConfig, Position
 
         risk_config = RiskConfig(min_liq_ratio=0.8, max_liq_ratio=1.2, max_margin=5000.0, min_total_margin=1000.0)
-        manager = PositionRiskManager('long', risk_config)
+        manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
         # liq_ratio = 88000 / 100000 = 0.88 > 1.05 * 0.8 = 0.84 ✓
         position = PositionState(
-            direction='long', size=Decimal('0.02'), entry_price=Decimal('100000.0'),
+            direction=Position.DIRECTION_LONG, size=Decimal('0.02'), entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('88000.0'), margin=Decimal('2000.0'), leverage=10
         )
         opposite = PositionState(
-            direction='short', size=Decimal('0.01'), entry_price=Decimal('100000.0'),
+            direction=Position.DIRECTION_SHORT, size=Decimal('0.01'), entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('110000.0'), margin=Decimal('1000.0'), leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(position, opposite, 100000.0, Decimal('10000.0'))
+        multipliers = manager.calculate_amount_multiplier(position, opposite, 100000.0)
         assert multipliers['Sell'] == 1.5, "Should decrease long position with Sell=1.5"
 
     def test_short_moderate_liq_risk_increases_opposite(self):
@@ -446,25 +446,38 @@ class TestPositionRiskManagerBehavior:
         elif 0.0 < self.get_liquidation_ratio(last_close) < self.__max_liq_ratio:
             self.__opposite.set_amount_multiplier(Position.SIDE_SELL, 0.5)
 
-        Gridcore equivalent: sets own SIDE_SELL = 0.5 to decrease short exposure
+        Gridcore uses two-position architecture: short modifies opposite (long) multipliers
         """
-        from gridcore.position import PositionRiskManager, PositionState, RiskConfig
+        from gridcore.position import PositionRiskManager, PositionState, RiskConfig, Position
 
         risk_config = RiskConfig(min_liq_ratio=0.8, max_liq_ratio=1.2, max_margin=5000.0, min_total_margin=1000.0)
-        manager = PositionRiskManager('short', risk_config)
+        short_manager = PositionRiskManager('short', risk_config)
+        long_manager = PositionRiskManager('long', risk_config)
+
+        # Link the two positions
+        short_manager.set_opposite(long_manager)
+        long_manager.set_opposite(short_manager)
 
         # liq_ratio = 108000 / 100000 = 1.08 (0.0 < 1.08 < 1.2) ✓
         position = PositionState(
-            direction='short', size=Decimal('0.015'), entry_price=Decimal('100000.0'),
+            direction=Position.DIRECTION_SHORT, size=Decimal('0.015'), entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('108000.0'), margin=Decimal('1500.0'), leverage=10
         )
         opposite = PositionState(
-            direction='long', size=Decimal('0.015'), entry_price=Decimal('100000.0'),
+            direction=Position.DIRECTION_LONG, size=Decimal('0.015'), entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('92000.0'), margin=Decimal('1500.0'), leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(position, opposite, 100000.0, Decimal('10000.0'))
-        assert multipliers['Sell'] == 0.5, "Should decrease short sells to increase long"
+        short_multipliers = short_manager.calculate_amount_multiplier(position, opposite, 100000.0)
+
+        # Short position should not modify itself
+        assert short_multipliers['Sell'] == 1.0
+        assert short_multipliers['Buy'] == 1.0
+
+        # Instead, it should modify the opposite (long) position's multipliers
+        long_multipliers = long_manager.get_amount_multiplier()
+        assert long_multipliers['Sell'] == 0.5, "Should decrease long sells to increase long"
+        assert long_multipliers['Buy'] == 1.0
 
     def test_small_long_position_increases_long(self):
         """
@@ -474,22 +487,23 @@ class TestPositionRiskManagerBehavior:
         elif self.position_ratio < 0.20:
             self.set_amount_multiplier(Position.SIDE_BUY, 2)
         """
-        from gridcore.position import PositionRiskManager, PositionState, RiskConfig
+        from gridcore.position import PositionRiskManager, PositionState, RiskConfig, Position
 
         risk_config = RiskConfig(min_liq_ratio=0.8, max_liq_ratio=1.2, max_margin=5000.0, min_total_margin=1000.0)
-        manager = PositionRiskManager('long', risk_config)
+        manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
         # position_ratio = 100 / 3000 = 0.033 < 0.20 ✓
+        # liq_ratio = 70000 / 100000 = 0.7 (below min 0.8, safe)
         position = PositionState(
-            direction='long', size=Decimal('0.001'), entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('95000.0'), margin=Decimal('100.0'), leverage=10
+            direction=Position.DIRECTION_LONG, size=Decimal('0.001'), entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('70000.0'), margin=Decimal('100.0'), leverage=10
         )
         opposite = PositionState(
-            direction='short', size=Decimal('0.03'), entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('110000.0'), margin=Decimal('3000.0'), leverage=10
+            direction=Position.DIRECTION_SHORT, size=Decimal('0.03'), entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('130000.0'), margin=Decimal('3000.0'), leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(position, opposite, 100000.0, Decimal('10000.0'))
+        multipliers = manager.calculate_amount_multiplier(position, opposite, 100000.0)
         assert multipliers['Buy'] == 2.0, "Should increase long position with Buy=2.0"
 
     def test_large_short_position_losing_increases_short(self):
@@ -500,23 +514,23 @@ class TestPositionRiskManagerBehavior:
         elif self.position_ratio > 2.0 and self.__upnl < 0:
             self.set_amount_multiplier(Position.SIDE_SELL, 2)
         """
-        from gridcore.position import PositionRiskManager, PositionState, RiskConfig
+        from gridcore.position import PositionRiskManager, PositionState, RiskConfig, Position
 
         risk_config = RiskConfig(min_liq_ratio=0.8, max_liq_ratio=1.2, max_margin=5000.0, min_total_margin=1000.0)
-        manager = PositionRiskManager('short', risk_config)
+        _, manager = PositionRiskManager.create_linked_pair(risk_config)
 
         # position_ratio = 2000 / 500 = 4.0 > 2.0 ✓
         # Price above entry (105000 > 100000) means short is losing
         position = PositionState(
-            direction='short', size=Decimal('2.0'), entry_price=Decimal('100000.0'),
+            direction=Position.DIRECTION_SHORT, size=Decimal('2.0'), entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('110000.0'), margin=Decimal('2000.0'), leverage=10
         )
         opposite = PositionState(
-            direction='long', size=Decimal('0.5'), entry_price=Decimal('100000.0'),
+            direction=Position.DIRECTION_LONG, size=Decimal('0.5'), entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('90000.0'), margin=Decimal('500.0'), leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(position, opposite, 105000.0, Decimal('10000.0'))
+        multipliers = manager.calculate_amount_multiplier(position, opposite, 105000.0)
         assert multipliers['Sell'] == 2.0, "Should increase short position with Sell=2.0"
 
     def test_low_total_margin_adjusts_position(self):
@@ -527,27 +541,28 @@ class TestPositionRiskManagerBehavior:
         elif self.is_position_equal() and self.get_total_margin() < self.__min_total_margin:
             self._adjust_position_for_low_margin()
         """
-        from gridcore.position import PositionRiskManager, PositionState, RiskConfig
+        from gridcore.position import PositionRiskManager, PositionState, RiskConfig, Position
 
         risk_config = RiskConfig(
             min_liq_ratio=0.8, max_liq_ratio=1.2,
             max_margin=5000.0, min_total_margin=1000.0,
             increase_same_position_on_low_margin=False
         )
-        manager = PositionRiskManager('long', risk_config)
+        manager, _ = PositionRiskManager.create_linked_pair(risk_config)
 
         # position_ratio = 400 / 400 = 1.0 (is_equal ✓)
         # total_margin = 800 < 1000 ✓
+        # liq_ratio = 70000 / 100000 = 0.7 (below min 0.8, safe)
         position = PositionState(
-            direction='long', size=Decimal('1.0'), entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('90000.0'), margin=Decimal('400.0'), leverage=10
+            direction=Position.DIRECTION_LONG, size=Decimal('1.0'), entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('70000.0'), margin=Decimal('400.0'), leverage=10
         )
         opposite = PositionState(
-            direction='short', size=Decimal('1.0'), entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('110000.0'), margin=Decimal('400.0'), leverage=10
+            direction=Position.DIRECTION_SHORT, size=Decimal('1.0'), entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('130000.0'), margin=Decimal('400.0'), leverage=10
         )
 
-        multipliers = manager.calculate_amount_multiplier(position, opposite, 100000.0, Decimal('10000.0'))
+        multipliers = manager.calculate_amount_multiplier(position, opposite, 100000.0)
         # Should reduce opposite side (Sell=0.5) to increase this position
         assert multipliers['Sell'] == 0.5, "Should adjust for low margin"
 
@@ -880,6 +895,7 @@ class TestEngineStrat50Behavior:
         Reference: PlaceLimitIntent.create() using SHA256 hash
         """
         from gridcore.intents import PlaceLimitIntent
+        from gridcore.position import Position
 
         # Create two intents with same parameters
         intent1 = PlaceLimitIntent.create(
@@ -888,7 +904,7 @@ class TestEngineStrat50Behavior:
             price=Decimal('99800.0'),
             qty=Decimal('0.01'),
             grid_level=5,
-            direction='long'
+            direction=Position.DIRECTION_LONG
         )
 
         intent2 = PlaceLimitIntent.create(
@@ -897,7 +913,7 @@ class TestEngineStrat50Behavior:
             price=Decimal('99800.0'),
             qty=Decimal('0.01'),
             grid_level=5,
-            direction='long'
+            direction=Position.DIRECTION_LONG
         )
 
         # Should have identical client_order_id
@@ -911,7 +927,7 @@ class TestEngineStrat50Behavior:
             price=Decimal('99800.0'),
             qty=Decimal('0.01'),
             grid_level=6,  # Different level
-            direction='long'
+            direction=Position.DIRECTION_LONG
         )
 
         assert intent1.client_order_id != intent3.client_order_id, \
