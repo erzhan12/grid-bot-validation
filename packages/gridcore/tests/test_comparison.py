@@ -1179,6 +1179,9 @@ class TestGridComparisonExtended:
         Tests grid shift when too many sell orders exist (>30% imbalance).
         Original shifts grid downward by removing top sell and adding bottom buy.
 
+        Realistic scenario: Price moves UP with multiple BUY fills, naturally
+        creating fewer BUY orders and many SELL orders (sell-heavy).
+
         Rationale: Existing tests only cover buy-heavy rebalancing. This validates
         the opposite direction to ensure __center_grid logic is symmetric.
 
@@ -1190,33 +1193,38 @@ class TestGridComparisonExtended:
             pytest.skip("Original bbu2-master code not available")
 
         symbol = 'BTCUSDT'
-        last_close = 100000.0
+        initial_price = 100000.0
         tick_size = 0.1
 
-        # Build grids
+        # Build initial grids
         MockBybitApiUsdt.ticksizes[symbol] = tick_size
         mock_strat = MockStrat()
         original_greed = OriginalGreed(mock_strat, symbol, n=50, step=0.2)
-        original_greed.build_greed(last_close)
+        original_greed.build_greed(initial_price)
 
         new_grid = Grid(tick_size=Decimal(str(tick_size)), grid_count=50, grid_step=0.2)
-        new_grid.build_grid(last_close)
+        new_grid.build_grid(initial_price)
 
-        # Artificially create sell-heavy scenario by marking many buys as WAIT
-        for g in original_greed.greed:
-            if g['side'] == original_greed.BUY and g['price'] < 99500:
-                g['side'] = original_greed.WAIT
+        # Simulate realistic upward price movement with multiple BUY fills
+        # Each fill marks nearby prices as WAIT, reducing active BUY count
+        # This naturally creates sell-heavy scenario: few BUY, some WAIT, many SELL
+        #
+        # With grid_step=0.2%, grid levels are ~0.2% apart:
+        # 99800 → 100000 → 100200 → 100400 → 100600 → 100800 → 101000
+        upward_fills = [
+            (99800.0, 99900.0),   # BUY at 99800 fills, price moves to 99900
+            (99900.0, 100200.0),  # Price jumps to 100200 (next grid level)
+            (100200.0, 100400.0), # SELL at 100200 fills, price at 100400
+            (100400.0, 100600.0), # SELL at 100400 fills, price at 100600
+            (100600.0, 100800.0), # SELL at 100600 fills, price at 100800
+        ]
 
-        for g in new_grid.grid:
-            if g['side'] == new_grid.BUY and g['price'] < 99500:
-                g['side'] = new_grid.WAIT
+        for filled_price, current_price in upward_fills:
+            original_greed.update_greed(filled_price, current_price)
+            new_grid.update_grid(filled_price, current_price)
 
-        # Trigger centering via update (price moved up)
-        last_filled = 101000.0
-        original_greed.update_greed(last_filled, last_close)
-        new_grid.update_grid(last_filled, last_close)
-
-        # Compare results after sell-heavy rebalancing
+        # After upward movement, grid should be sell-heavy
+        # Verify both implementations rebalance identically
         assert len(original_greed.greed) == len(new_grid.grid), \
             f"Length mismatch: original={len(original_greed.greed)}, new={len(new_grid.grid)}"
 
