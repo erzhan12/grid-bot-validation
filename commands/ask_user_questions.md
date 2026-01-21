@@ -1,0 +1,1 @@
+Read this plan file and interview me in detail using AskUserQuestionTool about literally anything: technical implementation, UI & UX, concerns, trade-offs, etc.
