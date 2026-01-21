@@ -4,6 +4,7 @@ Unit tests for Grid module.
 Tests grid level calculations to ensure identical behavior to original greed.py.
 """
 
+import pytest
 from decimal import Decimal
 from gridcore.grid import Grid
 
@@ -508,3 +509,46 @@ class TestGridEdgeCases:
         prices = [g['price'] for g in grid.grid]
         avg_step_pct = abs(prices[1] - prices[0]) / prices[0] * 100
         assert avg_step_pct < 0.02  # Should be around 0.01%
+
+
+class TestGridUpdateGridRebuild:
+    """Tests for update_grid rebuild behavior."""
+
+    def test_update_grid_on_empty_grid_builds_from_scratch(self):
+        """update_grid on empty grid triggers rebuild."""
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=50, grid_step=0.2)
+
+        # Grid is empty, so update_grid should trigger rebuild
+        grid.update_grid(last_filled_price=99000.0, last_close=100000.0)
+
+        # Grid should now be built
+        assert len(grid.grid) == 51
+
+
+class TestGridAnchorPrice:
+    """Tests for anchor_price property."""
+
+    def test_anchor_price_none_before_build(self):
+        """anchor_price returns None before grid is built."""
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=50, grid_step=0.2)
+        assert grid.anchor_price is None
+
+    def test_anchor_price_returns_original_center(self):
+        """anchor_price returns the original center price after build."""
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=50, grid_step=0.2)
+        grid.build_grid(100000.0)
+
+        assert grid.anchor_price == 100000.0
+
+    def test_anchor_price_unchanged_after_update(self):
+        """anchor_price remains unchanged after update_grid."""
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=50, grid_step=0.2)
+        grid.build_grid(100000.0)
+
+        original_anchor = grid.anchor_price
+
+        # Update grid with fills
+        grid.update_grid(last_filled_price=99800.0, last_close=100000.0)
+
+        # Anchor should remain the same
+        assert grid.anchor_price == original_anchor
