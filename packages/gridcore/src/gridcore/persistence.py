@@ -29,6 +29,10 @@ class GridAnchorStore:
         """
         self.file_path = file_path
 
+    def _validate_strat_id(self, strat_id: str) -> None:
+        if strat_id == "":
+            raise ValueError("strat_id must be a non-empty string")
+
     def load(self, strat_id: str) -> Optional[dict]:
         """
         Load anchor data for a strategy.
@@ -39,6 +43,7 @@ class GridAnchorStore:
         Returns:
             Dict with anchor_price, grid_step, grid_count or None if not found
         """
+        self._validate_strat_id(strat_id)
         if not os.path.exists(self.file_path):
             return None
 
@@ -59,6 +64,7 @@ class GridAnchorStore:
             grid_step: Grid step size in percentage
             grid_count: Number of grid levels
         """
+        self._validate_strat_id(strat_id)
         # Load existing data
         all_anchors = {}
         if os.path.exists(self.file_path):
@@ -94,6 +100,7 @@ class GridAnchorStore:
         Returns:
             True if deleted, False if not found
         """
+        self._validate_strat_id(strat_id)
         if not os.path.exists(self.file_path):
             return False
 
