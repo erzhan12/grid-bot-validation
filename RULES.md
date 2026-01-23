@@ -237,11 +237,14 @@ uv run pytest packages/gridcore/tests/test_grid.py -v
     - File: `packages/gridcore/src/gridcore/intents.py:21`
 17. **Testing Grid State (2026-01-23)**: When testing anchor_price or grid state, verify against actual grid structure, not just input values
     - **DON'T**: `assert engine.get_anchor_price() == 100000.0` (only checks input value)
-    - **DO**: Extract WAIT prices from grid, verify anchor matches actual WAIT zone
-    - **Pattern**: `wait_prices = [g['price'] for g in engine.grid.grid if g['side'] == GridSideType.WAIT]; assert anchor in wait_prices`
-    - **Why**: Grid may round prices, have multiple WAIT zones, or transform input in unexpected ways
-    - **Example**: `test_get_anchor_price_returns_wait_zone_price` verifies anchor matches actual grid WAIT zone
-    - File: `packages/gridcore/tests/test_engine.py:703-737`
+    - **DO**: Extract grid structure, verify anchor matches actual WAIT zone AND grid levels are preserved
+    - **Pattern for anchor**: `wait_prices = [g['price'] for g in engine.grid.grid if g['side'] == GridSideType.WAIT]; assert anchor in wait_prices`
+    - **Pattern for grid preservation**: `original_grid = [(g['price'], g['side']) for g in engine.grid.grid]; assert restarted_grid == original_grid`
+    - **Why**: Grid may round prices, have multiple WAIT zones, or transform input in unexpected ways. Test names claiming to test "grid levels" must verify actual grid structure.
+    - **Examples**:
+      - `test_get_anchor_price_returns_wait_zone_price` verifies anchor matches actual grid WAIT zone
+      - `test_anchor_price_preserves_grid_levels_on_restart` verifies grid structure is identical after restart
+    - File: `packages/gridcore/tests/test_engine.py:703-812`
 18. **GridSideType Naming (2026-01-23)**: Use `GridSideType` enum, not raw strings
     - **DO**: `g['side'] == GridSideType.WAIT` (type-safe, autocomplete, refactorable)
     - **DON'T**: `g['side'] == 'Wait'` (typo-prone, no IDE support)

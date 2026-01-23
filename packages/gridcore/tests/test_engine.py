@@ -775,8 +775,10 @@ class TestAnchorPricePersistence:
         )
         engine1.on_event(event1, {'long': [], 'short': []})
 
-        # Save anchor price (simulate persistence)
+        # Save anchor price and grid structure (simulate persistence)
         saved_anchor = engine1.get_anchor_price()
+        original_grid = [(g['price'], g['side']) for g in engine1.grid.grid]
+        assert len(original_grid) > 0, "Grid should be built"
 
         # Second run: "restart" with market at different price
         engine2 = GridEngine(
@@ -803,6 +805,13 @@ class TestAnchorPricePersistence:
         # Grid should be centered at saved anchor (100k), not market price (105k)
         assert engine2.get_anchor_price() == saved_anchor
         assert engine2.get_anchor_price() == 100000.0
+
+        # Verify actual grid levels are preserved (same prices and sides)
+        restarted_grid = [(g['price'], g['side']) for g in engine2.grid.grid]
+        assert len(restarted_grid) == len(original_grid), \
+            f"Grid size mismatch: {len(restarted_grid)} != {len(original_grid)}"
+        assert restarted_grid == original_grid, \
+            "Grid levels should be identical after restart with anchor_price"
 
     def test_anchor_price_returns_original_center_after_fills(self):
         """
