@@ -815,11 +815,12 @@ class TestAnchorPricePersistence:
 
     def test_anchor_price_returns_original_center_after_fills(self):
         """
-        Test that anchor_price returns the original center, not filled WAIT levels.
-        
-        After order fills, update_grid() marks filled levels as WAIT, creating
-        multiple WAIT items. anchor_price should return the original center,
-        not the first WAIT item found (which could be a filled level at lower price).
+        Test that anchor_price returns the original center, not based on current WAIT zones.
+
+        After order fills, update_grid() marks the filled level as WAIT (too close to
+        place new orders). The original center should become BUY/SELL based on the new
+        price, but anchor_price should still return the original center price that was
+        set when the grid was first built.
         """
         config = GridConfig(grid_count=50, grid_step=0.2)
         engine = GridEngine(
@@ -843,11 +844,13 @@ class TestAnchorPricePersistence:
         )
         engine.on_event(ticker_event, {'long': [], 'short': []})
 
-        # Verify anchor is 100k
+        # Verify anchor is 100k and original center is WAIT
         original_anchor = engine.get_anchor_price()
         assert original_anchor == 100000.0
+        original_center = next(g for g in engine.grid.grid if g['price'] == 100000.0)
+        assert original_center['side'] == GridSideType.WAIT
 
-        # Simulate fill at lower price (99800) - this will create a WAIT item at 99800
+        # Simulate fill at lower price (99800)
         execution_event = ExecutionEvent(
             event_type=EventType.EXECUTION,
             symbol='BTCUSDT',
@@ -859,27 +862,46 @@ class TestAnchorPricePersistence:
         )
         engine.on_event(execution_event)
 
-        # Update grid - this marks items near 99800 as WAIT
-        engine.on_event(ticker_event, {'long': [], 'short': []})
+        # Update grid with price near the fill (realistic scenario)
+        # Price moved to 99850 after the fill at 99800
+        # Note: update_grid() is only called when there are some existing limit orders
+        ticker_after_fill = TickerEvent(
+            event_type=EventType.TICKER,
+            symbol='BTCUSDT',
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            last_price=Decimal('99850.0'),  # Price near fill, not at original center
+            mark_price=Decimal('99850.0'),
+            bid1_price=Decimal('99849.0'),
+            ask1_price=Decimal('99851.0'),
+            funding_rate=Decimal('0.0001')
+        )
+        # Simulate some existing limit orders (required for update_grid to be called)
+        existing_limits = {
+            'long': [
+                {'orderId': '1', 'price': '99600.0', 'side': 'Buy'},
+                {'orderId': '2', 'price': '99400.0', 'side': 'Buy'},
+            ],
+            'short': []
+        }
+        engine.on_event(ticker_after_fill, existing_limits)
 
         # Verify anchor_price still returns original center (100k), not filled price (99800)
         anchor_after_fill = engine.get_anchor_price()
         assert anchor_after_fill == 100000.0, \
             f"Expected anchor_price to remain 100000.0 after fill, got {anchor_after_fill}"
-        assert anchor_after_fill != 99800.0, \
-            "anchor_price should not return filled price, should return original center"
 
-        # Verify there are multiple WAIT items (original center + filled level)
-        wait_items = [g for g in engine.grid.grid if g['side'] == 'Wait']
-        assert len(wait_items) > 1, "Should have multiple WAIT items after fill"
-        
-        # Verify the first WAIT item (by price) is the filled level, not the center
-        wait_prices = sorted([g['price'] for g in wait_items])
-        first_wait_price = wait_prices[0]
-        assert first_wait_price < 100000.0, "First WAIT item should be at filled price (lower)"
-        
-        # But anchor_price should still be the original center
-        assert anchor_after_fill == 100000.0
+        # Only the filled level should be WAIT (price moved away from original center)
+        wait_items = [g for g in engine.grid.grid if g['side'] == GridSideType.WAIT]
+        assert len(wait_items) == 1, \
+            f"Should have only 1 WAIT item (filled level), got {len(wait_items)}: {[g['price'] for g in wait_items]}"
+        assert wait_items[0]['price'] == 99800.0, \
+            f"WAIT should be at filled price 99800, got {wait_items[0]['price']}"
+
+        # Original center should now be SELL (since price 99850 < 100000)
+        center_after_fill = next(g for g in engine.grid.grid if g['price'] == 100000.0)
+        assert center_after_fill['side'] == GridSideType.SELL, \
+            f"Original center should be SELL after price moved below it, got {center_after_fill['side']}"
 
 
 class TestGridConfigValidation:
