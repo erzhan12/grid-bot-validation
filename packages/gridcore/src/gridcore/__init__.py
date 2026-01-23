@@ -9,7 +9,7 @@ applications.
 from gridcore.events import Event, EventType, TickerEvent, PublicTradeEvent, ExecutionEvent, OrderUpdateEvent
 from gridcore.intents import PlaceLimitIntent, CancelIntent
 from gridcore.config import GridConfig
-from gridcore.grid import Grid
+from gridcore.grid import Grid, GridSideType
 from gridcore.engine import GridEngine
 from gridcore.position import PositionState, Position, PositionRiskManager, RiskConfig
 from gridcore.persistence import GridAnchorStore
@@ -27,6 +27,7 @@ __all__ = [
     "CancelIntent",
     "GridConfig",
     "Grid",
+    "GridSideType",
     "GridEngine",
     "PositionState",
     "Position",

@@ -44,7 +44,14 @@ if 'pybit.unified_trading' not in sys.modules:
 if 'pybit.exceptions' not in sys.modules:
     sys.modules['pybit.exceptions'] = MockPybit.exceptions
 
-from gridcore.grid import Grid
+from gridcore.grid import Grid, GridSideType
+
+
+def normalize_side(side: str) -> str:
+    """Normalize side value for comparison (handles 'wait' vs 'Wait' difference)."""
+    if side.lower() == 'wait':
+        return GridSideType.WAIT
+    return side
 
 
 class MockStrat:
@@ -184,7 +191,7 @@ class TestGridCalculationsMatchOriginal:
         for i, (orig, new) in enumerate(zip(original_greed.greed, new_grid.grid)):
             assert abs(orig['price'] - new['price']) < 0.00001, \
                 f"Price mismatch at index {i}: original={orig['price']}, new={new['price']}"
-            assert orig['side'] == new['side'], \
+            assert normalize_side(orig['side']) == new['side'], \
                 f"Side mismatch at index {i}: original={orig['side']}, new={new['side']}"
 
     def test_build_greed_various_tick_sizes(self):
@@ -247,7 +254,7 @@ class TestGridCalculationsMatchOriginal:
         for i, (orig, new) in enumerate(zip(original_greed.greed, new_grid.grid)):
             assert abs(orig['price'] - new['price']) < 0.00001, \
                 f"Price mismatch at {i} after update: {orig['price']} vs {new['price']}"
-            assert orig['side'] == new['side'], \
+            assert normalize_side(orig['side']) == new['side'], \
                 f"Side mismatch at {i} after update: {orig['side']} vs {new['side']}"
 
     def test_center_greed_buy_heavy_scenario(self):
@@ -276,8 +283,8 @@ class TestGridCalculationsMatchOriginal:
                 g['side'] = original_greed.WAIT
 
         for g in new_grid.grid:
-            if g['side'] == new_grid.SELL and g['price'] > 100500:
-                g['side'] = new_grid.WAIT
+            if g['side'] == GridSideType.SELL and g['price'] > 100500:
+                g['side'] = GridSideType.WAIT
 
         # Trigger centering via update
         last_filled = 99000.0
@@ -328,7 +335,7 @@ class TestGridCalculationsMatchOriginal:
             for i, (orig, new) in enumerate(zip(original_greed.greed, new_grid.grid)):
                 assert abs(orig['price'] - new['price']) < 0.00001, \
                     f"Price mismatch at {i} after update ({last_filled}, {last_close})"
-                assert orig['side'] == new['side'], \
+                assert normalize_side(orig['side']) == new['side'], \
                     f"Side mismatch at {i} after update ({last_filled}, {last_close})"
 
     def test_update_greed_out_of_bounds_behavior(self):
@@ -367,7 +374,7 @@ class TestGridCalculationsMatchOriginal:
         for i, (orig, new) in enumerate(zip(original_greed.greed, new_grid.grid)):
             assert abs(orig['price'] - new['price']) < 0.00001, \
                 f"Price mismatch at {i} after out-of-bounds update: original={orig['price']}, new={new['price']}"
-            assert orig['side'] == new['side'], \
+            assert normalize_side(orig['side']) == new['side'], \
                 f"Side mismatch at {i} after out-of-bounds update: original={orig['side']}, new={new['side']}"
 
 
@@ -798,7 +805,7 @@ class TestEngineStrat50Behavior:
 
         # Grid should have been updated (some items marked as WAIT near 99800)
         grid_after = engine.grid.grid
-        wait_items = [g for g in grid_after if g['side'] == 'wait']
+        wait_items = [g for g in grid_after if g['side'] == 'Wait']
         assert len(wait_items) > 0, "Grid should have WAIT items after execution"
 
     def test_cancel_intent_for_side_mismatch(self):
@@ -994,7 +1001,7 @@ class TestGridEdgeCaseBehavior:
         # Artificially create buy-heavy scenario by marking many sells as WAIT
         for g in grid.grid:
             if g['side'] == 'Sell' and g['price'] > 100500:
-                g['side'] = 'wait'
+                g['side'] = 'Wait'
 
         # Count before rebalancing
         buy_count_before = sum(1 for g in grid.grid if g['side'] == 'Buy')
@@ -1029,7 +1036,7 @@ class TestGridEdgeCaseBehavior:
         # Artificially create sell-heavy scenario
         for g in grid.grid:
             if g['side'] == 'Buy' and g['price'] < 99500:
-                g['side'] = 'wait'
+                g['side'] = 'Wait'
 
         # Trigger update which should call __center_grid
         grid.update_grid(101000.0, 100000.0)
@@ -1054,7 +1061,7 @@ class TestGridEdgeCaseBehavior:
         grid.update_grid(99800.0, 100000.0)
 
         # Items near 99800 should be marked as WAIT
-        wait_items = [g for g in grid.grid if g['side'] == 'wait']
+        wait_items = [g for g in grid.grid if g['side'] == 'Wait']
         assert len(wait_items) > 0, "Should have WAIT items near filled price"
 
         # Verify wait items are close to filled price
@@ -1159,7 +1166,7 @@ class TestGridEdgeCaseBehavior:
             # Full correctness (sorting + sequence) is tested through is_grid_correct() in other tests.
 
             # Should have WAIT items near filled prices
-            wait_items = [g for g in grid.grid if g['side'] == 'wait']
+            wait_items = [g for g in grid.grid if g['side'] == 'Wait']
             assert len(wait_items) > 0, f"Should have WAIT items after fill at {filled_price}"
 
 
@@ -1231,7 +1238,7 @@ class TestGridComparisonExtended:
         for i, (orig, new) in enumerate(zip(original_greed.greed, new_grid.grid)):
             assert abs(orig['price'] - new['price']) < 0.00001, \
                 f"Price mismatch at {i} after sell-heavy centering: {orig['price']} vs {new['price']}"
-            assert orig['side'] == new['side'], \
+            assert normalize_side(orig['side']) == new['side'], \
                 f"Side mismatch at {i} after sell-heavy centering: {orig['side']} vs {new['side']}"
 
     @pytest.mark.parametrize("grid_count", [10, 20])
@@ -1271,7 +1278,7 @@ class TestGridComparisonExtended:
         for i, (orig, new) in enumerate(zip(original_greed.greed, new_grid.grid)):
             assert abs(orig['price'] - new['price']) < 0.00001, \
                 f"Price mismatch at {i} for grid_count={grid_count}: {orig['price']} vs {new['price']}"
-            assert orig['side'] == new['side'], \
+            assert normalize_side(orig['side']) == new['side'], \
                 f"Side mismatch at {i} for grid_count={grid_count}: {orig['side']} vs {new['side']}"
 
     @pytest.mark.parametrize("grid_count", [100, 200])
@@ -1311,7 +1318,7 @@ class TestGridComparisonExtended:
         for i, (orig, new) in enumerate(zip(original_greed.greed, new_grid.grid)):
             assert abs(orig['price'] - new['price']) < 0.00001, \
                 f"Price mismatch at {i} for grid_count={grid_count}: {orig['price']} vs {new['price']}"
-            assert orig['side'] == new['side'], \
+            assert normalize_side(orig['side']) == new['side'], \
                 f"Side mismatch at {i} for grid_count={grid_count}: {orig['side']} vs {new['side']}"
 
     @pytest.mark.parametrize("grid_step", [0.05, 0.1, 0.5, 1.0])
@@ -1351,7 +1358,7 @@ class TestGridComparisonExtended:
         for i, (orig, new) in enumerate(zip(original_greed.greed, new_grid.grid)):
             assert abs(orig['price'] - new['price']) < 0.00001, \
                 f"Price mismatch at {i} for grid_step={grid_step}: {orig['price']} vs {new['price']}"
-            assert orig['side'] == new['side'], \
+            assert normalize_side(orig['side']) == new['side'], \
                 f"Side mismatch at {i} for grid_step={grid_step}: {orig['side']} vs {new['side']}"
 
     @pytest.mark.parametrize("price,tick_size", [
@@ -1396,7 +1403,7 @@ class TestGridComparisonExtended:
             tolerance = max(0.00001, abs(orig['price']) * 0.0000001)
             assert abs(orig['price'] - new['price']) < tolerance, \
                 f"Price mismatch at {i} for price={price}, tick_size={tick_size}: {orig['price']} vs {new['price']}"
-            assert orig['side'] == new['side'], \
+            assert normalize_side(orig['side']) == new['side'], \
                 f"Side mismatch at {i} for price={price}: {orig['side']} vs {new['side']}"
 
     def test_none_handling_matches_original(self):
@@ -1565,5 +1572,5 @@ class TestGridComparisonExtended:
             for i, (orig, new) in enumerate(zip(original_greed.greed, new_grid.grid)):
                 assert abs(orig['price'] - new['price']) < 0.00001, \
                     f"Price mismatch at {i} after rebuild at {rebuild_price}: {orig['price']} vs {new['price']}"
-                assert orig['side'] == new['side'], \
+                assert normalize_side(orig['side']) == new['side'], \
                     f"Side mismatch at {i} after rebuild at {rebuild_price}: {orig['side']} vs {new['side']}"

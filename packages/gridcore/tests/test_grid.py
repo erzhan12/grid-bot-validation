@@ -6,7 +6,7 @@ Tests grid level calculations to ensure identical behavior to original greed.py.
 
 import pytest
 from decimal import Decimal
-from gridcore.grid import Grid
+from gridcore.grid import Grid, GridSideType
 
 
 class TestGridBasic:
@@ -21,9 +21,9 @@ class TestGridBasic:
         assert len(grid.grid) == 51
 
         # Count sides
-        buy_count = sum(1 for g in grid.grid if g['side'] == grid.BUY)
-        sell_count = sum(1 for g in grid.grid if g['side'] == grid.SELL)
-        wait_count = sum(1 for g in grid.grid if g['side'] == grid.WAIT)
+        buy_count = sum(1 for g in grid.grid if g['side'] == GridSideType.BUY)
+        sell_count = sum(1 for g in grid.grid if g['side'] == GridSideType.SELL)
+        wait_count = sum(1 for g in grid.grid if g['side'] == GridSideType.WAIT)
 
         assert buy_count == 25
         assert wait_count == 1
@@ -90,13 +90,13 @@ class TestGridCorrectness:
         # Break sequence by putting SELL before BUY (but keep prices sorted)
         if len(grid.grid) > 10:
             # Find a BUY and a SELL
-            buy_item = next((g for g in grid.grid if g['side'] == grid.BUY), None)
-            sell_item = next((g for g in grid.grid if g['side'] == grid.SELL), None)
+            buy_item = next((g for g in grid.grid if g['side'] == GridSideType.BUY), None)
+            sell_item = next((g for g in grid.grid if g['side'] == GridSideType.SELL), None)
             
             if buy_item and sell_item and buy_item['price'] < sell_item['price']:
                 # Swap sides but keep prices sorted
-                buy_item['side'] = grid.SELL
-                sell_item['side'] = grid.BUY
+                buy_item['side'] = GridSideType.SELL
+                sell_item['side'] = GridSideType.BUY
                 # Should return False because sequence is wrong
                 assert grid.is_grid_correct() is False
 
@@ -162,7 +162,7 @@ class TestGridCorrectness:
 
         # Artificially set all sides to BUY
         for g in grid.grid:
-            g['side'] = grid.BUY
+            g['side'] = GridSideType.BUY
 
         # Should return False because sequence is invalid (no WAIT or SELL)
         assert grid.is_grid_correct() is False
@@ -174,7 +174,7 @@ class TestGridCorrectness:
 
         # Artificially set all sides to SELL
         for g in grid.grid:
-            g['side'] = grid.SELL
+            g['side'] = GridSideType.SELL
 
         # Should return False because sequence is invalid (no BUY or WAIT)
         assert grid.is_grid_correct() is False
@@ -186,7 +186,7 @@ class TestGridCorrectness:
 
         # Artificially set all sides to WAIT
         for g in grid.grid:
-            g['side'] = grid.WAIT
+            g['side'] = GridSideType.WAIT
 
         # Should return False because sequence is invalid (no BUY or SELL)
         assert grid.is_grid_correct() is False
@@ -197,7 +197,7 @@ class TestGridCorrectness:
         grid.build_grid(100000.0)
 
         # Remove WAIT items
-        grid.grid = [g for g in grid.grid if g['side'] != grid.WAIT]
+        grid.grid = [g for g in grid.grid if g['side'] != GridSideType.WAIT]
 
         # Should return True because BUY→SELL is a valid pattern
         assert grid.is_grid_correct() is True
@@ -220,14 +220,14 @@ class TestGridCorrectness:
 
         # Artificially create multiple consecutive WAITs by setting adjacent items to WAIT
         # Find the WAIT item and set adjacent items to WAIT as well
-        wait_index = next((i for i, g in enumerate(grid.grid) if g['side'] == grid.WAIT), None)
+        wait_index = next((i for i, g in enumerate(grid.grid) if g['side'] == GridSideType.WAIT), None)
         if wait_index is not None and 0 < wait_index < len(grid.grid) - 1:
             # Set item before WAIT to WAIT (if it's a BUY)
-            if grid.grid[wait_index - 1]['side'] == grid.BUY:
-                grid.grid[wait_index - 1]['side'] = grid.WAIT
+            if grid.grid[wait_index - 1]['side'] == GridSideType.BUY:
+                grid.grid[wait_index - 1]['side'] = GridSideType.WAIT
             # Set item after WAIT to WAIT (if it's a SELL)
-            if grid.grid[wait_index + 1]['side'] == grid.SELL:
-                grid.grid[wait_index + 1]['side'] = grid.WAIT
+            if grid.grid[wait_index + 1]['side'] == GridSideType.SELL:
+                grid.grid[wait_index + 1]['side'] = GridSideType.WAIT
 
         # Grid with multiple WAITs in a row should still be correct
         assert grid.is_grid_correct() is True
@@ -247,7 +247,7 @@ class TestGridUpdate:
         # The filled price should be marked as WAIT
         filled_level = next((g for g in grid.grid if abs(g['price'] - 99800.0) < 1), None)
         assert filled_level is not None
-        assert filled_level['side'] == grid.WAIT
+        assert filled_level['side'] == GridSideType.WAIT
 
     def test_update_grid_rebuilds_on_out_of_bounds(self):
         """Grid rebuilds if price moves outside bounds."""
@@ -271,7 +271,7 @@ class TestGridUpdate:
         assert new_max > original_max
 
         # Middle should be near new price
-        middle_prices = [g['price'] for g in grid.grid if g['side'] == grid.WAIT]
+        middle_prices = [g['price'] for g in grid.grid if g['side'] == GridSideType.WAIT]
         assert len(middle_prices) >= 1
         # Middle should be within a few steps of new price
         assert abs(middle_prices[0] - new_price) / new_price < 0.01
@@ -325,8 +325,8 @@ class TestGridRebalancing:
         assert max_price_after > max_price_before, "Grid should shift upward (new top level added)"
 
         # Verify the grid is still buy-heavy (rebalancing only shifts one level at a time)
-        buy_after = sum(1 for g in grid.grid if g['side'] == grid.BUY)
-        sell_after = sum(1 for g in grid.grid if g['side'] == grid.SELL)
+        buy_after = sum(1 for g in grid.grid if g['side'] == GridSideType.BUY)
+        sell_after = sum(1 for g in grid.grid if g['side'] == GridSideType.SELL)
         total_after = buy_after + sell_after
         if total_after > 0:
             imbalance_after = abs(buy_after - sell_after) / total_after
@@ -366,8 +366,8 @@ class TestGridRebalancing:
         assert min_price_after < min_price_before, "Grid should shift downward (new bottom level added)"
 
         # Verify the grid is still sell-heavy (rebalancing only shifts one level at a time)
-        buy_after = sum(1 for g in grid.grid if g['side'] == grid.BUY)
-        sell_after = sum(1 for g in grid.grid if g['side'] == grid.SELL)
+        buy_after = sum(1 for g in grid.grid if g['side'] == GridSideType.BUY)
+        sell_after = sum(1 for g in grid.grid if g['side'] == GridSideType.SELL)
         total_after = buy_after + sell_after
         if total_after > 0:
             imbalance_after = abs(sell_after - buy_after) / total_after
@@ -466,12 +466,12 @@ class TestGridRebuild:
 
         # Build at initial price
         grid.build_grid(100000.0)
-        wait_levels = [g for g in grid.grid if g['side'] == grid.WAIT]
+        wait_levels = [g for g in grid.grid if g['side'] == GridSideType.WAIT]
         assert abs(wait_levels[0]['price'] - 100000.0) < 1
 
         # Rebuild at new price
         grid.build_grid(120000.0)
-        wait_levels = [g for g in grid.grid if g['side'] == grid.WAIT]
+        wait_levels = [g for g in grid.grid if g['side'] == GridSideType.WAIT]
         assert abs(wait_levels[0]['price'] - 120000.0) < 1
 
         # Grid size should remain the same

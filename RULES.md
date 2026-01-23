@@ -19,6 +19,7 @@ Successfully extracted pure strategy logic from `bbu2-master` into `packages/gri
    - **IMPORTANT**: `tick_size` must be passed as `Decimal` parameter, not looked up from exchange
    - Removed: `read_from_db()`, `write_to_db()`, `strat` dependency
    - Added: `is_price_sorted()`, `is_greed_correct()` validation methods
+   - **GridSideType enum (2026-01-23)**: Renamed from `GridSide` to `GridSideType` for clarity (BUY, SELL, WAIT are type constants)
    - **is_grid_correct() Pattern Support (2026-01-10)**: Method accepts both BUY→WAIT→SELL and BUY→SELL patterns. Sometimes there's no WAIT state between BUY and SELL levels, which is now considered valid.
    - **Extended Comparison Tests (2026-01-20)**: Added 8 new direct comparison tests to `test_comparison.py::TestGridComparisonExtended` covering:
      - Sell-heavy rebalancing (opposite direction of existing buy-heavy test)
@@ -37,6 +38,19 @@ Successfully extracted pure strategy logic from `bbu2-master` into `packages/gri
    - Event-driven pattern: `on_event(event) → list[Intent]`
    - **CRITICAL**: Engine NEVER makes network calls or has side effects
    - Returns intents (PlaceLimitIntent, CancelIntent), execution layer handles actual orders
+   - **Helper Methods Pattern (2026-01-23)**: Use `_cancel_limit()` and `_cancel_all_limits()` for DRY CancelIntent creation
+     - `_cancel_limit(limit, reason)` - Creates single CancelIntent from limit dict
+     - `_cancel_all_limits(limits, reason)` - Creates list of CancelIntents
+     - Benefits: Eliminates code duplication, centralizes field extraction pattern, improves readability
+     - Usage: `intents.extend(self._cancel_all_limits(limits, 'rebuild'))` instead of loop
+     - Applies to all CancelIntent creation: rebuild, side_mismatch, outside_grid
+   - **OrderUpdateEvent Handling (2026-01-23)**: Tracks order lifecycle to prevent duplicate placements
+     - Original bbu2: Used `handle_order()` to accumulate WebSocket updates in buffer, merged with cached state in `get_limit_orders()`
+     - gridcore: Engine tracks `pending_orders` dict (client_order_id → order_id) to know what IT placed
+     - Statuses tracked: 'New', 'PartiallyFilled' (pending), 'Filled', 'Cancelled', 'Rejected' (terminal)
+     - **IMPORTANT**: Does NOT track 'Active' status (see Pitfall #15 below)
+     - Returns empty intent list (order tracking is internal state management only)
+     - Execution layer provides full `limit_orders` dict to `on_event()` - engine doesn't maintain order state
    - File: `packages/gridcore/src/gridcore/engine.py`
 
 4. **Position Risk Management Module (`position.py`)**
@@ -71,6 +85,12 @@ Successfully extracted pure strategy logic from `bbu2-master` into `packages/gri
    - Events (`events.py`): Immutable dataclasses representing market data and order updates
    - Intents (`intents.py`): Immutable dataclasses representing desired actions
    - **PITFALL**: All event dataclass fields that extend Event must have default values (Python dataclass inheritance requirement)
+   - **OrderUpdateEvent vs Original bbu2 (2026-01-23)**:
+     - **Original bbu2**: `handle_order()` accumulated WebSocket updates in `order_data` buffer, `get_limit_orders()` merged buffer with cached state and cleared buffer
+     - **gridcore**: Engine receives `OrderUpdateEvent` per order status change, tracks minimal `pending_orders` state, execution layer maintains full order list
+     - **Transformation**: Pull model (poll `get_limit_orders()`) → Push model (receive `OrderUpdateEvent`)
+     - **Responsibility split**: Engine tracks what it placed, execution layer provides current order state via `limit_orders` parameter
+     - **Status filtering**: Original checked `['Active', 'New', 'PartiallyFilled']` (V3 legacy), gridcore checks `['New', 'PartiallyFilled']` (V5 correct)
    - Files: `packages/gridcore/src/gridcore/events.py`, `packages/gridcore/src/gridcore/intents.py`
 
 6. **Testing**
@@ -164,7 +184,12 @@ uv run pytest packages/gridcore/tests/test_grid.py -v
 7. **ALWAYS** pass tick_size as Decimal parameter to Grid, never look it up from exchange
 8. **ALWAYS** run tests before committing changes to gridcore
 9. **Grid Rebuild**: `build_greed()` clears `self.greed = []` before building to prevent doubling on rebuilds
-10. **Duplicate Orders**: `PlaceLimitIntent.create()` uses deterministic `client_order_id` (SHA256 hash of symbol+side+price+grid_level+direction) so execution layer can detect/skip duplicates
+10. **Duplicate Orders**: `PlaceLimitIntent.create()` uses deterministic `client_order_id` (SHA256 hash of identity params) so execution layer can detect/skip duplicates
+    - **Dynamic Identity Hash (2026-01-23)**: Uses `_IDENTITY_PARAMS` class constant to define which parameters affect order identity
+    - Current identity params: `['symbol', 'side', 'price', 'grid_level', 'direction']`
+    - Excluded from hash: `qty` (execution layer determines), `reduce_only` (order flag)
+    - **Maintenance**: When adding new parameters, decide if they affect identity. If yes, add to `_IDENTITY_PARAMS`. If no (like `qty`), don't add.
+    - **Benefit**: No manual f-string construction; adding/removing identity params is a one-line change to the list
 11. **Position Risk Management**: For SHORT positions, higher liquidation ratio means closer to liquidation (use `>` not `<` in conditions)
 12. **Two-Position Architecture (CRITICAL)**: Always create BOTH Position objects and link with `set_opposite()`
     - Each trading pair requires two Position objects: one for long, one for short
@@ -190,6 +215,39 @@ uv run pytest packages/gridcore/tests/test_grid.py -v
     - Long: High liq → Moderate liq (modifies opposite) → Low margin → Position ratios
     - Short: High liq → Position ratios/margin → Moderate liq (modifies opposite)
     - Test scenarios must have SAFE liquidation ratios when testing position sizing logic
+14. **CancelIntent Creation (2026-01-23)**: Use helper methods instead of creating CancelIntent directly
+    - **DO**: `intents.append(self._cancel_limit(limit, 'reason'))` for single cancellation
+    - **DO**: `intents.extend(self._cancel_all_limits(limits, 'reason'))` for bulk cancellation
+    - **DON'T**: Create CancelIntent objects directly in loops (duplicates field extraction logic)
+    - File: `packages/gridcore/src/gridcore/engine.py` (see `_cancel_limit`, `_cancel_all_limits`)
+15. **Bybit Order Status 'Active' is LEGACY (2026-01-23)**: V5 API does NOT have 'Active' status
+    - **Bybit V3 API (deprecated Aug 31, 2024)**: Had 'Active' status for triggered conditional orders
+    - **Bybit V5 API (current)**: Valid statuses are 'New', 'PartiallyFilled', 'Filled', 'Cancelled', 'Rejected', 'Untriggered', 'Triggered', 'Deactivated'
+    - **bbu2-master issue**: Code checks `['Active', 'New', 'PartiallyFilled']` but uses V5 API (`category='linear'`)
+    - **Result**: 'Active' never matches (harmless but confusing migration artifact from V3→V5 upgrade)
+    - **gridcore fix**: Only checks actual V5 statuses: `['New', 'PartiallyFilled']` for pending, `['Filled', 'Cancelled', 'Rejected']` for terminal
+    - **Reference**: [Bybit V5 Order Status Enums](https://bybit-exchange.github.io/docs/v5/enum), [V3→V5 Migration](https://announcements.bybit.com/article/important-api-update-transition-from-open-api-v3-to-open-api-v5-blt07c25e4e6f734fee/)
+    - File: `bbu_reference/bbu2-master/bybit_api_usdt.py:41`, `packages/gridcore/src/gridcore/engine.py:157-160`
+16. **PlaceLimitIntent Identity Parameters (2026-01-23)**: When adding new parameters to `PlaceLimitIntent.create()`, update `_IDENTITY_PARAMS`
+    - **Rule**: If new parameter affects order uniqueness (like `symbol`, `price`, `grid_level`), add it to `_IDENTITY_PARAMS` class constant
+    - **Exception**: Parameters that DON'T affect identity (like `qty`, `reduce_only`) should NOT be added
+    - **Why**: `client_order_id` is SHA256 hash of identity params for deduplication; wrong params = broken deduplication
+    - **Pattern**: `_IDENTITY_PARAMS = ['symbol', 'side', 'price', 'grid_level', 'direction']` drives dynamic hash generation
+    - **Test**: `test_qty_does_not_affect_id` verifies that `qty` is correctly excluded from identity hash
+    - File: `packages/gridcore/src/gridcore/intents.py:21`
+17. **Testing Grid State (2026-01-23)**: When testing anchor_price or grid state, verify against actual grid structure, not just input values
+    - **DON'T**: `assert engine.get_anchor_price() == 100000.0` (only checks input value)
+    - **DO**: Extract WAIT prices from grid, verify anchor matches actual WAIT zone
+    - **Pattern**: `wait_prices = [g['price'] for g in engine.grid.grid if g['side'] == GridSideType.WAIT]; assert anchor in wait_prices`
+    - **Why**: Grid may round prices, have multiple WAIT zones, or transform input in unexpected ways
+    - **Example**: `test_get_anchor_price_returns_wait_zone_price` verifies anchor matches actual grid WAIT zone
+    - File: `packages/gridcore/tests/test_engine.py:703-737`
+18. **GridSideType Naming (2026-01-23)**: Use `GridSideType` enum, not raw strings
+    - **DO**: `g['side'] == GridSideType.WAIT` (type-safe, autocomplete, refactorable)
+    - **DON'T**: `g['side'] == 'Wait'` (typo-prone, no IDE support)
+    - **Values**: `GridSideType.BUY` ('Buy'), `GridSideType.SELL` ('Sell'), `GridSideType.WAIT` ('Wait')
+    - **History**: Renamed from `GridSide` to `GridSideType` for clarity (these are type constants, not directional sides)
+    - File: `packages/gridcore/src/gridcore/grid.py:20-24`
 
 ## Grid Anchor Persistence
 

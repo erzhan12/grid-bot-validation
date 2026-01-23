@@ -9,8 +9,9 @@ from datetime import datetime, UTC
 from decimal import Decimal
 from gridcore.engine import GridEngine
 from gridcore.config import GridConfig
-from gridcore.events import TickerEvent, ExecutionEvent, OrderUpdateEvent, EventType
+from gridcore.events import TickerEvent, ExecutionEvent, OrderUpdateEvent, PublicTradeEvent, EventType
 from gridcore.intents import PlaceLimitIntent, CancelIntent
+from gridcore.grid import GridSideType
 
 
 class TestGridEngineBasic:
@@ -229,6 +230,7 @@ class TestGridEngineCancellation:
         # Create a limit order with wrong side (Sell at buy price)
         # Find a buy level price
         buy_level = next(g for g in engine.grid.grid if g['side'] == 'Buy')
+        wrong_price = Decimal(str(buy_level['price']))
         wrong_side_order = {
             'orderId': 'order123',
             'price': str(buy_level['price']),
@@ -243,6 +245,15 @@ class TestGridEngineCancellation:
         cancel_intents = [i for i in intents if isinstance(i, CancelIntent) and i.reason == 'side_mismatch']
         assert len(cancel_intents) >= 1
         assert any(i.order_id == 'order123' for i in cancel_intents)
+
+        # Check that the order was replaced with a Buy order at the SAME price
+        place_intents = [i for i in intents if isinstance(i, PlaceLimitIntent)]
+        replacement_intent = next(
+            (i for i in place_intents if i.side == 'Buy' and i.price == wrong_price),
+            None
+        )
+        assert replacement_intent is not None, \
+            f"Expected Buy order at {wrong_price} to replace cancelled Sell"
 
     def test_cancel_intent_outside_grid(self):
         """Price outside grid range gets CancelIntent."""
@@ -271,7 +282,7 @@ class TestGridEngineCancellation:
             'qty': '0.001'
         }
 
-        intents = engine.on_event(event, {'long': [outside_order], 'short': []})
+        intents = engine.on_event(event, {'long': [], 'short': [outside_order]})
 
         # Should have cancel intent for outside grid
         cancel_intents = [i for i in intents if isinstance(i, CancelIntent) and i.reason == 'outside_grid']
@@ -299,7 +310,7 @@ class TestGridEngineCancellation:
 
         # Store original grid state
         original_grid_size = len(engine.grid.grid)
-        # original_center_price = next((g['price'] for g in engine.grid.grid if g['side'] == engine.grid.WAIT), None)
+        # original_center_price = next((g['price'] for g in engine.grid.grid if g['side'] == GridSideType.WAIT), None)
 
         # Create too many orders (> 60)
         too_many_orders = [
@@ -331,7 +342,7 @@ class TestGridEngineCancellation:
         assert len(cancel_intents) == 70
 
         # Grid should be rebuilt (centered on new price)
-        new_center_price = next((g['price'] for g in engine.grid.grid if g['side'] == engine.grid.WAIT), None)
+        new_center_price = next((g['price'] for g in engine.grid.grid if g['side'] == GridSideType.WAIT), None)
         assert new_center_price is not None
         # Center should be near the new price (within a few steps)
         assert abs(new_center_price - 105000.0) / 105000.0 < 0.01
@@ -714,10 +725,16 @@ class TestAnchorPricePersistence:
 
         engine.on_event(event, {'long': [], 'short': []})
 
-        # get_anchor_price should return the center (WAIT zone) price
+        # Find the actual WAIT zone price(s) from the grid
+        wait_prices = [g['price'] for g in engine.grid.grid if g['side'] == GridSideType.WAIT]
+        assert len(wait_prices) >= 1, "Grid should have at least one WAIT zone"
+
+        # get_anchor_price should return the original center WAIT price
         anchor = engine.get_anchor_price()
         assert anchor is not None
+        # Anchor should match the original WAIT zone (middle of WAIT zones if multiple)
         assert anchor == 100000.0
+        assert anchor in wait_prices, f"Anchor {anchor} should be in WAIT zones {wait_prices}"
 
     def test_get_anchor_price_returns_none_when_grid_empty(self):
         """get_anchor_price returns None when grid is empty."""
@@ -844,7 +861,7 @@ class TestAnchorPricePersistence:
             "anchor_price should not return filled price, should return original center"
 
         # Verify there are multiple WAIT items (original center + filled level)
-        wait_items = [g for g in engine.grid.grid if g['side'] == 'wait']
+        wait_items = [g for g in engine.grid.grid if g['side'] == 'Wait']
         assert len(wait_items) > 1, "Should have multiple WAIT items after fill"
         
         # Verify the first WAIT item (by price) is the filled level, not the center
@@ -854,3 +871,176 @@ class TestAnchorPricePersistence:
         
         # But anchor_price should still be the original center
         assert anchor_after_fill == 100000.0
+
+
+class TestGridConfigValidation:
+    """Tests for GridConfig validation in __post_init__."""
+
+    def test_grid_count_must_be_positive(self):
+        """grid_count <= 0 raises ValueError."""
+        with pytest.raises(ValueError, match="grid_count must be positive"):
+            GridConfig(grid_count=0, grid_step=0.2)
+
+        with pytest.raises(ValueError, match="grid_count must be positive"):
+            GridConfig(grid_count=-1, grid_step=0.2)
+
+    def test_grid_step_must_be_positive(self):
+        """grid_step <= 0 raises ValueError."""
+        with pytest.raises(ValueError, match="grid_step must be positive"):
+            GridConfig(grid_count=50, grid_step=0)
+
+        with pytest.raises(ValueError, match="grid_step must be positive"):
+            GridConfig(grid_count=50, grid_step=-0.1)
+
+    def test_rebalance_threshold_must_be_between_0_and_1(self):
+        """rebalance_threshold outside (0, 1) raises ValueError."""
+        with pytest.raises(ValueError, match="rebalance_threshold must be between 0 and 1"):
+            GridConfig(grid_count=50, grid_step=0.2, rebalance_threshold=0)
+
+        with pytest.raises(ValueError, match="rebalance_threshold must be between 0 and 1"):
+            GridConfig(grid_count=50, grid_step=0.2, rebalance_threshold=1)
+
+        with pytest.raises(ValueError, match="rebalance_threshold must be between 0 and 1"):
+            GridConfig(grid_count=50, grid_step=0.2, rebalance_threshold=1.5)
+
+        with pytest.raises(ValueError, match="rebalance_threshold must be between 0 and 1"):
+            GridConfig(grid_count=50, grid_step=0.2, rebalance_threshold=-0.1)
+
+    def test_valid_config_succeeds(self):
+        """Valid config values pass validation."""
+        config = GridConfig(grid_count=50, grid_step=0.2, rebalance_threshold=0.3)
+        assert config.grid_count == 50
+        assert config.grid_step == 0.2
+        assert config.rebalance_threshold == 0.3
+
+
+class TestPublicTradeEventValidation:
+    """Tests for PublicTradeEvent validation."""
+
+    def test_public_trade_event_validates_event_type(self):
+        """PublicTradeEvent enforces event_type=PUBLIC_TRADE."""
+        # Valid event
+        valid_event = PublicTradeEvent(
+            event_type=EventType.PUBLIC_TRADE,
+            symbol='BTCUSDT',
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            trade_id='trade123',
+            side='Buy',
+            price=Decimal('100000.0'),
+            size=Decimal('0.001')
+        )
+        assert valid_event.event_type == EventType.PUBLIC_TRADE
+
+        # Invalid event type should raise ValueError
+        with pytest.raises(ValueError, match="PublicTradeEvent must have event_type=PUBLIC_TRADE"):
+            PublicTradeEvent(
+                event_type=EventType.TICKER,  # Wrong type
+                symbol='BTCUSDT',
+                exchange_ts=datetime.now(UTC),
+                local_ts=datetime.now(UTC),
+                trade_id='trade123',
+                side='Buy',
+                price=Decimal('100000.0'),
+                size=Decimal('0.001')
+            )
+
+
+class TestEngineEdgeCasesAdvanced:
+    """Advanced edge case tests for engine coverage."""
+
+    def test_get_wait_indices_fallback_no_wait_items(self):
+        """Test fallback when no WAIT indices exist (line 232)."""
+        config = GridConfig(grid_count=50, grid_step=0.2)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
+
+        # Build grid first
+        event = TickerEvent(
+            event_type=EventType.TICKER,
+            symbol='BTCUSDT',
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            last_price=Decimal('100000.0'),
+            mark_price=Decimal('100000.0'),
+            bid1_price=Decimal('99999.0'),
+            ask1_price=Decimal('100001.0'),
+            funding_rate=Decimal('0.0001')
+        )
+        engine.on_event(event, {'long': [], 'short': []})
+
+        # Remove all WAIT items to trigger fallback
+        engine.grid.grid = [g for g in engine.grid.grid if g['side'] != GridSideType.WAIT]
+
+        # Call _get_wait_indices - should use fallback
+        center_index = engine._get_wait_indices()
+        expected_center = len(engine.grid.grid) // 2
+        assert center_index == expected_center
+
+    def test_get_wait_indices_empty_grid(self):
+        """Test fallback when grid is empty (line 232)."""
+        config = GridConfig(grid_count=50, grid_step=0.2)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
+
+        # Grid is empty initially
+        center_index = engine._get_wait_indices()
+        assert center_index == 0
+
+    def test_create_place_intent_returns_none_for_wait(self):
+        """_create_place_intent returns None for WAIT side (line 317)."""
+        config = GridConfig(grid_count=50, grid_step=0.2)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
+        engine.last_close = 100000.0
+
+        wait_grid = {'side': 'Wait', 'price': 100000.0}
+        result = engine._create_place_intent(wait_grid, 'long', 25)
+        assert result is None
+
+    def test_create_place_intent_returns_none_when_no_last_close(self):
+        """_create_place_intent returns None when last_close is None (line 320)."""
+        config = GridConfig(grid_count=50, grid_step=0.2)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
+
+        # last_close is None by default
+        assert engine.last_close is None
+
+        buy_grid = {'side': 'Buy', 'price': 99000.0}
+        result = engine._create_place_intent(buy_grid, 'long', 10)
+        assert result is None
+
+    def test_create_place_intent_returns_none_when_too_close(self):
+        """_create_place_intent returns None when price too close to market (line 332)."""
+        config = GridConfig(grid_count=50, grid_step=0.2)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
+        engine.last_close = 100000.0
+
+        # Grid step is 0.2%, so grid_step/2 = 0.1%
+        # Price at 99950 is 0.05% below 100000 - too close
+        too_close_buy = {'side': 'Buy', 'price': 99950.0}
+        result = engine._create_place_intent(too_close_buy, 'long', 10)
+        assert result is None
+
+    def test_execution_event_before_grid_built(self):
+        """ExecutionEvent before grid is built doesn't crash."""
+        config = GridConfig(grid_count=50, grid_step=0.2)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
+
+        # Send execution event without building grid first
+        exec_event = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol='BTCUSDT',
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            exec_id='exec123',
+            order_id='order123',
+            order_link_id='client123',
+            side='Buy',
+            price=Decimal('99800.0'),
+            qty=Decimal('0.001'),
+            fee=Decimal('0.05'),
+            closed_pnl=Decimal('0')
+        )
+
+        # last_close is None, so grid.update_grid won't be called
+        intents = engine.on_event(exec_event)
+        assert len(intents) == 0
+        assert engine.last_filled_price == 99800.0

@@ -30,6 +30,10 @@ class PlaceLimitIntent:
     grid_level: int       # Grid level index for comparison reports
     direction: str        # 'long' or 'short'
 
+    # Parameters that determine order identity for deduplication
+    # Excludes: qty (execution layer determines), reduce_only (order flag)
+    _IDENTITY_PARAMS = ['symbol', 'side', 'price', 'grid_level', 'direction']
+
     @classmethod
     def create(
         cls,
@@ -44,24 +48,31 @@ class PlaceLimitIntent:
         """
         Factory method to create a PlaceLimitIntent with deterministic client_order_id.
 
-        The client_order_id is generated deterministically from order characteristics,
-        ensuring that duplicate placement attempts for the same grid level produce
-        the same ID. This allows the execution layer to detect and skip duplicates.
+        The client_order_id is generated deterministically from order identity parameters
+        (see _IDENTITY_PARAMS), ensuring that duplicate placement attempts for the same
+        grid level produce the same ID. This allows the execution layer to detect and
+        skip duplicates.
+
+        NOTE: When adding new parameters, consider whether they should be part of the
+        identity hash. If yes, add to _IDENTITY_PARAMS. If no (like qty), don't add.
 
         Args:
             symbol: Trading pair symbol
             side: 'Buy' or 'Sell'
             price: Limit order price
-            qty: Order quantity
+            qty: Order quantity (NOT part of identity hash)
             grid_level: Grid level index (for tracking/reporting)
             direction: 'long' or 'short'
-            reduce_only: Whether this is a reduce-only order
+            reduce_only: Whether this is a reduce-only order (NOT part of identity hash)
 
         Returns:
             PlaceLimitIntent with deterministic client_order_id
         """
-        # Generate deterministic client_order_id from order characteristics
-        id_string = f"{symbol}_{side}_{price}_{grid_level}_{direction}"
+        # Generate deterministic client_order_id from identity parameters
+        # Dynamically build from _IDENTITY_PARAMS to avoid maintenance issues
+        params = locals()
+        id_components = [str(params[param]) for param in cls._IDENTITY_PARAMS]
+        id_string = "_".join(id_components)
         deterministic_id = hashlib.sha256(id_string.encode()).hexdigest()[:16]
 
         return cls(

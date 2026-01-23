@@ -11,9 +11,17 @@ Extracted from bbu2-master/greed.py with the following key transformations:
 
 import logging
 from decimal import Decimal
+from enum import StrEnum
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+class GridSideType(StrEnum):
+    """Grid level side type constants."""
+    BUY = 'Buy'
+    SELL = 'Sell'
+    WAIT = 'Wait'
 
 
 class Grid:
@@ -39,9 +47,6 @@ class Grid:
         self.tick_size = tick_size
         self.grid_count = grid_count
         self.grid_step = grid_step
-        self.BUY = 'Buy'
-        self.SELL = 'Sell'
-        self.WAIT = 'wait'
         self.REBALANCE_THRESHOLD = rebalance_threshold
         self._original_anchor_price: Optional[float] = None
 
@@ -90,7 +95,7 @@ class Grid:
         rounded_price = self._round_price(last_close)
         self._original_anchor_price = rounded_price
         self.grid.append({
-            'side': self.WAIT,
+            'side': GridSideType.WAIT,
             'price': rounded_price
         })
 
@@ -98,13 +103,13 @@ class Grid:
         price = last_close
         for _ in range(half_grid):
             price = self._round_price(price * (1 + step))
-            self.grid.append({'side': self.SELL, 'price': price})
+            self.grid.append({'side': GridSideType.SELL, 'price': price})
 
         # Build lower half (BUY orders)
         price = last_close
         for _ in range(half_grid):
             price = self._round_price(price * (1 - step))
-            self.grid.insert(0, {'side': self.BUY, 'price': price})
+            self.grid.insert(0, {'side': GridSideType.BUY, 'price': price})
 
     def __rebuild_grid(self, last_close: float) -> None:
         """
@@ -144,11 +149,11 @@ class Grid:
         # Update grid sides
         for grid in self.grid:
             if self.__is_too_close(grid['price'], last_filled_price):
-                grid['side'] = self.WAIT
+                grid['side'] = GridSideType.WAIT
             elif last_close < grid['price']:
-                grid['side'] = self.SELL
+                grid['side'] = GridSideType.SELL
             elif last_close > grid['price']:
-                grid['side'] = self.BUY
+                grid['side'] = GridSideType.BUY
 
         self.__center_grid()
 
@@ -169,9 +174,9 @@ class Grid:
 
         # Single pass to count and find prices
         for grid in self.grid:
-            if grid['side'] == self.BUY:
+            if grid['side'] == GridSideType.BUY:
                 buy_count += 1
-            elif grid['side'] == self.SELL:
+            elif grid['side'] == GridSideType.SELL:
                 sell_count += 1
                 highest_sell_price = grid['price']
 
@@ -183,13 +188,13 @@ class Grid:
         if (buy_count - sell_count) / total_count > self.REBALANCE_THRESHOLD:
             self.grid.pop(0)  # Delete the bottom line
             price = self._round_price(highest_sell_price * (1 + step))
-            self.grid.append({'side': self.SELL, 'price': price})
+            self.grid.append({'side': GridSideType.SELL, 'price': price})
 
         # Too many sells → shift grid downward
         elif (sell_count - buy_count) / total_count > self.REBALANCE_THRESHOLD:
             self.grid.pop()  # Delete the top line
             price = self._round_price(lowest_buy_price * (1 - step))
-            self.grid.insert(0, {'side': self.BUY, 'price': price})
+            self.grid.insert(0, {'side': GridSideType.BUY, 'price': price})
 
     def __is_too_close(self, price1: float, price2: float) -> bool:
         """
@@ -249,7 +254,7 @@ class Grid:
         for grid in self.grid:
             side = grid['side']
 
-            if side == self.BUY:
+            if side == GridSideType.BUY:
                 # BUY is only valid in BUY phase (state 0)
                 if current_state == 0:
                     has_seen_buy = True
@@ -257,7 +262,7 @@ class Grid:
                 else:
                     # Can't go back to BUY after WAIT or SELL
                     return False
-            elif side == self.WAIT:
+            elif side == GridSideType.WAIT:
                 # WAIT is valid after BUY (state 0) or after other WAITs (state 1)
                 if current_state == 0 and has_seen_buy:
                     # Transition from BUY to WAIT phase
@@ -269,7 +274,7 @@ class Grid:
                 else:
                     # WAIT not allowed after SELL
                     return False
-            elif side == self.SELL:
+            elif side == GridSideType.SELL:
                 # SELL is valid after BUY (state 0), WAIT (state 1), or other SELLs (state 2)
                 if current_state == 0 and has_seen_buy:
                     # Direct transition from BUY to SELL (no WAIT)
@@ -297,7 +302,7 @@ class Grid:
 
         Reference: bbu2-master/greed.py:143-149
         """
-        return sum(1 for step in self.grid if step['side'] == self.SELL)
+        return sum(1 for step in self.grid if step['side'] == GridSideType.SELL)
 
     @property
     def __grid_count_buy(self) -> int:
@@ -306,7 +311,7 @@ class Grid:
 
         Reference: bbu2-master/greed.py:151-157
         """
-        return sum(1 for step in self.grid if step['side'] == self.BUY)
+        return sum(1 for step in self.grid if step['side'] == GridSideType.BUY)
 
     @property
     def __min_grid(self) -> float:

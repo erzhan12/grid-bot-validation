@@ -15,7 +15,7 @@ from typing import Optional
 from gridcore.config import GridConfig
 
 from gridcore.events import Event, TickerEvent, ExecutionEvent, OrderUpdateEvent
-from gridcore.grid import Grid
+from gridcore.grid import Grid, GridSideType
 from gridcore.intents import PlaceLimitIntent, CancelIntent
 
 logger = logging.getLogger(__name__)
@@ -173,6 +173,38 @@ class GridEngine:
         """
         return self.grid.anchor_price
 
+    def _cancel_limit(self, limit: dict, reason: str) -> CancelIntent:
+        """
+        Create a CancelIntent for a single limit order.
+
+        Args:
+            limit: Limit order dict with 'orderId', 'price', 'side'
+            reason: Cancellation reason (e.g., 'rebuild', 'side_mismatch', 'outside_grid')
+
+        Returns:
+            CancelIntent for the order
+        """
+        return CancelIntent(
+            symbol=self.symbol,
+            order_id=limit['orderId'],
+            reason=reason,
+            price=Decimal(str(limit['price'])),
+            side=limit['side']
+        )
+
+    def _cancel_all_limits(self, limits: list[dict], reason: str) -> list[CancelIntent]:
+        """
+        Create CancelIntent objects for multiple limit orders.
+
+        Args:
+            limits: List of limit order dicts
+            reason: Cancellation reason for all orders
+
+        Returns:
+            List of CancelIntent objects
+        """
+        return [self._cancel_limit(limit, reason) for limit in limits]
+
     def _check_and_place(self, direction: str, limits: list[dict]) -> list[PlaceLimitIntent | CancelIntent]:
         """
         Check grid and generate intents for order placement/cancellation.
@@ -194,14 +226,7 @@ class GridEngine:
             # Rebuild grid if we have a valid last_close (matches original behavior)
             if self.last_close is not None:
                 self.grid.build_grid(self.last_close)
-            for limit in limits:
-                intents.append(CancelIntent(
-                    symbol=self.symbol,
-                    order_id=limit['orderId'],
-                    reason='rebuild',
-                    price=Decimal(str(limit['price'])),
-                    side=limit['side']
-                ))
+            intents.extend(self._cancel_all_limits(limits, 'rebuild'))
             return intents
 
         # Update grid if we have some fills
@@ -223,7 +248,7 @@ class GridEngine:
         Returns:
             Index of center of grid
         """
-        wait_indices = [i for i, grid_item in enumerate(self.grid.grid) if grid_item['side'] == self.grid.WAIT]
+        wait_indices = [i for i, grid_item in enumerate(self.grid.grid) if grid_item['side'] == GridSideType.WAIT]
         if wait_indices:
             # Use the middle of the WAIT region as center
             center_index = (wait_indices[0] + wait_indices[-1]) // 2
@@ -255,7 +280,7 @@ class GridEngine:
 
         # Find center and create sorted grid items
         center_index = self._get_wait_indices()
-        indexed_grids = [(i, grid_item) for i, grid_item in enumerate(self.grid.grid) if grid_item['side'] != self.grid.WAIT]
+        indexed_grids = [(i, grid_item) for i, grid_item in enumerate(self.grid.grid) if grid_item['side'] != GridSideType.WAIT]
         # Sort by distance from center (primary) then by price (secondary)
         sorted_grids = sorted(indexed_grids, key=lambda x: (abs(x[0] - center_index), x[1]['price']))
 
@@ -267,13 +292,7 @@ class GridEngine:
             if limit:
                 # Cancel if side mismatch
                 if limit['side'] != grid_item['side']:
-                    intents.append(CancelIntent(
-                        symbol=self.symbol,
-                        order_id=limit['orderId'],
-                        reason='side_mismatch',
-                        price=Decimal(str(limit['price'])),
-                        side=limit['side']
-                    ))
+                    intents.append(self._cancel_limit(limit, 'side_mismatch'))
                     # Then place correct order
                     place_intent = self._create_place_intent(grid_item, direction, index)
                     if place_intent:
@@ -286,16 +305,11 @@ class GridEngine:
 
         # Cancel limits outside grid range
         grid_price_set = {round(grid_item['price'], 8) for grid_item in self.grid.grid}
-        for limit in sorted_limits:
-            limit_price = round(float(limit['price']), 8)
-            if limit_price not in grid_price_set:
-                intents.append(CancelIntent(
-                    symbol=self.symbol,
-                    order_id=limit['orderId'],
-                    reason='outside_grid',
-                    price=Decimal(str(limit['price'])),
-                    side=limit['side']
-                ))
+        outside_limits = [
+            limit for limit in sorted_limits
+            if round(float(limit['price']), 8) not in grid_price_set
+        ]
+        intents.extend(self._cancel_all_limits(outside_limits, 'outside_grid'))
 
         return intents
 
@@ -313,7 +327,7 @@ class GridEngine:
         Returns:
             PlaceLimitIntent or None if order shouldn't be placed
         """
-        if grid['side'] == self.grid.WAIT:
+        if grid['side'] == GridSideType.WAIT:
             return None
 
         if self.last_close is None:
@@ -323,8 +337,8 @@ class GridEngine:
         diff_p = (self.last_close - grid['price']) / self.last_close * 100
 
         # Buy orders must be below market, sell orders above market
-        if (grid['side'] == self.grid.BUY and diff_p <= 0) or \
-           (grid['side'] == self.grid.SELL and diff_p >= 0):
+        if (grid['side'] == GridSideType.BUY and diff_p <= 0) or \
+           (grid['side'] == GridSideType.SELL and diff_p >= 0):
             return None
 
         # Must be far enough from current price
