@@ -1,0 +1,658 @@
+"""Tests for gridbot orchestrator module."""
+
+import asyncio
+from decimal import Decimal
+from unittest.mock import Mock, MagicMock, patch, AsyncMock
+
+import pytest
+
+from gridbot.config import GridbotConfig, AccountConfig, StrategyConfig
+from gridbot.orchestrator import Orchestrator
+
+
+@pytest.fixture
+def account_config():
+    """Sample account configuration."""
+    return AccountConfig(
+        name="test_account",
+        api_key="test_key",
+        api_secret="test_secret",
+        testnet=True,
+    )
+
+
+@pytest.fixture
+def strategy_config():
+    """Sample strategy configuration."""
+    return StrategyConfig(
+        strat_id="btcusdt_test",
+        account="test_account",
+        symbol="BTCUSDT",
+        tick_size=Decimal("0.1"),
+        grid_count=20,
+        grid_step=0.2,
+        shadow_mode=False,
+    )
+
+
+@pytest.fixture
+def gridbot_config(account_config, strategy_config):
+    """Sample gridbot configuration."""
+    return GridbotConfig(
+        accounts=[account_config],
+        strategies=[strategy_config],
+        database_url="sqlite:///:memory:",
+        position_check_interval=60.0,
+    )
+
+
+class TestOrchestratorBasic:
+    """Basic tests for Orchestrator."""
+
+    def test_create_orchestrator(self, gridbot_config):
+        """Test creating orchestrator."""
+        orchestrator = Orchestrator(gridbot_config)
+
+        assert orchestrator.running is False
+        assert len(orchestrator._runners) == 0
+
+
+class TestOrchestratorInit:
+    """Tests for orchestrator initialization."""
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_init_account(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        gridbot_config,
+        account_config,
+    ):
+        """Test account initialization."""
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+
+        assert "test_account" in orchestrator._rest_clients
+        assert "test_account" in orchestrator._executors
+        assert "test_account" in orchestrator._reconcilers
+        assert "test_account" in orchestrator._public_ws
+        assert "test_account" in orchestrator._private_ws
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_init_strategy(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        gridbot_config,
+        account_config,
+        strategy_config,
+    ):
+        """Test strategy initialization."""
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+
+        assert "btcusdt_test" in orchestrator._runners
+        assert "btcusdt_test" in orchestrator._retry_queues
+
+
+class TestOrchestratorRouting:
+    """Tests for event routing."""
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_build_routing_maps(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        gridbot_config,
+        account_config,
+        strategy_config,
+    ):
+        """Test routing map construction."""
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+
+        # Check symbol routing
+        assert "BTCUSDT" in orchestrator._symbol_to_runners
+        assert len(orchestrator._symbol_to_runners["BTCUSDT"]) == 1
+
+        # Check account routing
+        assert "test_account" in orchestrator._account_to_runners
+        assert len(orchestrator._account_to_runners["test_account"]) == 1
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_get_account_for_strategy(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        gridbot_config,
+    ):
+        """Test getting account for strategy."""
+        orchestrator = Orchestrator(gridbot_config)
+
+        account = orchestrator._get_account_for_strategy("btcusdt_test")
+        assert account == "test_account"
+
+        account = orchestrator._get_account_for_strategy("nonexistent")
+        assert account is None
+
+
+class TestOrchestratorMultipleStrategies:
+    """Tests with multiple strategies."""
+
+    @pytest.fixture
+    def multi_config(self, account_config):
+        """Config with multiple strategies."""
+        strategies = [
+            StrategyConfig(
+                strat_id="btcusdt_test",
+                account="test_account",
+                symbol="BTCUSDT",
+                tick_size=Decimal("0.1"),
+            ),
+            StrategyConfig(
+                strat_id="ethusdt_test",
+                account="test_account",
+                symbol="ETHUSDT",
+                tick_size=Decimal("0.01"),
+            ),
+        ]
+        return GridbotConfig(
+            accounts=[account_config],
+            strategies=strategies,
+        )
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_multiple_strategies_same_account(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        multi_config,
+        account_config,
+    ):
+        """Test multiple strategies on same account."""
+        orchestrator = Orchestrator(multi_config)
+        await orchestrator._init_account(account_config)
+
+        for strategy in multi_config.strategies:
+            await orchestrator._init_strategy(strategy)
+
+        orchestrator._build_routing_maps()
+
+        # Should have 2 runners
+        assert len(orchestrator._runners) == 2
+
+        # Account should have 2 runners
+        assert len(orchestrator._account_to_runners["test_account"]) == 2
+
+        # Each symbol should have 1 runner
+        assert len(orchestrator._symbol_to_runners["BTCUSDT"]) == 1
+        assert len(orchestrator._symbol_to_runners["ETHUSDT"]) == 1
+
+
+class TestOrchestratorLifecycle:
+    """Tests for orchestrator lifecycle."""
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_start_sets_running(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        gridbot_config,
+    ):
+        """Test start sets running flag."""
+        # Mock WebSocket connect methods
+        mock_public_ws.return_value.connect = Mock()
+        mock_public_ws.return_value.subscribe_ticker = Mock()
+        mock_private_ws.return_value.connect = Mock()
+        mock_private_ws.return_value.subscribe_position = Mock()
+        mock_private_ws.return_value.subscribe_order = Mock()
+        mock_private_ws.return_value.subscribe_execution = Mock()
+
+        # Mock REST client methods
+        mock_rest_client.return_value.get_open_orders = Mock(return_value=[])
+
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator.start()
+
+        assert orchestrator.running is True
+
+        await orchestrator.stop()
+        assert orchestrator.running is False
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_stop_disconnects_websockets(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        gridbot_config,
+    ):
+        """Test stop disconnects WebSockets."""
+        mock_public_ws.return_value.connect = Mock()
+        mock_public_ws.return_value.subscribe_ticker = Mock()
+        mock_public_ws.return_value.disconnect = Mock()
+        mock_private_ws.return_value.connect = Mock()
+        mock_private_ws.return_value.subscribe_position = Mock()
+        mock_private_ws.return_value.subscribe_order = Mock()
+        mock_private_ws.return_value.subscribe_execution = Mock()
+        mock_private_ws.return_value.disconnect = Mock()
+        mock_rest_client.return_value.get_open_orders = Mock(return_value=[])
+
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator.start()
+        await orchestrator.stop()
+
+        # Verify disconnect was called
+        mock_public_ws.return_value.disconnect.assert_called()
+        mock_private_ws.return_value.disconnect.assert_called()
+
+
+class TestOrchestratorGuardClauses:
+    """Tests for guard clauses in start/stop and run_until_shutdown."""
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_start_already_running_returns_early(
+        self, mock_private_ws, mock_public_ws, mock_rest_client, gridbot_config
+    ):
+        """Test start() returns immediately when already running."""
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._running = True
+        await orchestrator.start()
+        assert len(orchestrator._runners) == 0
+
+    @pytest.mark.asyncio
+    async def test_stop_not_running_returns_early(self, gridbot_config):
+        """Test stop() returns immediately when not running."""
+        orchestrator = Orchestrator(gridbot_config)
+        assert not orchestrator._running
+        await orchestrator.stop()
+        assert not orchestrator._running
+
+    @pytest.mark.asyncio
+    async def test_run_until_shutdown(self, gridbot_config):
+        """Test run_until_shutdown returns when shutdown event is set."""
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._shutdown_event.set()
+        await orchestrator.run_until_shutdown()
+
+
+class TestOrchestratorPositionWsCache:
+    """Tests for WebSocket position data caching."""
+
+    def test_on_position_stores_linear_data(self, gridbot_config):
+        """Test _on_position stores linear position data in cache."""
+        orchestrator = Orchestrator(gridbot_config)
+        message = {
+            "data": [
+                {
+                    "category": "linear",
+                    "symbol": "BTCUSDT",
+                    "side": "Buy",
+                    "size": "0.1",
+                    "avgPrice": "42500.00",
+                }
+            ]
+        }
+        orchestrator._on_position("test_account", message)
+
+        cached = orchestrator._position_ws_data["test_account"]["BTCUSDT"]["Buy"]
+        assert cached["size"] == "0.1"
+        assert cached["avgPrice"] == "42500.00"
+
+    def test_on_position_stores_both_sides(self, gridbot_config):
+        """Test _on_position stores both Buy and Sell positions."""
+        orchestrator = Orchestrator(gridbot_config)
+        message = {
+            "data": [
+                {"category": "linear", "symbol": "BTCUSDT", "side": "Buy", "size": "0.1"},
+                {"category": "linear", "symbol": "BTCUSDT", "side": "Sell", "size": "0.05"},
+            ]
+        }
+        orchestrator._on_position("test_account", message)
+
+        assert orchestrator._position_ws_data["test_account"]["BTCUSDT"]["Buy"]["size"] == "0.1"
+        assert orchestrator._position_ws_data["test_account"]["BTCUSDT"]["Sell"]["size"] == "0.05"
+
+    def test_on_position_filters_non_linear(self, gridbot_config):
+        """Test _on_position ignores non-linear positions."""
+        orchestrator = Orchestrator(gridbot_config)
+        message = {
+            "data": [
+                {"category": "spot", "symbol": "BTCUSDT", "side": "Buy", "size": "1.0"},
+            ]
+        }
+        orchestrator._on_position("test_account", message)
+        # Account key is created but no symbol data stored
+        assert len(orchestrator._position_ws_data.get("test_account", {})) == 0
+
+    def test_on_position_skips_empty_symbol_or_side(self, gridbot_config):
+        """Test _on_position skips entries with empty symbol or side."""
+        orchestrator = Orchestrator(gridbot_config)
+        message = {
+            "data": [
+                {"category": "linear", "symbol": "", "side": "Buy", "size": "0.1"},
+                {"category": "linear", "symbol": "BTCUSDT", "side": "", "size": "0.1"},
+            ]
+        }
+        orchestrator._on_position("test_account", message)
+        account_data = orchestrator._position_ws_data.get("test_account", {})
+        assert len(account_data.get("BTCUSDT", {})) == 0
+
+    def test_on_position_handles_empty_data(self, gridbot_config):
+        """Test _on_position handles empty or missing data gracefully."""
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._on_position("test_account", {"data": []})
+        orchestrator._on_position("test_account", {})
+
+    def test_get_position_from_ws_returns_cached_data(self, gridbot_config):
+        """Test _get_position_from_ws returns data when available."""
+        orchestrator = Orchestrator(gridbot_config)
+        pos = {"symbol": "BTCUSDT", "side": "Buy", "size": "0.1"}
+        orchestrator._position_ws_data = {"acct": {"BTCUSDT": {"Buy": pos}}}
+
+        result = orchestrator._get_position_from_ws("acct", "BTCUSDT", "Buy")
+        assert result == pos
+
+    def test_get_position_from_ws_returns_none_when_missing(self, gridbot_config):
+        """Test _get_position_from_ws returns None for missing data."""
+        orchestrator = Orchestrator(gridbot_config)
+        assert orchestrator._get_position_from_ws("missing", "BTCUSDT", "Buy") is None
+
+        orchestrator._position_ws_data = {"acct": {}}
+        assert orchestrator._get_position_from_ws("acct", "BTCUSDT", "Buy") is None
+
+        orchestrator._position_ws_data = {"acct": {"BTCUSDT": {}}}
+        assert orchestrator._get_position_from_ws("acct", "BTCUSDT", "Buy") is None
+
+
+class TestOrchestratorEventHandlers:
+    """Tests for WebSocket event handler routing."""
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_on_ticker_routes_to_runner(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test _on_ticker normalizes and routes event to runner."""
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        orchestrator._event_loop = asyncio.get_running_loop()
+
+        mock_event = Mock()
+        orchestrator._normalizers["test_account"] = Mock()
+        orchestrator._normalizers["test_account"].normalize_ticker.return_value = mock_event
+
+        runner = orchestrator._runners["btcusdt_test"]
+        runner.on_ticker = AsyncMock(return_value=[])
+
+        orchestrator._on_ticker("test_account", "BTCUSDT", {"topic": "tickers.BTCUSDT"})
+        await asyncio.sleep(0.05)
+
+        runner.on_ticker.assert_called_once_with(mock_event)
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_on_ticker_none_event_skipped(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test _on_ticker skips when normalizer returns None."""
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        orchestrator._event_loop = asyncio.get_running_loop()
+
+        orchestrator._normalizers["test_account"] = Mock()
+        orchestrator._normalizers["test_account"].normalize_ticker.return_value = None
+
+        runner = orchestrator._runners["btcusdt_test"]
+        runner.on_ticker = AsyncMock(return_value=[])
+
+        orchestrator._on_ticker("test_account", "BTCUSDT", {})
+        await asyncio.sleep(0.05)
+
+        runner.on_ticker.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_on_order_routes_to_runner(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test _on_order normalizes and routes events to runner."""
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        orchestrator._event_loop = asyncio.get_running_loop()
+
+        mock_event = Mock()
+        mock_event.symbol = "BTCUSDT"
+        orchestrator._normalizers["test_account"] = Mock()
+        orchestrator._normalizers["test_account"].normalize_order.return_value = [mock_event]
+
+        runner = orchestrator._runners["btcusdt_test"]
+        runner.on_order_update = AsyncMock(return_value=[])
+
+        orchestrator._on_order("test_account", {"topic": "order"})
+        await asyncio.sleep(0.05)
+
+        runner.on_order_update.assert_called_once_with(mock_event)
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_on_execution_routes_to_runner(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test _on_execution normalizes and routes events to runner."""
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        orchestrator._event_loop = asyncio.get_running_loop()
+
+        mock_event = Mock()
+        mock_event.symbol = "BTCUSDT"
+        orchestrator._normalizers["test_account"] = Mock()
+        orchestrator._normalizers["test_account"].normalize_execution.return_value = [mock_event]
+
+        runner = orchestrator._runners["btcusdt_test"]
+        runner.on_execution = AsyncMock(return_value=[])
+
+        orchestrator._on_execution("test_account", {"topic": "execution"})
+        await asyncio.sleep(0.05)
+
+        runner.on_execution.assert_called_once_with(mock_event)
+
+
+class TestOrchestratorPositionCheckLoop:
+    """Tests for the periodic position check loop."""
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_position_check_uses_ws_data(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test position check uses WebSocket data when available."""
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        orchestrator._running = True
+
+        # Replace runner with mock
+        mock_runner = Mock()
+        mock_runner.strat_id = "btcusdt_test"
+        mock_runner.symbol = "BTCUSDT"
+        mock_runner.engine.last_close = 42000.0
+        mock_runner.on_position_update = AsyncMock()
+        orchestrator._account_to_runners["test_account"] = [mock_runner]
+
+        # Pre-populate WS position cache
+        long_pos = {"symbol": "BTCUSDT", "side": "Buy", "size": "0.1"}
+        short_pos = {"symbol": "BTCUSDT", "side": "Sell", "size": "0.05"}
+        orchestrator._position_ws_data = {
+            "test_account": {"BTCUSDT": {"Buy": long_pos, "Sell": short_pos}}
+        }
+
+        # Mock REST client wallet balance
+        rest_client = orchestrator._rest_clients["test_account"]
+        rest_client.get_wallet_balance.return_value = {
+            "list": [{"coin": [{"coin": "USDT", "walletBalance": "10000"}]}]
+        }
+
+        # Run one iteration then stop
+        async def stop_after_first(seconds):
+            orchestrator._running = False
+
+        with patch("asyncio.sleep", new_callable=AsyncMock, side_effect=stop_after_first):
+            await orchestrator._position_check_loop()
+
+        mock_runner.on_position_update.assert_called_once_with(
+            long_position=long_pos,
+            short_position=short_pos,
+            wallet_balance=10000.0,
+            last_close=42000.0,
+        )
+        rest_client.get_positions.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_position_check_falls_back_to_rest(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test position check falls back to REST when WS data is missing."""
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        orchestrator._running = True
+
+        # Replace runner with mock
+        mock_runner = Mock()
+        mock_runner.strat_id = "btcusdt_test"
+        mock_runner.symbol = "BTCUSDT"
+        mock_runner.engine.last_close = 42000.0
+        mock_runner.on_position_update = AsyncMock()
+        orchestrator._account_to_runners["test_account"] = [mock_runner]
+
+        # NO WS data
+        orchestrator._position_ws_data = {}
+
+        # Mock REST client
+        rest_client = orchestrator._rest_clients["test_account"]
+        rest_client.get_wallet_balance.return_value = {
+            "list": [{"coin": [{"coin": "USDT", "walletBalance": "5000"}]}]
+        }
+        long_pos_rest = {"symbol": "BTCUSDT", "side": "Buy", "size": "0.2"}
+        short_pos_rest = {"symbol": "BTCUSDT", "side": "Sell", "size": "0.1"}
+        other_pos = {"symbol": "ETHUSDT", "side": "Buy", "size": "1.0"}  # unrelated symbol
+        rest_client.get_positions.return_value = [other_pos, long_pos_rest, short_pos_rest]
+
+        async def stop_after_first(seconds):
+            orchestrator._running = False
+
+        with patch("asyncio.sleep", new_callable=AsyncMock, side_effect=stop_after_first):
+            await orchestrator._position_check_loop()
+
+        rest_client.get_positions.assert_called_once()
+        mock_runner.on_position_update.assert_called_once_with(
+            long_position=long_pos_rest,
+            short_position=short_pos_rest,
+            wallet_balance=5000.0,
+            last_close=42000.0,
+        )
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_position_check_handles_account_error(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test position check catches and logs per-account errors."""
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        orchestrator._running = True
+
+        # Make REST client raise error
+        rest_client = orchestrator._rest_clients["test_account"]
+        rest_client.get_wallet_balance.side_effect = Exception("API error")
+
+        async def stop_after_first(seconds):
+            orchestrator._running = False
+
+        with patch("asyncio.sleep", new_callable=AsyncMock, side_effect=stop_after_first):
+            await orchestrator._position_check_loop()
+        # Should not raise — error is caught and logged
+
+
+class TestOrchestratorDbRecords:
+    """Tests for database record stubs."""
+
+    @pytest.mark.asyncio
+    async def test_create_run_records_with_db(self, gridbot_config):
+        """Test _create_run_records executes when db is present."""
+        orchestrator = Orchestrator(gridbot_config, db=Mock())
+        await orchestrator._create_run_records()
+
+    @pytest.mark.asyncio
+    async def test_update_run_records_stopped_with_db(self, gridbot_config):
+        """Test _update_run_records_stopped executes when db is present."""
+        orchestrator = Orchestrator(gridbot_config, db=Mock())
+        await orchestrator._update_run_records_stopped()
