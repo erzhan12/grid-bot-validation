@@ -256,6 +256,47 @@ class TestRetryQueueProcessing:
         executor.assert_called_once()
 
 
+class TestRetryQueueCancelDispatch:
+    """Tests for CancelIntent dispatch through retry queue."""
+
+    @pytest.mark.asyncio
+    async def test_process_due_cancel_intent(self, cancel_intent, success_result):
+        """Test CancelIntent is dispatched through process_due and received by executor."""
+        executor = Mock(return_value=success_result)
+        queue = RetryQueue(
+            executor_func=executor,
+            max_attempts=3,
+            initial_backoff_seconds=0.01,
+        )
+        queue.add(cancel_intent, "Cancel failed")
+
+        await asyncio.sleep(0.02)
+        processed = await queue.process_due()
+
+        assert processed == 1
+        assert queue.size == 0
+        executor.assert_called_once_with(cancel_intent)
+
+    @pytest.mark.asyncio
+    async def test_process_due_cancel_intent_failure_retries(self, cancel_intent, failure_result):
+        """Test failed CancelIntent stays in queue for retry."""
+        executor = Mock(return_value=failure_result)
+        queue = RetryQueue(
+            executor_func=executor,
+            max_attempts=3,
+            initial_backoff_seconds=0.01,
+        )
+        queue.add(cancel_intent, "Cancel failed")
+
+        await asyncio.sleep(0.02)
+        processed = await queue.process_due()
+
+        assert processed == 0
+        assert queue.size == 1
+        assert queue._queue[0].attempt_count == 2
+        executor.assert_called_once_with(cancel_intent)
+
+
 class TestRetryQueueBackgroundTask:
     """Tests for RetryQueue background task."""
 
