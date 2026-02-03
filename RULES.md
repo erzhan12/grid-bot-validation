@@ -143,12 +143,17 @@ uv pip install -e packages/gridcore
 ### Running Tests
 
 ```bash
+# Run all project tests (recommended)
+make test
+
 # Run all gridcore tests with coverage
 uv run pytest packages/gridcore/tests/ --cov=gridcore --cov-fail-under=80 -v
 
 # Run specific test file
 uv run pytest packages/gridcore/tests/test_grid.py -v
 ```
+
+**make test**: Runs pytest separately for gridcore, bybit_adapter, grid_db, event_saver, gridbot (avoids `conftest` ImportPathMismatchError when multiple `tests/conftest.py` exist). Coverage is appended; the final run prints `term-missing` for the combined report. `--cov-fail-under` is not applied to the merged total (~73%); to enforce 80% on one package: `uv run pytest <testpath> --cov=<pkg> --cov-fail-under=80`.
 
 ### Key Files
 
@@ -196,17 +201,23 @@ uv run pytest packages/gridcore/tests/test_grid.py -v
     - **RECOMMENDED**: Use `Position.create_linked_pair(risk_config)` helper to create properly linked positions
     - **Manual linking**: Call `long.set_opposite(short)` and `short.set_opposite(long)` before using
     - **Validation (2026-01-15)**: `calculate_amount_multiplier()` now validates that opposite is linked and raises `ValueError` if not
-    - **String Constants (2026-01-15)**: Use `Position.DIRECTION_LONG`, `Position.DIRECTION_SHORT`, `Position.SIDE_BUY`, `Position.SIDE_SELL` instead of hardcoded strings
+    - **DirectionType Enum (2026-01-25)**: Use `DirectionType.LONG`, `DirectionType.SHORT` instead of hardcoded strings `'long'`/`'short'`
+      - `DirectionType` is a `StrEnum` (like `GridSideType`) - values are strings, so backward-compatible
+      - Imported from `gridcore` or `gridcore.position`
+      - `Position.DIRECTION_LONG` and `Position.DIRECTION_SHORT` are aliases for backward compatibility
+    - **String Constants (2026-01-15)**: Use `Position.SIDE_BUY`, `Position.SIDE_SELL` instead of hardcoded strings
     - Moderate liquidation risk triggers cross-position adjustments (modifying opposite's multipliers)
     - Without linking, the method will fail with a clear error message instead of silently doing nothing
     - Example:
       ```python
+      from gridcore import Position, DirectionType
+
       # RECOMMENDED approach
       long_mgr, short_mgr = Position.create_linked_pair(risk_config)
 
       # Manual approach (if different configs needed)
-      long_mgr = Position(Position.DIRECTION_LONG, long_config)
-      short_mgr = Position(Position.DIRECTION_SHORT, short_config)
+      long_mgr = Position(DirectionType.LONG, long_config)
+      short_mgr = Position(DirectionType.SHORT, short_config)
       long_mgr.set_opposite(short_mgr)
       short_mgr.set_opposite(long_mgr)
       ```
@@ -751,9 +762,199 @@ uv run pytest shared/db/tests -v
 uv run pytest apps/event_saver/tests -v
 ```
 
+## Phase E: Live Bot Rewrite (gridbot)
+
+### Completed: 2026-01-24
+
+Successfully implemented a multi-tenant grid trading bot using gridcore strategy engine.
+
+### Key Components
+
+1. **Package Structure**
+   ```
+   apps/gridbot/
+   ├── pyproject.toml           # Dependencies: gridcore, bybit-adapter, grid-db, event-saver
+   ├── conf/
+   │   └── gridbot.yaml.example # Example configuration
+   ├── src/gridbot/
+   │   ├── __init__.py
+   │   ├── config.py            # Pydantic config models
+   │   ├── executor.py          # Intent → Bybit API calls
+   │   ├── retry_queue.py       # Failed intent retry (3 attempts, 30s max)
+   │   ├── runner.py            # StrategyRunner wrapping GridEngine
+   │   ├── reconciler.py        # Exchange state sync
+   │   ├── orchestrator.py      # Multi-strategy coordinator
+   │   └── main.py              # Entry point with signal handling
+   └── tests/
+       └── test_*.py            # 101 tests
+   ```
+
+2. **Architecture Decisions**
+   - Single process handles all accounts
+   - YAML configuration file
+   - Hybrid event loop: async WebSocket + periodic polling (~63s positions)
+   - In-memory order tracking, reconcile from exchange on startup
+   - Failed intents: queue for retry (3 attempts, 30s max, exponential backoff)
+   - Shadow mode: log intents without executing
+   - Startup sync: adopt existing orders from exchange
+
+3. **Data Flow**
+   ```
+   WebSocket Events → Orchestrator → StrategyRunner → GridEngine.on_event() → Intents
+                                                                                  ↓
+                                                              Executor (shadow: log | live: execute)
+                                                                                  ↓
+                                                                         Bybit REST API
+   ```
+
+4. **Key Files**
+   - `config.py`: `AccountConfig`, `StrategyConfig`, `GridbotConfig` Pydantic models
+   - `executor.py`: `IntentExecutor.execute_place()`, `execute_cancel()`, `execute_batch()`
+   - `retry_queue.py`: `RetryQueue` with exponential backoff (1s, 2s, 4s)
+   - `runner.py`: `StrategyRunner` wraps `GridEngine`, tracks orders, handles position updates
+   - `reconciler.py`: `Reconciler.reconcile_startup()`, `reconcile_reconnect()`
+   - `orchestrator.py`: `Orchestrator` coordinates multiple strategies, routes events
+
+5. **Configuration Example**
+   ```yaml
+   accounts:
+     - name: "main_account"
+       api_key: "YOUR_API_KEY"
+       api_secret: "YOUR_API_SECRET"
+       testnet: true
+
+   strategies:
+     - strat_id: "btcusdt_main"
+       account: "main_account"
+       symbol: "BTCUSDT"
+       tick_size: "0.1"
+       grid_count: 50
+       grid_step: 0.2
+       amount: "x0.001"  # 0.1% of wallet per order
+       max_margin: 8
+       shadow_mode: false
+   ```
+
+6. **Running the Bot**
+   ```bash
+   # Run with default config (conf/gridbot.yaml)
+   uv run python -m gridbot.main
+
+   # Run with custom config
+   uv run python -m gridbot.main --config path/to/config.yaml
+
+   # Run with debug logging
+   uv run python -m gridbot.main --debug
+   ```
+
+7. **Testing**
+   ```bash
+   uv run pytest apps/gridbot/tests -v
+   ```
+
+### Key Implementation Notes
+
+1. **Order Tracking Pattern**
+   - `TrackedOrder` dataclass tracks order lifecycle (pending → placed → filled/cancelled)
+   - Deterministic `client_order_id` (16-char hex from SHA256) enables deduplication
+   - `runner.inject_open_orders()` for startup reconciliation
+
+2. **Position Risk Management**
+   - `StrategyRunner` owns linked `Position` pair (long/short)
+   - `on_position_update()` calculates `position_ratio` and `amount_multiplier`
+   - Periodic position check (default 63s) via `orchestrator._position_check_loop()`
+
+3. **Event Routing**
+   - `_symbol_to_runners`: routes ticker events by symbol
+   - `_account_to_runners`: routes position/order/execution events by account
+   - WebSocket callbacks use `asyncio.run_coroutine_threadsafe()` for thread safety
+
+4. **Shadow Mode**
+   - `shadow_mode=True` in strategy config → intents logged but not executed
+   - `IntentExecutor` returns shadow order IDs: `shadow_{client_order_id}`
+   - Useful for validating strategy behavior before live trading
+
+5. **Reconciliation**
+   - Startup: fetch open orders, identify "our" orders (16-char hex orderLinkId), inject into runner
+   - Reconnect: compare exchange state with in-memory, update tracked orders
+   - Orphan detection: orders on exchange not matching our pattern
+
+### Common Pitfalls
+
+1. **BybitNormalizer Import**: Use `from bybit_adapter.normalizer import BybitNormalizer`, not `Normalizer`
+2. **RiskConfig Parameters**: `max_margin`, not `min_margin` (see `gridcore.position.RiskConfig`)
+3. **PositionState.direction**: Required parameter, use `"long"` or `"short"`
+4. **Test Isolation**: Run test suites separately due to conftest conflicts
+5. **Position WebSocket-First Pattern (2026-01-26)**: Position updates use WebSocket as primary source, REST as fallback
+   - **Original bbu2 pattern**: `handle_position()` stores WS data → `__get_position_status()` uses WS first, REST fallback
+   - **Orchestrator implementation**: `_on_position()` stores WS data in `_position_ws_data[account][symbol][side]`
+   - `_position_check_loop()` calls `_get_position_from_ws()` first, falls back to REST if None
+   - **Benefits**: Real-time position updates vs 63s polling delay
+   - File: `apps/gridbot/src/gridbot/orchestrator.py:337-391, 424-500`
+
+6. **Same-Order Detection & Blocking (2026-02-01)**: Detects AND blocks duplicate orders at same price level (bbu2-style safety)
+   - **Purpose**: Detect if two DIFFERENT orders at the SAME price got filled (indicates grid duplication bug). BLOCKS all new order placement when detected to prevent position accumulation that could cause liquidation.
+   - **Implementation**: `StrategyRunner._check_same_orders()` monitors execution events
+   - **Buffers**: Separate deques for long/short direction (maxlen=2, matches bbu2 `[:2]` per side)
+   - **Direction logic**: Uses `closed_size != 0` (Bybit's `closedSize` field, not `closed_pnl`) to determine closing trades
+     - `closed_pnl` can be 0 for break-even closes; `closed_size` is always non-zero for closing trades
+     - Buy + not closing = opening long → long buffer
+     - Sell + closing = closing long → long buffer
+     - Buy + closing = closing short → short buffer
+     - Sell + not closing = opening short → short buffer
+   - **Blocking behavior** (matches bbu2 `_check_pair_step` returning early):
+     - `on_ticker()`: Always passes event to engine (keeps `last_close` fresh), but skips intent execution
+     - `on_execution()`: Still passes event to engine (grid state update) but skips intent execution
+     - `on_order_update()`: Still passes event to engine (order state update) but skips intent execution
+     - **Pattern**: All three handlers follow the same structure: engine always runs, only `_execute_intents()` is gated by `not self._same_order_error`
+   - **CRITICAL: Both-side check** (matches bbu2): `_check_same_orders()` always checks BOTH long and short buffers on every execution event. If only the current side's buffer were checked, a clean fill on the opposite side would reset `_same_order_error` and silently clear the error. Pattern: check long → if error, return → check short.
+   - **Auto-recovery** (bbu2-style): `_check_same_orders_side()` resets `_same_order_error=False` at the start before re-evaluating. Error auto-clears when a new fill at a different price arrives (1 clean fill pushes the older entry out of the 2-entry buffer, matching bbu2 `[:2]` behavior).
+   - **Telegram alert**: Sends throttled Telegram notification on first detection via `Notifier`
+   - **Error state**: `runner.same_order_error` property, manual reset with `reset_same_order_error()`
+   - **NOT an error**: Same order_id at same price (partial fills are OK)
+   - **leavesQty filter** (2026-02-02): Only fully filled orders (`leaves_qty == 0`) enter the buffer, matching bbu2 `handle_execution` filter (`leavesQty == '0'`). Partial fills are skipped to prevent buffer dilution.
+   - **ExecutionEvent.closed_size / leaves_qty**: Added to `gridcore.events.ExecutionEvent`, extracted from Bybit `closedSize` and `leavesQty` in `bybit_adapter.normalizer`
+   - **Retry queue dispatcher**: `_init_strategy()` creates a `_dispatch_intent()` closure that routes `CancelIntent` to `executor.execute_cancel` and `PlaceLimitIntent` to `executor.execute_place`. Without this, failed cancels would be retried via `execute_place`, causing stale orders to persist.
+   - Files: `apps/gridbot/src/gridbot/runner.py`, `apps/gridbot/src/gridbot/orchestrator.py`, `packages/gridcore/src/gridcore/events.py`, `packages/bybit_adapter/src/bybit_adapter/normalizer.py`
+
+7. **Exception Handling at WS Dispatch Boundary (2026-02-01)**: Two-layer exception handling prevents WS events from crashing the bot
+   - **Orchestrator layer**: All WS callbacks (`_on_ticker`, `_on_position`, `_on_order`, `_on_execution`) wrapped with `try/except Exception` → catches normalization errors, logs + sends Telegram alert via `Notifier`
+   - **Runner layer**: All event handlers (`on_ticker`, `on_execution`, `on_order_update`, `on_position_update`) wrapped with `try/except Exception` → logs with `exc_info=True` + re-raises so orchestrator can handle notification
+   - **Pattern**: Runner logs + re-raises; orchestrator catches + notifies
+   - Files: `apps/gridbot/src/gridbot/orchestrator.py`, `apps/gridbot/src/gridbot/runner.py`
+
+8. **Telegram Notifier (2026-02-01)**: Thread-safe alert sender with throttling
+   - **Config**: `notification.telegram.bot_token` and `notification.telegram.chat_id` in YAML config (gitignored)
+   - **Throttle**: Max 1 Telegram alert per error key per 60 seconds (always logs)
+   - **Thread-safe**: Sends in background daemon thread (WS callbacks run on pybit's thread)
+   - **Graceful degradation**: If no Telegram config or `pyTelegramBotAPI` not installed, falls back to log-only
+   - **telebot token format**: Token must contain a colon (e.g., `123456:ABC-DEF...`), otherwise `TeleBot()` raises
+   - **Dependency**: `pytelegrambotapi>=4.24.0` in `apps/gridbot/pyproject.toml`
+   - File: `apps/gridbot/src/gridbot/notifier.py`
+
+9. **WebSocket Health Check Loop (2026-02-01)**: 10-second polling for connection health
+   - **Orchestrator**: `_health_check_loop()` runs as asyncio task, checks `is_connected()` on each public/private WS
+   - **Reconnect**: Only disconnected connections are reconnected (not all), re-subscribes all channels
+   - **Lifecycle**: Started in `start()`, cancelled in `stop()` alongside `_position_check_task`
+   - **Failure handling**: Reconnect failures are caught and alerted (don't crash the loop)
+   - **WS client API**: `ws_client.is_connected()` and `ws_client.get_connection_state()` already existed in bybit_adapter
+   - File: `apps/gridbot/src/gridbot/orchestrator.py`
+
+### Test Commands
+```bash
+# Run gridbot tests
+uv run pytest apps/gridbot/tests -v
+
+# Run all project tests (separately due to conftest conflicts)
+uv run pytest packages/gridcore/tests -v
+uv run pytest packages/bybit_adapter/tests -v
+uv run pytest shared/db/tests -v
+uv run pytest apps/event_saver/tests -v
+uv run pytest apps/gridbot/tests -v
+```
+
 ## Next Steps (Future Phases)
 
-- Phase E: Live Bot Rewrite (multi-tenant orchestrator)
 - Phase F: Backtest Rewrite (trade-through fill model)
 - Phase G: Comparator (validation metrics)
 - Phase H: Testing & Validation
