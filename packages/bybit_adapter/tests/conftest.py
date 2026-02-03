@@ -77,6 +77,7 @@ def sample_execution_message():
                 "side": "Buy",
                 "leavesQty": "0",
                 "closedPnl": "10.50",
+                "closedSize": "0.1",
                 "isMaker": True,
             },
             {

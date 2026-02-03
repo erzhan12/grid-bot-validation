@@ -1,9 +1,13 @@
-"""REST API client for Bybit gap reconciliation.
+"""REST API client for Bybit trading and gap reconciliation.
 
-This module provides REST API methods to fetch historical data for gap filling
-when WebSocket connections are lost and reconnected.
+This module provides REST API methods for:
+- Order management (place, cancel, query)
+- Historical data fetching for gap filling
 
 Reference:
+- Place Order: https://bybit-exchange.github.io/docs/v5/order/create-order
+- Cancel Order: https://bybit-exchange.github.io/docs/v5/order/cancel-order
+- Open Orders: https://bybit-exchange.github.io/docs/v5/order/open-order
 - Market Recent Trade: https://bybit-exchange.github.io/docs/v5/market/recent-trade
 - Execution List: https://bybit-exchange.github.io/docs/v5/order/execution
 - Order History: https://bybit-exchange.github.io/docs/v5/order/order-list
@@ -285,6 +289,201 @@ class BybitRestClient:
         result = response.get("result", {})
         logger.debug("Fetched wallet balance")
         return result
+
+    # -------------------------------------------------------------------------
+    # Order Management Methods
+    # -------------------------------------------------------------------------
+
+    def place_order(
+        self,
+        symbol: str,
+        side: str,
+        order_type: str,
+        qty: str,
+        price: Optional[str] = None,
+        reduce_only: bool = False,
+        position_idx: int = 0,
+        order_link_id: Optional[str] = None,
+    ) -> dict:
+        """Place a new order.
+
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+            side: Order side ("Buy" or "Sell")
+            order_type: Order type ("Limit" or "Market")
+            qty: Order quantity as string
+            price: Limit price as string (required for Limit orders)
+            reduce_only: Whether this is a reduce-only order
+            position_idx: Position index for hedge mode (0=one-way, 1=buy-side, 2=sell-side)
+            order_link_id: Custom order ID for tracking (client_order_id)
+
+        Returns:
+            Order response dict with keys: orderId, orderLinkId, etc.
+
+        Raises:
+            Exception: If API call fails
+
+        Reference:
+            bbu_reference/bbu2-master/bybit_api_usdt.py:315-329
+        """
+        logger.info(f"Placing {order_type} {side} order: {symbol} qty={qty} price={price}")
+
+        params = {
+            "category": "linear",
+            "symbol": symbol,
+            "side": side,
+            "orderType": order_type,
+            "qty": qty,
+            "reduceOnly": reduce_only,
+            "positionIdx": position_idx,
+        }
+        if price is not None:
+            params["price"] = price
+        if order_link_id is not None:
+            params["orderLinkId"] = order_link_id
+
+        response = self._session.place_order(**params)
+        self._check_response(response, "place_order")
+
+        result = response.get("result", {})
+        order_id = result.get("orderId", "")
+        logger.info(f"Order placed successfully: {order_id}")
+        return result
+
+    def cancel_order(
+        self,
+        symbol: str,
+        order_id: Optional[str] = None,
+        order_link_id: Optional[str] = None,
+    ) -> bool:
+        """Cancel an existing order.
+
+        Either order_id or order_link_id must be provided.
+
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+            order_id: Exchange order ID
+            order_link_id: Custom order ID (client_order_id)
+
+        Returns:
+            True if cancellation succeeded
+
+        Raises:
+            Exception: If API call fails
+            ValueError: If neither order_id nor order_link_id provided
+
+        Reference:
+            bbu_reference/bbu2-master/bybit_api_usdt.py:442-448
+        """
+        if order_id is None and order_link_id is None:
+            raise ValueError("Either order_id or order_link_id must be provided")
+
+        logger.info(f"Canceling order: {symbol} order_id={order_id} order_link_id={order_link_id}")
+
+        params = {
+            "category": "linear",
+            "symbol": symbol,
+        }
+        if order_id is not None:
+            params["orderId"] = order_id
+        if order_link_id is not None:
+            params["orderLinkId"] = order_link_id
+
+        try:
+            response = self._session.cancel_order(**params)
+            self._check_response(response, "cancel_order")
+            logger.info(f"Order cancelled successfully")
+            return True
+        except Exception as e:
+            # Order may already be filled or cancelled
+            logger.warning(f"Cancel order failed: {e}")
+            return False
+
+    def cancel_all_orders(self, symbol: str) -> int:
+        """Cancel all open orders for a symbol.
+
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+
+        Returns:
+            Number of orders cancelled (from API response)
+
+        Raises:
+            Exception: If API call fails
+
+        Reference:
+            bbu_reference/bbu2-master/bybit_api_usdt.py:450-452
+        """
+        logger.info(f"Canceling all orders for {symbol}")
+
+        response = self._session.cancel_all_orders(
+            category="linear",
+            symbol=symbol,
+        )
+        self._check_response(response, "cancel_all_orders")
+
+        # V5 API returns list of cancelled orders
+        result = response.get("result", {})
+        cancelled = result.get("list", [])
+        logger.info(f"Cancelled {len(cancelled)} orders")
+        return len(cancelled)
+
+    def get_open_orders(
+        self,
+        symbol: Optional[str] = None,
+        order_type: str = "Limit",
+        limit: int = 50,
+    ) -> list[dict]:
+        """Fetch all open orders with pagination.
+
+        Args:
+            symbol: Filter by symbol (optional)
+            order_type: Filter by order type (default "Limit")
+            limit: Results per page (max 50)
+
+        Returns:
+            List of open order dicts
+
+        Raises:
+            Exception: If API call fails
+
+        Reference:
+            bbu_reference/bbu2-master/bybit_api_usdt.py:380-404
+        """
+        logger.debug(f"Fetching open orders for {symbol or 'all symbols'}")
+
+        all_orders = []
+        cursor = None
+
+        while True:
+            params = {
+                "category": "linear",
+                "limit": min(limit, 50),
+            }
+            if symbol:
+                params["symbol"] = symbol
+            if cursor:
+                params["cursor"] = cursor
+
+            response = self._session.get_open_orders(**params)
+            self._check_response(response, "get_open_orders")
+
+            result = response.get("result", {})
+            orders = result.get("list", [])
+
+            if not orders:
+                break
+
+            # Filter by order type
+            filtered = [o for o in orders if o.get("orderType") == order_type]
+            all_orders.extend(filtered)
+
+            cursor = result.get("nextPageCursor")
+            if not cursor:
+                break
+
+        logger.debug(f"Fetched {len(all_orders)} open {order_type} orders")
+        return all_orders
 
     def _check_response(self, response: dict, method: str) -> None:
         """Check API response for errors.

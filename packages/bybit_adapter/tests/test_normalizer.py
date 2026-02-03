@@ -180,6 +180,36 @@ class TestNormalizeExecution:
         assert event.qty == Decimal("0.1")
         assert event.fee == Decimal("0.425")
         assert event.closed_pnl == Decimal("10.50")
+        assert event.closed_size == Decimal("0.1")
+        assert event.leaves_qty == Decimal("0")
+
+    def test_normalize_execution_closed_size_default(self):
+        """Test closed_size defaults to 0 when closedSize not in message."""
+        message = {
+            "topic": "execution",
+            "data": [
+                {
+                    "category": "linear",
+                    "symbol": "BTCUSDT",
+                    "execId": "exec-1",
+                    "orderId": "order-1",
+                    "orderLinkId": "link-1",
+                    "execPrice": "50000.0",
+                    "execQty": "0.1",
+                    "execFee": "0.5",
+                    "execType": "Trade",
+                    "execTime": "1704639600000",
+                    "side": "Buy",
+                    "closedPnl": "0",
+                    # No closedSize field
+                },
+            ],
+        }
+        normalizer = BybitNormalizer()
+        events = normalizer.normalize_execution(message)
+
+        assert len(events) == 1
+        assert events[0].closed_size == Decimal("0")
 
     def test_normalize_execution_with_context(
         self, sample_execution_message, sample_user_id, sample_account_id, sample_run_id

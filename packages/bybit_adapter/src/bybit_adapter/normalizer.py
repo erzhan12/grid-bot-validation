@@ -228,6 +228,10 @@ class BybitNormalizer:
 
             # Parse closed PnL - may be "closedPnl" or "execPnl" depending on API version
             closed_pnl_str = exec_data.get("closedPnl") or exec_data.get("execPnl", "0")
+            # closedSize: qty of position closed by this execution ("0" = opening trade)
+            closed_size_str = exec_data.get("closedSize", "0")
+            # leavesQty: remaining unfilled quantity ("0" = fully filled)
+            leaves_qty_str = exec_data.get("leavesQty", "0")
 
             event = ExecutionEvent(
                 event_type=EventType.EXECUTION,
@@ -245,6 +249,8 @@ class BybitNormalizer:
                 qty=Decimal(exec_data.get("execQty", "0")),
                 fee=Decimal(exec_data.get("execFee", "0")),
                 closed_pnl=Decimal(closed_pnl_str),
+                closed_size=Decimal(closed_size_str),
+                leaves_qty=Decimal(leaves_qty_str),
             )
             events.append(event)
 
