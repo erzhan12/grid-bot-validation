@@ -1,0 +1,46 @@
+# Gridbot Configuration Example
+# Copy to gridbot.yaml and update with your settings
+
+accounts:
+  - name: "main_account"
+    api_key: "YOUR_API_KEY"
+    api_secret: "YOUR_API_SECRET"
+    testnet: true
+
+strategies:
+  - strat_id: "btcusdt_main"
+    account: "main_account"
+    symbol: "BTCUSDT"
+    tick_size: "0.1"
+    grid_count: 50
+    grid_step: 0.2
+    amount: "x0.001"  # 0.1% of wallet per order
+    max_margin: 8
+    long_koef: 1.0
+    min_liq_ratio: 0.8
+    max_liq_ratio: 1.2
+    min_total_margin: 0.15
+    shadow_mode: false  # Set to true to log without executing
+
+  - strat_id: "ethusdt_main"
+    account: "main_account"
+    symbol: "ETHUSDT"
+    tick_size: "0.01"
+    grid_count: 50
+    grid_step: 0.2
+    amount: "x0.001"
+    max_margin: 8
+    long_koef: 1.0
+    shadow_mode: true  # Shadow mode for testing
+
+# Database connection
+database_url: "sqlite:///gridbot.db"
+
+# Timing
+position_check_interval: 63.0  # seconds
+
+# Notifications (optional)
+# notification:
+#   telegram:
+#     bot_token: "YOUR_BOT_TOKEN"
+#     chat_id: "YOUR_CHAT_ID"
