@@ -7,6 +7,7 @@ from unittest.mock import Mock, MagicMock, patch, AsyncMock
 import pytest
 
 from gridbot.config import GridbotConfig, AccountConfig, StrategyConfig
+from gridbot.notifier import Notifier
 from gridbot.orchestrator import Orchestrator
 
 
@@ -656,3 +657,319 @@ class TestOrchestratorDbRecords:
         """Test _update_run_records_stopped executes when db is present."""
         orchestrator = Orchestrator(gridbot_config, db=Mock())
         await orchestrator._update_run_records_stopped()
+
+
+class TestOrchestratorRetryDispatcher:
+    """Tests for retry queue intent dispatch routing."""
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_retry_dispatcher_routes_cancel_to_execute_cancel(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test retry queue dispatches CancelIntent to execute_cancel, not execute_place."""
+        from gridcore.intents import CancelIntent, PlaceLimitIntent
+        from unittest.mock import call
+
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+
+        # Get the executor that was created for this strategy
+        executor = orchestrator._runners["btcusdt_test"]._executor
+
+        # Get the retry queue's executor function (the dispatcher)
+        retry_queue = orchestrator._retry_queues["btcusdt_test"]
+        dispatcher = retry_queue._executor_func
+
+        cancel = CancelIntent(symbol="BTCUSDT", order_id="order_123", reason="test")
+
+        # Reset mocks to track only our call
+        executor.execute_cancel = MagicMock(return_value=Mock(success=True))
+        executor.execute_place = MagicMock(return_value=Mock(success=True))
+
+        dispatcher(cancel)
+
+        executor.execute_cancel.assert_called_once_with(cancel)
+        executor.execute_place.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_retry_dispatcher_routes_place_to_execute_place(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test retry queue dispatches PlaceLimitIntent to execute_place."""
+        from gridcore.intents import PlaceLimitIntent
+
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+
+        executor = orchestrator._runners["btcusdt_test"]._executor
+        retry_queue = orchestrator._retry_queues["btcusdt_test"]
+        dispatcher = retry_queue._executor_func
+
+        place = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.001"),
+            grid_level=10,
+            direction="long",
+        )
+
+        executor.execute_cancel = MagicMock(return_value=Mock(success=True))
+        executor.execute_place = MagicMock(return_value=Mock(success=True))
+
+        dispatcher(place)
+
+        executor.execute_place.assert_called_once_with(place)
+        executor.execute_cancel.assert_not_called()
+
+
+class TestOrchestratorExceptionHandling:
+    """Tests for exception handling in WebSocket callbacks."""
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_on_ticker_exception_does_not_crash(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test _on_ticker catches exceptions and notifies."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        orchestrator._event_loop = asyncio.get_running_loop()
+
+        # Make normalizer raise
+        orchestrator._normalizers["test_account"] = Mock()
+        orchestrator._normalizers["test_account"].normalize_ticker.side_effect = ValueError("bad data")
+
+        # Should not raise
+        orchestrator._on_ticker("test_account", "BTCUSDT", {})
+
+        notifier.alert_exception.assert_called_once()
+        assert "on_ticker" in notifier.alert_exception.call_args[0][0]
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_on_order_exception_does_not_crash(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test _on_order catches exceptions and notifies."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        orchestrator._event_loop = asyncio.get_running_loop()
+
+        orchestrator._normalizers["test_account"] = Mock()
+        orchestrator._normalizers["test_account"].normalize_order.side_effect = KeyError("missing")
+
+        orchestrator._on_order("test_account", {})
+
+        notifier.alert_exception.assert_called_once()
+        assert "on_order" in notifier.alert_exception.call_args[0][0]
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_on_execution_exception_does_not_crash(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test _on_execution catches exceptions and notifies."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        orchestrator._event_loop = asyncio.get_running_loop()
+
+        orchestrator._normalizers["test_account"] = Mock()
+        orchestrator._normalizers["test_account"].normalize_execution.side_effect = TypeError("oops")
+
+        orchestrator._on_execution("test_account", {})
+
+        notifier.alert_exception.assert_called_once()
+        assert "on_execution" in notifier.alert_exception.call_args[0][0]
+
+    def test_on_position_exception_does_not_crash(self, gridbot_config):
+        """Test _on_position catches broad exceptions and notifies."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+
+        # Pass data that will raise inside the handler
+        # message["data"] is not iterable
+        orchestrator._on_position("test_account", {"data": 12345})
+
+        notifier.alert_exception.assert_called_once()
+        assert "on_position" in notifier.alert_exception.call_args[0][0]
+
+
+class TestOrchestratorHealthCheckLoop:
+    """Tests for WebSocket health check loop."""
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_health_check_reconnects_disconnected_public_ws(
+        self, mock_private_ws_cls, mock_public_ws_cls, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test health check reconnects a disconnected public WebSocket."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        orchestrator._running = True
+
+        # Simulate public WS disconnected
+        pub_ws = orchestrator._public_ws["test_account"]
+        pub_ws.is_connected.return_value = False
+        pub_ws.connect = Mock()
+        pub_ws.disconnect = Mock()
+        pub_ws.subscribe_ticker = Mock()
+
+        # Private WS is fine
+        priv_ws = orchestrator._private_ws["test_account"]
+        priv_ws.is_connected.return_value = True
+
+        async def stop_immediately(seconds):
+            orchestrator._running = False
+
+        with patch("asyncio.sleep", new_callable=AsyncMock, side_effect=stop_immediately):
+            await orchestrator._health_check_loop()
+
+        pub_ws.disconnect.assert_called_once()
+        pub_ws.connect.assert_called_once()
+        pub_ws.subscribe_ticker.assert_called()
+        notifier.alert.assert_called()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_health_check_reconnects_disconnected_private_ws(
+        self, mock_private_ws_cls, mock_public_ws_cls, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test health check reconnects a disconnected private WebSocket."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        orchestrator._running = True
+
+        # Public WS is fine
+        pub_ws = orchestrator._public_ws["test_account"]
+        pub_ws.is_connected.return_value = True
+
+        # Simulate private WS disconnected
+        priv_ws = orchestrator._private_ws["test_account"]
+        priv_ws.is_connected.return_value = False
+        priv_ws.connect = Mock()
+        priv_ws.disconnect = Mock()
+        priv_ws.subscribe_position = Mock()
+        priv_ws.subscribe_order = Mock()
+        priv_ws.subscribe_execution = Mock()
+
+        async def stop_immediately(seconds):
+            orchestrator._running = False
+
+        with patch("asyncio.sleep", new_callable=AsyncMock, side_effect=stop_immediately):
+            await orchestrator._health_check_loop()
+
+        priv_ws.disconnect.assert_called_once()
+        priv_ws.connect.assert_called_once()
+        priv_ws.subscribe_position.assert_called()
+        priv_ws.subscribe_order.assert_called()
+        priv_ws.subscribe_execution.assert_called()
+        notifier.alert.assert_called()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_health_check_skips_connected(
+        self, mock_private_ws_cls, mock_public_ws_cls, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test health check does nothing when all WS are connected."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        orchestrator._running = True
+
+        pub_ws = orchestrator._public_ws["test_account"]
+        pub_ws.is_connected.return_value = True
+
+        priv_ws = orchestrator._private_ws["test_account"]
+        priv_ws.is_connected.return_value = True
+
+        async def stop_immediately(seconds):
+            orchestrator._running = False
+
+        with patch("asyncio.sleep", new_callable=AsyncMock, side_effect=stop_immediately):
+            await orchestrator._health_check_loop()
+
+        # No reconnect calls, no alerts
+        notifier.alert.assert_not_called()
+        notifier.alert_exception.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_health_check_reconnect_failure_notifies(
+        self, mock_private_ws_cls, mock_public_ws_cls, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test health check notifies on reconnect failure."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        orchestrator._running = True
+
+        # Public WS disconnected and reconnect fails
+        pub_ws = orchestrator._public_ws["test_account"]
+        pub_ws.is_connected.return_value = False
+        pub_ws.disconnect = Mock()
+        pub_ws.connect = Mock(side_effect=Exception("connection refused"))
+
+        # Private WS fine
+        priv_ws = orchestrator._private_ws["test_account"]
+        priv_ws.is_connected.return_value = True
+
+        async def stop_immediately(seconds):
+            orchestrator._running = False
+
+        with patch("asyncio.sleep", new_callable=AsyncMock, side_effect=stop_immediately):
+            await orchestrator._health_check_loop()
+
+        # Should have alert for disconnect + alert_exception for reconnect failure
+        assert notifier.alert.call_count >= 1
+        assert notifier.alert_exception.call_count >= 1

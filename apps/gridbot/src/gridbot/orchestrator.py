@@ -21,6 +21,7 @@ from bybit_adapter.normalizer import BybitNormalizer
 from grid_db import DatabaseFactory, DatabaseSettings
 from grid_db import Run, Strategy, BybitAccount, User
 from gridcore import GridAnchorStore
+from gridcore.intents import CancelIntent
 
 from event_saver.writers import (
     ExecutionWriter,
@@ -31,9 +32,12 @@ from event_saver.writers import (
 
 from gridbot.config import GridbotConfig, AccountConfig, StrategyConfig
 from gridbot.executor import IntentExecutor
+from gridbot.notifier import Notifier
 from gridbot.runner import StrategyRunner
 from gridbot.reconciler import Reconciler
 from gridbot.retry_queue import RetryQueue
+
+_HEALTH_CHECK_INTERVAL = 10  # seconds
 
 
 logger = logging.getLogger(__name__)
@@ -64,6 +68,7 @@ class Orchestrator:
         config: GridbotConfig,
         db: Optional[DatabaseFactory] = None,
         anchor_store_path: str = "db/grid_anchor.json",
+        notifier: Optional[Notifier] = None,
     ):
         """Initialize orchestrator.
 
@@ -71,10 +76,12 @@ class Orchestrator:
             config: Gridbot configuration.
             db: Database factory for persistence (optional).
             anchor_store_path: Path to grid anchor JSON file.
+            notifier: Alert notifier (optional, log-only if None).
         """
         self._config = config
         self._db = db
         self._anchor_store = GridAnchorStore(anchor_store_path)
+        self._notifier = notifier or Notifier()
 
         # Per-account resources
         self._rest_clients: dict[str, BybitRestClient] = {}
@@ -100,6 +107,7 @@ class Orchestrator:
         self._shutdown_event = asyncio.Event()
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._position_check_task: Optional[asyncio.Task] = None
+        self._health_check_task: Optional[asyncio.Task] = None
 
         # WebSocket position data cache: account_name -> symbol -> side -> position_data
         # Follows original bbu2 pattern: WebSocket provides real-time updates,
@@ -159,8 +167,9 @@ class Orchestrator:
         # Create database Run records
         await self._create_run_records()
 
-        # Start position check task
+        # Start background tasks
         self._position_check_task = asyncio.create_task(self._position_check_loop())
+        self._health_check_task = asyncio.create_task(self._health_check_loop())
 
         # Start retry queues
         for queue in self._retry_queues.values():
@@ -177,13 +186,14 @@ class Orchestrator:
         self._running = False
         self._shutdown_event.set()
 
-        # Stop position check task
-        if self._position_check_task:
-            self._position_check_task.cancel()
-            try:
-                await self._position_check_task
-            except asyncio.CancelledError:
-                pass
+        # Stop background tasks
+        for task in (self._position_check_task, self._health_check_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
         # Stop retry queues
         for queue in self._retry_queues.values():
@@ -251,9 +261,14 @@ class Orchestrator:
             shadow_mode=strategy_config.shadow_mode,
         )
 
-        # Create retry queue
+        # Create retry queue with dispatcher that routes by intent type
+        def _dispatch_intent(intent):
+            if isinstance(intent, CancelIntent):
+                return executor.execute_cancel(intent)
+            return executor.execute_place(intent)
+
         retry_queue = RetryQueue(
-            executor_func=executor.execute_place,
+            executor_func=_dispatch_intent,
             max_attempts=3,
             max_elapsed_seconds=30.0,
         )
@@ -265,6 +280,7 @@ class Orchestrator:
             executor=executor,
             anchor_store=self._anchor_store,
             on_intent_failed=lambda intent, error: retry_queue.add(intent, error),
+            notifier=self._notifier,
         )
         self._runners[strat_id] = runner
 
@@ -325,19 +341,22 @@ class Orchestrator:
 
     def _on_ticker(self, account_name: str, symbol: str, message: dict) -> None:
         """Handle ticker WebSocket message."""
-        normalizer = self._normalizers[account_name]
-        event = normalizer.normalize_ticker(message)
+        try:
+            normalizer = self._normalizers[account_name]
+            event = normalizer.normalize_ticker(message)
 
-        if event is None:
-            return
+            if event is None:
+                return
 
-        # Route to all runners for this symbol
-        runners = self._symbol_to_runners.get(symbol, [])
-        for runner in runners:
-            asyncio.run_coroutine_threadsafe(
-                runner.on_ticker(event),
-                self._event_loop,
-            )
+            # Route to all runners for this symbol
+            runners = self._symbol_to_runners.get(symbol, [])
+            for runner in runners:
+                asyncio.run_coroutine_threadsafe(
+                    runner.on_ticker(event),
+                    self._event_loop,
+                )
+        except Exception as e:
+            self._notifier.alert_exception("_on_ticker", e, error_key="ws_on_ticker")
 
     def _on_position(self, account_name: str, message: dict) -> None:
         """Handle position WebSocket message.
@@ -393,40 +412,46 @@ class Orchestrator:
                     f"size={pos.get('size')} avgPrice={pos.get('avgPrice')}"
                 )
 
-        except (KeyError, ValueError) as e:
-            logger.warning(f"Error processing position WebSocket message: {e}")
+        except Exception as e:
+            self._notifier.alert_exception("_on_position", e, error_key="ws_on_position")
 
     def _on_order(self, account_name: str, message: dict) -> None:
         """Handle order WebSocket message."""
-        normalizer = self._normalizers[account_name]
-        events = normalizer.normalize_order(message)
+        try:
+            normalizer = self._normalizers[account_name]
+            events = normalizer.normalize_order(message)
 
-        for event in events:
-            # Route to runner for this symbol
-            runners = self._symbol_to_runners.get(event.symbol, [])
-            for runner in runners:
-                # Filter by account
-                if self._get_account_for_strategy(runner.strat_id) == account_name:
-                    asyncio.run_coroutine_threadsafe(
-                        runner.on_order_update(event),
-                        self._event_loop,
-                    )
+            for event in events:
+                # Route to runner for this symbol
+                runners = self._symbol_to_runners.get(event.symbol, [])
+                for runner in runners:
+                    # Filter by account
+                    if self._get_account_for_strategy(runner.strat_id) == account_name:
+                        asyncio.run_coroutine_threadsafe(
+                            runner.on_order_update(event),
+                            self._event_loop,
+                        )
+        except Exception as e:
+            self._notifier.alert_exception("_on_order", e, error_key="ws_on_order")
 
     def _on_execution(self, account_name: str, message: dict) -> None:
         """Handle execution WebSocket message."""
-        normalizer = self._normalizers[account_name]
-        events = normalizer.normalize_execution(message)
+        try:
+            normalizer = self._normalizers[account_name]
+            events = normalizer.normalize_execution(message)
 
-        for event in events:
-            # Route to runner for this symbol
-            runners = self._symbol_to_runners.get(event.symbol, [])
-            for runner in runners:
-                # Filter by account
-                if self._get_account_for_strategy(runner.strat_id) == account_name:
-                    asyncio.run_coroutine_threadsafe(
-                        runner.on_execution(event),
-                        self._event_loop,
-                    )
+            for event in events:
+                # Route to runner for this symbol
+                runners = self._symbol_to_runners.get(event.symbol, [])
+                for runner in runners:
+                    # Filter by account
+                    if self._get_account_for_strategy(runner.strat_id) == account_name:
+                        asyncio.run_coroutine_threadsafe(
+                            runner.on_execution(event),
+                            self._event_loop,
+                        )
+        except Exception as e:
+            self._notifier.alert_exception("_on_execution", e, error_key="ws_on_execution")
 
     def _get_position_from_ws(
         self, account_name: str, symbol: str, side: str
@@ -520,6 +545,77 @@ class Orchestrator:
                 break
             except Exception as e:
                 logger.error(f"Position check loop error: {e}")
+
+    async def _health_check_loop(self) -> None:
+        """Periodic WebSocket health check.
+
+        Checks every 10 seconds whether each WebSocket connection is alive.
+        Reconnects only the disconnected ones. Alerts on disconnect/reconnect.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(_HEALTH_CHECK_INTERVAL)
+
+                for account_name in list(self._public_ws.keys()):
+                    # Check public WS
+                    pub_ws = self._public_ws.get(account_name)
+                    if pub_ws and not pub_ws.is_connected():
+                        self._notifier.alert(
+                            f"Public WS disconnected for {account_name}, reconnecting",
+                            error_key=f"ws_pub_disconnect_{account_name}",
+                        )
+                        try:
+                            pub_ws.disconnect()
+                            pub_ws.connect()
+                            # Re-subscribe tickers
+                            symbols = {
+                                r.symbol
+                                for r in self._account_to_runners.get(account_name, [])
+                            }
+                            for symbol in symbols:
+                                pub_ws.subscribe_ticker(
+                                    symbol=symbol,
+                                    callback=lambda msg, s=symbol, a=account_name: self._on_ticker(a, s, msg),
+                                )
+                            logger.info(f"Public WS reconnected for {account_name}")
+                        except Exception as e:
+                            self._notifier.alert_exception(
+                                f"Public WS reconnect {account_name}", e,
+                                error_key=f"ws_pub_reconnect_{account_name}",
+                            )
+
+                    # Check private WS
+                    priv_ws = self._private_ws.get(account_name)
+                    if priv_ws and not priv_ws.is_connected():
+                        self._notifier.alert(
+                            f"Private WS disconnected for {account_name}, reconnecting",
+                            error_key=f"ws_priv_disconnect_{account_name}",
+                        )
+                        try:
+                            priv_ws.disconnect()
+                            priv_ws.connect()
+                            priv_ws.subscribe_position(
+                                callback=lambda msg, a=account_name: self._on_position(a, msg),
+                            )
+                            priv_ws.subscribe_order(
+                                callback=lambda msg, a=account_name: self._on_order(a, msg),
+                            )
+                            priv_ws.subscribe_execution(
+                                callback=lambda msg, a=account_name: self._on_execution(a, msg),
+                            )
+                            logger.info(f"Private WS reconnected for {account_name}")
+                        except Exception as e:
+                            self._notifier.alert_exception(
+                                f"Private WS reconnect {account_name}", e,
+                                error_key=f"ws_priv_reconnect_{account_name}",
+                            )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self._notifier.alert_exception(
+                    "_health_check_loop", e, error_key="health_check_loop"
+                )
 
     def _get_account_for_strategy(self, strat_id: str) -> Optional[str]:
         """Get account name for a strategy."""
