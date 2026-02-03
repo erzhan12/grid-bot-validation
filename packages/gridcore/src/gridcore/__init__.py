@@ -11,7 +11,7 @@ from gridcore.intents import PlaceLimitIntent, CancelIntent
 from gridcore.config import GridConfig
 from gridcore.grid import Grid, GridSideType
 from gridcore.engine import GridEngine
-from gridcore.position import PositionState, Position, PositionRiskManager, RiskConfig
+from gridcore.position import PositionState, Position, PositionRiskManager, RiskConfig, DirectionType
 from gridcore.persistence import GridAnchorStore
 
 __version__ = "0.1.0"
@@ -33,5 +33,6 @@ __all__ = [
     "Position",
     "PositionRiskManager",  # Alias for Position (backward compatibility)
     "RiskConfig",
+    "DirectionType",
     "GridAnchorStore",
 ]

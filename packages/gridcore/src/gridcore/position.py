@@ -11,9 +11,16 @@ reference and modify each other's multipliers via set_opposite().
 import logging
 from dataclasses import dataclass
 from decimal import Decimal
+from enum import StrEnum
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+class DirectionType(StrEnum):
+    """Position direction type constants."""
+    LONG = 'long'
+    SHORT = 'short'
 
 
 @dataclass
@@ -65,9 +72,9 @@ class Position:
     SIDE_BUY = 'Buy'
     SIDE_SELL = 'Sell'
 
-    # Direction constants
-    DIRECTION_LONG = 'long'
-    DIRECTION_SHORT = 'short'
+    # Direction constants (aliases for DirectionType enum values)
+    DIRECTION_LONG = DirectionType.LONG
+    DIRECTION_SHORT = DirectionType.SHORT
 
     def __init__(self, direction: str, risk_config: RiskConfig):
         """
@@ -139,8 +146,16 @@ class Position:
         """
         Calculate order size multipliers based on position state.
 
-        This method resets multipliers for BOTH this position AND the opposite
-        position, then applies risk management rules that may modify either.
+        IMPORTANT: Caller must reset multipliers on BOTH positions before calling
+        this method for each direction. This matches bbu2 pattern where reset
+        happens once before both long and short calculations, so cross-position
+        effects from the first call are preserved during the second call.
+
+        Example:
+            long_mgr.reset_amount_multiplier()
+            short_mgr.reset_amount_multiplier()
+            long_mult = long_mgr.calculate_amount_multiplier(long_state, short_state, price)
+            short_mult = short_mgr.calculate_amount_multiplier(short_state, long_state, price)
 
         IMPORTANT: The opposite position must be linked via set_opposite() before
         calling this method. Without linking, moderate liquidation risk adjustments
@@ -166,11 +181,6 @@ class Position:
                 f"Call set_opposite() before calculate_amount_multiplier() or use "
                 f"Position.create_linked_pair() to create properly linked positions."
             )
-
-        # Reset both positions' multipliers
-        self.reset_amount_multiplier()
-        if self._opposite:
-            self._opposite.reset_amount_multiplier()
 
         # Calculate position metrics
         if position.entry_price is None or position.entry_price == 0:
