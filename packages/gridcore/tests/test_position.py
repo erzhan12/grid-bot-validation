@@ -929,8 +929,12 @@ class TestCalculateAmountMultiplierEdgeCases:
         # Position ratio should be very large (2.0 / 0.0001 = 20000)
         assert long_mgr.position_ratio == 2.0 / 0.0001
 
-    def test_resets_opposite_multipliers(self):
-        """calculate_amount_multiplier resets both positions' multipliers."""
+    def test_caller_must_reset_before_calculate(self):
+        """Caller must reset multipliers before calculate_amount_multiplier.
+
+        Matches bbu2 pattern: reset once, then calculate both directions.
+        calculate_amount_multiplier does NOT reset internally.
+        """
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
@@ -944,6 +948,10 @@ class TestCalculateAmountMultiplierEdgeCases:
         long_mgr.set_amount_multiplier(Position.SIDE_SELL, 5.0)
         short_mgr.set_amount_multiplier(Position.SIDE_BUY, 5.0)
         short_mgr.set_amount_multiplier(Position.SIDE_SELL, 5.0)
+
+        # Reset BOTH before calculating (caller responsibility)
+        long_mgr.reset_amount_multiplier()
+        short_mgr.reset_amount_multiplier()
 
         # Use a neutral position that won't trigger any rules
         position = PositionState(
@@ -962,7 +970,7 @@ class TestCalculateAmountMultiplierEdgeCases:
 
         long_mgr.calculate_amount_multiplier(position, opposite, last_close=100000.0)
 
-        # Both should be reset to 1.0
+        # Both should still be at 1.0 (reset by caller, no rules triggered)
         assert short_mgr.amount_multiplier == {'Buy': 1.0, 'Sell': 1.0}
 
     def test_positive_unrealized_pnl_long(self):

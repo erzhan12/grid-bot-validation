@@ -94,6 +94,8 @@ class ExecutionEvent(Event):
     qty: Decimal = Decimal('0')
     fee: Decimal = Decimal('0')
     closed_pnl: Decimal = Decimal('0')
+    closed_size: Decimal = Decimal('0')  # Qty closed by this execution (Bybit closedSize)
+    leaves_qty: Decimal = Decimal('0')  # Remaining unfilled quantity (Bybit leavesQty)
 
     def __post_init__(self):
         if self.event_type != EventType.EXECUTION:
