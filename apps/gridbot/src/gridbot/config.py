@@ -58,6 +58,19 @@ class StrategyConfig(BaseModel):
         return v
 
 
+class TelegramConfig(BaseModel):
+    """Telegram notification configuration."""
+
+    bot_token: str = Field(..., description="Telegram bot token")
+    chat_id: str = Field(..., description="Telegram chat ID for alerts")
+
+
+class NotificationConfig(BaseModel):
+    """Notification configuration."""
+
+    telegram: Optional[TelegramConfig] = None
+
+
 class GridbotConfig(BaseModel):
     """Root configuration for gridbot."""
 
@@ -75,6 +88,9 @@ class GridbotConfig(BaseModel):
         default=63.0,
         description="Seconds between position checks",
     )
+
+    # Notifications
+    notification: Optional[NotificationConfig] = None
 
     @model_validator(mode="after")
     def validate_account_references(self):
