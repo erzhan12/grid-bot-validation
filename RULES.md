@@ -6,6 +6,8 @@
 
 Successfully extracted pure strategy logic from `bbu2-master` into `packages/gridcore/` with zero exchange dependencies.
 
+**Documentation**: See `docs/features/0001_IMPLEMENTATION_SUMMARY.md` for complete implementation summary and usage examples.
+
 ### Key Implementation Notes
 
 1. **Zero Exchange Dependencies**
@@ -198,6 +200,7 @@ uv run pytest packages/gridcore/tests/test_grid.py -v
     - **Safety check added**: `build_grid()` validates no duplicate prices (would violate uniqueness without grid_level in hash)
     - **Maintenance**: When adding new parameters, decide if they affect identity. If yes, add to `_IDENTITY_PARAMS`. If no (like `qty`, `grid_level`), don't add.
     - **Benefit**: No manual f-string construction; adding/removing identity params is a one-line change to the list
+    - **Documentation**: See `docs/features/ORDER_IDENTITY_DESIGN.md` for comprehensive design rationale and implementation details
 11. **Position Risk Management**: For SHORT positions, higher liquidation ratio means closer to liquidation (use `>` not `<` in conditions)
 12. **Two-Position Architecture (CRITICAL)**: Always create BOTH Position objects and link with `set_opposite()`
     - Each trading pair requires two Position objects: one for long, one for short
