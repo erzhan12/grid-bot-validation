@@ -31,8 +31,9 @@ class PlaceLimitIntent:
     direction: str        # 'long' or 'short'
 
     # Parameters that determine order identity for deduplication
-    # Excludes: qty (execution layer determines), reduce_only (order flag)
-    _IDENTITY_PARAMS = ['symbol', 'side', 'price', 'grid_level', 'direction']
+    # Excludes: qty (execution layer determines), reduce_only (order flag), grid_level (tracking only)
+    # NOTE: grid_level is NOT part of identity hash - orders survive grid rebalancing
+    _IDENTITY_PARAMS = ['symbol', 'side', 'price', 'direction']
 
     @classmethod
     def create(
@@ -49,19 +50,24 @@ class PlaceLimitIntent:
         Factory method to create a PlaceLimitIntent with deterministic client_order_id.
 
         The client_order_id is generated deterministically from order identity parameters
-        (see _IDENTITY_PARAMS), ensuring that duplicate placement attempts for the same
-        grid level produce the same ID. This allows the execution layer to detect and
-        skip duplicates.
+        (see _IDENTITY_PARAMS), ensuring that duplicate placement attempts at the same
+        price produce the same ID. This allows the execution layer to detect and skip
+        duplicates.
+
+        IMPORTANT: grid_level is NOT part of the identity hash. Orders are identified
+        by (symbol, side, price, direction) only. This means orders survive grid
+        rebalancing (center_grid) as long as the price remains in the grid. The
+        grid_level field is preserved for tracking and analytics purposes.
 
         NOTE: When adding new parameters, consider whether they should be part of the
-        identity hash. If yes, add to _IDENTITY_PARAMS. If no (like qty), don't add.
+        identity hash. If yes, add to _IDENTITY_PARAMS. If no (like qty, grid_level), don't add.
 
         Args:
             symbol: Trading pair symbol
             side: 'Buy' or 'Sell'
             price: Limit order price
             qty: Order quantity (NOT part of identity hash)
-            grid_level: Grid level index (for tracking/reporting)
+            grid_level: Grid level index (for tracking/reporting, NOT part of identity hash)
             direction: 'long' or 'short'
             reduce_only: Whether this is a reduce-only order (NOT part of identity hash)
 

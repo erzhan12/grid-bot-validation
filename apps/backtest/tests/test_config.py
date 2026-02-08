@@ -6,10 +6,12 @@ import tempfile
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from backtest.config import (
     BacktestConfig,
     BacktestStrategyConfig,
+    WindDownMode,
     load_config,
 )
 
@@ -60,7 +62,7 @@ class TestBacktestConfig:
 
         assert config.initial_balance == Decimal("10000")
         assert config.enable_funding is True
-        assert config.wind_down_mode == "leave_open"
+        assert config.wind_down_mode == WindDownMode.LEAVE_OPEN
 
     def test_initial_balance_from_int(self):
         """initial_balance can be provided as int."""
@@ -70,7 +72,7 @@ class TestBacktestConfig:
 
     def test_wind_down_mode_validation(self):
         """Invalid wind_down_mode raises error."""
-        with pytest.raises(ValueError):
+        with pytest.raises(ValidationError, match="wind_down_mode"):
             BacktestConfig(wind_down_mode="invalid")
 
     def test_get_strategy(self):

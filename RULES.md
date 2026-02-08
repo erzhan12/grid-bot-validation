@@ -191,9 +191,12 @@ uv run pytest packages/gridcore/tests/test_grid.py -v
 9. **Grid Rebuild**: `build_greed()` clears `self.greed = []` before building to prevent doubling on rebuilds
 10. **Duplicate Orders**: `PlaceLimitIntent.create()` uses deterministic `client_order_id` (SHA256 hash of identity params) so execution layer can detect/skip duplicates
     - **Dynamic Identity Hash (2026-01-23)**: Uses `_IDENTITY_PARAMS` class constant to define which parameters affect order identity
-    - Current identity params: `['symbol', 'side', 'price', 'grid_level', 'direction']`
-    - Excluded from hash: `qty` (execution layer determines), `reduce_only` (order flag)
-    - **Maintenance**: When adding new parameters, decide if they affect identity. If yes, add to `_IDENTITY_PARAMS`. If no (like `qty`), don't add.
+    - **UPDATED (2026-02-06)**: Removed `grid_level` from identity hash - Current identity params: `['symbol', 'side', 'price', 'direction']`
+    - **Rationale**: Orders survive grid rebalancing (`center_grid()`) when grid_level changes but price stays same
+    - Excluded from hash: `qty` (execution layer determines), `reduce_only` (order flag), `grid_level` (tracking only)
+    - **grid_level field preserved**: Still part of dataclass for tracking/reporting/analytics, just not in hash
+    - **Safety check added**: `build_grid()` validates no duplicate prices (would violate uniqueness without grid_level in hash)
+    - **Maintenance**: When adding new parameters, decide if they affect identity. If yes, add to `_IDENTITY_PARAMS`. If no (like `qty`, `grid_level`), don't add.
     - **Benefit**: No manual f-string construction; adding/removing identity params is a one-line change to the list
 11. **Position Risk Management**: For SHORT positions, higher liquidation ratio means closer to liquidation (use `>` not `<` in conditions)
 12. **Two-Position Architecture (CRITICAL)**: Always create BOTH Position objects and link with `set_opposite()`
@@ -1179,6 +1182,39 @@ Successfully implemented a backtest system using gridcore's GridEngine with trad
 - Quantity rounding uses `math.ceil` (round UP), not round to nearest
 - Rationale: Ensures orders meet minimum size requirements, safer than rounding down
 - bbu2 reference: `bbu_reference/bbu2-master/bybit_api_usdt.py:271-273`
+
+### Test Improvements (2026-02-06)
+
+**State Reset Test Fix:**
+
+1. **Fixed `test_run_resets_state_between_runs` to actually validate reset**
+   - **Issue**: Test ran same symbol twice, checking `len(runners) == 1` - would pass even without reset (same key overwrite)
+   - **Fix**: Changed to run BTCUSDT then ETHUSDT (no strategy), assert `len(runners) == 0`
+   - **Validates**: Multi-symbol runs don't accumulate old runners
+   - **File**: `apps/backtest/tests/test_engine.py:145-169`
+
+2. **Added `test_run_creates_new_runner_instances` for object identity check**
+   - **Validates**: Each run creates new runner instances, not reusing old ones
+   - **Pattern**: Store first runner reference, run again, assert `first_runner is not second_runner`
+   - **File**: `apps/backtest/tests/test_engine.py:171-191`
+
+**Testing Pattern for State Reset:**
+- Use **multi-symbol approach** when testing cross-contamination between runs
+- Use **object identity (`is not`)** when verifying fresh instances are created
+- Both patterns together provide comprehensive validation of state reset
+
+**WindDownMode Enum Refactoring:**
+
+3. **Refactored `wind_down_mode` from string validation to StrEnum**
+   - **Before**: `wind_down_mode: str` with `@field_validator` checking valid strings
+   - **After**: `WindDownMode(StrEnum)` with values `LEAVE_OPEN`, `CLOSE_ALL`
+   - **Benefits**: Type safety, IDE autocomplete, refactorability, consistency with gridcore enums
+   - **Pattern**: Following established StrEnum pattern (DirectionType, SideType, GridSideType)
+   - **Files**:
+     - Enum: `apps/backtest/src/backtest/config.py:16-20`
+     - Usage: `apps/backtest/src/backtest/engine.py:15,385`
+     - Tests: `apps/backtest/tests/test_config.py:75`, `apps/backtest/tests/test_engine.py:82,93`
+     - Export: `apps/backtest/src/backtest/__init__.py`
 
 ### Test Commands
 ```bash

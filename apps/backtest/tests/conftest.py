@@ -7,7 +7,7 @@ import pytest
 
 from gridcore import TickerEvent, EventType
 
-from backtest.config import BacktestConfig, BacktestStrategyConfig
+from backtest.config import BacktestConfig, BacktestStrategyConfig, WindDownMode
 from backtest.fill_simulator import TradeThroughFillSimulator
 from backtest.order_manager import BacktestOrderManager, SimulatedOrder
 from backtest.position_tracker import BacktestPositionTracker
@@ -39,7 +39,7 @@ def sample_config(sample_strategy_config):
         initial_balance=Decimal("10000"),
         enable_funding=True,
         funding_rate=Decimal("0.0001"),
-        wind_down_mode="leave_open",
+        wind_down_mode=WindDownMode.LEAVE_OPEN,
     )
 
 

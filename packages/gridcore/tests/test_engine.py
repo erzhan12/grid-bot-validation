@@ -622,6 +622,34 @@ class TestDeterministicClientOrderId:
         # IDs should be the same - qty doesn't affect idempotency
         assert intent1.client_order_id == intent2.client_order_id
 
+    def test_grid_level_does_not_affect_id(self):
+        """Grid level is not part of the idempotency key (allows orders to survive rebalancing)."""
+        intent1 = PlaceLimitIntent.create(
+            symbol='BTCUSDT',
+            side='Buy',
+            price=Decimal('99000.0'),
+            qty=Decimal('0.001'),
+            grid_level=10,
+            direction='long',
+        )
+
+        intent2 = PlaceLimitIntent.create(
+            symbol='BTCUSDT',
+            side='Buy',
+            price=Decimal('99000.0'),
+            qty=Decimal('0.001'),
+            grid_level=15,  # Different grid_level
+            direction='long',
+        )
+
+        # IDs should be the same - grid_level doesn't affect idempotency
+        # This allows orders to survive center_grid() rebalancing
+        assert intent1.client_order_id == intent2.client_order_id
+
+        # But grid_level field is still preserved for tracking
+        assert intent1.grid_level == 10
+        assert intent2.grid_level == 15
+
 
 class TestAnchorPricePersistence:
     """Tests for anchor price persistence functionality."""

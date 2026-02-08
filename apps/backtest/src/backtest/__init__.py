@@ -4,7 +4,7 @@ Backtest package for grid trading strategy simulation.
 Uses gridcore's GridEngine with trade-through fill model.
 """
 
-from backtest.config import BacktestConfig, BacktestStrategyConfig
+from backtest.config import BacktestConfig, BacktestStrategyConfig, WindDownMode
 from backtest.session import BacktestSession, BacktestMetrics, BacktestTrade
 from backtest.fill_simulator import TradeThroughFillSimulator
 from backtest.position_tracker import BacktestPositionTracker, PositionState
@@ -17,6 +17,7 @@ __all__ = [
     # Config
     "BacktestConfig",
     "BacktestStrategyConfig",
+    "WindDownMode",
     # Session
     "BacktestSession",
     "BacktestMetrics",

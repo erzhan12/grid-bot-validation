@@ -5,11 +5,19 @@ Loads backtest configuration from YAML file with Pydantic validation.
 
 import os
 from decimal import Decimal
+from enum import StrEnum
 from pathlib import Path
 from typing import Optional
 
 import yaml
 from pydantic import BaseModel, Field, field_validator
+
+
+class WindDownMode(StrEnum):
+    """Wind-down mode at end of backtest."""
+
+    LEAVE_OPEN = "leave_open"
+    CLOSE_ALL = "close_all"
 
 
 class BacktestStrategyConfig(BaseModel):
@@ -87,9 +95,9 @@ class BacktestConfig(BaseModel):
     )
 
     # End-of-backtest handling
-    wind_down_mode: str = Field(
-        default="leave_open",
-        description="What to do with positions at end: 'leave_open' or 'close_all'",
+    wind_down_mode: WindDownMode = Field(
+        default=WindDownMode.LEAVE_OPEN,
+        description="What to do with positions at end",
     )
 
     @field_validator("initial_balance", mode="before")
@@ -110,15 +118,6 @@ class BacktestConfig(BaseModel):
             return Decimal(v)
         if isinstance(v, (int, float)):
             return Decimal(str(v))
-        return v
-
-    @field_validator("wind_down_mode")
-    @classmethod
-    def validate_wind_down_mode(cls, v):
-        """Validate wind_down_mode is valid."""
-        valid = {"leave_open", "close_all"}
-        if v not in valid:
-            raise ValueError(f"wind_down_mode must be one of {valid}, got '{v}'")
         return v
 
     def get_strategy(self, strat_id: str) -> Optional[BacktestStrategyConfig]:

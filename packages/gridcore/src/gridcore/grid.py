@@ -111,6 +111,19 @@ class Grid:
             price = self._round_price(price * (1 - step))
             self.grid.insert(0, {'side': GridSideType.BUY, 'price': price})
 
+        # Safety check: Ensure no duplicate prices (critical since grid_level not in hash)
+        prices = [g['price'] for g in self.grid]
+        unique_prices = set(prices)
+        if len(prices) != len(unique_prices):
+            # Find duplicates for error message
+            from collections import Counter
+            duplicates = [price for price, count in Counter(prices).items() if count > 1]
+            raise ValueError(
+                f"Grid contains duplicate prices: {duplicates}. "
+                f"This violates order identity uniqueness (grid_level not in hash). "
+                f"Check tick_size={self.tick_size} and grid_step={self.grid_step}."
+            )
+
     def __rebuild_grid(self, last_close: float) -> None:
         """
         Rebuild grid from scratch.
