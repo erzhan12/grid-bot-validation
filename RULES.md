@@ -1166,16 +1166,23 @@ Successfully implemented a backtest system using gridcore's GridEngine with trad
 
 **Instrument Info Fetching & Quantity Rounding:**
 
-2. **Created `instrument_info.py` module for Bybit instrument parameters**
-   - Fetches `qty_step`, `tick_size`, `min_qty`, `max_qty` from Bybit public API using `pybit`
-   - Caches to `conf/instruments_cache.json` (hybrid approach: fetch from API, fallback to cache)
-   - `InstrumentInfo.round_qty()` rounds UP using `math.ceil` (matches bbu2 `__round_amount`)
-   - **File**: `apps/backtest/src/backtest/instrument_info.py`
+2. **`InstrumentInfoProvider` class (OOP refactor of `instrument_info.py`)**
+   - Encapsulates `fetch_from_bybit`, `load_from_cache`, `save_to_cache`, `get` into a class
+   - `cache_path` and `cache_ttl` are instance attributes (no more module-level state)
+   - `pybit` import is lazy (inside `fetch_from_bybit` method only)
+   - **API validation**: Rejects zero `qty_step`/`tick_size` from API (returns `None` → triggers cache fallback)
+   - **24h cache TTL**: Each cache entry stores `cached_at` ISO timestamp; stale entries trigger API refresh
+   - **TTL configurable**: `BacktestConfig.instrument_cache_ttl_hours` (default 24, passed to provider via engine)
+   - **Fallback cascade**: fresh cache → API → stale cache → hardcoded defaults
+   - **Backward-compatible**: Old cache files without `cached_at` are treated as stale (triggers refresh)
+   - **Tests**: 30 tests in `test_instrument_info.py` (96% coverage)
+   - **Files**: `apps/backtest/src/backtest/instrument_info.py`, `apps/backtest/tests/test_instrument_info.py`
 
 3. **Integrated quantity rounding in BacktestEngine**
-   - `_init_runner()` fetches instrument info before creating qty_calculator
+   - `BacktestEngine.__init__` creates `InstrumentInfoProvider` with TTL from config
+   - `_init_runner()` calls `self._instrument_provider.get(symbol)` for instrument info
    - `_create_qty_calculator()` applies `instrument_info.round_qty()` to all qty calculations
-   - **File**: `apps/backtest/src/backtest/engine.py:231-250, 276-323`
+   - **Files**: `apps/backtest/src/backtest/engine.py:112-114,235`, `apps/backtest/src/backtest/config.py:103-108`
 
 4. **Added `pybit>=5.8` dependency**
    - Required for `HTTP().get_instruments_info()` public API call
