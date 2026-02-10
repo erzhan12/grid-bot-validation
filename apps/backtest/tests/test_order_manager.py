@@ -279,3 +279,132 @@ class TestBacktestOrderManager:
 
         # Commission = 0.1 * 100000 * 0.0002 = 2
         assert fills[0].fee == Decimal("2")
+
+    def test_cancel_by_client_order_id_success(self, order_manager, sample_timestamp):
+        """Cancel by client_order_id removes order from active."""
+        order_manager.place_order(
+            client_order_id="c1",
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("100000"),
+            qty=Decimal("0.1"),
+            direction="long",
+            grid_level=0,
+            timestamp=sample_timestamp,
+        )
+
+        success = order_manager.cancel_by_client_order_id("c1", sample_timestamp)
+
+        assert success is True
+        assert order_manager.total_active_orders == 0
+        assert len(order_manager.cancelled_orders) == 1
+        assert order_manager.cancelled_orders[0].status == "cancelled"
+        assert order_manager.cancelled_orders[0].client_order_id == "c1"
+
+    def test_cancel_by_client_order_id_not_found(self, order_manager, sample_timestamp):
+        """Cancel with non-existent client_order_id returns False."""
+        success = order_manager.cancel_by_client_order_id("nonexistent", sample_timestamp)
+
+        assert success is False
+
+    def test_cancel_by_client_order_id_allows_reuse(self, order_manager, sample_timestamp):
+        """Canceled client_order_id can be reused for a new order."""
+        order_manager.place_order(
+            client_order_id="c1",
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("100000"),
+            qty=Decimal("0.1"),
+            direction="long",
+            grid_level=0,
+            timestamp=sample_timestamp,
+        )
+
+        order_manager.cancel_by_client_order_id("c1", sample_timestamp)
+
+        # Reuse the same client_order_id
+        order = order_manager.place_order(
+            client_order_id="c1",
+            symbol="BTCUSDT",
+            side="Sell",
+            price=Decimal("101000"),
+            qty=Decimal("0.2"),
+            direction="short",
+            grid_level=1,
+            timestamp=sample_timestamp,
+        )
+
+        assert order is not None
+        assert order.client_order_id == "c1"
+        assert order_manager.total_active_orders == 1
+
+    def test_get_order_by_id_found(self, order_manager, sample_timestamp):
+        """Get active order by order_id."""
+        order = order_manager.place_order(
+            client_order_id="c1",
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("100000"),
+            qty=Decimal("0.1"),
+            direction="long",
+            grid_level=0,
+            timestamp=sample_timestamp,
+        )
+
+        found = order_manager.get_order_by_id(order.order_id)
+
+        assert found is not None
+        assert found.order_id == order.order_id
+        assert found.client_order_id == "c1"
+
+    def test_get_order_by_id_not_found(self, order_manager):
+        """Get non-existent order_id returns None."""
+        assert order_manager.get_order_by_id("nonexistent") is None
+
+    def test_get_order_by_client_id_active(self, order_manager, sample_timestamp):
+        """Get active order by client_order_id."""
+        order_manager.place_order(
+            client_order_id="c1",
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("100000"),
+            qty=Decimal("0.1"),
+            direction="long",
+            grid_level=0,
+            timestamp=sample_timestamp,
+        )
+
+        found = order_manager.get_order_by_client_id("c1")
+
+        assert found is not None
+        assert found.client_order_id == "c1"
+        assert found.status == "pending"
+
+    def test_get_order_by_client_id_filled(self, order_manager, sample_timestamp):
+        """Get filled order by client_order_id."""
+        order_manager.place_order(
+            client_order_id="c1",
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("100000"),
+            qty=Decimal("0.1"),
+            direction="long",
+            grid_level=0,
+            timestamp=sample_timestamp,
+        )
+
+        # Fill the order
+        order_manager.check_fills(
+            current_price=Decimal("99000"),
+            timestamp=sample_timestamp,
+        )
+
+        found = order_manager.get_order_by_client_id("c1")
+
+        assert found is not None
+        assert found.client_order_id == "c1"
+        assert found.status == "filled"
+
+    def test_get_order_by_client_id_not_found(self, order_manager):
+        """Get non-existent client_order_id returns None."""
+        assert order_manager.get_order_by_client_id("nonexistent") is None
