@@ -10,7 +10,6 @@ from typing import Iterator, Optional
 
 from gridcore import TickerEvent, EventType
 from grid_db import DatabaseFactory, TickerSnapshot, PublicTrade
-from grid_db.repositories import TickerSnapshotRepository, PublicTradeRepository
 
 
 @dataclass
@@ -70,20 +69,28 @@ class HistoricalDataProvider:
             yield from self._iterate_tickers()
 
     def _iterate_tickers(self) -> Iterator[TickerEvent]:
-        """Iterate over TickerSnapshot records."""
-        with self._db.get_session() as session:
-            repo = TickerSnapshotRepository(session)
+        """Iterate over TickerSnapshot records.
 
-            # Paginate through data
-            offset = 0
+        Uses cursor-based pagination on exchange_ts for O(1) page fetches.
+        Safe because (symbol, exchange_ts) has a unique constraint.
+        """
+        with self._db.get_session() as session:
+            cursor_ts = self._start_ts
+            use_gte = True  # First query uses >=, subsequent use >
+
             while True:
-                snapshots = (
+                query = (
                     session.query(TickerSnapshot)
                     .filter(TickerSnapshot.symbol == self._symbol)
-                    .filter(TickerSnapshot.exchange_ts >= self._start_ts)
                     .filter(TickerSnapshot.exchange_ts <= self._end_ts)
-                    .order_by(TickerSnapshot.exchange_ts)
-                    .offset(offset)
+                )
+                if use_gte:
+                    query = query.filter(TickerSnapshot.exchange_ts >= cursor_ts)
+                else:
+                    query = query.filter(TickerSnapshot.exchange_ts > cursor_ts)
+
+                snapshots = (
+                    query.order_by(TickerSnapshot.exchange_ts)
                     .limit(self._batch_size)
                     .all()
                 )
@@ -104,29 +111,44 @@ class HistoricalDataProvider:
                         funding_rate=snapshot.funding_rate,
                     )
 
-                offset += len(snapshots)
-
                 if len(snapshots) < self._batch_size:
                     break
+
+                cursor_ts = snapshots[-1].exchange_ts
+                use_gte = False
 
     def _iterate_trades(self) -> Iterator[TickerEvent]:
         """Iterate over PublicTrade records, converting to TickerEvents.
 
+        Uses composite cursor (exchange_ts, id) because multiple trades
+        can share the same timestamp. The id column breaks ties.
+
         Note: Trades don't have bid/ask/funding, so we use price for all.
         """
         with self._db.get_session() as session:
-            repo = PublicTradeRepository(session)
+            from sqlalchemy import tuple_
 
-            # Paginate through data
-            offset = 0
+            cursor_ts = self._start_ts
+            cursor_id = 0
+            is_first = True  # First query uses >= on ts, subsequent use composite >
+
             while True:
-                trades = (
+                query = (
                     session.query(PublicTrade)
                     .filter(PublicTrade.symbol == self._symbol)
-                    .filter(PublicTrade.exchange_ts >= self._start_ts)
                     .filter(PublicTrade.exchange_ts <= self._end_ts)
-                    .order_by(PublicTrade.exchange_ts)
-                    .offset(offset)
+                )
+                if is_first:
+                    query = query.filter(PublicTrade.exchange_ts >= cursor_ts)
+                else:
+                    # Composite cursor: skip rows at or before (cursor_ts, cursor_id)
+                    query = query.filter(
+                        tuple_(PublicTrade.exchange_ts, PublicTrade.id)
+                        > tuple_(cursor_ts, cursor_id)
+                    )
+
+                trades = (
+                    query.order_by(PublicTrade.exchange_ts, PublicTrade.id)
                     .limit(self._batch_size)
                     .all()
                 )
@@ -147,10 +169,12 @@ class HistoricalDataProvider:
                         funding_rate=Decimal("0"),  # Not available
                     )
 
-                offset += len(trades)
-
                 if len(trades) < self._batch_size:
                     break
+
+                cursor_ts = trades[-1].exchange_ts
+                cursor_id = trades[-1].id
+                is_first = False
 
     def get_data_range_info(self) -> DataRangeInfo:
         """Get information about available data range.

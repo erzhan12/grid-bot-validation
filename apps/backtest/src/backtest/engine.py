@@ -43,6 +43,10 @@ class FundingSimulator:
         self.rate = rate
         self._last_funding_time: Optional[datetime] = None
 
+    def reset(self) -> None:
+        """Reset funding simulator state for a new run."""
+        self._last_funding_time = None
+
     def should_apply_funding(self, current_time: datetime) -> bool:
         """Check if funding should be applied at this time.
 
@@ -148,7 +152,7 @@ class BacktestEngine:
         self._last_prices = {}
         self._last_timestamp = None
         if self._funding_simulator:
-            self._funding_simulator._last_funding_time = None
+            self._funding_simulator.reset()
 
         # Create session
         self._session = BacktestSession(

@@ -130,10 +130,6 @@ class BacktestConfig(BaseModel):
     def get_strategy(self, strat_id: str) -> Optional[BacktestStrategyConfig]:
         """Get strategy config by ID."""
         return next((s for s in self.strategies if s.strat_id == strat_id), None)
-        # for s in self.strategies:
-        #     if s.strat_id == strat_id:
-        #         return s
-        # return None
 
     def get_strategies_for_symbol(self, symbol: str) -> list[BacktestStrategyConfig]:
         """Get all strategies for a symbol."""

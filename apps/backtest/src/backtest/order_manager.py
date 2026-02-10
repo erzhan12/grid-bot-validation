@@ -203,7 +203,7 @@ class BacktestOrderManager:
                     qty=order.qty,
                     fee=fee,
                     closed_pnl=Decimal("0"),  # Will be calculated by position tracker
-                    closed_size=Decimal("0"),  # Will be determined by position tracker
+                    closed_size=Decimal("0"),  # Not used in backtest (live bot uses for same-order detection)
                     leaves_qty=Decimal("0"),  # Fully filled
                 )
                 fills.append(exec_event)
