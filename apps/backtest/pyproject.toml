@@ -1,0 +1,24 @@
+[project]
+name = "backtest"
+version = "0.1.0"
+description = "Grid trading backtest system with trade-through fill model"
+requires-python = ">=3.11"
+dependencies = [
+    "gridcore",
+    "grid-db",
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "pybit>=5.8",
+]
+
+[tool.uv.sources]
+gridcore = { workspace = true }
+grid-db = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/backtest"]
