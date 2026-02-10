@@ -100,6 +100,13 @@ class BacktestConfig(BaseModel):
         description="What to do with positions at end",
     )
 
+    # Instrument info cache
+    instrument_cache_ttl_hours: int = Field(
+        default=24,
+        gt=0,
+        description="Hours before instrument cache is refreshed from API",
+    )
+
     @field_validator("initial_balance", mode="before")
     @classmethod
     def parse_initial_balance(cls, v):

@@ -15,7 +15,7 @@ from gridcore import DirectionType, SideType
 from backtest.config import BacktestConfig, BacktestStrategyConfig, WindDownMode
 from backtest.data_provider import HistoricalDataProvider, InMemoryDataProvider, DataRangeInfo
 from backtest.fill_simulator import TradeThroughFillSimulator
-from backtest.instrument_info import get_instrument_info, InstrumentInfo
+from backtest.instrument_info import InstrumentInfoProvider, InstrumentInfo
 from backtest.order_manager import BacktestOrderManager
 from backtest.executor import BacktestExecutor
 from backtest.position_tracker import BacktestPositionTracker
@@ -110,6 +110,9 @@ class BacktestEngine:
         """
         self._config = config
         self._db = db
+        self._instrument_provider = InstrumentInfoProvider(
+            cache_ttl=timedelta(hours=config.instrument_cache_ttl_hours),
+        )
 
         # Session and runners (created per run)
         self._session: Optional[BacktestSession] = None
@@ -232,7 +235,7 @@ class BacktestEngine:
     def _init_runner(self, strategy_config: BacktestStrategyConfig) -> None:
         """Initialize a runner for a strategy."""
         # Fetch instrument info (from API or cache)
-        instrument_info = get_instrument_info(strategy_config.symbol)
+        instrument_info = self._instrument_provider.get(strategy_config.symbol)
         logger.info(
             f"Instrument {strategy_config.symbol}: "
             f"qty_step={instrument_info.qty_step}, tick_size={instrument_info.tick_size}"
