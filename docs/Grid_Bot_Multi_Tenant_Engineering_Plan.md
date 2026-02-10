@@ -394,9 +394,12 @@ class PlaceLimitIntent:
     price: Decimal
     qty: Decimal
     reduce_only: bool
-    client_order_id: str  # Auto-generated for matching
-    grid_level: int       # For comparison reports
+    client_order_id: str  # Auto-generated hash from (symbol, side, price, direction)
+    grid_level: int       # For tracking/comparison reports (NOT part of identity hash)
+    direction: str        # 'long' or 'short'
 ```
+
+**Order Identity:** Orders are identified by `(symbol, side, price, direction)` only. `grid_level` is preserved for tracking but does NOT affect `client_order_id`. This allows orders to survive grid rebalancing (`center_grid()`) when grid levels shift but prices remain the same.
 
 ### 4.3 Strategy Engine API
 
@@ -497,8 +500,10 @@ class ReplayFeed:
 
 1. **Run Live Bot:** Execute with data capture enabled, generating run_id
 2. **Run Backtest:** Load run config, replay same time window with same gridcore version
-3. **Compare:** Match executions by client_order_id (orderLinkId) and grid_level
+3. **Compare:** Match executions by client_order_id (orderLinkId). Use grid_level for enriched reporting (e.g., "which grid levels filled most frequently")
 4. **Report:** Generate metrics and identify divergences
+
+**Note:** `client_order_id` is deterministic based on `(symbol, side, price, direction)`. Orders are matched by this ID. `grid_level` provides additional context for analysis but is not used for matching (allows comparison even if grid rebalances during run).
 
 ### 7.2 Comparison Metrics
 

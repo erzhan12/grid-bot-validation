@@ -23,6 +23,12 @@ class DirectionType(StrEnum):
     SHORT = 'short'
 
 
+class SideType(StrEnum):
+    """Order side type constants."""
+    BUY = 'Buy'
+    SELL = 'Sell'
+
+
 @dataclass
 class PositionState:
     """
@@ -68,9 +74,9 @@ class Position:
     Reference: bbu2-master/position.py:4-159
     """
 
-    # Order side constants
-    SIDE_BUY = 'Buy'
-    SIDE_SELL = 'Sell'
+    # Order side constants (aliases for SideType enum values)
+    SIDE_BUY = SideType.BUY
+    SIDE_SELL = SideType.SELL
 
     # Direction constants (aliases for DirectionType enum values)
     DIRECTION_LONG = DirectionType.LONG

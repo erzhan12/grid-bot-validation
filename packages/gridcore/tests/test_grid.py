@@ -47,6 +47,20 @@ class TestGridBasic:
 
         assert len(grid.grid) == 0
 
+    def test_build_grid_no_duplicate_prices(self):
+        """Grid build validates no duplicate prices (critical for order identity)."""
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=50, grid_step=0.2)
+        grid.build_grid(100000.0)
+
+        # Extract all prices
+        prices = [g['price'] for g in grid.grid]
+
+        # All prices must be unique
+        assert len(prices) == len(set(prices)), "Grid contains duplicate prices"
+
+        # Also verify prices are sorted
+        assert prices == sorted(prices), "Grid prices are not in ascending order"
+
     def test_is_greed_correct(self):
         """Valid BUY→WAIT→SELL sequence."""
         grid = Grid(tick_size=Decimal('0.1'), grid_count=50, grid_step=0.2)

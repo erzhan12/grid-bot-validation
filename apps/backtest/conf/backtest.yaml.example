@@ -1,0 +1,37 @@
+# Backtest Configuration Example
+# Copy to backtest.yaml and customize
+
+strategies:
+  - strat_id: "btcusdt_backtest"
+    symbol: "BTCUSDT"
+    tick_size: "0.1"
+    grid_count: 50
+    grid_step: 0.2
+    amount: "x0.001"  # 0.1% of wallet per order
+    max_margin: 8.0
+    long_koef: 1.0
+    min_liq_ratio: 0.8
+    max_liq_ratio: 1.2
+    min_total_margin: 0.15
+    commission_rate: "0.0002"  # 0.02% maker fee
+
+  # Add more strategies as needed
+  # - strat_id: "ethusdt_backtest"
+  #   symbol: "ETHUSDT"
+  #   tick_size: "0.01"
+  #   ...
+
+# Database connection
+database_url: "sqlite:///gridbot.db"
+
+# Initial wallet balance for simulation
+initial_balance: 10000
+
+# Funding simulation
+enable_funding: true
+funding_rate: "0.0001"  # 0.01% per 8 hours
+
+# What to do with positions at end of backtest
+# - "leave_open": Report unrealized PnL
+# - "close_all": Force close at last price
+wind_down_mode: "leave_open"

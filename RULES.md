@@ -6,6 +6,8 @@
 
 Successfully extracted pure strategy logic from `bbu2-master` into `packages/gridcore/` with zero exchange dependencies.
 
+**Documentation**: See `docs/features/0001_IMPLEMENTATION_SUMMARY.md` for complete implementation summary and usage examples.
+
 ### Key Implementation Notes
 
 1. **Zero Exchange Dependencies**
@@ -191,10 +193,14 @@ uv run pytest packages/gridcore/tests/test_grid.py -v
 9. **Grid Rebuild**: `build_greed()` clears `self.greed = []` before building to prevent doubling on rebuilds
 10. **Duplicate Orders**: `PlaceLimitIntent.create()` uses deterministic `client_order_id` (SHA256 hash of identity params) so execution layer can detect/skip duplicates
     - **Dynamic Identity Hash (2026-01-23)**: Uses `_IDENTITY_PARAMS` class constant to define which parameters affect order identity
-    - Current identity params: `['symbol', 'side', 'price', 'grid_level', 'direction']`
-    - Excluded from hash: `qty` (execution layer determines), `reduce_only` (order flag)
-    - **Maintenance**: When adding new parameters, decide if they affect identity. If yes, add to `_IDENTITY_PARAMS`. If no (like `qty`), don't add.
+    - **UPDATED (2026-02-06)**: Removed `grid_level` from identity hash - Current identity params: `['symbol', 'side', 'price', 'direction']`
+    - **Rationale**: Orders survive grid rebalancing (`center_grid()`) when grid_level changes but price stays same
+    - Excluded from hash: `qty` (execution layer determines), `reduce_only` (order flag), `grid_level` (tracking only)
+    - **grid_level field preserved**: Still part of dataclass for tracking/reporting/analytics, just not in hash
+    - **Safety check added**: `build_grid()` validates no duplicate prices (would violate uniqueness without grid_level in hash)
+    - **Maintenance**: When adding new parameters, decide if they affect identity. If yes, add to `_IDENTITY_PARAMS`. If no (like `qty`, `grid_level`), don't add.
     - **Benefit**: No manual f-string construction; adding/removing identity params is a one-line change to the list
+    - **Documentation**: See `docs/features/ORDER_IDENTITY_DESIGN.md` for comprehensive design rationale and implementation details
 11. **Position Risk Management**: For SHORT positions, higher liquidation ratio means closer to liquidation (use `>` not `<` in conditions)
 12. **Two-Position Architecture (CRITICAL)**: Always create BOTH Position objects and link with `set_opposite()`
     - Each trading pair requires two Position objects: one for long, one for short
@@ -205,7 +211,10 @@ uv run pytest packages/gridcore/tests/test_grid.py -v
       - `DirectionType` is a `StrEnum` (like `GridSideType`) - values are strings, so backward-compatible
       - Imported from `gridcore` or `gridcore.position`
       - `Position.DIRECTION_LONG` and `Position.DIRECTION_SHORT` are aliases for backward compatibility
-    - **String Constants (2026-01-15)**: Use `Position.SIDE_BUY`, `Position.SIDE_SELL` instead of hardcoded strings
+    - **SideType Enum (2026-02-05)**: Use `SideType.BUY`, `SideType.SELL` instead of hardcoded strings `'Buy'`/`'Sell'`
+      - `SideType` is a `StrEnum` - values are strings, so backward-compatible
+      - Imported from `gridcore` or `gridcore.position`
+      - `Position.SIDE_BUY` and `Position.SIDE_SELL` are now aliases for `SideType.BUY`/`SideType.SELL`
     - Moderate liquidation risk triggers cross-position adjustments (modifying opposite's multipliers)
     - Without linking, the method will fail with a clear error message instead of silently doing nothing
     - Example:
@@ -951,10 +960,287 @@ uv run pytest packages/bybit_adapter/tests -v
 uv run pytest shared/db/tests -v
 uv run pytest apps/event_saver/tests -v
 uv run pytest apps/gridbot/tests -v
+uv run pytest apps/backtest/tests -v
+```
+
+## Phase F: Backtest Rewrite (backtest)
+
+### Completed: 2026-02-03
+
+Successfully implemented a backtest system using gridcore's GridEngine with trade-through fill model.
+
+### Key Components
+
+1. **Package Structure**
+   ```
+   apps/backtest/
+   ├── pyproject.toml           # Dependencies: gridcore, grid-db (NO bybit_adapter)
+   ├── conf/
+   │   └── backtest.yaml.example
+   ├── src/backtest/
+   │   ├── __init__.py
+   │   ├── config.py             # BacktestConfig, BacktestStrategyConfig
+   │   ├── fill_simulator.py     # TradeThroughFillSimulator
+   │   ├── position_tracker.py   # BacktestPositionTracker
+   │   ├── order_manager.py      # BacktestOrderManager
+   │   ├── executor.py           # BacktestExecutor
+   │   ├── runner.py             # BacktestRunner
+   │   ├── engine.py             # BacktestEngine
+   │   ├── session.py            # BacktestSession
+   │   ├── data_provider.py      # HistoricalDataProvider, InMemoryDataProvider
+   │   └── main.py               # CLI entry point
+   └── tests/
+       └── test_*.py             # 60 tests
+   ```
+
+2. **Trade-Through Fill Model**
+   - BUY fills when `current_price <= limit_price`
+   - SELL fills when `current_price >= limit_price`
+   - Fill price = limit price (conservative assumption)
+   - Reference: `bbu_reference/backtest_reference/bbu_backtest-main/src/backtest_order_manager.py`
+
+3. **Architecture**
+   - Reuses `GridEngine` directly from gridcore (no modifications)
+   - Separate from gridbot (no WebSocket, no bybit_adapter dependency)
+   - In-memory order book simulation
+   - Position tracking with PnL calculations
+   - Funding simulation (8-hour intervals)
+
+4. **Running Backtest**
+   ```bash
+   # Run with default config
+   uv run python -m backtest.main --config conf/backtest.yaml
+
+   # Run with date range
+   uv run python -m backtest.main --config conf/backtest.yaml \
+       --start "2025-01-01" --end "2025-01-31"
+
+   # Export results to CSV
+   uv run python -m backtest.main --config conf/backtest.yaml --export results.csv
+   ```
+
+5. **Testing**
+   ```bash
+   uv run pytest apps/backtest/tests -v
+   ```
+
+### Key Implementation Notes
+
+1. **Order Format for GridEngine**: Use camelCase keys (`orderId`, `orderLinkId`, `price` as string)
+   - GridEngine expects Bybit API response format
+   - `get_limit_orders()` returns `{"long": [...], "short": [...]}`
+   - Keys: `orderId`, `orderLinkId`, `price` (string), `qty` (string), `side`
+
+2. **Position Tracker vs gridcore.Position**
+   - `BacktestPositionTracker`: Tracks size, entry price, realized/unrealized PnL
+   - `gridcore.Position`: Handles risk multipliers (different purpose)
+   - Backtest does NOT use gridcore.Position for PnL tracking
+
+3. **Quantity Calculation**
+   - Uses same amount format as gridbot: `"100"` (fixed USDT), `"x0.001"` (wallet fraction), `"b0.001"` (base currency)
+   - `qty_calculator` function passed to executor
+
+4. **Data Sources**
+   - `HistoricalDataProvider`: From database (TickerSnapshot or PublicTrade tables)
+   - `InMemoryDataProvider`: For testing with pre-created events
+
+5. **Funding Simulation**
+   - 8-hour intervals (00:00, 08:00, 16:00 UTC)
+   - Long pays, short receives when rate > 0
+   - Configurable via `enable_funding` and `funding_rate`
+
+### Bug Fixes (2026-02-03)
+
+**HIGH Priority:**
+
+1. **Filled Orders Lose Direction**
+   - **Issue**: `get_order_by_client_id()` only searched `active_orders`, but filled orders are moved to `filled_orders` before `_process_fill()` can look them up
+   - **Fix**: Extended `get_order_by_client_id()` to also search `filled_orders`
+   - **File**: `apps/backtest/src/backtest/order_manager.py:236-247`
+
+2. **client_order_id Reuse Blocked Forever**
+   - **Issue**: `_client_order_ids` set never removed IDs on fill/cancel, blocking deterministic ID reuse
+   - **Fix**: Added `_client_order_ids.discard()` in `cancel_order()` and `check_fills()`
+   - **Files**: `apps/backtest/src/backtest/order_manager.py:133-137, 178-185`
+
+3. **Multi-Symbol Runs Contaminated**
+   - **Issue**: `BacktestEngine.run()` didn't reset `_runners` or `_funding_simulator` state between runs
+   - **Fix**: Added state reset at start of `run()`: `self._runners = {}`, `_last_prices = {}`, `_last_timestamp = None`, `_last_funding_time = None`
+   - **File**: `apps/backtest/src/backtest/engine.py:138-144`
+
+**MEDIUM Priority:**
+
+4. **Funding Sign Tracking Inverted**
+   - **Issue**: `get_total_pnl()` used `+ funding_paid` but `funding_paid` is positive when we paid (should decrease PnL)
+   - **Fix**: Changed to `- funding_paid` in `get_total_pnl()` with corrected comment
+   - **File**: `apps/backtest/src/backtest/position_tracker.py:196-203`
+
+5. **close_all Wind-Down Mode Not Implemented**
+   - **Issue**: `_wind_down()` only logged open positions, didn't actually close them
+   - **Fix**: Implemented `_force_close_position()` that realizes PnL and records closing trades
+   - **File**: `apps/backtest/src/backtest/engine.py:336-395`
+
+6. **Test String-Decimal Type Error**
+   - **Issue**: `test_process_tick_fills_order` did `buy_price - Decimal("100")` where `buy_price` was a string
+   - **Fix**: Converted to `Decimal(buy_price)`
+   - **File**: `apps/backtest/tests/test_runner.py:72`
+
+7. **Missing Tests for Core Modules**
+   - **Issue**: No tests for BacktestEngine, BacktestExecutor, InMemoryDataProvider, FundingSimulator
+   - **Fix**: Added `test_engine.py` (14 tests) and `test_executor.py` (7 tests)
+   - **Files**: `apps/backtest/tests/test_engine.py`, `apps/backtest/tests/test_executor.py`
+
+### Bug Fixes (2026-02-04)
+
+**HIGH Priority:**
+
+8. **Multi-Strategy Equity Incorrect**
+   - **Issue**: Each runner called `session.update_equity()` with only its own unrealized PnL; multi-strategy runs had incorrect equity/balance
+   - **Fix**: Moved equity update to engine level in `_process_tick()` BEFORE runners execute (aggregates all runners' unrealized PnL)
+   - **Files**: `apps/backtest/src/backtest/engine.py:327-330`, `apps/backtest/src/backtest/runner.py:186-188`
+
+**MEDIUM Priority:**
+
+9. **close_all Leaves Stale Unrealized PnL**
+   - **Issue**: After force-closing, `unrealized_pnl` in tracker wasn't recalculated, causing non-zero final unrealized in metrics
+   - **Fix**: Added `tracker.calculate_unrealized_pnl(price)` after `process_fill()` in `_force_close_position()`
+   - **File**: `apps/backtest/src/backtest/engine.py:410-411`
+
+10. **Wallet-Fraction Sizing Uses Stale Balance**
+    - **Issue**: Orders used `session.current_balance` before equity was updated, so sizing lagged by one tick
+    - **Fix**: Engine now updates equity BEFORE runners process tick (fix #8 addresses this)
+    - **File**: `apps/backtest/src/backtest/engine.py:327-330`
+
+11. **Equity Updates Before Fills Processed**
+    - **Issue**: Equity updated before fills processed, so fills from current tick weren't reflected until next tick
+    - **Fix**: Split `runner.process_tick()` into two phases: `process_fills()` and `execute_tick()`. Engine now: (1) processes fills for all runners, (2) updates equity, (3) executes tick intents
+    - **Files**: `apps/backtest/src/backtest/runner.py:134-199`, `apps/backtest/src/backtest/engine.py:316-347`
+
+### Design Decisions (2026-02-04)
+
+1. **DB Persistence Skipped** - Backtest results are kept in-memory + CSV export only
+   - No `BacktestExecution` or `Run` persistence models implemented
+   - Use `BacktestReporter` for CSV export instead of database storage
+   - Rationale: Simpler architecture, backtests are typically one-off runs not requiring persistent storage
+   - Future: Can add DB persistence if multi-run comparison or long-term storage becomes necessary
+
+2. **Strict Cross Fill Model** - Orders only fill when price CROSSES the limit (not touches)
+   - BUY fills when `current_price < limit_price` (price must go BELOW)
+   - SELL fills when `current_price > limit_price` (price must go ABOVE)
+   - At limit price (`==`), order does NOT fill
+   - Rationale: Conservative assumption - at limit price, fill is not guaranteed (queue position, volume at level)
+   - Better for grid trading where orders sit at common price levels with competition
+   - File: `apps/backtest/src/backtest/fill_simulator.py`
+
+### Metrics & Reporting (2026-02-04)
+
+1. **BacktestMetrics** - Full performance metrics in `session.py`:
+   - Trade stats: total_trades, winning_trades, losing_trades, win_rate, avg_win, avg_loss
+   - PnL: total_realized_pnl, total_unrealized_pnl, total_commission, total_funding, net_pnl
+   - Risk: max_drawdown, max_drawdown_pct, max_drawdown_duration (ticks), sharpe_ratio
+   - Balance: initial_balance, final_balance, return_pct
+   - Activity: total_volume, turnover (volume / initial_balance)
+   - Direction breakdown: long_trades, short_trades, long_pnl, short_pnl, long_profit_factor, short_profit_factor
+
+2. **Sharpe Ratio Calculation** - `_calculate_sharpe_ratio()` in `session.py`:
+   - Annualized from equity curve returns
+   - Default assumes minute-level data (252 * 24 * 60 periods/year)
+   - Formula: `(mean_return / std_return) * sqrt(periods_per_year)`
+
+3. **BacktestReporter** - CSV export in `reporter.py`:
+   - `export_trades(path)`: Trade history with notional values
+   - `export_equity_curve(path)`: Equity and return % over time
+   - `export_metrics(path)`: All metrics as key-value CSV
+   - `export_all(output_dir)`: All exports to directory
+   - `get_summary_dict()`: Metrics as Python dict (useful for programmatic access)
+
+### Bug Fixes (2026-02-05)
+
+**Unrealized PnL % (ROE) for Risk Management:**
+
+1. **Added `calculate_unrealized_pnl_percent(current_price, leverage)` to BacktestPositionTracker**
+   - Uses exact bbu2 formula: `(1/entry - 1/close) * entry * 100 * leverage` (long)
+   - Short formula: `(1/close - 1/entry) * entry * 100 * leverage`
+   - Added `unrealized_pnl_percent` field to `PositionState` dataclass
+   - **File**: `apps/backtest/src/backtest/position_tracker.py:167-203`
+
+**Instrument Info Fetching & Quantity Rounding:**
+
+2. **`InstrumentInfoProvider` class (OOP refactor of `instrument_info.py`)**
+   - Encapsulates `fetch_from_bybit`, `load_from_cache`, `save_to_cache`, `get` into a class
+   - `cache_path` and `cache_ttl` are instance attributes (no more module-level state)
+   - `pybit` import is lazy (inside `fetch_from_bybit` method only)
+   - **API validation**: Rejects zero `qty_step`/`tick_size` from API (returns `None` → triggers cache fallback)
+   - **24h cache TTL**: Each cache entry stores `cached_at` ISO timestamp; stale entries trigger API refresh
+   - **TTL configurable**: `BacktestConfig.instrument_cache_ttl_hours` (default 24, passed to provider via engine)
+   - **Fallback cascade**: fresh cache → API → stale cache → hardcoded defaults
+   - **Backward-compatible**: Old cache files without `cached_at` are treated as stale (triggers refresh)
+   - **Tests**: 30 tests in `test_instrument_info.py` (96% coverage)
+   - **Files**: `apps/backtest/src/backtest/instrument_info.py`, `apps/backtest/tests/test_instrument_info.py`
+
+3. **Integrated quantity rounding in BacktestEngine**
+   - `BacktestEngine.__init__` creates `InstrumentInfoProvider` with TTL from config
+   - `_init_runner()` calls `self._instrument_provider.get(symbol)` for instrument info
+   - `_create_qty_calculator()` applies `instrument_info.round_qty()` to all qty calculations
+   - **Files**: `apps/backtest/src/backtest/engine.py:112-114,235`, `apps/backtest/src/backtest/config.py:103-108`
+
+4. **Added `pybit>=5.8` dependency**
+   - Required for `HTTP().get_instruments_info()` public API call
+   - **File**: `apps/backtest/pyproject.toml`
+
+**Key Notes:**
+- Quantity rounding uses `math.ceil` (round UP), not round to nearest
+- Rationale: Ensures orders meet minimum size requirements, safer than rounding down
+- bbu2 reference: `bbu_reference/bbu2-master/bybit_api_usdt.py:271-273`
+
+### Test Improvements (2026-02-06)
+
+**State Reset Test Fix:**
+
+1. **Fixed `test_run_resets_state_between_runs` to actually validate reset**
+   - **Issue**: Test ran same symbol twice, checking `len(runners) == 1` - would pass even without reset (same key overwrite)
+   - **Fix**: Changed to run BTCUSDT then ETHUSDT (no strategy), assert `len(runners) == 0`
+   - **Validates**: Multi-symbol runs don't accumulate old runners
+   - **File**: `apps/backtest/tests/test_engine.py:145-169`
+
+2. **Added `test_run_creates_new_runner_instances` for object identity check**
+   - **Validates**: Each run creates new runner instances, not reusing old ones
+   - **Pattern**: Store first runner reference, run again, assert `first_runner is not second_runner`
+   - **File**: `apps/backtest/tests/test_engine.py:171-191`
+
+**Testing Pattern for State Reset:**
+- Use **multi-symbol approach** when testing cross-contamination between runs
+- Use **object identity (`is not`)** when verifying fresh instances are created
+- Both patterns together provide comprehensive validation of state reset
+
+**WindDownMode Enum Refactoring:**
+
+3. **Refactored `wind_down_mode` from string validation to StrEnum**
+   - **Before**: `wind_down_mode: str` with `@field_validator` checking valid strings
+   - **After**: `WindDownMode(StrEnum)` with values `LEAVE_OPEN`, `CLOSE_ALL`
+   - **Benefits**: Type safety, IDE autocomplete, refactorability, consistency with gridcore enums
+   - **Pattern**: Following established StrEnum pattern (DirectionType, SideType, GridSideType)
+   - **Files**:
+     - Enum: `apps/backtest/src/backtest/config.py:16-20`
+     - Usage: `apps/backtest/src/backtest/engine.py:15,385`
+     - Tests: `apps/backtest/tests/test_config.py:75`, `apps/backtest/tests/test_engine.py:82,93`
+     - Export: `apps/backtest/src/backtest/__init__.py`
+
+### Test Commands
+```bash
+# Run backtest tests
+uv run pytest apps/backtest/tests -v
+
+# Run all project tests (separately due to conftest conflicts)
+uv run pytest packages/gridcore/tests -v
+uv run pytest packages/bybit_adapter/tests -v
+uv run pytest shared/db/tests -v
+uv run pytest apps/event_saver/tests -v
+uv run pytest apps/gridbot/tests -v
+uv run pytest apps/backtest/tests -v
 ```
 
 ## Next Steps (Future Phases)
 
-- Phase F: Backtest Rewrite (trade-through fill model)
 - Phase G: Comparator (validation metrics)
 - Phase H: Testing & Validation

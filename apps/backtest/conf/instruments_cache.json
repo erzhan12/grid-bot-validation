@@ -1,0 +1,9 @@
+{
+  "BTCUSDT": {
+    "symbol": "BTCUSDT",
+    "qty_step": "0.001",
+    "tick_size": "0.10",
+    "min_qty": "0.001",
+    "max_qty": "1190.000"
+  }
+}

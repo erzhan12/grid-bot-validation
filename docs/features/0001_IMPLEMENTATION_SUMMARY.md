@@ -76,8 +76,9 @@ packages/gridcore/
 - `CancelIntent` - Intent to cancel order
 
 **Key Features**:
-- Auto-generated client_order_id (UUID)
-- Tracks grid_level for reporting
+- Deterministic `client_order_id` (SHA256 hash of symbol, side, price, direction)
+- Tracks `grid_level` for reporting/analytics (NOT part of identity hash)
+- Allows orders to survive grid rebalancing when prices don't change
 - Immutable dataclasses
 
 #### 3. Config Module (`config.py`)
