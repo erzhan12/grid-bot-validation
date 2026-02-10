@@ -81,6 +81,7 @@ class BacktestConfig(BaseModel):
     # Initial balance
     initial_balance: Decimal = Field(
         default=Decimal("10000"),
+        gt=0,
         description="Initial wallet balance in USDT",
     )
 
