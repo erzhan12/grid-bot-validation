@@ -45,14 +45,19 @@ class BacktestReporter:
         """The backtest metrics."""
         return self._session.metrics
 
+    def _ensure_path(self, path: Union[str, Path]) -> Path:
+        """Convert to Path and create parent directories."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
     def export_trades(self, path: Union[str, Path]) -> None:
         """Export trades to CSV.
 
         Args:
             path: Output file path.
         """
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path = self._ensure_path(path)
 
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
@@ -95,8 +100,7 @@ class BacktestReporter:
         Args:
             path: Output file path.
         """
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path = self._ensure_path(path)
 
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
@@ -117,8 +121,7 @@ class BacktestReporter:
         Args:
             path: Output file path.
         """
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path = self._ensure_path(path)
 
         m = self._session.metrics
         metrics_data = [
