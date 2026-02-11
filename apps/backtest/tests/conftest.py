@@ -6,6 +6,7 @@ from decimal import Decimal
 import pytest
 
 from gridcore import TickerEvent, EventType
+from grid_db import DatabaseFactory, DatabaseSettings
 
 from backtest.config import BacktestConfig, BacktestStrategyConfig, WindDownMode
 from backtest.fill_simulator import TradeThroughFillSimulator
@@ -13,6 +14,25 @@ from backtest.order_manager import BacktestOrderManager, SimulatedOrder
 from backtest.position_tracker import BacktestPositionTracker
 from backtest.session import BacktestSession
 from backtest.executor import BacktestExecutor
+
+
+@pytest.fixture
+def db_settings():
+    """In-memory SQLite settings for testing."""
+    return DatabaseSettings(
+        db_type="sqlite",
+        db_name=":memory:",
+        echo_sql=False,
+    )
+
+
+@pytest.fixture
+def db(db_settings):
+    """Create fresh in-memory database for each test."""
+    database = DatabaseFactory(db_settings)
+    database.create_tables()
+    yield database
+    database.drop_tables()
 
 
 @pytest.fixture
