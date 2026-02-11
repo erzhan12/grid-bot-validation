@@ -5,7 +5,7 @@ Stores trades, equity curve, and calculates final metrics.
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional
 
@@ -183,11 +183,18 @@ class BacktestSession:
 
         return equity
 
-    def finalize(self, final_unrealized_pnl: Decimal = Decimal("0")) -> BacktestMetrics:
+    def finalize(
+        self,
+        final_unrealized_pnl: Decimal = Decimal("0"),
+        sharpe_interval: timedelta = timedelta(hours=1),
+    ) -> BacktestMetrics:
         """Calculate final metrics.
 
         Args:
             final_unrealized_pnl: Unrealized PnL at end of backtest
+            sharpe_interval: Resampling interval for Sharpe ratio calculation.
+                Raw tick data has irregular spacing, so equity is resampled
+                to fixed intervals before computing returns.
 
         Returns:
             Calculated metrics
@@ -234,8 +241,8 @@ class BacktestSession:
         # Finalize drawdown duration (check if still in drawdown at end)
         max_dd_duration = max(self._max_drawdown_duration, self._current_drawdown_duration)
 
-        # Calculate Sharpe ratio from equity curve
-        sharpe_ratio = self._calculate_sharpe_ratio()
+        # Calculate Sharpe ratio from equity curve (resampled to fixed intervals)
+        sharpe_ratio = self._calculate_sharpe_ratio(sharpe_interval)
 
         # Calculate turnover
         turnover = (
@@ -295,12 +302,15 @@ class BacktestSession:
 
         return self.metrics
 
-    def _calculate_sharpe_ratio(self, periods_per_year: int = 252 * 24 * 60) -> float:
+    def _calculate_sharpe_ratio(self, interval: timedelta = timedelta(hours=1)) -> float:
         """Calculate annualized Sharpe ratio from equity curve.
 
+        Raw equity data comes at irregular tick intervals, so it is
+        resampled to fixed-width buckets before computing returns.
+        Each bucket takes the last equity value that falls within it.
+
         Args:
-            periods_per_year: Number of periods per year for annualization.
-                Default assumes minute-level data (252 trading days * 24 hours * 60 minutes).
+            interval: Resampling interval (default: 1 hour).
 
         Returns:
             Annualized Sharpe ratio (0 if insufficient data).
@@ -308,34 +318,72 @@ class BacktestSession:
         if len(self.equity_curve) < 2:
             return 0.0
 
-        # Calculate returns
-        equities = [float(eq) for _, eq in self.equity_curve]
-        returns = []
-        for i in range(1, len(equities)):
-            if equities[i - 1] != 0:
-                ret = (equities[i] - equities[i - 1]) / equities[i - 1]
-                returns.append(ret)
-
-        if not returns:
+        # Resample to fixed intervals
+        resampled = self._resample_equity(interval)
+        if len(resampled) < 2:
             return 0.0
 
-        # Calculate mean and std of returns
-        mean_return = sum(returns) / len(returns)
+        # Calculate returns between consecutive buckets
+        returns = []
+        for i in range(1, len(resampled)):
+            if resampled[i - 1] != 0:
+                ret = (resampled[i] - resampled[i - 1]) / resampled[i - 1]
+                returns.append(ret)
 
         if len(returns) < 2:
             return 0.0
 
+        # Calculate mean and std of returns
+        mean_return = sum(returns) / len(returns)
         variance = sum((r - mean_return) ** 2 for r in returns) / (len(returns) - 1)
         std_return = variance ** 0.5
 
         if std_return == 0:
             return 0.0
 
-        # Annualize: Sharpe = (mean * sqrt(periods)) / std
-        # Simplified: mean/std * sqrt(periods)
-        sharpe = (mean_return / std_return) * (periods_per_year ** 0.5)
+        # Annualize: crypto trades 24/7 → 365.25 days/year
+        seconds_per_year = 365.25 * 24 * 3600
+        periods_per_year = seconds_per_year / interval.total_seconds()
 
+        sharpe = (mean_return / std_return) * (periods_per_year ** 0.5)
         return sharpe
+
+    def _resample_equity(self, interval: timedelta) -> list[float]:
+        """Resample equity curve to fixed-width time buckets.
+
+        Takes the last equity value within each bucket. Buckets with
+        no data points are skipped (no forward-fill).
+
+        Args:
+            interval: Bucket width.
+
+        Returns:
+            List of equity values at regular intervals.
+        """
+        if not self.equity_curve:
+            return []
+
+        start_ts = self.equity_curve[0][0]
+        end_ts = self.equity_curve[-1][0]
+
+        resampled: list[float] = []
+        bucket_start = start_ts
+        eq_idx = 0
+
+        while bucket_start <= end_ts:
+            bucket_end = bucket_start + interval
+            last_value = None
+
+            while eq_idx < len(self.equity_curve) and self.equity_curve[eq_idx][0] < bucket_end:
+                last_value = float(self.equity_curve[eq_idx][1])
+                eq_idx += 1
+
+            if last_value is not None:
+                resampled.append(last_value)
+
+            bucket_start = bucket_end
+
+        return resampled
 
     def get_summary(self) -> str:
         """Get human-readable summary of results."""
