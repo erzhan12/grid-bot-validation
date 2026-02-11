@@ -75,6 +75,12 @@ def parse_args() -> argparse.Namespace:
         help="Enable debug logging",
     )
 
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit on first symbol failure in multi-symbol runs",
+    )
+
     return parser.parse_args()
 
 
@@ -170,12 +176,20 @@ def main() -> int:
         logger.info(f"Symbols: {symbols}")
 
         # Run backtest
+        failed_symbols: list[str] = []
         for symbol in symbols:
             logger.info(f"\n{'='*50}")
             logger.info(f"Running backtest for {symbol}")
             logger.info(f"{'='*50}")
 
-            session = engine.run(symbol, start_ts, end_ts)
+            try:
+                session = engine.run(symbol, start_ts, end_ts)
+            except Exception as e:
+                logger.exception(f"Backtest failed for {symbol}: {e}")
+                if args.strict:
+                    return 2
+                failed_symbols.append(symbol)
+                continue
 
             # Print summary
             print(session.get_summary())
@@ -189,13 +203,17 @@ def main() -> int:
                     export_path = str(base.with_stem(f"{base.stem}_{symbol}"))
                 export_results(session, export_path)
 
+        if failed_symbols:
+            logger.error(f"Failed symbols: {', '.join(failed_symbols)}")
+            return 2
+
         return 0
 
     except FileNotFoundError as e:
         logger.error(f"Config error: {e}")
         return 1
     except Exception as e:
-        logger.exception(f"Backtest failed: {e}")
+        logger.exception(f"Startup failed: {e}")
         return 1
 
 
