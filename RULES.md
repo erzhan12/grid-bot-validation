@@ -1017,7 +1017,11 @@ Successfully implemented a backtest system using gridcore's GridEngine with trad
 
    # Export results to CSV
    uv run python -m backtest.main --config conf/backtest.yaml --export results.csv
+
+   # Strict mode: exit on first symbol failure in multi-symbol runs
+   uv run python -m backtest.main --config conf/backtest.yaml --strict
    ```
+   - **Exit codes**: `0` = success, `1` = config/startup error, `2` = execution error
 
 5. **Testing**
    ```bash
@@ -1143,8 +1147,10 @@ Successfully implemented a backtest system using gridcore's GridEngine with trad
    - Direction breakdown: long_trades, short_trades, long_pnl, short_pnl, long_profit_factor, short_profit_factor
 
 2. **Sharpe Ratio Calculation** - `_calculate_sharpe_ratio()` in `session.py`:
-   - Annualized from equity curve returns
-   - Default assumes minute-level data (252 * 24 * 60 periods/year)
+   - Raw tick data has irregular spacing, so equity is resampled to fixed intervals before computing returns
+   - Interval is parameterized via `finalize(sharpe_interval=timedelta(hours=1))` (default: 1 hour)
+   - `_resample_equity(interval)`: Bins equity points into fixed-width buckets, takes last value per bucket, skips empty buckets
+   - Annualization uses 365.25 days/year (crypto 24/7)
    - Formula: `(mean_return / std_return) * sqrt(periods_per_year)`
 
 3. **BacktestReporter** - CSV export in `reporter.py`:
@@ -1225,6 +1231,33 @@ Successfully implemented a backtest system using gridcore's GridEngine with trad
      - Usage: `apps/backtest/src/backtest/engine.py:15,385`
      - Tests: `apps/backtest/tests/test_config.py:75`, `apps/backtest/tests/test_engine.py:82,93`
      - Export: `apps/backtest/src/backtest/__init__.py`
+
+### Improvements (2026-02-11)
+
+1. **Direction Inference Warning** - `runner.py:_infer_direction()`
+   - Added `logger.warning` when fallback is used (indicates order tracking gap)
+   - Should never trigger in normal operation — every fill comes from an order we placed
+   - **File**: `apps/backtest/src/backtest/runner.py:254-271`
+
+2. **Sharpe Ratio Resampling** - `session.py:_calculate_sharpe_ratio()`
+   - Equity curve resampled to fixed intervals before computing returns (raw ticks are irregular)
+   - Parameterized via `finalize(sharpe_interval=timedelta(hours=1))`
+   - **Files**: `apps/backtest/src/backtest/session.py:302-390`
+
+3. **Reporter DRY** - `reporter.py:_ensure_path()`
+   - Extracted path creation helper to avoid repeating `Path(path)` + `mkdir(parents=True)` in every export method
+   - **File**: `apps/backtest/src/backtest/reporter.py:48-52`
+
+4. **CLI Exit Codes & --strict** - `main.py`
+   - Exit code `1` = config/startup error, `2` = execution error
+   - `--strict` flag: exit on first symbol failure in multi-symbol runs
+   - **File**: `apps/backtest/src/backtest/main.py`
+
+5. **Input Validation** - `position_tracker.py`
+   - Commission rate bounds check in `__init__` (must be in `[0, 0.01]`)
+   - Price/qty positive validation in `process_fill()`
+   - Warning log for unusually high funding rates (> 1%)
+   - **File**: `apps/backtest/src/backtest/position_tracker.py`
 
 ### Test Commands
 ```bash
