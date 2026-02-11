@@ -252,15 +252,23 @@ class BacktestRunner:
         )
 
     def _infer_direction(self, side: str) -> str:
-        """Infer direction from side when order info not available.
+        """Infer direction from side when order lookup fails.
 
-        This is a fallback - normally we get direction from the order.
+        This fallback should NOT trigger in normal operation — every fill
+        in backtest comes from an order placed by BacktestExecutor, so
+        get_order_by_client_id() should always find it. If this runs,
+        it indicates an order tracking gap (e.g., mismatched client_order_id).
 
-        Buy side = opening long or closing short
-        Sell side = opening short or closing long
-
-        Without more context, we guess based on current positions.
+        Heuristic based on current position state:
+        - Selling while holding long → closing long
+        - Buying while holding short → closing short
+        - Otherwise → opening new position (Buy=long, Sell=short)
         """
+        logger.warning(
+            "%s: Direction inference fallback used for side=%s "
+            "(order not found — possible order tracking gap)",
+            self.strat_id, side,
+        )
         # If we have a long position and selling, probably closing long
         if side == SideType.SELL and self._long_tracker.has_position:
             return DirectionType.LONG
