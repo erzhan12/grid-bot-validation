@@ -4,11 +4,15 @@ Tracks position size, entry price, and calculates realized/unrealized PnL.
 Separate from gridcore.Position which handles risk multipliers.
 """
 
+import logging
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Optional
 
 from gridcore import DirectionType, SideType
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -48,6 +52,8 @@ class BacktestPositionTracker:
         """
         if direction not in (DirectionType.LONG, DirectionType.SHORT):
             raise ValueError(f"direction must be '{DirectionType.LONG}' or '{DirectionType.SHORT}', got '{direction}'")
+        if commission_rate < 0 or commission_rate > Decimal("0.01"):
+            raise ValueError(f"Commission rate {commission_rate} outside expected range [0, 0.01]")
 
         self.direction = direction
         self.commission_rate = commission_rate
@@ -69,6 +75,9 @@ class BacktestPositionTracker:
         Returns:
             Realized PnL from this fill (0 if opening/adding to position)
         """
+        if price <= 0 or qty <= 0:
+            raise ValueError(f"Invalid fill: price={price}, qty={qty}")
+
         # Calculate and deduct commission
         commission = qty * price * self.commission_rate
         self.state.commission_paid += commission
@@ -221,6 +230,9 @@ class BacktestPositionTracker:
         Returns:
             Funding payment amount (negative = paid, positive = received)
         """
+        if abs(rate) > Decimal("0.01"):
+            logger.warning("Unusually high funding rate: %s", rate)
+
         if self.state.size == 0:
             return Decimal("0")
 
