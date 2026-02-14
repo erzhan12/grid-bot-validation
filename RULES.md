@@ -215,6 +215,10 @@ uv run pytest packages/gridcore/tests/test_grid.py -v
       - `SideType` is a `StrEnum` - values are strings, so backward-compatible
       - Imported from `gridcore` or `gridcore.position`
       - `Position.SIDE_BUY` and `Position.SIDE_SELL` are now aliases for `SideType.BUY`/`SideType.SELL`
+      - **Comparator (2026-02-13)**: `NormalizedTrade` uses `SideType` and `DirectionType` for `side`/`direction`; loaders convert string inputs via `SideType(s)` / `DirectionType(s)`
+    - **RunType Enum (2026-02-13)**: Use `RunType.LIVE`, `RunType.BACKTEST`, `RunType.SHADOW` instead of strings
+      - `RunType` is a `StrEnum` defined in `grid_db.enums` and exported from `grid_db`
+      - Values: `'live'`, `'backtest'`, `'shadow'`
     - Moderate liquidation risk triggers cross-position adjustments (modifying opposite's multipliers)
     - Without linking, the method will fail with a clear error message instead of silently doing nothing
     - Example:
@@ -1273,7 +1277,128 @@ uv run pytest apps/gridbot/tests -v
 uv run pytest apps/backtest/tests -v
 ```
 
+## Phase G: Comparator (backtest-vs-live validation)
+
+### Completed: 2026-02-12
+
+Successfully implemented a comparator package that validates backtest results against live trade data.
+
+### Key Components
+
+1. **Package Structure**
+   ```
+   apps/comparator/
+   ├── pyproject.toml           # Dependencies: grid-db, backtest (workspace)
+   ├── src/comparator/
+   │   ├── __init__.py
+   │   ├── config.py            # ComparatorConfig (Pydantic)
+   │   ├── loader.py            # LiveTradeLoader, BacktestTradeLoader, NormalizedTrade
+   │   ├── matcher.py           # TradeMatcher (join on client_order_id)
+   │   ├── metrics.py           # ValidationMetrics, calculate_metrics()
+   │   ├── equity.py            # Equity curve comparison (resample, divergence)
+   │   ├── reporter.py          # CSV export and console summary
+   │   └── main.py              # CLI with --backtest-trades / --backtest-config
+   └── tests/
+       ├── conftest.py          # Shared fixtures (db, make_trade, sample data)
+       ├── test_loader.py       # 14 tests (partial fills, direction inference)
+       ├── test_matcher.py      # 7 tests
+       ├── test_metrics.py      # 19 tests
+       ├── test_equity.py       # 13 tests
+       ├── test_reporter.py     # 9 tests (incl. reused-ID CSV regression)
+       └── test_main.py         # 17 tests (CLI args, datetime, equity paths)
+   ```
+
+2. **Trade Matching**
+   - Joins on `(client_order_id, occurrence)` composite key (handles deterministic ID reuse)
+   - `occurrence` = nth time the same `client_order_id` appears chronologically (sorted by `timestamp, client_order_id, side` for deterministic tie-breaking)
+   - Produces: matched pairs, live-only (missed by backtest), backtest-only (phantom fills)
+   - Live trades: aggregates partial fills by `(order_link_id, order_id)` using VWAP price
+   - Same `order_link_id` + different `order_id` = lifecycle reuse (separate trades, not partial fills)
+
+3. **Direction Inference (Live Trades)**
+   - Live `PrivateExecution` has no direction field; inferred from `side` + `closed_pnl`:
+     - `closed_pnl != 0` → closing trade: Buy+closing = short, Sell+closing = long
+     - `closed_pnl == 0` → opening trade: Buy = long, Sell = short
+   - **LIMITATION**: Break-even closes (`closed_pnl==0`) are misclassified as opening trades
+   - Backtest trades carry direction from `BacktestTrade.direction`
+   - **For matched pairs**: Metrics direction breakdown prefers backtest direction (always correct) over inferred live direction
+
+4. **Validation Metrics**
+   - Coverage: match_rate, phantom_rate, live/backtest trade counts
+   - Price accuracy: mean/median/max absolute delta across matched pairs
+   - Quantity accuracy: mean/median/max absolute delta
+   - PnL: cumulative totals, delta, Pearson correlation of cumulative PnL curves
+   - Fees: total comparison and delta
+   - Volume: from both matched and unmatched trades
+   - Direction breakdown: long/short match counts and PnL deltas
+   - Timing: mean absolute time delta between matched pairs
+   - Tolerance breaches: `price_tolerance=0` means exact match required (flags any non-zero delta); `qty_tolerance` same semantics
+   - Equity curve: max/mean divergence, correlation
+
+5. **Equity Curve Comparison** (`EquityComparator` class in `equity.py`)
+   - OOP class following same pattern as `TradeMatcher` (no constructor args, methods are operations)
+   - `load_live(session, ...)`: from `WalletSnapshot.wallet_balance` via `WalletSnapshotRepository.get_by_account_range()`
+   - `load_backtest_from_csv(path)` / `load_backtest_from_session(equity_curve)`: from CSV export or `BacktestSession.equity_curve`
+   - `resample(live, backtest, interval)`: resampled to common 1-hour grid
+   - `compute_metrics(resampled)`: computes max/mean divergence and correlation
+   - `export(resampled, path)`: exports `equity_comparison.csv`
+
+6. **CLI Modes**
+   - `--backtest-trades path.csv`: Load pre-existing backtest CSV
+   - `--backtest-config path.yaml`: Run backtest from config, then compare
+   - `--backtest-equity path.csv`: Optional equity curve CSV for equity comparison
+   - `--coin USDT`: Coin for live wallet balance lookup
+   - Date parsing: date-only `--end` values auto-set to 23:59:59.999999
+
+7. **Testing**
+   ```bash
+   uv run pytest apps/comparator/tests --cov=comparator --cov-report=term-missing -v
+   ```
+   105 tests, 96% coverage (main.py: 83%)
+
+### Key Implementation Notes
+
+1. **OOP Consistency** - All comparator modules use classes, not standalone functions
+   - `LiveTradeLoader`, `BacktestTradeLoader` (loader.py)
+   - `TradeMatcher` (matcher.py)
+   - `EquityComparator` (equity.py)
+   - `ComparatorReporter` (reporter.py)
+   - Pattern: No-arg constructors for pure computation classes (`TradeMatcher`, `EquityComparator`); session/state passed per-method
+
+2. **NormalizedTrade Dataclass** - Common format bridging live and backtest data
+   - Fields: `client_order_id`, `symbol`, `side`, `price`, `qty`, `fee`, `realized_pnl`, `timestamp`, `source`, `direction`, `occurrence`
+   - `source` is "live" or "backtest"
+   - `direction` is "long" or "short" (inferred for live, carried for backtest)
+   - `occurrence` is 0-based index for client_order_id reuse handling
+
+2. **Pearson Correlation** - Custom implementation in `metrics.py`
+   - Used for both PnL curve and equity curve correlation
+   - Returns 0.0 for insufficient data or zero variance
+
+3. **End-Date Truncation Fix**
+   - `_parse_datetime("2025-01-31")` returns midnight, dropping the final day
+   - Fix: `end_of_day=True` param sets time to `23:59:59.999999` for date-only inputs
+
+4. **DB Layer Extension**
+   - Added `WalletSnapshotRepository.get_by_account_range()` for time-range equity queries
+   - File: `shared/db/src/grid_db/repositories.py`
+
+### Common Pitfalls
+
+1. **SQLite Strips Timezone Info** - Compare datetimes with `.replace(tzinfo=None)` in tests. In integration tests with in-memory SQLite, use naive timestamps for test data to match DB output.
+2. **Direction != Side** - A Sell can close a long position; use `direction` field, not `side`
+3. **Volume from Unmatched Trades** - Must be computed before early return on zero matched pairs
+4. **client_order_id Reuse** - Deterministic SHA256 produces same ID for same (symbol, side, price, direction). After fill/cancel, the ID can be reused for a new order lifecycle. Live data: use `(order_link_id, order_id)` to distinguish partial fills (same order_id) from reuse (different order_id). Matcher: use `(client_order_id, occurrence)` composite key.
+5. **Tolerance Semantics** - `tolerance=0` means exact match (any non-zero delta is flagged). Don't add `> 0` guards that would disable the check at zero.
+6. **Break-Even Close Direction** - Live direction inferred from `closed_pnl != 0` is fragile for break-even closes. Always prefer backtest direction for matched pair analysis.
+7. **Datetime UTC Normalization** - `_parse_datetime()` normalizes all inputs to UTC. Aware non-UTC inputs are converted via `.astimezone(timezone.utc)`. Naive inputs get UTC assigned.
+8. **Reporter Delta Lookup** - Use `zip(matched, trade_deltas)` not a dict keyed by `client_order_id` — the dict approach fails when IDs are reused. The deltas list is 1:1 with matched pairs by construction.
+9. **Breach Tuples** - `ValidationMetrics.breaches` stores `(client_order_id, occurrence)` tuples, not bare strings. This avoids ambiguity when IDs are reused.
+10. **Occurrence Tie-Breaking Limitation** - If two trades share exact `(timestamp, client_order_id, side)`, occurrence assignment is non-deterministic across sources. Extremely unlikely in practice (requires same hash reused at same millisecond with same side).
+11. **Timestamp Normalization** - All loader/equity entry points call `_normalize_ts()` from `loader.py` to strip timezone info, producing naive UTC datetimes. This prevents `TypeError` when comparing/subtracting timestamps from different sources (SQLite returns naive, CSV `fromisoformat()` can return aware). When adding new data entry points, always wrap timestamps with `_normalize_ts()`.
+12. **Config Mode Symbol Propagation** - In `main()` config mode, the resolved `symbol = args.symbol or "BTCUSDT"` must be set on `config.symbol` so the live loader is filtered consistently with the backtest.
+13. **Symmetric Symbol Filtering** - `run()` filters `backtest_trades` by `config.symbol` before matching. This ensures both live and backtest sides use the same symbol filter, whether trades come from CSV (which may contain multiple symbols) or config mode.
+
 ## Next Steps (Future Phases)
 
-- Phase G: Comparator (validation metrics)
 - Phase H: Testing & Validation
