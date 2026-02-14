@@ -1020,6 +1020,64 @@ class TestWalletSnapshotRepository:
         # Compare timestamps (may lose timezone info in SQLite)
         assert latest.exchange_ts.replace(tzinfo=None) == ts3.replace(tzinfo=None)
 
+    def test_get_by_account_range(self, session, sample_account):
+        """Test retrieval of wallet snapshots within a time range."""
+        from grid_db import WalletSnapshotRepository, WalletSnapshot
+        from decimal import Decimal
+        from datetime import timedelta
+
+        repo = WalletSnapshotRepository(session)
+
+        base_ts = datetime(2025, 1, 15, 12, 0, 0, tzinfo=UTC)
+        models = [
+            WalletSnapshot(
+                account_id=str(sample_account.account_id),
+                coin="USDT",
+                exchange_ts=base_ts,
+                local_ts=base_ts,
+                wallet_balance=Decimal("10000.00"),
+                available_balance=Decimal("9500.00"),
+            ),
+            WalletSnapshot(
+                account_id=str(sample_account.account_id),
+                coin="USDT",
+                exchange_ts=base_ts + timedelta(hours=1),
+                local_ts=base_ts + timedelta(hours=1),
+                wallet_balance=Decimal("10050.00"),
+                available_balance=Decimal("9550.00"),
+            ),
+            WalletSnapshot(
+                account_id=str(sample_account.account_id),
+                coin="USDT",
+                exchange_ts=base_ts + timedelta(hours=2),
+                local_ts=base_ts + timedelta(hours=2),
+                wallet_balance=Decimal("10030.00"),
+                available_balance=Decimal("9530.00"),
+            ),
+        ]
+        repo.bulk_insert(models)
+
+        # Query range that covers first two snapshots
+        results = repo.get_by_account_range(
+            str(sample_account.account_id),
+            "USDT",
+            base_ts,
+            base_ts + timedelta(hours=1),
+        )
+
+        assert len(results) == 2
+        assert results[0].wallet_balance == Decimal("10000.00")
+        assert results[1].wallet_balance == Decimal("10050.00")
+
+        # Query range that covers none
+        results = repo.get_by_account_range(
+            str(sample_account.account_id),
+            "USDT",
+            base_ts - timedelta(hours=2),
+            base_ts - timedelta(hours=1),
+        )
+        assert len(results) == 0
+
 
 class TestTickerSnapshotRepository:
     """Test TickerSnapshotRepository bulk insert and queries."""

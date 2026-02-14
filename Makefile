@@ -11,7 +11,8 @@ test:
 	uv run pytest packages/bybit_adapter/tests --cov=bybit_adapter --cov-append -q
 	uv run pytest shared/db/tests --cov=grid_db --cov-append -q
 	uv run pytest apps/event_saver/tests --cov=event_saver --cov-append -q
-	uv run pytest apps/gridbot/tests --cov=gridbot --cov-append --cov-report=term-missing -v
+	uv run pytest apps/gridbot/tests --cov=gridbot --cov-append -q
+	uv run pytest apps/comparator/tests --cov=comparator --cov-append --cov-report=term-missing -v
 
 # Run ruff linter
 lint:
