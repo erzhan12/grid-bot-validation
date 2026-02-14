@@ -937,6 +937,36 @@ class WalletSnapshotRepository(BaseRepository[WalletSnapshot]):
 
         return result.rowcount if result.rowcount else 0
 
+    def get_by_account_range(
+        self,
+        account_id: str,
+        coin: str,
+        start_ts: datetime,
+        end_ts: datetime,
+    ) -> List[WalletSnapshot]:
+        """Get wallet snapshots for an account/coin within a time range.
+
+        Args:
+            account_id: Account ID.
+            coin: Coin symbol (e.g., 'USDT').
+            start_ts: Start timestamp (inclusive).
+            end_ts: End timestamp (inclusive).
+
+        Returns:
+            List of WalletSnapshot instances ordered by exchange_ts.
+        """
+        return (
+            self.session.query(WalletSnapshot)
+            .filter(
+                WalletSnapshot.account_id == account_id,
+                WalletSnapshot.coin == coin,
+                WalletSnapshot.exchange_ts >= start_ts,
+                WalletSnapshot.exchange_ts <= end_ts,
+            )
+            .order_by(WalletSnapshot.exchange_ts)
+            .all()
+        )
+
     def get_latest_by_account_coin(
         self,
         account_id: str,

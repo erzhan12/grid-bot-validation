@@ -20,6 +20,7 @@ from grid_db.models import (
     PositionSnapshot,
     WalletSnapshot,
 )
+from grid_db.enums import RunType
 from grid_db.repositories import (
     BaseRepository,
     UserRepository,
@@ -49,6 +50,7 @@ __all__ = [
     "ApiCredential",
     "Strategy",
     "Run",
+    "RunType",
     "TickerSnapshot",
     "PublicTrade",
     "PrivateExecution",
