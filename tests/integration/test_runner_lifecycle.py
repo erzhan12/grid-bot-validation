@@ -61,7 +61,7 @@ class TestRunnerLifecycle:
 
         # Grid should have been built
         assert runner._engine.grid is not None
-        assert runner._engine.grid.grid is not None
+        assert runner._engine.grid.is_grid_correct()
         assert len(runner._engine.grid.grid) > 0
 
     @pytest.mark.asyncio
@@ -145,6 +145,7 @@ class TestRunnerLifecycle:
 
         # Grid should still be valid
         assert runner._engine.grid is not None
+        assert runner._engine.grid.is_grid_correct()
 
     @pytest.mark.asyncio
     async def test_shadow_mode_no_real_api_calls(self, strategy_config, executor):
