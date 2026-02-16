@@ -92,6 +92,10 @@ class GridbotConfig(BaseModel):
         default=61.0,
         description="Seconds between periodic order reconciliation (0 to disable)",
     )
+    wallet_cache_interval: float = Field(
+        default=300.0,
+        description="Seconds to cache wallet balance (0 to disable caching)",
+    )
 
     # Notifications
     notification: Optional[NotificationConfig] = None

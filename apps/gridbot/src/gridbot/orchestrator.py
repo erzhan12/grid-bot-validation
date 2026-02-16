@@ -115,6 +115,9 @@ class Orchestrator:
         # HTTP REST is used only as fallback when WebSocket data is not available
         self._position_ws_data: dict[str, dict[str, dict[str, dict]]] = {}
 
+        # Wallet balance cache: account_name -> (balance, timestamp)
+        self._wallet_cache: dict[str, tuple[float, datetime]] = {}
+
     @property
     def running(self) -> bool:
         """Whether orchestrator is running."""
@@ -473,6 +476,51 @@ class Orchestrator:
         except (KeyError, TypeError):
             return None
 
+    def _get_wallet_balance(self, account_name: str) -> float:
+        """Get wallet balance, using cache if available.
+
+        Args:
+            account_name: Account name.
+
+        Returns:
+            Wallet balance in USDT.
+        """
+        # Check if caching is disabled
+        if self._config.wallet_cache_interval <= 0:
+            return self._fetch_wallet_balance(account_name)
+
+        # Check cache
+        cached = self._wallet_cache.get(account_name)
+        if cached:
+            balance, timestamp = cached
+            age = (datetime.now(UTC) - timestamp).total_seconds()
+            if age < self._config.wallet_cache_interval:
+                return balance
+
+        # Cache miss or expired - fetch fresh
+        balance = self._fetch_wallet_balance(account_name)
+        self._wallet_cache[account_name] = (balance, datetime.now(UTC))
+        return balance
+
+    def _fetch_wallet_balance(self, account_name: str) -> float:
+        """Fetch wallet balance from REST API.
+
+        Args:
+            account_name: Account name.
+
+        Returns:
+            Wallet balance in USDT.
+        """
+        rest_client = self._rest_clients[account_name]
+        wallet = rest_client.get_wallet_balance()
+
+        for account in wallet.get("list", []):
+            for coin in account.get("coin", []):
+                if coin.get("coin") == "USDT":
+                    return float(coin.get("walletBalance", 0))
+
+        return 0.0
+
     async def _position_check_loop(self) -> None:
         """Periodic position check loop.
 
@@ -489,14 +537,8 @@ class Orchestrator:
                     try:
                         rest_client = self._rest_clients[account_name]
 
-                        # Fetch wallet balance (always from REST for accuracy)
-                        wallet = rest_client.get_wallet_balance()
-                        wallet_balance = 0.0
-                        for account in wallet.get("list", []):
-                            for coin in account.get("coin", []):
-                                if coin.get("coin") == "USDT":
-                                    wallet_balance = float(coin.get("walletBalance", 0))
-                                    break
+                        # Fetch wallet balance (cached to reduce API calls)
+                        wallet_balance = self._get_wallet_balance(account_name)
 
                         # Check if we need to fall back to REST for positions
                         # (REST sync ensures freshness even when WS data exists)

@@ -899,6 +899,15 @@ Successfully implemented a multi-tenant grid trading bot using gridcore strategy
      - **bbu2 reference**: Original bot used `LIMITS_READ_INTERVAL = 61` with hybrid WebSocket + REST pattern (WebSocket updates between REST syncs)
      - **Files**: `apps/gridbot/src/gridbot/config.py:90-93`, `apps/gridbot/src/gridbot/orchestrator.py:620-672`, `apps/gridbot/src/gridbot/reconciler.py:138-226`
 
+6. **Wallet Balance Caching (2026-02-16)**: Reduces REST API load by caching wallet balance
+   - **Purpose**: Minimize wallet balance API calls while maintaining reasonable freshness for position risk calculations
+   - **Implementation**: `Orchestrator._get_wallet_balance()` checks cache before fetching from REST
+   - **Configuration**: `wallet_cache_interval` in `GridbotConfig` (default 300.0 seconds = 5 minutes, 0 to disable)
+   - **Behavior**: Returns cached balance if age < interval, otherwise fetches fresh and updates cache
+   - **API call reduction**: ~79% fewer calls (from 57/hour to 12/hour per account at default settings)
+   - **bbu2 reference**: Original bot cached for 620s (`GET_WALLET_INTERVAL = 10 * 62`); gridbot defaults to 300s for better freshness
+   - **Files**: `apps/gridbot/src/gridbot/config.py:94-97`, `apps/gridbot/src/gridbot/orchestrator.py:479-525`
+
 ### Common Pitfalls
 
 1. **BybitNormalizer Import**: Use `from bybit_adapter.normalizer import BybitNormalizer`, not `Normalizer`

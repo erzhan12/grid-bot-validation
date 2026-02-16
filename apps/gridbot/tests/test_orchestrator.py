@@ -1108,3 +1108,136 @@ class TestOrchestratorOrderSyncLoop:
 
         # Should have called reconcile
         reconciler.reconcile_reconnect.assert_called_once()
+
+
+class TestOrchestratorWalletCache:
+    """Tests for wallet balance caching."""
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_get_wallet_balance_caches_result(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test wallet balance is cached on first fetch."""
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+
+        # Mock REST client
+        rest_client = orchestrator._rest_clients["test_account"]
+        rest_client.get_wallet_balance.return_value = {
+            "list": [{"coin": [{"coin": "USDT", "walletBalance": "5000"}]}]
+        }
+
+        # First call should fetch and cache
+        balance = orchestrator._get_wallet_balance("test_account")
+        assert balance == 5000.0
+        rest_client.get_wallet_balance.assert_called_once()
+
+        # Cache should be populated
+        assert "test_account" in orchestrator._wallet_cache
+        cached_balance, timestamp = orchestrator._wallet_cache["test_account"]
+        assert cached_balance == 5000.0
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_get_wallet_balance_returns_cached_value(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test subsequent calls return cached value within interval."""
+        from datetime import datetime, UTC
+
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+
+        # Pre-populate cache with recent timestamp
+        orchestrator._wallet_cache["test_account"] = (10000.0, datetime.now(UTC))
+
+        # Mock REST client
+        rest_client = orchestrator._rest_clients["test_account"]
+        rest_client.get_wallet_balance.return_value = {
+            "list": [{"coin": [{"coin": "USDT", "walletBalance": "9999"}]}]
+        }
+
+        # Should return cached value without calling REST
+        balance = orchestrator._get_wallet_balance("test_account")
+        assert balance == 10000.0
+        rest_client.get_wallet_balance.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_get_wallet_balance_refreshes_after_expiry(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test cache expires and refetches after interval."""
+        from datetime import datetime, UTC, timedelta
+
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+
+        # Pre-populate cache with old timestamp (expired)
+        old_timestamp = datetime.now(UTC) - timedelta(seconds=400)
+        orchestrator._wallet_cache["test_account"] = (5000.0, old_timestamp)
+
+        # Mock REST client with new balance
+        rest_client = orchestrator._rest_clients["test_account"]
+        rest_client.get_wallet_balance.return_value = {
+            "list": [{"coin": [{"coin": "USDT", "walletBalance": "7500"}]}]
+        }
+
+        # Should fetch fresh value and update cache
+        balance = orchestrator._get_wallet_balance("test_account")
+        assert balance == 7500.0
+        rest_client.get_wallet_balance.assert_called_once()
+
+        # Cache should be updated with new value
+        cached_balance, timestamp = orchestrator._wallet_cache["test_account"]
+        assert cached_balance == 7500.0
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_get_wallet_balance_disabled_when_interval_zero(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        account_config, strategy_config,
+    ):
+        """Test caching is disabled when wallet_cache_interval is 0."""
+        from datetime import datetime, UTC
+
+        # Create config with wallet_cache_interval = 0
+        config = GridbotConfig(
+            accounts=[account_config],
+            strategies=[strategy_config],
+            wallet_cache_interval=0.0,
+        )
+        orchestrator = Orchestrator(config)
+        await orchestrator._init_account(account_config)
+
+        # Pre-populate cache (should be ignored)
+        orchestrator._wallet_cache["test_account"] = (5000.0, datetime.now(UTC))
+
+        # Mock REST client
+        rest_client = orchestrator._rest_clients["test_account"]
+        rest_client.get_wallet_balance.return_value = {
+            "list": [{"coin": [{"coin": "USDT", "walletBalance": "8000"}]}]
+        }
+
+        # Should always fetch fresh, ignore cache
+        balance = orchestrator._get_wallet_balance("test_account")
+        assert balance == 8000.0
+        rest_client.get_wallet_balance.assert_called_once()
+
+        # Call again - should fetch again (no caching)
+        rest_client.get_wallet_balance.reset_mock()
+        balance = orchestrator._get_wallet_balance("test_account")
+        assert balance == 8000.0
+        rest_client.get_wallet_balance.assert_called_once()

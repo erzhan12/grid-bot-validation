@@ -39,6 +39,7 @@ database_url: "sqlite:///gridbot.db"
 # Timing
 position_check_interval: 63.0  # seconds
 order_sync_interval: 61.0  # seconds (0 to disable periodic order reconciliation)
+wallet_cache_interval: 300.0  # seconds (0 to disable, fetch every time)
 
 # Notifications (optional)
 # notification:
