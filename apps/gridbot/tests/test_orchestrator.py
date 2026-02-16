@@ -973,3 +973,138 @@ class TestOrchestratorHealthCheckLoop:
         # Should have alert for disconnect + alert_exception for reconnect failure
         assert notifier.alert.call_count >= 1
         assert notifier.alert_exception.call_count >= 1
+
+
+class TestOrchestratorOrderSyncLoop:
+    """Tests for the periodic order reconciliation loop."""
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_order_sync_loop_calls_reconcile_reconnect(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test order sync loop calls reconcile_reconnect periodically."""
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        orchestrator._running = True
+
+        # Mock reconciler
+        reconciler = orchestrator._reconcilers["test_account"]
+        reconciler.reconcile_reconnect = AsyncMock()
+        
+        # Mock ReconciliationResult
+        from gridbot.reconciler import ReconciliationResult
+        reconciler.reconcile_reconnect.return_value = ReconciliationResult(
+            orders_fetched=5,
+            orders_injected=0,
+            orphan_orders=0,
+        )
+
+        # Run one iteration then stop
+        async def stop_after_first(seconds):
+            orchestrator._running = False
+
+        with patch("asyncio.sleep", new_callable=AsyncMock, side_effect=stop_after_first):
+            await orchestrator._order_sync_loop()
+
+        # Should have called reconcile_reconnect for our runner
+        reconciler.reconcile_reconnect.assert_called_once()
+        runner = orchestrator._runners["btcusdt_test"]
+        reconciler.reconcile_reconnect.assert_called_with(runner)
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_order_sync_loop_disabled_when_interval_zero(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        account_config, strategy_config,
+    ):
+        """Test order sync loop is disabled when order_sync_interval is 0."""
+        # Create config with order_sync_interval = 0
+        config = GridbotConfig(
+            accounts=[account_config],
+            strategies=[strategy_config],
+            order_sync_interval=0.0,
+        )
+        orchestrator = Orchestrator(config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        orchestrator._running = True
+
+        # Mock reconciler - should not be called
+        reconciler = orchestrator._reconcilers["test_account"]
+        reconciler.reconcile_reconnect = AsyncMock()
+
+        # Run the loop
+        await orchestrator._order_sync_loop()
+
+        # Should return early and not call reconcile
+        reconciler.reconcile_reconnect.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_order_sync_loop_handles_errors(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test order sync loop catches and logs errors."""
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        orchestrator._running = True
+
+        # Make reconciler raise error
+        reconciler = orchestrator._reconcilers["test_account"]
+        reconciler.reconcile_reconnect = AsyncMock(side_effect=Exception("API error"))
+
+        async def stop_after_first(seconds):
+            orchestrator._running = False
+
+        with patch("asyncio.sleep", new_callable=AsyncMock, side_effect=stop_after_first):
+            await orchestrator._order_sync_loop()
+        
+        # Should not raise — error is caught and logged
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_order_sync_loop_logs_discrepancies(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test order sync loop logs when discrepancies are found."""
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        orchestrator._running = True
+
+        # Mock reconciler to return discrepancies
+        from gridbot.reconciler import ReconciliationResult
+        reconciler = orchestrator._reconcilers["test_account"]
+        reconciler.reconcile_reconnect = AsyncMock()
+        reconciler.reconcile_reconnect.return_value = ReconciliationResult(
+            orders_fetched=10,
+            orders_injected=2,
+            orphan_orders=1,
+        )
+
+        async def stop_after_first(seconds):
+            orchestrator._running = False
+
+        with patch("asyncio.sleep", new_callable=AsyncMock, side_effect=stop_after_first):
+            await orchestrator._order_sync_loop()
+
+        # Should have called reconcile
+        reconciler.reconcile_reconnect.assert_called_once()

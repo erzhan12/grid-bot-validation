@@ -108,6 +108,7 @@ class Orchestrator:
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._position_check_task: Optional[asyncio.Task] = None
         self._health_check_task: Optional[asyncio.Task] = None
+        self._order_sync_task: Optional[asyncio.Task] = None
 
         # WebSocket position data cache: account_name -> symbol -> side -> position_data
         # Follows original bbu2 pattern: WebSocket provides real-time updates,
@@ -170,6 +171,7 @@ class Orchestrator:
         # Start background tasks
         self._position_check_task = asyncio.create_task(self._position_check_loop())
         self._health_check_task = asyncio.create_task(self._health_check_loop())
+        self._order_sync_task = asyncio.create_task(self._order_sync_loop())
 
         # Start retry queues
         for queue in self._retry_queues.values():
@@ -187,7 +189,7 @@ class Orchestrator:
         self._shutdown_event.set()
 
         # Stop background tasks
-        for task in (self._position_check_task, self._health_check_task):
+        for task in (self._position_check_task, self._health_check_task, self._order_sync_task):
             if task:
                 task.cancel()
                 try:
@@ -616,6 +618,55 @@ class Orchestrator:
                 self._notifier.alert_exception(
                     "_health_check_loop", e, error_key="health_check_loop"
                 )
+
+    async def _order_sync_loop(self) -> None:
+        """Periodic order reconciliation loop.
+
+        Fetches open orders from exchange via REST and reconciles with in-memory state.
+        Matches bbu2's LIMITS_READ_INTERVAL pattern (61 seconds by default).
+        """
+        # Skip if disabled
+        if self._config.order_sync_interval <= 0:
+            logger.info("Order sync loop disabled (order_sync_interval <= 0)")
+            return
+
+        while self._running:
+            try:
+                await asyncio.sleep(self._config.order_sync_interval)
+
+                for account_name, runners in self._account_to_runners.items():
+                    reconciler = self._reconcilers.get(account_name)
+                    if not reconciler:
+                        continue
+
+                    for runner in runners:
+                        try:
+                            result = await reconciler.reconcile_reconnect(runner)
+                            
+                            if result.errors:
+                                logger.warning(
+                                    f"{runner.strat_id}: Order sync completed with errors: {result.errors}"
+                                )
+                            elif result.orders_injected > 0 or result.orphan_orders > 0:
+                                logger.info(
+                                    f"{runner.strat_id}: Order sync - "
+                                    f"fetched={result.orders_fetched}, "
+                                    f"injected={result.orders_injected}, "
+                                    f"orphans={result.orphan_orders}"
+                                )
+                            else:
+                                logger.debug(
+                                    f"{runner.strat_id}: Order sync - in sync, "
+                                    f"{result.orders_fetched} orders checked"
+                                )
+
+                        except Exception as e:
+                            logger.error(f"{runner.strat_id}: Order sync error: {e}")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Order sync loop error: {e}")
 
     def _get_account_for_strategy(self, strat_id: str) -> Optional[str]:
         """Get account name for a strategy."""

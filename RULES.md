@@ -888,9 +888,16 @@ Successfully implemented a multi-tenant grid trading bot using gridcore strategy
    - Useful for validating strategy behavior before live trading
 
 5. **Reconciliation**
-   - Startup: fetch open orders, identify "our" orders (16-char hex orderLinkId), inject into runner
-   - Reconnect: compare exchange state with in-memory, update tracked orders
-   - Orphan detection: orders on exchange not matching our pattern
+   - **Startup**: fetch open orders, identify "our" orders (16-char hex orderLinkId), inject into runner
+   - **Reconnect**: compare exchange state with in-memory, update tracked orders
+   - **Orphan detection**: orders on exchange not matching our pattern
+   - **Periodic Order Sync (2026-02-16)**: Matches bbu2's `LIMITS_READ_INTERVAL` pattern (61s by default)
+     - **Purpose**: Continuously reconcile order state via REST API to catch missed WebSocket updates
+     - **Implementation**: `Orchestrator._order_sync_loop()` runs as asyncio task, calls `reconciler.reconcile_reconnect()` for each runner
+     - **Configuration**: `order_sync_interval` in `GridbotConfig` (default 61.0 seconds, 0 to disable)
+     - **Behavior**: Logs discrepancies (orders missing on exchange, orders missing in memory), injects missing orders, marks cancelled orders
+     - **bbu2 reference**: Original bot used `LIMITS_READ_INTERVAL = 61` with hybrid WebSocket + REST pattern (WebSocket updates between REST syncs)
+     - **Files**: `apps/gridbot/src/gridbot/config.py:90-93`, `apps/gridbot/src/gridbot/orchestrator.py:620-672`, `apps/gridbot/src/gridbot/reconciler.py:138-226`
 
 ### Common Pitfalls
 
@@ -1399,6 +1406,104 @@ Successfully implemented a comparator package that validates backtest results ag
 12. **Config Mode Requires --symbol** - `--symbol` is required when using `--backtest-config` (returns exit code 1 if omitted). This prevents silent defaulting to BTCUSDT for non-BTC strategies. In CSV mode, `--symbol` remains optional.
 13. **Symmetric Symbol Filtering** - `run()` filters `backtest_trades` by `config.symbol` before matching. This ensures both live and backtest sides use the same symbol filter, whether trades come from CSV (which may contain multiple symbols) or config mode.
 
+## Phase H: Testing & Validation
+
+### Completed: 2026-02-14
+
+Successfully implemented comprehensive unit test coverage improvements, cross-package integration tests, and shadow-mode validation pipeline tests.
+
+### Key Components
+
+1. **Coverage Improvements (Unit Tests)**
+   - `bybit_adapter/rest_client.py`: 16% → 100% (45 tests in `test_rest_client.py`)
+   - `event_saver/main.py`: 18% → 70%+ (30 tests in `test_main.py`)
+   - `event_saver/collectors`: 26-29% → 70%+ (tests in `test_public_collector.py`, `test_private_collector.py`)
+   - `gridbot/main.py`: 0% → 60%+ (14 tests in `test_main.py`)
+   - `bybit_adapter/ws_client.py`: 6 new edge case tests added
+
+2. **Cross-Package Integration Tests** (`tests/integration/`)
+   ```
+   tests/integration/
+   ├── __init__.py
+   ├── conftest.py                    # Shared fixtures (make_ticker_event, generate_price_series)
+   ├── test_engine_to_executor.py     # 15 tests: GridEngine → IntentExecutor pipeline + REST payload mapping
+   ├── test_backtest_to_comparator.py # 5 tests: BacktestEngine → Comparator round-trip
+   ├── test_runner_lifecycle.py       # 9 tests: StrategyRunner full lifecycle (fills, position, same-order)
+   ├── test_eventsaver_db.py          # 10 tests: EventSaver → Database pipeline + writer integration
+   └── test_shadow_validation.py      # 6 tests: Shadow-mode dual-path validation
+   ```
+
+3. **Shadow-Mode Validation Pipeline** (`test_shadow_validation.py`)
+   - Feeds identical price data through two independently constructed paths:
+     - **Path A**: `BacktestEngine` (orchestrated, high-level)
+     - **Path B**: Manual `GridEngine + BacktestOrderManager` (low-level, mimics shadow mode)
+   - Validates: trade count match, deterministic client_order_ids, 100% comparator match rate, zero price/qty deltas, identical PnL totals
+   - Uses `generate_price_series()` for reproducible sine-wave price oscillation
+
+### Running Tests
+
+```bash
+# Run all tests (unit + integration)
+make test
+
+# Run integration tests only
+make test-integration
+
+# Run specific integration test
+uv run pytest tests/integration/test_shadow_validation.py -v
+```
+
+### Key Implementation Notes
+
+1. **Event Constructor Requirements**
+   - All gridcore event dataclasses require `event_type` and `local_ts` fields (Python dataclass inheritance)
+   - Example: `TickerEvent(event_type=EventType.TICKER, symbol=..., exchange_ts=..., local_ts=..., last_price=...)`
+
+2. **BybitNormalizer Does Not Fail on Invalid Input**
+   - `normalize_ticker({"invalid": "data"})` creates a default event instead of raising
+   - To test error paths, mock the normalizer: `collector._normalizer.normalize_ticker = MagicMock(side_effect=Exception(...))`
+
+3. **PrivateExecution Has No `user_id` Field**
+   - SQLAlchemy model does not have `user_id` column (only `run_id` and `account_id`)
+   - Cascade delete via `Run` → `PrivateExecution` (not direct user linkage)
+
+4. **IntentExecutor Attribute Names**
+   - REST client stored as `self._client` (not `self._rest_client`)
+   - File: `apps/gridbot/src/gridbot/executor.py`
+
+5. **Backtest Fill Parameters**
+   - Amplitude=2000 and num_ticks=500 needed for reliable trade generation with grid_step=0.5 and grid_count=20
+   - Smaller amplitudes may not cross enough grid levels to trigger fills
+
+6. **TradeMatcher Returns MatchResult Object**
+   - `matcher.match()` returns `MatchResult`, not a tuple
+   - Access via: `result.matched`, `result.live_only`, `result.backtest_only`
+
+7. **ValidationMetrics Field Names**
+   - Uses `price_mean_abs_delta` (not `price_mean_delta`)
+   - Uses `cumulative_pnl_delta` (not `pnl_delta`)
+
+8. **Qty Rounding for Shadow-Mode Tests**
+   - Must match `InstrumentInfo.round_qty()` which rounds UP via `math.ceil`
+   - Default qty_step for BTCUSDT: `Decimal("0.001")`
+   - Pattern: `steps = math.ceil(float(raw_qty) / float(qty_step)); return Decimal(str(steps)) * qty_step`
+
+9. **Makefile Integration Test Target**
+   - Integration tests run as the final step in `make test` (after all per-package tests)
+   - Coverage is appended (`--cov-append`) so integration test coverage counts toward total
+   - `make test-integration` runs integration tests in isolation
+
+### Common Pitfalls
+
+1. **conftest ImportPathMismatchError**: Run test suites separately (per-directory) to avoid conftest conflicts across packages
+2. **SQLite Strips Timezone**: Use naive UTC timestamps in test data for in-memory SQLite tests
+3. **Shadow-Mode Qty Calculator**: Must replicate `BacktestEngine._create_qty_calculator()` exactly, including `InstrumentInfo.round_qty()` ceil rounding
+4. **generate_price_series**: Uses sine-wave oscillation; period = `num_ticks / 4` (4 complete oscillations). Increase `amplitude` for more fills.
+5. **Mocking `async def` functions in cli() tests**: When `cli()` calls `asyncio.run(main(...))`, patching `main` with `return_value=0` auto-creates an `AsyncMock` that still returns a coroutine. Use `patch("module.main", new=MagicMock(return_value=0))` to force a regular MagicMock, so `main(args)` returns `0` directly (not a coroutine), avoiding un-awaited coroutine warnings.
+6. **`asyncio.get_event_loop()` deprecation in tests**: Use `asyncio.new_event_loop()` instead of `asyncio.get_event_loop()` when setting up event loops in non-async test methods (e.g., `saver._event_loop = asyncio.new_event_loop()`).
+7. **PlaceLimitIntent constructor**: Requires `qty` and `grid_level` positional args — cannot construct with just symbol/side/price/direction/client_order_id.
+8. **Integration test discovery**: Must add `"tests/integration"` to `testpaths` in `pyproject.toml` for pytest to discover them.
+
 ## Next Steps (Future Phases)
 
-- Phase H: Testing & Validation
+- Phase I: Deployment & Monitoring

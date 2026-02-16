@@ -88,6 +88,10 @@ class GridbotConfig(BaseModel):
         default=63.0,
         description="Seconds between position checks",
     )
+    order_sync_interval: float = Field(
+        default=61.0,
+        description="Seconds between periodic order reconciliation (0 to disable)",
+    )
 
     # Notifications
     notification: Optional[NotificationConfig] = None
