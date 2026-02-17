@@ -12,7 +12,7 @@ from gridcore.intents import PlaceLimitIntent, CancelIntent
 
 from gridbot.executor import IntentExecutor
 
-from helpers import make_ticker_event
+from integration_helpers import make_ticker_event
 
 
 class TestEngineToExecutor:

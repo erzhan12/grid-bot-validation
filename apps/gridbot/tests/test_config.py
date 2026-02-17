@@ -190,6 +190,18 @@ class TestGridbotConfig:
         config = GridbotConfig(accounts=[account], strategies=strategies)
         assert len(config.get_strategies_for_account("multi")) == 2
 
+    @pytest.mark.parametrize("field", ["wallet_cache_interval", "order_sync_interval"])
+    def test_negative_interval_rejected(self, field):
+        """Negative interval values are rejected by validator."""
+        with pytest.raises(ValueError, match="must be >= 0"):
+            GridbotConfig(**{field: -1.0})
+
+    @pytest.mark.parametrize("field", ["wallet_cache_interval", "order_sync_interval"])
+    def test_zero_interval_accepted(self, field):
+        """Zero is valid (disables the feature)."""
+        config = GridbotConfig(**{field: 0.0})
+        assert getattr(config, field) == 0.0
+
 
 class TestLoadConfig:
     """Tests for load_config function."""

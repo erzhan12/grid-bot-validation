@@ -14,7 +14,7 @@ from gridbot.config import StrategyConfig
 from gridbot.executor import IntentExecutor
 from gridbot.runner import StrategyRunner
 
-from helpers import make_ticker_event
+from integration_helpers import make_ticker_event
 
 
 def _make_strategy_config():

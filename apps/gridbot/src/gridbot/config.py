@@ -100,6 +100,13 @@ class GridbotConfig(BaseModel):
     # Notifications
     notification: Optional[NotificationConfig] = None
 
+    @field_validator("wallet_cache_interval", "order_sync_interval")
+    @classmethod
+    def non_negative(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("must be >= 0 (use 0 to disable)")
+        return v
+
     @model_validator(mode="after")
     def validate_account_references(self):
         """Ensure all strategy account references exist."""

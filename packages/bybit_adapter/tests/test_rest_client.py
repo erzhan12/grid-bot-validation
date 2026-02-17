@@ -302,6 +302,12 @@ class TestGetWalletBalance:
 
         mock_session.get_wallet_balance.assert_called_once_with(accountType="CONTRACT")
 
+    def test_api_error_raises(self, client, mock_session):
+        mock_session.get_wallet_balance.return_value = _error_response(10001, "Auth failed")
+
+        with pytest.raises(Exception, match="Auth failed"):
+            client.get_wallet_balance()
+
 
 # ---------------------------------------------------------------------------
 # place_order

@@ -1092,7 +1092,6 @@ class TestOrchestratorOrderSyncLoop:
         orchestrator._running = True
 
         # Mock reconciler to return discrepancies
-
         reconciler = orchestrator._reconcilers["test_account"]
         reconciler.reconcile_reconnect = AsyncMock()
         reconciler.reconcile_reconnect.return_value = ReconciliationResult(

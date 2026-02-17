@@ -906,6 +906,7 @@ Successfully implemented a multi-tenant grid trading bot using gridcore strategy
    - **Behavior**: Returns cached balance if age < interval, otherwise fetches fresh and updates cache
    - **API call reduction**: ~79% fewer calls (from 57/hour to 12/hour per account at default settings)
    - **bbu2 reference**: Original bot cached for 620s (`GET_WALLET_INTERVAL = 10 * 62`); gridbot defaults to 300s for better freshness
+   - **Lock design**: Single `asyncio.Lock` covers all accounts. Acceptable for low account counts; if many accounts run concurrently, consider per-account locks (`dict[str, asyncio.Lock]`) to avoid unnecessary serialization
    - **Files**: `apps/gridbot/src/gridbot/config.py:94-97`, `apps/gridbot/src/gridbot/orchestrator.py:479-525`
 
 ### Common Pitfalls

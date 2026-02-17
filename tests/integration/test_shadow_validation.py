@@ -31,7 +31,7 @@ from comparator.loader import BacktestTradeLoader
 from comparator.matcher import TradeMatcher
 from comparator.metrics import calculate_metrics
 
-from helpers import generate_price_series
+from integration_helpers import generate_price_series
 
 
 # Shared configuration constants

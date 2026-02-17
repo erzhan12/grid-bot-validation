@@ -117,7 +117,9 @@ class Orchestrator:
 
         # Wallet balance cache: account_name -> (balance, timestamp)
         self._wallet_cache: dict[str, tuple[float, datetime]] = {}
-        self._wallet_cache_lock = asyncio.Lock()
+        # NOTE: single lock covers all accounts; acceptable for low account counts.
+        # If many accounts run concurrently, consider per-account locks.
+        self._wallet_cache_lock = asyncio.Lock()  # safe outside event loop (Python 3.10+)
 
     @property
     def running(self) -> bool:
@@ -523,6 +525,7 @@ class Orchestrator:
 
         for account in wallet.get("list", []):
             for coin in account.get("coin", []):
+                # USDT-margined only: look for USDT coin in unified wallet
                 if coin.get("coin") == "USDT":
                     return float(coin.get("walletBalance", 0))
 
