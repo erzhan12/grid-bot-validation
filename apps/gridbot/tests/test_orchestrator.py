@@ -997,7 +997,7 @@ class TestOrchestratorOrderSyncLoop:
         # Mock reconciler
         reconciler = orchestrator._reconcilers["test_account"]
         reconciler.reconcile_reconnect = AsyncMock()
-        
+
         # Mock ReconciliationResult
 
         reconciler.reconcile_reconnect.return_value = ReconciliationResult(
@@ -1073,7 +1073,7 @@ class TestOrchestratorOrderSyncLoop:
 
         with patch("asyncio.sleep", new_callable=AsyncMock, side_effect=stop_after_first):
             await orchestrator._order_sync_loop()
-        
+
         # Should not raise — error is caught and logged
 
     @pytest.mark.asyncio
@@ -1241,4 +1241,31 @@ class TestOrchestratorWalletCache:
         rest_client.get_wallet_balance.reset_mock()
         balance = await orchestrator._get_wallet_balance("test_account")
         assert balance == 8000.0
+        rest_client.get_wallet_balance.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_get_wallet_balance_concurrent_deduplicates(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Concurrent cache misses should issue only one REST call."""
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+
+        rest_client = orchestrator._rest_clients["test_account"]
+        rest_client.get_wallet_balance.return_value = {
+            "list": [{"coin": [{"coin": "USDT", "walletBalance": "5000"}]}]
+        }
+
+        # Launch two concurrent calls — both see empty cache
+        results = await asyncio.gather(
+            orchestrator._get_wallet_balance("test_account"),
+            orchestrator._get_wallet_balance("test_account"),
+        )
+
+        assert results == [5000.0, 5000.0]
+        # Lock ensures only one fetch, second caller hits cache
         rest_client.get_wallet_balance.assert_called_once()

@@ -4,10 +4,12 @@ Validates that normalized events flow through writers into the database
 and are queryable via repositories.
 """
 
+from dataclasses import dataclass
+
 import pytest
 from datetime import datetime, timezone
 from decimal import Decimal
-from uuid import uuid4
+from uuid import uuid4, UUID
 
 from grid_db import DatabaseFactory, DatabaseSettings
 from grid_db import User, BybitAccount, Strategy, Run
@@ -17,6 +19,16 @@ from grid_db import (
     OrderRepository,
 )
 from grid_db.models import PublicTrade, PrivateExecution
+
+
+@dataclass
+class SeededDb:
+    """Result of the seeded_db fixture."""
+    db: DatabaseFactory
+    user_id: UUID
+    account_id: UUID
+    strategy_id: UUID
+    run_id: UUID
 from gridcore.events import PublicTradeEvent, ExecutionEvent, OrderUpdateEvent, EventType
 from event_saver.writers import TradeWriter, ExecutionWriter, OrderWriter
 
@@ -66,13 +78,13 @@ def seeded_db(db):
         session.add(run)
         session.flush()
 
-        return {
-            "db": db,
-            "user_id": user.user_id,
-            "account_id": account.account_id,
-            "strategy_id": strategy.strategy_id,
-            "run_id": run.run_id,
-        }
+        return SeededDb(
+            db=db,
+            user_id=user.user_id,
+            account_id=account.account_id,
+            strategy_id=strategy.strategy_id,
+            run_id=run.run_id,
+        )
 
 
 class TestPublicTradesPipeline:
@@ -157,9 +169,9 @@ class TestPrivateExecutionsPipeline:
 
     def test_bulk_insert_executions(self, seeded_db):
         """Bulk insert executions with run_id and query them back."""
-        db = seeded_db["db"]
-        run_id = seeded_db["run_id"]
-        account_id = seeded_db["account_id"]
+        db = seeded_db.db
+        run_id = seeded_db.run_id
+        account_id = seeded_db.account_id
 
         executions = []
         for i in range(5):
@@ -186,9 +198,9 @@ class TestPrivateExecutionsPipeline:
 
     def test_duplicate_executions_skipped(self, seeded_db):
         """Duplicate exec_id should be skipped."""
-        db = seeded_db["db"]
-        run_id = seeded_db["run_id"]
-        account_id = seeded_db["account_id"]
+        db = seeded_db.db
+        run_id = seeded_db.run_id
+        account_id = seeded_db.account_id
 
         exc = PrivateExecution(
             run_id=run_id,
@@ -232,9 +244,9 @@ class TestPrivateExecutionsPipeline:
 
     def test_cascade_delete_removes_executions(self, seeded_db):
         """Deleting a Run should cascade-delete its executions."""
-        db = seeded_db["db"]
-        run_id = seeded_db["run_id"]
-        account_id = seeded_db["account_id"]
+        db = seeded_db.db
+        run_id = seeded_db.run_id
+        account_id = seeded_db.account_id
 
         exc = PrivateExecution(
             run_id=run_id,
@@ -299,9 +311,9 @@ class TestWriterPipeline:
     @pytest.mark.asyncio
     async def test_execution_writer_flush_persists_to_db(self, seeded_db):
         """ExecutionWriter.write() + flush() → executions queryable via repository."""
-        db = seeded_db["db"]
-        run_id = seeded_db["run_id"]
-        account_id = seeded_db["account_id"]
+        db = seeded_db.db
+        run_id = seeded_db.run_id
+        account_id = seeded_db.account_id
 
         writer = ExecutionWriter(db=db, batch_size=100, flush_interval=60.0)
 
@@ -407,9 +419,9 @@ class TestOrderWriterPipeline:
     @pytest.mark.asyncio
     async def test_order_writer_flush_persists_to_db(self, seeded_db):
         """OrderWriter.write() + flush() → orders queryable via repository."""
-        db = seeded_db["db"]
-        run_id = seeded_db["run_id"]
-        account_id = seeded_db["account_id"]
+        db = seeded_db.db
+        run_id = seeded_db.run_id
+        account_id = seeded_db.account_id
 
         writer = OrderWriter(db=db, batch_size=100, flush_interval=60.0)
 
@@ -447,9 +459,9 @@ class TestOrderWriterPipeline:
     @pytest.mark.asyncio
     async def test_order_writer_duplicate_updates_status(self, seeded_db):
         """Writing same order_id twice with different status triggers ON CONFLICT DO UPDATE."""
-        db = seeded_db["db"]
-        run_id = seeded_db["run_id"]
-        account_id = seeded_db["account_id"]
+        db = seeded_db.db
+        run_id = seeded_db.run_id
+        account_id = seeded_db.account_id
 
         writer = OrderWriter(db=db, batch_size=100, flush_interval=60.0)
 

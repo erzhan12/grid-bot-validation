@@ -117,6 +117,7 @@ class Orchestrator:
 
         # Wallet balance cache: account_name -> (balance, timestamp)
         self._wallet_cache: dict[str, tuple[float, datetime]] = {}
+        self._wallet_cache_lock = asyncio.Lock()
 
     @property
     def running(self) -> bool:
@@ -479,6 +480,9 @@ class Orchestrator:
     async def _get_wallet_balance(self, account_name: str) -> float:
         """Get wallet balance, using cache if available.
 
+        Uses asyncio.Lock to prevent duplicate REST fetches when multiple
+        async tasks call this concurrently for the same account.
+
         Args:
             account_name: Account name.
 
@@ -489,18 +493,19 @@ class Orchestrator:
         if self._config.wallet_cache_interval <= 0:
             return await self._fetch_wallet_balance(account_name)
 
-        # Check cache
-        cached = self._wallet_cache.get(account_name)
-        if cached:
-            balance, timestamp = cached
-            age = (datetime.now(UTC) - timestamp).total_seconds()
-            if age < self._config.wallet_cache_interval:
-                return balance
+        async with self._wallet_cache_lock:
+            # Check cache (inside lock to prevent duplicate fetches)
+            cached = self._wallet_cache.get(account_name)
+            if cached:
+                balance, timestamp = cached
+                age = (datetime.now(UTC) - timestamp).total_seconds()
+                if age < self._config.wallet_cache_interval:
+                    return balance
 
-        # Cache miss or expired - fetch fresh
-        balance = await self._fetch_wallet_balance(account_name)
-        self._wallet_cache[account_name] = (balance, datetime.now(UTC))
-        return balance
+            # Cache miss or expired - fetch fresh
+            balance = await self._fetch_wallet_balance(account_name)
+            self._wallet_cache[account_name] = (balance, datetime.now(UTC))
+            return balance
 
     async def _fetch_wallet_balance(self, account_name: str) -> float:
         """Fetch wallet balance from REST API.
@@ -676,8 +681,6 @@ class Orchestrator:
 
         while self._running:
             try:
-                await asyncio.sleep(self._config.order_sync_interval)
-
                 for account_name, runners in self._account_to_runners.items():
                     reconciler = self._reconcilers.get(account_name)
                     if not reconciler:
@@ -707,9 +710,14 @@ class Orchestrator:
                         except Exception as e:
                             logger.error(f"{runner.strat_id}: Order sync error: {e}")
 
+                await asyncio.sleep(self._config.order_sync_interval)
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                # Guards against errors outside the per-runner try/except:
+                # e.g. _account_to_runners mutation during iteration,
+                # missing reconciler attribute, or asyncio.sleep failure.
                 logger.error(f"Order sync loop error: {e}")
                 await asyncio.sleep(self._config.order_sync_interval)
 

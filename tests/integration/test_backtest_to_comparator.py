@@ -40,66 +40,56 @@ def _make_backtest_config(strat_id="test_strat"):
     )
 
 
+@pytest.fixture
+def backtest_session():
+    """Run a backtest with oscillating prices and return the session.
+
+    Large amplitude (2000) with grid_step=0.5 and grid_count=20 ensures
+    price crosses multiple grid levels to trigger fills.
+    """
+    config = _make_backtest_config()
+    engine = BacktestEngine(config=config)
+
+    events = generate_price_series(
+        symbol="BTCUSDT",
+        start_price=100000.0,
+        amplitude=2000.0,
+        num_ticks=500,
+        interval_seconds=60,
+    )
+    provider = InMemoryDataProvider(events)
+
+    return engine.run(
+        symbol="BTCUSDT",
+        start_ts=events[0].exchange_ts,
+        end_ts=events[-1].exchange_ts,
+        data_provider=provider,
+    )
+
+
+@pytest.fixture
+def exported_csv(backtest_session, tmp_path):
+    """Export backtest trades to CSV and return the path."""
+    csv_path = str(tmp_path / "trades.csv")
+    reporter = BacktestReporter(backtest_session)
+    reporter.export_trades(csv_path)
+    return csv_path
+
+
 class TestBacktestToComparator:
     """Test the full backtest → export → comparator pipeline."""
 
-    def test_backtest_produces_trades(self):
+    def test_backtest_produces_trades(self, backtest_session):
         """Backtest with oscillating prices should produce trades."""
-        config = _make_backtest_config()
-        engine = BacktestEngine(config=config)
+        assert len(backtest_session.trades) > 0
 
-        # Large amplitude (2000) with grid_step=0.5 and grid_count=20 ensures
-        # price crosses multiple grid levels to trigger fills
-        events = generate_price_series(
-            symbol="BTCUSDT",
-            start_price=100000.0,
-            amplitude=2000.0,
-            num_ticks=500,
-            interval_seconds=60,
-        )
-        provider = InMemoryDataProvider(events)
-
-        session = engine.run(
-            symbol="BTCUSDT",
-            start_ts=events[0].exchange_ts,
-            end_ts=events[-1].exchange_ts,
-            data_provider=provider,
-        )
-
-        assert len(session.trades) > 0
-
-    def test_export_and_load_round_trip(self, tmp_path):
+    def test_export_and_load_round_trip(self, backtest_session, exported_csv):
         """Exported trades CSV should load correctly via BacktestTradeLoader."""
-        config = _make_backtest_config()
-        engine = BacktestEngine(config=config)
-
-        events = generate_price_series(
-            symbol="BTCUSDT",
-            start_price=100000.0,
-            amplitude=2000.0,
-            num_ticks=500,
-            interval_seconds=60,
-        )
-        provider = InMemoryDataProvider(events)
-
-        session = engine.run(
-            symbol="BTCUSDT",
-            start_ts=events[0].exchange_ts,
-            end_ts=events[-1].exchange_ts,
-            data_provider=provider,
-        )
-
-        # Export trades
-        csv_path = str(tmp_path / "trades.csv")
-        reporter = BacktestReporter(session)
-        reporter.export_trades(csv_path)
-
-        # Load via comparator
         loader = BacktestTradeLoader()
-        normalized = loader.load_from_csv(csv_path)
+        normalized = loader.load_from_csv(exported_csv)
 
         # Count should match
-        assert len(normalized) == len(session.trades)
+        assert len(normalized) == len(backtest_session.trades)
 
         # All trades should have valid fields
         for trade in normalized:
@@ -109,85 +99,32 @@ class TestBacktestToComparator:
             assert trade.qty > 0
             assert trade.client_order_id
 
-    def test_self_comparison_perfect_match(self, tmp_path):
+    def test_self_comparison_perfect_match(self, backtest_session, exported_csv):
         """Backtest compared to itself should produce 100% match rate."""
-        config = _make_backtest_config()
-        engine = BacktestEngine(config=config)
-
-        events = generate_price_series(
-            symbol="BTCUSDT",
-            start_price=100000.0,
-            amplitude=2000.0,
-            num_ticks=500,
-            interval_seconds=60,
-        )
-        provider = InMemoryDataProvider(events)
-
-        session = engine.run(
-            symbol="BTCUSDT",
-            start_ts=events[0].exchange_ts,
-            end_ts=events[-1].exchange_ts,
-            data_provider=provider,
-        )
-
-        if len(session.trades) == 0:
+        if len(backtest_session.trades) == 0:
             pytest.skip("No trades produced, cannot test matching")
 
-        # Export trades
-        csv_path = str(tmp_path / "trades.csv")
-        reporter = BacktestReporter(session)
-        reporter.export_trades(csv_path)
-
-        # Load same CSV twice (simulating backtest vs "live")
         loader = BacktestTradeLoader()
-        trades_a = loader.load_from_csv(csv_path)
-        trades_b = loader.load_from_csv(csv_path)
-
-        # Set different sources
+        trades_a = loader.load_from_csv(exported_csv)
+        trades_b = loader.load_from_csv(exported_csv)
 
         trades_b_as_live = [replace(t, source="live") for t in trades_b]
 
-        # Match
         matcher = TradeMatcher()
         result = matcher.match(trades_b_as_live, trades_a)
-        matched, live_only, backtest_only = result.matched, result.live_only, result.backtest_only
 
-        assert len(matched) == len(trades_a)
-        assert len(live_only) == 0
-        assert len(backtest_only) == 0
+        assert len(result.matched) == len(trades_a)
+        assert len(result.live_only) == 0
+        assert len(result.backtest_only) == 0
 
-    def test_self_comparison_zero_deltas(self, tmp_path):
+    def test_self_comparison_zero_deltas(self, backtest_session, exported_csv):
         """Self-comparison should produce zero price/qty/PnL deltas."""
-        config = _make_backtest_config()
-        engine = BacktestEngine(config=config)
-
-        events = generate_price_series(
-            symbol="BTCUSDT",
-            start_price=100000.0,
-            amplitude=2000.0,
-            num_ticks=500,
-            interval_seconds=60,
-        )
-        provider = InMemoryDataProvider(events)
-
-        session = engine.run(
-            symbol="BTCUSDT",
-            start_ts=events[0].exchange_ts,
-            end_ts=events[-1].exchange_ts,
-            data_provider=provider,
-        )
-
-        if len(session.trades) == 0:
+        if len(backtest_session.trades) == 0:
             pytest.skip("No trades produced, cannot test metrics")
 
-        csv_path = str(tmp_path / "trades.csv")
-        reporter = BacktestReporter(session)
-        reporter.export_trades(csv_path)
-
         loader = BacktestTradeLoader()
-        trades_a = loader.load_from_csv(csv_path)
-        trades_b = loader.load_from_csv(csv_path)
-
+        trades_a = loader.load_from_csv(exported_csv)
+        trades_b = loader.load_from_csv(exported_csv)
 
         trades_b_as_live = [replace(t, source="live") for t in trades_b]
 
@@ -199,28 +136,9 @@ class TestBacktestToComparator:
         assert metrics.price_mean_abs_delta == 0.0
         assert metrics.qty_mean_abs_delta == 0.0
 
-    def test_export_metrics_csv(self, tmp_path):
+    def test_export_metrics_csv(self, backtest_session, tmp_path):
         """Full pipeline: backtest → export metrics → verify file."""
-        config = _make_backtest_config()
-        engine = BacktestEngine(config=config)
-
-        events = generate_price_series(
-            symbol="BTCUSDT",
-            start_price=100000.0,
-            amplitude=2000.0,
-            num_ticks=500,
-            interval_seconds=60,
-        )
-        provider = InMemoryDataProvider(events)
-
-        session = engine.run(
-            symbol="BTCUSDT",
-            start_ts=events[0].exchange_ts,
-            end_ts=events[-1].exchange_ts,
-            data_provider=provider,
-        )
-
-        reporter = BacktestReporter(session)
+        reporter = BacktestReporter(backtest_session)
         metrics_path = str(tmp_path / "metrics.csv")
         reporter.export_metrics(metrics_path)
 

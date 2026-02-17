@@ -33,6 +33,8 @@ def generate_price_series(
     """Generate oscillating price series for testing.
 
     Produces a sine-wave-like oscillation around start_price.
+    To guarantee grid fills, amplitude must exceed
+    grid_step * grid_count / 2 (half the grid span).
 
     Returns:
         List of TickerEvent objects.
