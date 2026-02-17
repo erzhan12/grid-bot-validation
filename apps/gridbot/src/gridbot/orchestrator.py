@@ -118,7 +118,7 @@ class Orchestrator:
         # Wallet balance cache: account_name -> (balance, timestamp)
         self._wallet_cache: dict[str, tuple[float, datetime]] = {}
         # NOTE: single lock covers all accounts; acceptable for low account counts.
-        # If many accounts run concurrently, consider per-account locks.
+        # TODO: switch to per-account locks if account count grows beyond ~10.
         self._wallet_cache_lock = asyncio.Lock()  # safe outside event loop (Python 3.10+)
 
     @property
@@ -529,6 +529,7 @@ class Orchestrator:
                 if coin.get("coin") == "USDT":
                     return float(coin.get("walletBalance", 0))
 
+        logger.warning("No USDT balance found in wallet response for %s: %s", account_name, wallet)
         return 0.0
 
     async def _position_check_loop(self) -> None:
@@ -684,8 +685,9 @@ class Orchestrator:
 
         while self._running:
             try:
-                # Reconcile immediately on start, then sleep between cycles
-                # (matches _position_check_loop / _health_check_loop pattern).
+                # Reconcile immediately on start, then sleep between cycles.
+                # (Differs from _position_check_loop which sleeps first —
+                # immediate sync on startup ensures order state is fresh.)
                 for account_name, runners in list(self._account_to_runners.items()):
                     reconciler = self._reconcilers.get(account_name)
                     if not reconciler:
@@ -726,7 +728,10 @@ class Orchestrator:
                 # Guards against errors outside the per-runner try/except:
                 # e.g. missing reconciler attribute or asyncio.sleep failure.
                 logger.error(f"Order sync loop error: {e}")
-                await asyncio.sleep(self._config.order_sync_interval)
+                try:
+                    await asyncio.sleep(self._config.order_sync_interval)
+                except asyncio.CancelledError:
+                    break
 
     def _get_account_for_strategy(self, strat_id: str) -> Optional[str]:
         """Get account name for a strategy."""
