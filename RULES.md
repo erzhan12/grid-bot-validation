@@ -1509,14 +1509,17 @@ uv run pytest tests/integration/test_shadow_validation.py -v
 2. **SQLite Strips Timezone**: Use naive UTC timestamps in test data for in-memory SQLite tests
 3. **Shadow-Mode Qty Calculator**: Must replicate `BacktestEngine._create_qty_calculator()` exactly, including `InstrumentInfo.round_qty()` ceil rounding
 4. **generate_price_series**: Uses sine-wave oscillation; period = `num_ticks / 4` (4 complete oscillations). Increase `amplitude` for more fills.
-5. **Mocking `async def` functions in cli() tests**: When `cli()` calls `asyncio.run(main(...))`, patching `main` with `return_value=0` auto-creates an `AsyncMock` that still returns a coroutine. Use `patch("module.main", new=MagicMock(return_value=0))` to force a regular MagicMock, so `main(args)` returns `0` directly (not a coroutine), avoiding un-awaited coroutine warnings.
+5. **Mocking `async def` functions in cli() tests**: When `cli()` calls `asyncio.run(main(...))`, patching `main` with `return_value=0` auto-creates an `AsyncMock` that still returns a coroutine. Use `_close_dangling_coro(mock_run)` helper (in `test_main.py`) to close the unawaited coroutine after assertions, silencing warnings.
 6. **`asyncio.get_event_loop()` deprecation in tests**: Use `asyncio.new_event_loop()` instead of `asyncio.get_event_loop()` when setting up event loops in non-async test methods (e.g., `saver._event_loop = asyncio.new_event_loop()`).
 7. **PlaceLimitIntent constructor**: Requires `qty` and `grid_level` positional args — cannot construct with just symbol/side/price/direction/client_order_id.
 8. **Integration test discovery**: Must add `"tests/integration"` to `testpaths` in `pyproject.toml` for pytest to discover them.
 9. **Import ordering in test files**: Never place class/dataclass definitions between import blocks. All imports must be grouped at the top of the file before any class or function definitions (e.g., `test_eventsaver_db.py` had `SeededDb` splitting import blocks).
-10. **`asyncio.CancelledError` is a `BaseException`**: In nested try/except patterns, `CancelledError` passes through `except Exception` blocks. Always catch it in the outer loop with a comment explaining why (see `orchestrator.py:_order_sync_loop`).
+10. **`asyncio.CancelledError` is a `BaseException`**: In nested try/except patterns, `CancelledError` passes through `except Exception` blocks. Always catch it in the outer loop with a comment explaining why. Also wrap any `await asyncio.sleep()` inside `except Exception` recovery handlers with its own `except asyncio.CancelledError: break` (see `orchestrator.py:_order_sync_loop`).
 11. **Blocking I/O in async code**: Use `asyncio.to_thread()` to wrap blocking calls (e.g., SQLAlchemy `session.commit()`) in async methods. Requires Python 3.9+ (`pyproject.toml` declares `>=3.11`).
 12. **Dict iteration in async loops**: Snapshot mutable dicts with `list(d.items())` before iterating in background tasks (`_position_check_loop`, `_order_sync_loop`). The main event loop can mutate `_account_to_runners` between `await` points, causing `RuntimeError: dictionary changed size during iteration`.
+13. **Logging style in orchestrator loops**: Use `%s`-style format args (`logger.error("msg: %s", var)`) not f-strings (`logger.error(f"msg: {var}")`) in loop error/warning/info/debug handlers. Avoids string interpolation when log level is disabled. File: `apps/gridbot/src/gridbot/orchestrator.py`.
+14. **`integration_helpers.py` import path**: `tests/integration/conftest.py` adds `tests/integration/` to `sys.path` explicitly so `import integration_helpers` works even when pytest is invoked without the root `pyproject.toml` `pythonpath` setting (e.g., per-app test runs).
+15. **`_fetch_wallet_balance` fallback**: Returns `0.0` when no USDT balance is found in the wallet API response, but now logs `logger.warning` first so unexpected API structures are visible in logs.
 
 ## Next Steps (Future Phases)
 
