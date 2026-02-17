@@ -1,6 +1,6 @@
 """Tests for WebSocket client disconnect/reconnect detection."""
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 import time
 
@@ -283,12 +283,12 @@ class TestPublicWebSocketClientEdgeCases:
         )
 
         client.connect()
-        ts_before = client._state.last_message_ts
+        past = datetime.now(timezone.utc) - timedelta(seconds=1)
+        client._state.last_message_ts = past
 
-        time.sleep(0.01)
         client._handle_ticker({"topic": "tickers.BTCUSDT", "data": {}})
 
-        assert client._state.last_message_ts > ts_before
+        assert client._state.last_message_ts > past
         ticker_received.assert_called_once()
         client.disconnect()
 
@@ -303,12 +303,12 @@ class TestPublicWebSocketClientEdgeCases:
         )
 
         client.connect()
-        ts_before = client._state.last_message_ts
+        past = datetime.now(timezone.utc) - timedelta(seconds=1)
+        client._state.last_message_ts = past
 
-        time.sleep(0.01)
         client._handle_trade({"topic": "publicTrade.BTCUSDT", "data": []})
 
-        assert client._state.last_message_ts > ts_before
+        assert client._state.last_message_ts > past
         trade_received.assert_called_once()
         client.disconnect()
 
@@ -415,13 +415,13 @@ class TestPrivateWebSocketClientHandlers:
         )
 
         client.connect()
-        ts_before = client._state.last_message_ts
+        past = datetime.now(timezone.utc) - timedelta(seconds=1)
+        client._state.last_message_ts = past
 
-        time.sleep(0.01)
         msg = {"topic": "execution", "data": [{"execId": "e1"}]}
         client._handle_execution(msg)
 
-        assert client._state.last_message_ts > ts_before
+        assert client._state.last_message_ts > past
         mock_callback.assert_called_once_with(msg)
         client.disconnect()
 
@@ -456,13 +456,13 @@ class TestPrivateWebSocketClientHandlers:
         )
 
         client.connect()
-        ts_before = client._state.last_message_ts
+        past = datetime.now(timezone.utc) - timedelta(seconds=1)
+        client._state.last_message_ts = past
 
-        time.sleep(0.01)
         msg = {"topic": "order", "data": [{"orderId": "o1"}]}
         client._handle_order(msg)
 
-        assert client._state.last_message_ts > ts_before
+        assert client._state.last_message_ts > past
         mock_callback.assert_called_once_with(msg)
         client.disconnect()
 
@@ -478,12 +478,12 @@ class TestPrivateWebSocketClientHandlers:
         )
 
         client.connect()
-        ts_before = client._state.last_message_ts
+        past = datetime.now(timezone.utc) - timedelta(seconds=1)
+        client._state.last_message_ts = past
 
-        time.sleep(0.01)
         msg = {"topic": "position", "data": [{"symbol": "BTCUSDT"}]}
         client._handle_position(msg)
 
-        assert client._state.last_message_ts > ts_before
+        assert client._state.last_message_ts > past
         mock_callback.assert_called_once_with(msg)
         client.disconnect()

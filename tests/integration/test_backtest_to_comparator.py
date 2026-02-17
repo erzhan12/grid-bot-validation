@@ -5,6 +5,8 @@ and matched correctly. A backtest compared to itself should produce
 100% match rate and zero deltas.
 """
 
+from dataclasses import replace
+
 import pytest
 from pathlib import Path
 
@@ -17,7 +19,7 @@ from comparator.loader import BacktestTradeLoader
 from comparator.matcher import TradeMatcher
 from comparator.metrics import calculate_metrics
 
-from tests.integration.conftest import generate_price_series
+from helpers import generate_price_series
 
 
 def _make_backtest_config(strat_id="test_strat"):
@@ -142,7 +144,7 @@ class TestBacktestToComparator:
         trades_b = loader.load_from_csv(csv_path)
 
         # Set different sources
-        from dataclasses import replace
+
         trades_b_as_live = [replace(t, source="live") for t in trades_b]
 
         # Match
@@ -186,7 +188,7 @@ class TestBacktestToComparator:
         trades_a = loader.load_from_csv(csv_path)
         trades_b = loader.load_from_csv(csv_path)
 
-        from dataclasses import replace
+
         trades_b_as_live = [replace(t, source="live") for t in trades_b]
 
         matcher = TradeMatcher()

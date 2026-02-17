@@ -476,7 +476,7 @@ class Orchestrator:
         except (KeyError, TypeError):
             return None
 
-    def _get_wallet_balance(self, account_name: str) -> float:
+    async def _get_wallet_balance(self, account_name: str) -> float:
         """Get wallet balance, using cache if available.
 
         Args:
@@ -487,7 +487,7 @@ class Orchestrator:
         """
         # Check if caching is disabled
         if self._config.wallet_cache_interval <= 0:
-            return self._fetch_wallet_balance(account_name)
+            return await self._fetch_wallet_balance(account_name)
 
         # Check cache
         cached = self._wallet_cache.get(account_name)
@@ -498,12 +498,14 @@ class Orchestrator:
                 return balance
 
         # Cache miss or expired - fetch fresh
-        balance = self._fetch_wallet_balance(account_name)
+        balance = await self._fetch_wallet_balance(account_name)
         self._wallet_cache[account_name] = (balance, datetime.now(UTC))
         return balance
 
-    def _fetch_wallet_balance(self, account_name: str) -> float:
+    async def _fetch_wallet_balance(self, account_name: str) -> float:
         """Fetch wallet balance from REST API.
+
+        Runs synchronous REST call in thread to avoid blocking event loop.
 
         Args:
             account_name: Account name.
@@ -512,7 +514,7 @@ class Orchestrator:
             Wallet balance in USDT.
         """
         rest_client = self._rest_clients[account_name]
-        wallet = rest_client.get_wallet_balance()
+        wallet = await asyncio.to_thread(rest_client.get_wallet_balance)
 
         for account in wallet.get("list", []):
             for coin in account.get("coin", []):
@@ -538,7 +540,7 @@ class Orchestrator:
                         rest_client = self._rest_clients[account_name]
 
                         # Fetch wallet balance (cached to reduce API calls)
-                        wallet_balance = self._get_wallet_balance(account_name)
+                        wallet_balance = await self._get_wallet_balance(account_name)
 
                         # Check if we need to fall back to REST for positions
                         # (REST sync ensures freshness even when WS data exists)
@@ -556,7 +558,7 @@ class Orchestrator:
                             if long_pos is None or short_pos is None:
                                 # Lazy fetch REST positions (once per account)
                                 if rest_positions is None:
-                                    rest_positions = rest_client.get_positions()
+                                    rest_positions = await asyncio.to_thread(rest_client.get_positions)
                                     logger.debug(
                                         f"Fetched positions from REST for {account_name} "
                                         f"(WS data incomplete)"
@@ -684,7 +686,7 @@ class Orchestrator:
                     for runner in runners:
                         try:
                             result = await reconciler.reconcile_reconnect(runner)
-                            
+
                             if result.errors:
                                 logger.warning(
                                     f"{runner.strat_id}: Order sync completed with errors: {result.errors}"
@@ -709,6 +711,7 @@ class Orchestrator:
                 break
             except Exception as e:
                 logger.error(f"Order sync loop error: {e}")
+                await asyncio.sleep(self._config.order_sync_interval)
 
     def _get_account_for_strategy(self, strat_id: str) -> Optional[str]:
         """Get account name for a strategy."""

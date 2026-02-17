@@ -9,6 +9,7 @@ import pytest
 from gridbot.config import GridbotConfig, AccountConfig, StrategyConfig
 from gridbot.notifier import Notifier
 from gridbot.orchestrator import Orchestrator
+from gridbot.reconciler import ReconciliationResult
 
 
 @pytest.fixture
@@ -998,7 +999,7 @@ class TestOrchestratorOrderSyncLoop:
         reconciler.reconcile_reconnect = AsyncMock()
         
         # Mock ReconciliationResult
-        from gridbot.reconciler import ReconciliationResult
+
         reconciler.reconcile_reconnect.return_value = ReconciliationResult(
             orders_fetched=5,
             orders_injected=0,
@@ -1091,7 +1092,7 @@ class TestOrchestratorOrderSyncLoop:
         orchestrator._running = True
 
         # Mock reconciler to return discrepancies
-        from gridbot.reconciler import ReconciliationResult
+
         reconciler = orchestrator._reconcilers["test_account"]
         reconciler.reconcile_reconnect = AsyncMock()
         reconciler.reconcile_reconnect.return_value = ReconciliationResult(
@@ -1132,7 +1133,7 @@ class TestOrchestratorWalletCache:
         }
 
         # First call should fetch and cache
-        balance = orchestrator._get_wallet_balance("test_account")
+        balance = await orchestrator._get_wallet_balance("test_account")
         assert balance == 5000.0
         rest_client.get_wallet_balance.assert_called_once()
 
@@ -1165,7 +1166,7 @@ class TestOrchestratorWalletCache:
         }
 
         # Should return cached value without calling REST
-        balance = orchestrator._get_wallet_balance("test_account")
+        balance = await orchestrator._get_wallet_balance("test_account")
         assert balance == 10000.0
         rest_client.get_wallet_balance.assert_not_called()
 
@@ -1194,7 +1195,7 @@ class TestOrchestratorWalletCache:
         }
 
         # Should fetch fresh value and update cache
-        balance = orchestrator._get_wallet_balance("test_account")
+        balance = await orchestrator._get_wallet_balance("test_account")
         assert balance == 7500.0
         rest_client.get_wallet_balance.assert_called_once()
 
@@ -1232,12 +1233,12 @@ class TestOrchestratorWalletCache:
         }
 
         # Should always fetch fresh, ignore cache
-        balance = orchestrator._get_wallet_balance("test_account")
+        balance = await orchestrator._get_wallet_balance("test_account")
         assert balance == 8000.0
         rest_client.get_wallet_balance.assert_called_once()
 
         # Call again - should fetch again (no caching)
         rest_client.get_wallet_balance.reset_mock()
-        balance = orchestrator._get_wallet_balance("test_account")
+        balance = await orchestrator._get_wallet_balance("test_account")
         assert balance == 8000.0
         rest_client.get_wallet_balance.assert_called_once()
