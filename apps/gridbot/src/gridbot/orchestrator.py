@@ -681,6 +681,8 @@ class Orchestrator:
 
         while self._running:
             try:
+                # Reconcile immediately on start, then sleep between cycles
+                # (matches _position_check_loop / _health_check_loop pattern).
                 for account_name, runners in list(self._account_to_runners.items()):
                     reconciler = self._reconcilers.get(account_name)
                     if not reconciler:
