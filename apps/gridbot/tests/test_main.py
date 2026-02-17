@@ -196,6 +196,17 @@ class TestMain:
 # ---------------------------------------------------------------------------
 
 
+def _close_dangling_coro(mock_run):
+    """Close the unawaited coroutine created by asyncio.run(mock_main(...)).
+
+    When ``main`` is an AsyncMock patched into cli(), calling ``main(args)``
+    produces a real coroutine that ``asyncio.run`` (also mocked) never awaits.
+    Closing it explicitly silences "coroutine was never awaited" warnings.
+    """
+    coro = mock_run.call_args[0][0]
+    coro.close()
+
+
 class TestCli:
     def test_parses_config_flag(self):
         mock_main = AsyncMock(return_value=0)
@@ -210,9 +221,7 @@ class TestCli:
         assert exc_info.value.code == 0
         mock_main.assert_called_once_with("myconfig.yaml")
         mock_run.assert_called_once()
-        # Close dangling coroutine from asyncio.run(mock_main(...))
-        coro = mock_run.call_args[0][0]
-        coro.close()
+        _close_dangling_coro(mock_run)
 
     def test_parses_debug_flag(self):
         mock_main = AsyncMock(return_value=0)
@@ -225,9 +234,7 @@ class TestCli:
             cli()
 
         assert logging.getLogger("gridbot").level == logging.DEBUG
-        # Close dangling coroutine
-        coro = mock_run.call_args[0][0]
-        coro.close()
+        _close_dangling_coro(mock_run)
 
     def test_keyboard_interrupt_returns_130(self):
         mock_main = AsyncMock(return_value=0)
@@ -240,9 +247,7 @@ class TestCli:
             cli()
 
         assert exc_info.value.code == 130
-        # Close dangling coroutine
-        coro = mock_run.call_args[0][0]
-        coro.close()
+        _close_dangling_coro(mock_run)
 
     def test_default_config_is_none(self):
         mock_main = AsyncMock(return_value=0)
@@ -255,6 +260,4 @@ class TestCli:
             cli()
 
         mock_main.assert_called_once_with(None)
-        # Close dangling coroutine
-        coro = mock_run.call_args[0][0]
-        coro.close()
+        _close_dangling_coro(mock_run)

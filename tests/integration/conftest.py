@@ -1,7 +1,17 @@
 """Shared fixtures for integration tests."""
 
+import sys
+from pathlib import Path
+
 import pytest
 from decimal import Decimal
+
+# Ensure tests/integration is on sys.path so ``import integration_helpers``
+# works regardless of how pytest is invoked (e.g. per-app test runs that
+# don't inherit the root pyproject.toml pythonpath setting).
+_INTEGRATION_DIR = str(Path(__file__).resolve().parent)
+if _INTEGRATION_DIR not in sys.path:
+    sys.path.insert(0, _INTEGRATION_DIR)
 
 from gridcore.config import GridConfig
 

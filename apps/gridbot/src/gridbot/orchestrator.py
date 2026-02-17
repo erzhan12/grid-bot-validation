@@ -594,12 +594,12 @@ class Orchestrator:
                             )
 
                     except Exception as e:
-                        logger.error(f"Position check error for {account_name}: {e}")
+                        logger.error("Position check error for %s: %s", account_name, e)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Position check loop error: {e}")
+                logger.error("Position check loop error: %s", e)
 
     async def _health_check_loop(self) -> None:
         """Periodic WebSocket health check.
@@ -699,23 +699,23 @@ class Orchestrator:
 
                             if result.errors:
                                 logger.warning(
-                                    f"{runner.strat_id}: Order sync completed with errors: {result.errors}"
+                                    "%s: Order sync completed with errors: %s",
+                                    runner.strat_id, result.errors,
                                 )
                             elif result.orders_injected > 0 or result.orphan_orders > 0:
                                 logger.info(
-                                    f"{runner.strat_id}: Order sync - "
-                                    f"fetched={result.orders_fetched}, "
-                                    f"injected={result.orders_injected}, "
-                                    f"orphans={result.orphan_orders}"
+                                    "%s: Order sync - fetched=%d, injected=%d, orphans=%d",
+                                    runner.strat_id, result.orders_fetched,
+                                    result.orders_injected, result.orphan_orders,
                                 )
                             else:
                                 logger.debug(
-                                    f"{runner.strat_id}: Order sync - in sync, "
-                                    f"{result.orders_fetched} orders checked"
+                                    "%s: Order sync - in sync, %d orders checked",
+                                    runner.strat_id, result.orders_fetched,
                                 )
 
                         except Exception as e:
-                            logger.error(f"{runner.strat_id}: Order sync error: {e}")
+                            logger.error("%s: Order sync error: %s", runner.strat_id, e)
 
                 await asyncio.sleep(self._config.order_sync_interval)
 
@@ -727,7 +727,7 @@ class Orchestrator:
             except Exception as e:
                 # Guards against errors outside the per-runner try/except:
                 # e.g. missing reconciler attribute or asyncio.sleep failure.
-                logger.error(f"Order sync loop error: {e}")
+                logger.error("Order sync loop error: %s", e)
                 try:
                     await asyncio.sleep(self._config.order_sync_interval)
                 except asyncio.CancelledError:
