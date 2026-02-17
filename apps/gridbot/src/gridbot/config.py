@@ -88,9 +88,24 @@ class GridbotConfig(BaseModel):
         default=63.0,
         description="Seconds between position checks",
     )
+    order_sync_interval: float = Field(
+        default=61.0,
+        description="Seconds between periodic order reconciliation (0 to disable)",
+    )
+    wallet_cache_interval: float = Field(
+        default=300.0,
+        description="Seconds to cache wallet balance (0 to disable caching)",
+    )
 
     # Notifications
     notification: Optional[NotificationConfig] = None
+
+    @field_validator("wallet_cache_interval", "order_sync_interval")
+    @classmethod
+    def non_negative(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("must be >= 0 (use 0 to disable)")
+        return v
 
     @model_validator(mode="after")
     def validate_account_references(self):

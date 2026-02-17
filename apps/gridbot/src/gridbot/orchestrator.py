@@ -108,11 +108,18 @@ class Orchestrator:
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._position_check_task: Optional[asyncio.Task] = None
         self._health_check_task: Optional[asyncio.Task] = None
+        self._order_sync_task: Optional[asyncio.Task] = None
 
         # WebSocket position data cache: account_name -> symbol -> side -> position_data
         # Follows original bbu2 pattern: WebSocket provides real-time updates,
         # HTTP REST is used only as fallback when WebSocket data is not available
         self._position_ws_data: dict[str, dict[str, dict[str, dict]]] = {}
+
+        # Wallet balance cache: account_name -> (balance, timestamp)
+        self._wallet_cache: dict[str, tuple[float, datetime]] = {}
+        # NOTE: single lock covers all accounts; acceptable for low account counts.
+        # TODO: switch to per-account locks if account count grows beyond ~10.
+        self._wallet_cache_lock = asyncio.Lock()  # safe outside event loop (Python 3.10+)
 
     @property
     def running(self) -> bool:
@@ -170,6 +177,7 @@ class Orchestrator:
         # Start background tasks
         self._position_check_task = asyncio.create_task(self._position_check_loop())
         self._health_check_task = asyncio.create_task(self._health_check_loop())
+        self._order_sync_task = asyncio.create_task(self._order_sync_loop())
 
         # Start retry queues
         for queue in self._retry_queues.values():
@@ -187,7 +195,7 @@ class Orchestrator:
         self._shutdown_event.set()
 
         # Stop background tasks
-        for task in (self._position_check_task, self._health_check_task):
+        for task in (self._position_check_task, self._health_check_task, self._order_sync_task):
             if task:
                 task.cancel()
                 try:
@@ -471,6 +479,59 @@ class Orchestrator:
         except (KeyError, TypeError):
             return None
 
+    async def _get_wallet_balance(self, account_name: str) -> float:
+        """Get wallet balance, using cache if available.
+
+        Uses asyncio.Lock to prevent duplicate REST fetches when multiple
+        async tasks call this concurrently for the same account.
+
+        Args:
+            account_name: Account name.
+
+        Returns:
+            Wallet balance in USDT.
+        """
+        # Check if caching is disabled
+        if self._config.wallet_cache_interval <= 0:
+            return await self._fetch_wallet_balance(account_name)
+
+        async with self._wallet_cache_lock:
+            # Check cache (inside lock to prevent duplicate fetches)
+            cached = self._wallet_cache.get(account_name)
+            if cached:
+                balance, timestamp = cached
+                age = (datetime.now(UTC) - timestamp).total_seconds()
+                if age < self._config.wallet_cache_interval:
+                    return balance
+
+            # Cache miss or expired - fetch fresh
+            balance = await self._fetch_wallet_balance(account_name)
+            self._wallet_cache[account_name] = (balance, datetime.now(UTC))
+            return balance
+
+    async def _fetch_wallet_balance(self, account_name: str) -> float:
+        """Fetch wallet balance from REST API.
+
+        Runs synchronous REST call in thread to avoid blocking event loop.
+
+        Args:
+            account_name: Account name.
+
+        Returns:
+            Wallet balance in USDT.
+        """
+        rest_client = self._rest_clients[account_name]
+        wallet = await asyncio.to_thread(rest_client.get_wallet_balance)
+
+        for account in wallet.get("list", []):
+            for coin in account.get("coin", []):
+                # USDT-margined only: look for USDT coin in unified wallet
+                if coin.get("coin") == "USDT":
+                    return float(coin.get("walletBalance", 0))
+
+        logger.warning("No USDT balance found in wallet response for %s: %s", account_name, wallet)
+        return 0.0
+
     async def _position_check_loop(self) -> None:
         """Periodic position check loop.
 
@@ -483,18 +544,12 @@ class Orchestrator:
             try:
                 await asyncio.sleep(self._config.position_check_interval)
 
-                for account_name, runners in self._account_to_runners.items():
+                for account_name, runners in list(self._account_to_runners.items()):
                     try:
                         rest_client = self._rest_clients[account_name]
 
-                        # Fetch wallet balance (always from REST for accuracy)
-                        wallet = rest_client.get_wallet_balance()
-                        wallet_balance = 0.0
-                        for account in wallet.get("list", []):
-                            for coin in account.get("coin", []):
-                                if coin.get("coin") == "USDT":
-                                    wallet_balance = float(coin.get("walletBalance", 0))
-                                    break
+                        # Fetch wallet balance (cached to reduce API calls)
+                        wallet_balance = await self._get_wallet_balance(account_name)
 
                         # Check if we need to fall back to REST for positions
                         # (REST sync ensures freshness even when WS data exists)
@@ -512,7 +567,7 @@ class Orchestrator:
                             if long_pos is None or short_pos is None:
                                 # Lazy fetch REST positions (once per account)
                                 if rest_positions is None:
-                                    rest_positions = rest_client.get_positions()
+                                    rest_positions = await asyncio.to_thread(rest_client.get_positions)
                                     logger.debug(
                                         f"Fetched positions from REST for {account_name} "
                                         f"(WS data incomplete)"
@@ -539,12 +594,12 @@ class Orchestrator:
                             )
 
                     except Exception as e:
-                        logger.error(f"Position check error for {account_name}: {e}")
+                        logger.error("Position check error for %s: %s", account_name, e)
 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Position check loop error: {e}")
+                logger.error("Position check loop error: %s", e)
 
     async def _health_check_loop(self) -> None:
         """Periodic WebSocket health check.
@@ -616,6 +671,67 @@ class Orchestrator:
                 self._notifier.alert_exception(
                     "_health_check_loop", e, error_key="health_check_loop"
                 )
+
+    async def _order_sync_loop(self) -> None:
+        """Periodic order reconciliation loop.
+
+        Fetches open orders from exchange via REST and reconciles with in-memory state.
+        Matches bbu2's LIMITS_READ_INTERVAL pattern (61 seconds by default).
+        """
+        # Skip if disabled
+        if self._config.order_sync_interval <= 0:
+            logger.info("Order sync loop disabled (order_sync_interval <= 0)")
+            return
+
+        while self._running:
+            try:
+                # Reconcile immediately on start, then sleep between cycles.
+                # (Differs from _position_check_loop which sleeps first —
+                # immediate sync on startup ensures order state is fresh.)
+                for account_name, runners in list(self._account_to_runners.items()):
+                    reconciler = self._reconcilers.get(account_name)
+                    if not reconciler:
+                        continue
+
+                    for runner in runners:
+                        try:
+                            result = await reconciler.reconcile_reconnect(runner)
+
+                            if result.errors:
+                                logger.warning(
+                                    "%s: Order sync completed with errors: %s",
+                                    runner.strat_id, result.errors,
+                                )
+                            elif result.orders_injected > 0 or result.orphan_orders > 0:
+                                logger.info(
+                                    "%s: Order sync - fetched=%d, injected=%d, orphans=%d",
+                                    runner.strat_id, result.orders_fetched,
+                                    result.orders_injected, result.orphan_orders,
+                                )
+                            else:
+                                logger.debug(
+                                    "%s: Order sync - in sync, %d orders checked",
+                                    runner.strat_id, result.orders_fetched,
+                                )
+
+                        except Exception as e:
+                            logger.error("%s: Order sync error: %s", runner.strat_id, e)
+
+                await asyncio.sleep(self._config.order_sync_interval)
+
+            except asyncio.CancelledError:
+                # CancelledError is a BaseException, not Exception, so it
+                # passes through the inner `except Exception` and is caught
+                # here to cleanly exit the loop on task cancellation.
+                break
+            except Exception as e:
+                # Guards against errors outside the per-runner try/except:
+                # e.g. missing reconciler attribute or asyncio.sleep failure.
+                logger.error("Order sync loop error: %s", e)
+                try:
+                    await asyncio.sleep(self._config.order_sync_interval)
+                except asyncio.CancelledError:
+                    break
 
     def _get_account_for_strategy(self, strat_id: str) -> Optional[str]:
         """Get account name for a strategy."""
