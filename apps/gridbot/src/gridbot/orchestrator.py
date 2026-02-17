@@ -540,7 +540,7 @@ class Orchestrator:
             try:
                 await asyncio.sleep(self._config.position_check_interval)
 
-                for account_name, runners in self._account_to_runners.items():
+                for account_name, runners in list(self._account_to_runners.items()):
                     try:
                         rest_client = self._rest_clients[account_name]
 
@@ -681,7 +681,7 @@ class Orchestrator:
 
         while self._running:
             try:
-                for account_name, runners in self._account_to_runners.items():
+                for account_name, runners in list(self._account_to_runners.items()):
                     reconciler = self._reconcilers.get(account_name)
                     if not reconciler:
                         continue
@@ -719,8 +719,7 @@ class Orchestrator:
                 break
             except Exception as e:
                 # Guards against errors outside the per-runner try/except:
-                # e.g. _account_to_runners mutation during iteration,
-                # missing reconciler attribute, or asyncio.sleep failure.
+                # e.g. missing reconciler attribute or asyncio.sleep failure.
                 logger.error(f"Order sync loop error: {e}")
                 await asyncio.sleep(self._config.order_sync_interval)
 
