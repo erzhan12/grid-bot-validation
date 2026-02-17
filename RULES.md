@@ -1512,6 +1512,9 @@ uv run pytest tests/integration/test_shadow_validation.py -v
 6. **`asyncio.get_event_loop()` deprecation in tests**: Use `asyncio.new_event_loop()` instead of `asyncio.get_event_loop()` when setting up event loops in non-async test methods (e.g., `saver._event_loop = asyncio.new_event_loop()`).
 7. **PlaceLimitIntent constructor**: Requires `qty` and `grid_level` positional args — cannot construct with just symbol/side/price/direction/client_order_id.
 8. **Integration test discovery**: Must add `"tests/integration"` to `testpaths` in `pyproject.toml` for pytest to discover them.
+9. **Import ordering in test files**: Never place class/dataclass definitions between import blocks. All imports must be grouped at the top of the file before any class or function definitions (e.g., `test_eventsaver_db.py` had `SeededDb` splitting import blocks).
+10. **`asyncio.CancelledError` is a `BaseException`**: In nested try/except patterns, `CancelledError` passes through `except Exception` blocks. Always catch it in the outer loop with a comment explaining why (see `orchestrator.py:_order_sync_loop`).
+11. **Blocking I/O in async code**: Use `asyncio.to_thread()` to wrap blocking calls (e.g., SQLAlchemy `session.commit()`) in async methods. Requires Python 3.9+ (`pyproject.toml` declares `>=3.11`).
 
 ## Next Steps (Future Phases)
 

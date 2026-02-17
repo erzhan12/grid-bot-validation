@@ -19,6 +19,8 @@ from grid_db import (
     OrderRepository,
 )
 from grid_db.models import PublicTrade, PrivateExecution
+from gridcore.events import PublicTradeEvent, ExecutionEvent, OrderUpdateEvent, EventType
+from event_saver.writers import TradeWriter, ExecutionWriter, OrderWriter
 
 
 @dataclass
@@ -29,8 +31,6 @@ class SeededDb:
     account_id: UUID
     strategy_id: UUID
     run_id: UUID
-from gridcore.events import PublicTradeEvent, ExecutionEvent, OrderUpdateEvent, EventType
-from event_saver.writers import TradeWriter, ExecutionWriter, OrderWriter
 
 
 @pytest.fixture

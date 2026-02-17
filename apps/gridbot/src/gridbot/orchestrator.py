@@ -713,6 +713,9 @@ class Orchestrator:
                 await asyncio.sleep(self._config.order_sync_interval)
 
             except asyncio.CancelledError:
+                # CancelledError is a BaseException, not Exception, so it
+                # passes through the inner `except Exception` and is caught
+                # here to cleanly exit the loop on task cancellation.
                 break
             except Exception as e:
                 # Guards against errors outside the per-runner try/except:
