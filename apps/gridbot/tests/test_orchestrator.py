@@ -1269,3 +1269,24 @@ class TestOrchestratorWalletCache:
         assert results == [5000.0, 5000.0]
         # Lock ensures only one fetch, second caller hits cache
         rest_client.get_wallet_balance.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_get_wallet_balance_fetch_failure_propagates(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """REST failure propagates out — no stale zero cached."""
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+
+        rest_client = orchestrator._rest_clients["test_account"]
+        rest_client.get_wallet_balance.side_effect = ConnectionError("timeout")
+
+        with pytest.raises(ConnectionError, match="timeout"):
+            await orchestrator._get_wallet_balance("test_account")
+
+        # Cache must remain empty — no stale zero stored
+        assert "test_account" not in orchestrator._wallet_cache
