@@ -1521,6 +1521,57 @@ uv run pytest tests/integration/test_shadow_validation.py -v
 14. **`integration_helpers.py` import path**: `tests/integration/conftest.py` adds `tests/integration/` to `sys.path` explicitly so `import integration_helpers` works even when pytest is invoked without the root `pyproject.toml` `pythonpath` setting (e.g., per-app test runs).
 15. **`_fetch_wallet_balance` fallback**: Returns `0.0` when no USDT balance is found in the wallet API response, but now logs `logger.warning` first so unexpected API structures are visible in logs.
 
+## Phase I-1: Standalone Data Recorder (`apps/recorder/`)
+
+### Completed: 2026-02-18
+
+Standalone app that captures raw Bybit mainnet WebSocket data to SQLite for multi-day unattended runs, independent of any trading activity. Reuses `event_saver` collectors + writers directly.
+
+**Documentation**: See `docs/features/0008_PLAN.md` for architecture and `docs/features/0008_REVIEW.md` for review notes.
+
+### Key Implementation Notes
+
+1. **App Structure**
+   - Path: `apps/recorder/` (workspace package)
+   - Entry point: `recorder.main:cli` (`--config PATH`, `--debug`)
+   - Config: YAML-based with Pydantic validation (`recorder.config`)
+   - Core orchestrator: `recorder.recorder.Recorder`
+
+2. **Reuse Pattern**
+   - Imports `PublicCollector`, `PrivateCollector`, `AccountContext` from `event_saver.collectors`
+   - Imports all 6 writers from `event_saver.writers`
+   - Imports `GapReconciler` from `event_saver.reconciler`
+   - No code duplication — recorder is a thin orchestration wrapper
+
+3. **Fixed UUIDs for DB Seeding**
+   - Uses stable UUIDs (`_RECORDER_USER_ID`, `_RECORDER_ACCOUNT_ID`, `_RECORDER_STRATEGY_ID`) across restarts
+   - `_seed_db_records()` upserts User/BybitAccount/Strategy via `session.merge()`, creates new Run per session
+   - Required because execution/order writers need valid `run_id` FK chain
+
+4. **Strategy.symbol VARCHAR(20) Limit**
+   - Store only the first/primary symbol in `Strategy.symbol`
+   - Store full symbol list in `config_json["symbols"]` for reference
+   - Avoids overflow when recording multiple symbols
+
+5. **Private Gap Reconciliation**
+   - `_handle_private_gap()` calls `reconcile_executions()` per symbol (not just logging)
+   - Requires account credentials + run_id + symbols to be set
+
+6. **Thread-Safe Async Routing**
+   - All WS handlers use `asyncio.run_coroutine_threadsafe()` to route from WS thread to event loop
+   - `self._event_loop` captured during `start()` via `asyncio.get_running_loop()`
+
+7. **Config Search Order**
+   - `RECORDER_CONFIG_PATH` env var → `conf/recorder.yaml` → `recorder.yaml`
+   - Handles `yaml.YAMLError` (raises ValueError), empty YAML (defaults to `{}`)
+
+### Common Pitfalls (Recorder-Specific)
+
+1. **TickerEvent fields**: Does NOT have `index_price` or `next_funding_time` — check `gridcore.events.TickerEvent` dataclass definition before constructing test fixtures.
+2. **Mock collectors need `stop = AsyncMock()`**: When mocking `PublicCollector`/`PrivateCollector`, must set `stop` as `AsyncMock()` since `Recorder.stop()` awaits them.
+3. **`_close_dangling_coro()` pattern**: When testing `cli()` that calls `asyncio.run(main(...))`, the mock creates an unawaited coroutine. Use the helper to close it after assertions (same pattern as gridbot `test_main.py`).
+4. **Testnet default differs**: Recorder defaults to `testnet=False` (mainnet), unlike gridbot which defaults to `testnet=True`.
+
 ## Next Steps (Future Phases)
 
 - Phase I: Deployment & Monitoring
