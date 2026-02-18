@@ -14,7 +14,7 @@ from gridcore.events import (
     PublicTradeEvent,
 )
 
-from recorder.recorder import Recorder, _RECORDER_USER_ID, _RECORDER_ACCOUNT_ID
+from recorder.recorder import Recorder, _RECORDER_USER_ID, _RECORDER_ACCOUNT_ID, _RECORDER_STRATEGY_ID  # noqa: F401
 
 
 @pytest.fixture
