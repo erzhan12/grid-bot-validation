@@ -153,8 +153,8 @@ class Recorder:
                 account_id=_RECORDER_ACCOUNT_ID,
                 user_id=_RECORDER_USER_ID,
                 run_id=self._run_id,
-                api_key=self._config.account.api_key,
-                api_secret=self._config.account.api_secret,
+                api_key=self._config.account.api_key.get_secret_value(),
+                api_secret=self._config.account.api_secret.get_secret_value(),
                 environment=environment,
                 symbols=self._config.symbols,
             )
@@ -207,6 +207,11 @@ class Recorder:
 
         if self._private_collector:
             await self._private_collector.stop()
+
+        # GapReconciler is stateless (no background tasks, no held connections).
+        # Drop the reference so no new reconciliation futures are scheduled
+        # after stop; any in-flight REST futures will complete on their own.
+        self._reconciler = None
 
         # Stop writers (flushes remaining buffers)
         for writer in [
@@ -394,8 +399,8 @@ class Recorder:
                         symbol=symbol,
                         gap_start=gap_start,
                         gap_end=gap_end,
-                        api_key=self._config.account.api_key,
-                        api_secret=self._config.account.api_secret,
+                        api_key=self._config.account.api_key.get_secret_value(),
+                        api_secret=self._config.account.api_secret.get_secret_value(),
                         testnet=self._config.testnet,
                     ),
                     self._event_loop,

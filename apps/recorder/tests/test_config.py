@@ -43,8 +43,18 @@ class TestRecorderConfig:
             account=AccountConfig(api_key="key1", api_secret="secret1"),
         )
         assert config.account is not None
-        assert config.account.api_key == "key1"
-        assert config.account.api_secret == "secret1"
+        assert config.account.api_key.get_secret_value() == "key1"
+        assert config.account.api_secret.get_secret_value() == "secret1"
+
+    def test_account_secrets_redacted_in_repr(self):
+        config = RecorderConfig(
+            symbols=["BTCUSDT"],
+            account=AccountConfig(api_key="key1", api_secret="secret1"),
+        )
+        text = repr(config)
+        assert "key1" not in text
+        assert "secret1" not in text
+        assert "**********" in text
 
     def test_without_account(self):
         config = RecorderConfig(symbols=["BTCUSDT"])
@@ -86,7 +96,7 @@ class TestLoadConfig:
 
         config = load_config(str(config_file))
         assert config.account is not None
-        assert config.account.api_key == "mykey"
+        assert config.account.api_key.get_secret_value() == "mykey"
 
     def test_file_not_found(self):
         with pytest.raises(FileNotFoundError):

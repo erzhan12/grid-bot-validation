@@ -38,6 +38,7 @@ def setup_logging(debug: bool = False) -> None:
     handler.setFormatter(formatter)
 
     root_logger = logging.getLogger()
+    root_logger.handlers.clear()
     root_logger.setLevel(level)
     root_logger.addHandler(handler)
 
@@ -75,16 +76,9 @@ async def main(config_path: Optional[str] = None) -> int:
         logger.error("No symbols configured. Add symbols to recorder.yaml")
         return 1
 
-    # Initialize database
-    settings = DatabaseSettings()
-    if config.database_url.startswith("sqlite"):
-        settings.db_type = "sqlite"
-        if ":///" in config.database_url:
-            settings.db_name = config.database_url.split(":///")[-1]
-        elif "memory" in config.database_url:
-            settings.db_name = ":memory:"
-    else:
-        settings.database_url = config.database_url
+    # Initialize database — URL passed directly; DatabaseFactory._create_engine()
+    # determines sqlite vs postgresql from the URL string itself.
+    settings = DatabaseSettings(database_url=config.database_url)
 
     db = DatabaseFactory(settings)
     db.create_tables()

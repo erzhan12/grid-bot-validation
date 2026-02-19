@@ -8,14 +8,14 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 
 class AccountConfig(BaseModel):
     """Optional exchange account for private stream capture."""
 
-    api_key: str = Field(..., description="Bybit API key")
-    api_secret: str = Field(..., description="Bybit API secret")
+    api_key: SecretStr = Field(..., description="Bybit API key")
+    api_secret: SecretStr = Field(..., description="Bybit API secret")
 
 
 class RecorderConfig(BaseModel):
