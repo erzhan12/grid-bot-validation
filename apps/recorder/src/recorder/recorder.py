@@ -325,7 +325,9 @@ class Recorder:
                 if run:
                     run.status = status
                     run.end_ts = datetime.now(UTC)
-            logger.info(f"Marked run {self._run_id} as {status}")
+                    logger.info(f"Marked run {self._run_id} as {status}")
+                else:
+                    logger.warning(f"Run {self._run_id} not found in database")
         except Exception as e:
             logger.error(f"Failed to mark run {self._run_id} as {status}: {e}")
 

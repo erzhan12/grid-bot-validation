@@ -15,7 +15,7 @@ from gridcore.events import (
     PublicTradeEvent,
 )
 
-from recorder.recorder import Recorder, _RECORDER_USER_ID, _RECORDER_ACCOUNT_ID, _RECORDER_STRATEGY_ID  # noqa: F401
+from recorder.recorder import Recorder, _RECORDER_USER_ID, _RECORDER_ACCOUNT_ID
 
 
 @pytest.fixture
@@ -186,6 +186,62 @@ class TestRecorderStartStop:
 
 class TestRecorderHandlers:
     """Tests for data routing handlers."""
+
+    @pytest.mark.parametrize("handler_name,args", [
+        ("_handle_ticker", "ticker"),
+        ("_handle_trades", "trades"),
+        ("_handle_execution", "execution"),
+        ("_handle_order", "order"),
+        ("_handle_position", "position"),
+        ("_handle_wallet", "wallet"),
+        ("_handle_public_gap", "gap"),
+        ("_handle_private_gap", "gap"),
+    ])
+    def test_handlers_before_start_are_safe_noops(
+        self, handler_name, args, basic_config, db, make_ticker, make_trade
+    ):
+        """Calling any handler on a not-started Recorder must not raise."""
+        recorder = Recorder(config=basic_config, db=db)
+        handler = getattr(recorder, handler_name)
+
+        now = datetime.now(UTC)
+        if args == "ticker":
+            handler(make_ticker())
+        elif args == "trades":
+            handler([make_trade()])
+        elif args == "execution":
+            handler(ExecutionEvent(
+                event_type=EventType.EXECUTION,
+                symbol="BTCUSDT",
+                exchange_ts=now,
+                local_ts=now,
+                exec_id="e1",
+                order_id="o1",
+                side="Buy",
+                price=Decimal("50000"),
+                qty=Decimal("0.001"),
+            ))
+        elif args == "order":
+            handler(_RECORDER_ACCOUNT_ID, OrderUpdateEvent(
+                event_type=EventType.ORDER_UPDATE,
+                symbol="BTCUSDT",
+                exchange_ts=now,
+                local_ts=now,
+                order_id="o1",
+                status="New",
+                side="Buy",
+                price=Decimal("50000"),
+                qty=Decimal("0.001"),
+            ))
+        elif args == "position":
+            handler(_RECORDER_ACCOUNT_ID, {"data": []})
+        elif args == "wallet":
+            handler(_RECORDER_ACCOUNT_ID, {"data": []})
+        elif args == "gap":
+            if handler_name == "_handle_public_gap":
+                handler("BTCUSDT", now, now)
+            else:
+                handler(now, now)
 
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")

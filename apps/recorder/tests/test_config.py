@@ -129,7 +129,7 @@ class TestLoadConfig:
         config = load_config()
         assert config.symbols == ["BTCUSDT"]
 
-    def test_invalid_yaml_raises_error(self, tmp_path):
+    def test_invalid_config_values_raise_error(self, tmp_path):
         config_file = tmp_path / "recorder.yaml"
         config_file.write_text(yaml.dump({
             "symbols": ["BTCUSDT"],

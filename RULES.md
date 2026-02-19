@@ -1591,7 +1591,6 @@ Standalone app that captures raw Bybit mainnet WebSocket data to SQLite for mult
 5. **Position/wallet test data format**: `PositionWriter` and `WalletWriter` expect Bybit-formatted dicts with `"data"` keys (e.g., `{"data": [{"symbol": "BTCUSDT", ...}]}`). Flat dicts silently produce zero snapshots.
 6. **Test fixture deduplication**: Shared `db` fixture lives in `conftest.py` — do not duplicate in individual test files. Same for `basic_config` and `config_with_account`.
 7. **Mock config completeness**: When using `MagicMock()` for config in tests, set all attributes that `main()` accesses before the code path under test. E.g., `mock_config.database_url = "sqlite:///test.db"` — bare MagicMock attributes break `urlparse()`.
-8. **`noqa: F401` for forward-use imports**: `_RECORDER_STRATEGY_ID` is imported in test_recorder.py for future strategy-creation tests; suppress the ruff unused-import warning with `# noqa: F401`.
 
 ## Next Steps (Future Phases)
 
