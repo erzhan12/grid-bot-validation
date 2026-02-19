@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr, field_validator
 
 
 class AccountConfig(BaseModel):
@@ -25,6 +25,14 @@ class RecorderConfig(BaseModel):
         default_factory=list,
         description="Symbols to record (e.g., ['BTCUSDT'])",
     )
+
+    @field_validator("symbols")
+    @classmethod
+    def non_empty_symbols(cls, v: list[str]) -> list[str]:
+        if any(not s.strip() for s in v):
+            raise ValueError("symbols must be non-empty, non-whitespace strings")
+        return v
+
     database_url: str = Field(
         default="sqlite:///recorder.db",
         description="SQLite database path",

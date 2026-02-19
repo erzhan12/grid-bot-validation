@@ -1,7 +1,5 @@
 """Tests for recorder configuration."""
 
-import tempfile
-
 import pytest
 import yaml
 
@@ -102,9 +100,9 @@ class TestLoadConfig:
         with pytest.raises(FileNotFoundError):
             load_config("/nonexistent/path/recorder.yaml")
 
-    def test_no_config_found(self, monkeypatch):
+    def test_no_config_found(self, monkeypatch, tmp_path):
         monkeypatch.delenv("RECORDER_CONFIG_PATH", raising=False)
-        monkeypatch.chdir(tempfile.mkdtemp())
+        monkeypatch.chdir(tmp_path)
         with pytest.raises(FileNotFoundError, match="No config file found"):
             load_config()
 

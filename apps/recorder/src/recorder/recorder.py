@@ -99,6 +99,9 @@ class Recorder:
 
         self._shutdown_event.clear()
 
+        if not self._config.symbols:
+            raise ValueError("symbols must not be empty")
+
         logger.info("Starting Recorder...")
         self._start_time = datetime.now(UTC)
         self._event_loop = asyncio.get_running_loop()
@@ -418,6 +421,8 @@ class Recorder:
         self, symbol: str, gap_start: datetime, gap_end: datetime
     ) -> Optional[Future]:
         """Trigger REST reconciliation for public data gap."""
+        # Count unconditionally; if reconciler is unavailable (e.g. after stop),
+        # the gap is still tracked in stats but no REST backfill is triggered.
         with self._gap_lock:
             self._gap_count += 1
         if self._reconciler and self._event_loop:
@@ -439,6 +444,7 @@ class Recorder:
         self, gap_start: datetime, gap_end: datetime
     ) -> list[Future]:
         """Reconcile private stream gap via REST API."""
+        # Count unconditionally (see _handle_public_gap comment).
         with self._gap_lock:
             self._gap_count += 1
         gap_seconds = (gap_end - gap_start).total_seconds()

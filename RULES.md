@@ -1582,6 +1582,10 @@ Standalone app that captures raw Bybit mainnet WebSocket data to SQLite for mult
 10. **`setup_logging` Handler Guard**
     - `root_logger.handlers.clear()` before `addHandler()` prevents handler accumulation on repeated calls
 
+11. **Logging Style: f-strings**
+    - Use f-strings for all `logger.*()` calls: `logger.info(f"Starting {name}")`
+    - Exception: %-style is acceptable in hot-path callbacks (e.g., `_log_future_error`) where deferred formatting matters
+
 ### Common Pitfalls (Recorder-Specific)
 
 1. **TickerEvent fields**: Does NOT have `index_price` or `next_funding_time` — check `gridcore.events.TickerEvent` dataclass definition before constructing test fixtures.

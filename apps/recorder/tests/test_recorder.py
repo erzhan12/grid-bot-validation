@@ -763,3 +763,19 @@ class TestRecorderRunPersistence:
         assert recorder._run_id is None
 
         await recorder.stop()
+
+
+@pytest.mark.skip(reason="Integration test stub — see docs/features/0008_REVIEW.md residual risks")
+class TestRecorderDisconnectReconciliation:
+    """TODO: No integration test covers actual WS disconnect → reconnect → reconciliation.
+
+    The most dangerous failure mode for a multi-day recorder is a silent gap
+    that is never reconciled.  This stub exists to make that gap explicit
+    and encourage a follow-up integration test.
+    """
+
+    async def test_public_ws_disconnect_triggers_gap_reconciliation(self):
+        raise NotImplementedError
+
+    async def test_private_ws_disconnect_triggers_gap_reconciliation(self):
+        raise NotImplementedError
