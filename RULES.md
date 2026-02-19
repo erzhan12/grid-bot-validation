@@ -1533,7 +1533,8 @@ Standalone app that captures raw Bybit mainnet WebSocket data to SQLite for mult
 
 1. **App Structure**
    - Path: `apps/recorder/` (workspace package)
-   - Entry point: `recorder.main:cli` (`--config PATH`, `--debug`)
+   - Entry point: `recorder.main:cli` (`--config PATH`, `--debug`), registered in `pyproject.toml` `[project.scripts]`
+   - Run via: `uv run recorder --config path/to/config.yaml`
    - Config: YAML-based with Pydantic validation (`recorder.config`)
    - Core orchestrator: `recorder.recorder.Recorder`
 
@@ -1560,10 +1561,26 @@ Standalone app that captures raw Bybit mainnet WebSocket data to SQLite for mult
 6. **Thread-Safe Async Routing**
    - All WS handlers use `asyncio.run_coroutine_threadsafe()` to route from WS thread to event loop
    - `self._event_loop` captured during `start()` via `asyncio.get_running_loop()`
+   - **Every future gets a `_log_future_error()` done-callback** — never discard futures silently, especially in multi-day unattended tools
 
 7. **Config Search Order**
    - `RECORDER_CONFIG_PATH` env var → `conf/recorder.yaml` → `recorder.yaml`
    - Handles `yaml.YAMLError` (raises ValueError), empty YAML (defaults to `{}`)
+
+8. **SecretStr for API Credentials**
+   - `AccountConfig.api_key` and `api_secret` use Pydantic `SecretStr` to prevent accidental logging
+   - Access secrets via `.get_secret_value()` at the call site (e.g., `config.account.api_key.get_secret_value()`)
+   - Database URLs are sanitized via `_sanitize_url()` before logging (strips passwords from PostgreSQL URLs)
+
+9. **Lifecycle Safety Patterns**
+   - `self._running = True` is set at the **end** of `start()`, after all components succeed (not at the top)
+   - `stop(error=True)` marks the DB run as `"error"` instead of `"completed"` — called from the error path in `main.py`
+   - `_seed_db_records()` wraps DB ops in try/except → raises `RuntimeError` with clear message
+   - `_mark_run_status()` wraps DB ops in try/except → **logs** error (doesn't raise) to avoid interrupting shutdown
+   - Signal handlers in `run_until_shutdown()` are cleaned up via `try/finally` + `loop.remove_signal_handler()`
+
+10. **`setup_logging` Handler Guard**
+    - `root_logger.handlers.clear()` before `addHandler()` prevents handler accumulation on repeated calls
 
 ### Common Pitfalls (Recorder-Specific)
 
@@ -1571,6 +1588,10 @@ Standalone app that captures raw Bybit mainnet WebSocket data to SQLite for mult
 2. **Mock collectors need `stop = AsyncMock()`**: When mocking `PublicCollector`/`PrivateCollector`, must set `stop` as `AsyncMock()` since `Recorder.stop()` awaits them.
 3. **`_close_dangling_coro()` pattern**: When testing `cli()` that calls `asyncio.run(main(...))`, the mock creates an unawaited coroutine. Use the helper to close it after assertions (same pattern as gridbot `test_main.py`).
 4. **Testnet default differs**: Recorder defaults to `testnet=False` (mainnet), unlike gridbot which defaults to `testnet=True`.
+5. **Position/wallet test data format**: `PositionWriter` and `WalletWriter` expect Bybit-formatted dicts with `"data"` keys (e.g., `{"data": [{"symbol": "BTCUSDT", ...}]}`). Flat dicts silently produce zero snapshots.
+6. **Test fixture deduplication**: Shared `db` fixture lives in `conftest.py` — do not duplicate in individual test files. Same for `basic_config` and `config_with_account`.
+7. **Mock config completeness**: When using `MagicMock()` for config in tests, set all attributes that `main()` accesses before the code path under test. E.g., `mock_config.database_url = "sqlite:///test.db"` — bare MagicMock attributes break `urlparse()`.
+8. **`noqa: F401` for forward-use imports**: `_RECORDER_STRATEGY_ID` is imported in test_recorder.py for future strategy-creation tests; suppress the ruff unused-import warning with `# noqa: F401`.
 
 ## Next Steps (Future Phases)
 
