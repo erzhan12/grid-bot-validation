@@ -8,6 +8,7 @@ import asyncio
 import logging
 import signal
 import threading
+from concurrent.futures import Future
 from datetime import datetime, UTC
 from typing import Optional
 from uuid import UUID, uuid4
@@ -38,7 +39,10 @@ from recorder.config import RecorderConfig
 
 logger = logging.getLogger(__name__)
 
-# Fixed UUIDs for standalone recorder (stable across restarts)
+# Fixed UUIDs for standalone recorder (stable across restarts).
+# Intentionally shared: multiple instances against the same DB will reuse
+# these User/Account/Strategy rows (via session.merge), but each session
+# gets its own unique Run row, so recorded data stays isolated.
 _RECORDER_USER_ID = UUID("00000000-0000-0000-0000-000000000001")
 _RECORDER_ACCOUNT_ID = UUID("00000000-0000-0000-0000-000000000002")
 _RECORDER_STRATEGY_ID = UUID("00000000-0000-0000-0000-000000000003")
@@ -344,7 +348,7 @@ class Recorder:
                 logger.error("%s failed: %s", label, exc)
         return _cb
 
-    def _handle_ticker(self, event: TickerEvent) -> None:
+    def _handle_ticker(self, event: TickerEvent) -> Optional[Future]:
         """Route ticker event to writer."""
         if self._ticker_writer and self._event_loop:
             fut = asyncio.run_coroutine_threadsafe(
@@ -352,8 +356,10 @@ class Recorder:
                 self._event_loop,
             )
             fut.add_done_callback(self._log_future_error("ticker write"))
+            return fut
+        return None
 
-    def _handle_trades(self, events: list[PublicTradeEvent]) -> None:
+    def _handle_trades(self, events: list[PublicTradeEvent]) -> Optional[Future]:
         """Route trade events to writer."""
         if self._trade_writer and events and self._event_loop:
             fut = asyncio.run_coroutine_threadsafe(
@@ -361,8 +367,10 @@ class Recorder:
                 self._event_loop,
             )
             fut.add_done_callback(self._log_future_error("trade write"))
+            return fut
+        return None
 
-    def _handle_execution(self, event: ExecutionEvent) -> None:
+    def _handle_execution(self, event: ExecutionEvent) -> Optional[Future]:
         """Route execution event to writer."""
         if self._execution_writer and self._event_loop:
             fut = asyncio.run_coroutine_threadsafe(
@@ -370,8 +378,10 @@ class Recorder:
                 self._event_loop,
             )
             fut.add_done_callback(self._log_future_error("execution write"))
+            return fut
+        return None
 
-    def _handle_order(self, account_id: UUID, event: OrderUpdateEvent) -> None:
+    def _handle_order(self, account_id: UUID, event: OrderUpdateEvent) -> Optional[Future]:
         """Route order event to writer."""
         if self._order_writer and self._event_loop:
             fut = asyncio.run_coroutine_threadsafe(
@@ -379,8 +389,10 @@ class Recorder:
                 self._event_loop,
             )
             fut.add_done_callback(self._log_future_error("order write"))
+            return fut
+        return None
 
-    def _handle_position(self, account_id: UUID, message: dict) -> None:
+    def _handle_position(self, account_id: UUID, message: dict) -> Optional[Future]:
         """Route position snapshot to writer."""
         if self._position_writer and self._event_loop:
             fut = asyncio.run_coroutine_threadsafe(
@@ -388,8 +400,10 @@ class Recorder:
                 self._event_loop,
             )
             fut.add_done_callback(self._log_future_error("position write"))
+            return fut
+        return None
 
-    def _handle_wallet(self, account_id: UUID, message: dict) -> None:
+    def _handle_wallet(self, account_id: UUID, message: dict) -> Optional[Future]:
         """Route wallet snapshot to writer."""
         if self._wallet_writer and self._event_loop:
             fut = asyncio.run_coroutine_threadsafe(
@@ -397,10 +411,12 @@ class Recorder:
                 self._event_loop,
             )
             fut.add_done_callback(self._log_future_error("wallet write"))
+            return fut
+        return None
 
     def _handle_public_gap(
         self, symbol: str, gap_start: datetime, gap_end: datetime
-    ) -> None:
+    ) -> Optional[Future]:
         """Trigger REST reconciliation for public data gap."""
         with self._gap_lock:
             self._gap_count += 1
@@ -416,10 +432,12 @@ class Recorder:
             fut.add_done_callback(
                 self._log_future_error(f"public reconciliation ({symbol})")
             )
+            return fut
+        return None
 
     def _handle_private_gap(
         self, gap_start: datetime, gap_end: datetime
-    ) -> None:
+    ) -> list[Future]:
         """Reconcile private stream gap via REST API."""
         with self._gap_lock:
             self._gap_count += 1
@@ -429,6 +447,7 @@ class Recorder:
             f"({gap_start} to {gap_end})"
         )
 
+        futures: list[Future] = []
         if (
             self._reconciler
             and self._event_loop
@@ -453,15 +472,14 @@ class Recorder:
                 fut.add_done_callback(
                     self._log_future_error(f"private reconciliation ({symbol})")
                 )
+                futures.append(fut)
+        return futures
 
     async def _health_log_loop(self) -> None:
         """Periodically log health stats."""
         while self._running:
             try:
                 await asyncio.sleep(self._config.health_log_interval)
-                if not self._running:
-                    break
-
                 stats = self.get_stats()
                 logger.info(f"Health: {stats}")
 

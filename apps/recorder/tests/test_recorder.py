@@ -1,8 +1,10 @@
 """Tests for recorder orchestrator."""
 
 import asyncio
+from concurrent.futures import Future
 from datetime import datetime, UTC
 from decimal import Decimal
+from typing import Optional, Union
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -16,6 +18,17 @@ from gridcore.events import (
 )
 
 from recorder.recorder import Recorder, _RECORDER_USER_ID, _RECORDER_ACCOUNT_ID
+
+
+async def await_future(fut: Union[Optional[Future], list[Future]]) -> None:
+    """Deterministically await handler future(s) on the event loop."""
+    if fut is None:
+        return
+    if isinstance(fut, list):
+        for f in fut:
+            await asyncio.wrap_future(f)
+    else:
+        await asyncio.wrap_future(fut)
 
 
 @pytest.fixture
@@ -258,10 +271,8 @@ class TestRecorderHandlers:
         await recorder.start()
 
         event = make_ticker()
-        recorder._handle_ticker(event)
-
-        # Give event loop time to process the threadsafe callback
-        await asyncio.sleep(0.1)
+        fut = recorder._handle_ticker(event)
+        await await_future(fut)
 
         stats = recorder._ticker_writer.get_stats()
         assert stats["buffer_size"] >= 1 or stats["total_written"] >= 1
@@ -283,12 +294,34 @@ class TestRecorderHandlers:
         await recorder.start()
 
         events = [make_trade(trade_id=f"t{i}") for i in range(5)]
-        recorder._handle_trades(events)
-
-        await asyncio.sleep(0.1)
+        fut = recorder._handle_trades(events)
+        await await_future(fut)
 
         stats = recorder._trade_writer.get_stats()
         assert stats["buffer_size"] + stats["total_written"] >= 5
+
+        await recorder.stop()
+
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_handle_trades_empty_list_is_noop(
+        self, mock_rest_cls, mock_pub_cls, basic_config, db
+    ):
+        mock_pub = MagicMock()
+        mock_pub.start = AsyncMock()
+        mock_pub.stop = AsyncMock()
+        mock_pub.get_connection_state.return_value = None
+        mock_pub_cls.return_value = mock_pub
+
+        recorder = Recorder(config=basic_config, db=db)
+        await recorder.start()
+
+        fut = recorder._handle_trades([])
+        assert fut is None
+
+        stats = recorder._trade_writer.get_stats()
+        assert stats["buffer_size"] == 0
+        assert stats["total_written"] == 0
 
         await recorder.stop()
 
@@ -323,9 +356,8 @@ class TestRecorderHandlers:
             price=Decimal("50000"),
             qty=Decimal("0.001"),
         )
-        recorder._handle_execution(event)
-
-        await asyncio.sleep(0.1)
+        fut = recorder._handle_execution(event)
+        await await_future(fut)
 
         stats = recorder._execution_writer.get_stats()
         assert stats["buffer_size"] >= 1 or stats["total_written"] >= 1
@@ -363,9 +395,8 @@ class TestRecorderHandlers:
             price=Decimal("50000"),
             qty=Decimal("0.001"),
         )
-        recorder._handle_order(_RECORDER_ACCOUNT_ID, event)
-
-        await asyncio.sleep(0.1)
+        fut = recorder._handle_order(_RECORDER_ACCOUNT_ID, event)
+        await await_future(fut)
 
         stats = recorder._order_writer.get_stats()
         assert stats["buffer_size"] >= 1 or stats["total_written"] >= 1
@@ -392,7 +423,7 @@ class TestRecorderHandlers:
         recorder = Recorder(config=config_with_account, db=db)
         await recorder.start()
 
-        recorder._handle_position(_RECORDER_ACCOUNT_ID, {
+        fut = recorder._handle_position(_RECORDER_ACCOUNT_ID, {
             "data": [{
                 "symbol": "BTCUSDT",
                 "side": "Buy",
@@ -403,8 +434,7 @@ class TestRecorderHandlers:
                 "updatedTime": "1704067200000",
             }],
         })
-
-        await asyncio.sleep(0.1)
+        await await_future(fut)
 
         stats = recorder._position_writer.get_stats()
         assert stats["buffer_size"] >= 1 or stats["total_written"] >= 1
@@ -431,7 +461,7 @@ class TestRecorderHandlers:
         recorder = Recorder(config=config_with_account, db=db)
         await recorder.start()
 
-        recorder._handle_wallet(_RECORDER_ACCOUNT_ID, {
+        fut = recorder._handle_wallet(_RECORDER_ACCOUNT_ID, {
             "data": [{
                 "coin": [{
                     "coin": "USDT",
@@ -441,8 +471,7 @@ class TestRecorderHandlers:
                 "updateTime": "1704067200000",
             }],
         })
-
-        await asyncio.sleep(0.1)
+        await await_future(fut)
 
         stats = recorder._wallet_writer.get_stats()
         assert stats["buffer_size"] >= 1 or stats["total_written"] >= 1
@@ -471,12 +500,11 @@ class TestRecorderHandlers:
 
         gap_start = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
         gap_end = datetime(2026, 1, 1, 0, 0, 30, tzinfo=UTC)
-        recorder._handle_public_gap("BTCUSDT", gap_start, gap_end)
+        fut = recorder._handle_public_gap("BTCUSDT", gap_start, gap_end)
 
         assert recorder._gap_count == 1
 
-        # Give event loop time to process the threadsafe callback
-        await asyncio.sleep(0.1)
+        await await_future(fut)
 
         mock_reconciler.reconcile_public_trades.assert_awaited_once_with(
             symbol="BTCUSDT",
@@ -515,12 +543,11 @@ class TestRecorderHandlers:
 
         gap_start = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
         gap_end = datetime(2026, 1, 1, 0, 0, 30, tzinfo=UTC)
-        recorder._handle_private_gap(gap_start, gap_end)
+        futs = recorder._handle_private_gap(gap_start, gap_end)
 
         assert recorder._gap_count == 1
 
-        # Give event loop time to process the threadsafe callback
-        await asyncio.sleep(0.1)
+        await await_future(futs)
 
         mock_reconciler.reconcile_executions.assert_awaited_once_with(
             user_id=_RECORDER_USER_ID,
@@ -577,6 +604,7 @@ class TestRecorderStats:
         recorder = Recorder(config=basic_config, db=db)
         await recorder.start()
 
+        # Genuine timing need: uptime must be non-zero for meaningful stats
         await asyncio.sleep(0.1)
         stats = recorder.get_stats()
 
@@ -631,6 +659,7 @@ class TestRecorderStats:
         recorder = Recorder(config=basic_config, db=db)
         await recorder.start()
 
+        # Genuine timing need: uptime must be non-zero for msgs_per_sec
         await asyncio.sleep(0.1)
         stats = recorder.get_stats()
 

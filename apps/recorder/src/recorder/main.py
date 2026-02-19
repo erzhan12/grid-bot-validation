@@ -104,7 +104,10 @@ async def main(config_path: Optional[str] = None) -> int:
         await recorder.run_until_shutdown()
     except Exception as e:
         logger.error(f"Recorder error: {e}")
-        await recorder.stop(error=True)
+        try:
+            await recorder.stop(error=True)
+        except Exception as stop_err:
+            logger.error(f"Error during emergency stop: {stop_err}")
         return 2
 
     return 0
