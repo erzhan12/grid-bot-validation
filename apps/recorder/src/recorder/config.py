@@ -42,7 +42,7 @@ class RecorderConfig(BaseModel):
 
     # Gap reconciliation
     gap_threshold_seconds: float = Field(
-        default=5.0, ge=0, description="Min gap to trigger REST reconciliation"
+        default=5.0, gt=0, description="Min gap to trigger REST reconciliation"
     )
 
     # Health monitoring

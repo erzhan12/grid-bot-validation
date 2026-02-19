@@ -7,6 +7,7 @@ standalone mainnet recording sessions.
 import asyncio
 import logging
 import signal
+import threading
 from datetime import datetime, UTC
 from typing import Optional
 from uuid import UUID, uuid4
@@ -83,6 +84,7 @@ class Recorder:
         self._shutdown_event = asyncio.Event()
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._gap_count = 0
+        self._gap_lock = threading.Lock()
         self._run_id: Optional[UUID] = None
 
     async def start(self) -> None:
@@ -91,11 +93,14 @@ class Recorder:
             logger.warning("Recorder already running")
             return
 
+        self._shutdown_event.clear()
+
         logger.info("Starting Recorder...")
         self._start_time = datetime.now(UTC)
         self._event_loop = asyncio.get_running_loop()
 
-        # Initialize REST client for reconciliation (public endpoints)
+        # Initialize REST client for reconciliation (public endpoints only;
+        # empty credentials are intentional — no auth needed).
         rest_client = BybitRestClient(
             api_key="",
             api_secret="",
@@ -123,7 +128,7 @@ class Recorder:
 
         if self._config.account:
             # Seed DB parent records and create a Run for this session
-            self._run_id = self._seed_db_records()
+            self._run_id = await asyncio.to_thread(self._seed_db_records)
 
             self._execution_writer = ExecutionWriter(**writer_kwargs)
             self._order_writer = OrderWriter(**writer_kwargs)
@@ -231,7 +236,7 @@ class Recorder:
 
         # Mark run status in DB
         status = "error" if error else "completed"
-        self._mark_run_status(status)
+        await asyncio.to_thread(self._mark_run_status, status)
 
         # Log final stats
         stats = self.get_stats()
@@ -397,7 +402,8 @@ class Recorder:
         self, symbol: str, gap_start: datetime, gap_end: datetime
     ) -> None:
         """Trigger REST reconciliation for public data gap."""
-        self._gap_count += 1
+        with self._gap_lock:
+            self._gap_count += 1
         if self._reconciler and self._event_loop:
             fut = asyncio.run_coroutine_threadsafe(
                 self._reconciler.reconcile_public_trades(
@@ -415,7 +421,8 @@ class Recorder:
         self, gap_start: datetime, gap_end: datetime
     ) -> None:
         """Reconcile private stream gap via REST API."""
-        self._gap_count += 1
+        with self._gap_lock:
+            self._gap_count += 1
         gap_seconds = (gap_end - gap_start).total_seconds()
         logger.warning(
             f"Private stream gap detected: {gap_seconds:.1f}s "
@@ -469,9 +476,12 @@ class Recorder:
         if self._start_time:
             uptime = (datetime.now(UTC) - self._start_time).total_seconds()
 
+        with self._gap_lock:
+            gap_count = self._gap_count
+
         stats = {
             "uptime_seconds": round(uptime, 1),
-            "gaps_detected": self._gap_count,
+            "gaps_detected": gap_count,
         }
 
         # Public WS connection state

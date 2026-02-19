@@ -21,6 +21,7 @@ gap_threshold_seconds: 5.0
 health_log_interval: 300  # log health every 5 minutes
 
 # Optional: uncomment to also capture private streams
+# IMPORTANT: chmod 600 recorder.yaml to protect credentials on shared hosts
 # account:
 #   api_key: "YOUR_API_KEY"
 #   api_secret: "YOUR_API_SECRET"
