@@ -7,25 +7,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from grid_db import DatabaseFactory, DatabaseSettings
 from gridcore.events import (
     EventType,
+    ExecutionEvent,
+    OrderUpdateEvent,
     TickerEvent,
     PublicTradeEvent,
 )
 
 from recorder.recorder import Recorder, _RECORDER_USER_ID, _RECORDER_ACCOUNT_ID, _RECORDER_STRATEGY_ID  # noqa: F401
-
-
-@pytest.fixture
-def db():
-    """In-memory database for tests."""
-    settings = DatabaseSettings()
-    settings.db_type = "sqlite"
-    settings.db_name = ":memory:"
-    factory = DatabaseFactory(settings)
-    factory.create_tables()
-    return factory
 
 
 @pytest.fixture
@@ -243,6 +233,163 @@ class TestRecorderHandlers:
 
         stats = recorder._trade_writer.get_stats()
         assert stats["buffer_size"] + stats["total_written"] >= 5
+
+        await recorder.stop()
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_handle_execution_routes_to_writer(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db
+    ):
+        mock_pub = MagicMock()
+        mock_pub.start = AsyncMock()
+        mock_pub.stop = AsyncMock()
+        mock_pub.get_connection_state.return_value = None
+        mock_pub_cls.return_value = mock_pub
+
+        mock_priv = MagicMock()
+        mock_priv.start = AsyncMock()
+        mock_priv.stop = AsyncMock()
+        mock_priv_cls.return_value = mock_priv
+
+        recorder = Recorder(config=config_with_account, db=db)
+        await recorder.start()
+
+        event = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            exec_id="e1",
+            order_id="o1",
+            side="Buy",
+            price=Decimal("50000"),
+            qty=Decimal("0.001"),
+        )
+        recorder._handle_execution(event)
+
+        await asyncio.sleep(0.1)
+
+        stats = recorder._execution_writer.get_stats()
+        assert stats["buffer_size"] >= 1 or stats["total_written"] >= 1
+
+        await recorder.stop()
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_handle_order_routes_to_writer(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db
+    ):
+        mock_pub = MagicMock()
+        mock_pub.start = AsyncMock()
+        mock_pub.stop = AsyncMock()
+        mock_pub.get_connection_state.return_value = None
+        mock_pub_cls.return_value = mock_pub
+
+        mock_priv = MagicMock()
+        mock_priv.start = AsyncMock()
+        mock_priv.stop = AsyncMock()
+        mock_priv_cls.return_value = mock_priv
+
+        recorder = Recorder(config=config_with_account, db=db)
+        await recorder.start()
+
+        event = OrderUpdateEvent(
+            event_type=EventType.ORDER_UPDATE,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            order_id="o1",
+            status="New",
+            side="Buy",
+            price=Decimal("50000"),
+            qty=Decimal("0.001"),
+        )
+        recorder._handle_order(_RECORDER_ACCOUNT_ID, event)
+
+        await asyncio.sleep(0.1)
+
+        stats = recorder._order_writer.get_stats()
+        assert stats["buffer_size"] >= 1 or stats["total_written"] >= 1
+
+        await recorder.stop()
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_handle_position_routes_to_writer(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db
+    ):
+        mock_pub = MagicMock()
+        mock_pub.start = AsyncMock()
+        mock_pub.stop = AsyncMock()
+        mock_pub.get_connection_state.return_value = None
+        mock_pub_cls.return_value = mock_pub
+
+        mock_priv = MagicMock()
+        mock_priv.start = AsyncMock()
+        mock_priv.stop = AsyncMock()
+        mock_priv_cls.return_value = mock_priv
+
+        recorder = Recorder(config=config_with_account, db=db)
+        await recorder.start()
+
+        recorder._handle_position(_RECORDER_ACCOUNT_ID, {
+            "data": [{
+                "symbol": "BTCUSDT",
+                "side": "Buy",
+                "size": "0.1",
+                "entryPrice": "50000.0",
+                "liqPrice": "45000.0",
+                "unrealisedPnl": "100.0",
+                "updatedTime": "1704067200000",
+            }],
+        })
+
+        await asyncio.sleep(0.1)
+
+        stats = recorder._position_writer.get_stats()
+        assert stats["buffer_size"] >= 1 or stats["total_written"] >= 1
+
+        await recorder.stop()
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_handle_wallet_routes_to_writer(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db
+    ):
+        mock_pub = MagicMock()
+        mock_pub.start = AsyncMock()
+        mock_pub.stop = AsyncMock()
+        mock_pub.get_connection_state.return_value = None
+        mock_pub_cls.return_value = mock_pub
+
+        mock_priv = MagicMock()
+        mock_priv.start = AsyncMock()
+        mock_priv.stop = AsyncMock()
+        mock_priv_cls.return_value = mock_priv
+
+        recorder = Recorder(config=config_with_account, db=db)
+        await recorder.start()
+
+        recorder._handle_wallet(_RECORDER_ACCOUNT_ID, {
+            "data": [{
+                "coin": [{
+                    "coin": "USDT",
+                    "walletBalance": "10000.0",
+                    "availableToWithdraw": "9500.0",
+                }],
+                "updateTime": "1704067200000",
+            }],
+        })
+
+        await asyncio.sleep(0.1)
+
+        stats = recorder._wallet_writer.get_stats()
+        assert stats["buffer_size"] >= 1 or stats["total_written"] >= 1
 
         await recorder.stop()
 

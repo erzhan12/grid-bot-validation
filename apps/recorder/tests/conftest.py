@@ -2,7 +2,19 @@
 
 import pytest
 
+from grid_db import DatabaseFactory, DatabaseSettings
 from recorder.config import RecorderConfig, AccountConfig
+
+
+@pytest.fixture
+def db():
+    """In-memory database for tests."""
+    settings = DatabaseSettings()
+    settings.db_type = "sqlite"
+    settings.db_name = ":memory:"
+    factory = DatabaseFactory(settings)
+    factory.create_tables()
+    return factory
 
 
 @pytest.fixture

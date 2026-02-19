@@ -248,7 +248,11 @@ class Recorder:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, shutdown_handler)
 
-        await self._shutdown_event.wait()
+        try:
+            await self._shutdown_event.wait()
+        finally:
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.remove_signal_handler(sig)
         await self.stop()
 
     def _seed_db_records(self) -> UUID:
@@ -267,39 +271,42 @@ class Recorder:
         # full list goes in config_json for reference.
         primary_symbol = self._config.symbols[0] if self._config.symbols else "UNKNOWN"
 
-        with self._db.get_session() as session:
-            # Upsert User (merge = insert or update)
-            session.merge(User(
-                user_id=str(_RECORDER_USER_ID),
-                username="recorder",
-            ))
-            # Upsert BybitAccount
-            session.merge(BybitAccount(
-                account_id=str(_RECORDER_ACCOUNT_ID),
-                user_id=str(_RECORDER_USER_ID),
-                account_name="recorder",
-                environment=environment,
-            ))
-            # Upsert Strategy
-            session.merge(Strategy(
-                strategy_id=str(_RECORDER_STRATEGY_ID),
-                account_id=str(_RECORDER_ACCOUNT_ID),
-                strategy_type="recorder",
-                symbol=primary_symbol,
-                config_json={
-                    "mode": "recorder",
-                    "symbols": self._config.symbols,
-                },
-            ))
-            # Create new Run for this session
-            session.add(Run(
-                run_id=str(run_id),
-                user_id=str(_RECORDER_USER_ID),
-                account_id=str(_RECORDER_ACCOUNT_ID),
-                strategy_id=str(_RECORDER_STRATEGY_ID),
-                run_type="recording",
-                status="running",
-            ))
+        try:
+            with self._db.get_session() as session:
+                # Upsert User (merge = insert or update)
+                session.merge(User(
+                    user_id=str(_RECORDER_USER_ID),
+                    username="recorder",
+                ))
+                # Upsert BybitAccount
+                session.merge(BybitAccount(
+                    account_id=str(_RECORDER_ACCOUNT_ID),
+                    user_id=str(_RECORDER_USER_ID),
+                    account_name="recorder",
+                    environment=environment,
+                ))
+                # Upsert Strategy
+                session.merge(Strategy(
+                    strategy_id=str(_RECORDER_STRATEGY_ID),
+                    account_id=str(_RECORDER_ACCOUNT_ID),
+                    strategy_type="recorder",
+                    symbol=primary_symbol,
+                    config_json={
+                        "mode": "recorder",
+                        "symbols": self._config.symbols,
+                    },
+                ))
+                # Create new Run for this session
+                session.add(Run(
+                    run_id=str(run_id),
+                    user_id=str(_RECORDER_USER_ID),
+                    account_id=str(_RECORDER_ACCOUNT_ID),
+                    strategy_id=str(_RECORDER_STRATEGY_ID),
+                    run_type="recording",
+                    status="running",
+                ))
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize recording session: {e}") from e
 
         logger.info(f"Created recording run: {run_id}")
         return run_id
@@ -312,60 +319,77 @@ class Recorder:
         """
         if not self._run_id:
             return
-        with self._db.get_session() as session:
-            run = session.get(Run, str(self._run_id))
-            if run:
-                run.status = status
-                run.end_ts = datetime.now(UTC)
-        logger.info(f"Marked run {self._run_id} as {status}")
+        try:
+            with self._db.get_session() as session:
+                run = session.get(Run, str(self._run_id))
+                if run:
+                    run.status = status
+                    run.end_ts = datetime.now(UTC)
+            logger.info(f"Marked run {self._run_id} as {status}")
+        except Exception as e:
+            logger.error(f"Failed to mark run {self._run_id} as {status}: {e}")
+
+    @staticmethod
+    def _log_future_error(label: str):
+        """Return a done-callback that logs exceptions from fire-and-forget futures."""
+        def _cb(future):
+            if (exc := future.exception()) is not None:
+                logger.error("%s failed: %s", label, exc)
+        return _cb
 
     def _handle_ticker(self, event: TickerEvent) -> None:
         """Route ticker event to writer."""
         if self._ticker_writer and self._event_loop:
-            asyncio.run_coroutine_threadsafe(
+            fut = asyncio.run_coroutine_threadsafe(
                 self._ticker_writer.write([event]),
                 self._event_loop,
             )
+            fut.add_done_callback(self._log_future_error("ticker write"))
 
     def _handle_trades(self, events: list[PublicTradeEvent]) -> None:
         """Route trade events to writer."""
         if self._trade_writer and events and self._event_loop:
-            asyncio.run_coroutine_threadsafe(
+            fut = asyncio.run_coroutine_threadsafe(
                 self._trade_writer.write(events),
                 self._event_loop,
             )
+            fut.add_done_callback(self._log_future_error("trade write"))
 
     def _handle_execution(self, event: ExecutionEvent) -> None:
         """Route execution event to writer."""
         if self._execution_writer and self._event_loop:
-            asyncio.run_coroutine_threadsafe(
+            fut = asyncio.run_coroutine_threadsafe(
                 self._execution_writer.write([event]),
                 self._event_loop,
             )
+            fut.add_done_callback(self._log_future_error("execution write"))
 
     def _handle_order(self, account_id: UUID, event: OrderUpdateEvent) -> None:
         """Route order event to writer."""
         if self._order_writer and self._event_loop:
-            asyncio.run_coroutine_threadsafe(
+            fut = asyncio.run_coroutine_threadsafe(
                 self._order_writer.write(account_id, [event]),
                 self._event_loop,
             )
+            fut.add_done_callback(self._log_future_error("order write"))
 
     def _handle_position(self, account_id: UUID, message: dict) -> None:
         """Route position snapshot to writer."""
         if self._position_writer and self._event_loop:
-            asyncio.run_coroutine_threadsafe(
+            fut = asyncio.run_coroutine_threadsafe(
                 self._position_writer.write(account_id, [message]),
                 self._event_loop,
             )
+            fut.add_done_callback(self._log_future_error("position write"))
 
     def _handle_wallet(self, account_id: UUID, message: dict) -> None:
         """Route wallet snapshot to writer."""
         if self._wallet_writer and self._event_loop:
-            asyncio.run_coroutine_threadsafe(
+            fut = asyncio.run_coroutine_threadsafe(
                 self._wallet_writer.write(account_id, [message]),
                 self._event_loop,
             )
+            fut.add_done_callback(self._log_future_error("wallet write"))
 
     def _handle_public_gap(
         self, symbol: str, gap_start: datetime, gap_end: datetime
@@ -373,13 +397,16 @@ class Recorder:
         """Trigger REST reconciliation for public data gap."""
         self._gap_count += 1
         if self._reconciler and self._event_loop:
-            asyncio.run_coroutine_threadsafe(
+            fut = asyncio.run_coroutine_threadsafe(
                 self._reconciler.reconcile_public_trades(
                     symbol=symbol,
                     gap_start=gap_start,
                     gap_end=gap_end,
                 ),
                 self._event_loop,
+            )
+            fut.add_done_callback(
+                self._log_future_error(f"public reconciliation ({symbol})")
             )
 
     def _handle_private_gap(
@@ -400,7 +427,7 @@ class Recorder:
             and self._run_id
         ):
             for symbol in self._config.symbols:
-                asyncio.run_coroutine_threadsafe(
+                fut = asyncio.run_coroutine_threadsafe(
                     self._reconciler.reconcile_executions(
                         user_id=_RECORDER_USER_ID,
                         account_id=_RECORDER_ACCOUNT_ID,
@@ -413,6 +440,9 @@ class Recorder:
                         testnet=self._config.testnet,
                     ),
                     self._event_loop,
+                )
+                fut.add_done_callback(
+                    self._log_future_error(f"private reconciliation ({symbol})")
                 )
 
     async def _health_log_loop(self) -> None:

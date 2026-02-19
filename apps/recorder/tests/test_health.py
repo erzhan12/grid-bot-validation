@@ -5,21 +5,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from grid_db import DatabaseFactory, DatabaseSettings
 from bybit_adapter.ws_client import ConnectionState
 
 from recorder.config import RecorderConfig
 from recorder.recorder import Recorder
-
-
-@pytest.fixture
-def db():
-    settings = DatabaseSettings()
-    settings.db_type = "sqlite"
-    settings.db_name = ":memory:"
-    factory = DatabaseFactory(settings)
-    factory.create_tables()
-    return factory
 
 
 @pytest.fixture
