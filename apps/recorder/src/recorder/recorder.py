@@ -19,7 +19,7 @@ from grid_db import (
     Strategy,
     Run,
 )
-from gridcore.events import PublicTradeEvent, ExecutionEvent, TickerEvent
+from gridcore.events import PublicTradeEvent, ExecutionEvent, OrderUpdateEvent, TickerEvent
 
 from event_saver.collectors import PublicCollector, PrivateCollector, AccountContext
 from event_saver.writers import (
@@ -92,7 +92,6 @@ class Recorder:
             return
 
         logger.info("Starting Recorder...")
-        self._running = True
         self._start_time = datetime.now(UTC)
         self._event_loop = asyncio.get_running_loop()
 
@@ -177,6 +176,7 @@ class Recorder:
         # Start health logging
         self._health_task = asyncio.create_task(self._health_log_loop())
 
+        self._running = True
         logger.info(
             "Recorder started. "
             f"Symbols: {self._config.symbols}, "
@@ -184,8 +184,12 @@ class Recorder:
             f"Private: {self._config.account is not None}"
         )
 
-    async def stop(self) -> None:
-        """Stop all components gracefully."""
+    async def stop(self, *, error: bool = False) -> None:
+        """Stop all components gracefully.
+
+        Args:
+            error: If True, mark the DB run as 'error' instead of 'completed'.
+        """
         if not self._running:
             return
 
@@ -225,8 +229,9 @@ class Recorder:
             if writer:
                 await writer.stop()
 
-        # Mark run as completed
-        self._mark_run_completed()
+        # Mark run status in DB
+        status = "error" if error else "completed"
+        self._mark_run_status(status)
 
         # Log final stats
         stats = self.get_stats()
@@ -299,16 +304,20 @@ class Recorder:
         logger.info(f"Created recording run: {run_id}")
         return run_id
 
-    def _mark_run_completed(self) -> None:
-        """Mark the current Run as completed in the database."""
+    def _mark_run_status(self, status: str) -> None:
+        """Mark the current Run's status in the database.
+
+        Args:
+            status: Run status to set (e.g. 'completed', 'error').
+        """
         if not self._run_id:
             return
         with self._db.get_session() as session:
             run = session.get(Run, str(self._run_id))
             if run:
-                run.status = "completed"
+                run.status = status
                 run.end_ts = datetime.now(UTC)
-        logger.info(f"Marked run {self._run_id} as completed")
+        logger.info(f"Marked run {self._run_id} as {status}")
 
     def _handle_ticker(self, event: TickerEvent) -> None:
         """Route ticker event to writer."""
@@ -334,7 +343,7 @@ class Recorder:
                 self._event_loop,
             )
 
-    def _handle_order(self, account_id: UUID, event) -> None:
+    def _handle_order(self, account_id: UUID, event: OrderUpdateEvent) -> None:
         """Route order event to writer."""
         if self._order_writer and self._event_loop:
             asyncio.run_coroutine_threadsafe(

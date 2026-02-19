@@ -16,6 +16,9 @@ event-saver = { workspace = true }
 bybit-adapter = { workspace = true }
 grid-db = { workspace = true }
 
+[project.scripts]
+recorder = "recorder.main:cli"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

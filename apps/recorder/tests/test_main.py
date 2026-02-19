@@ -72,6 +72,7 @@ class TestMain:
     async def test_no_symbols_returns_1(self):
         mock_config = MagicMock()
         mock_config.symbols = []
+        mock_config.database_url = "sqlite:///test.db"
 
         with patch("recorder.main.load_config", return_value=mock_config):
             result = await main("test.yaml")
@@ -125,7 +126,7 @@ class TestMain:
             result = await main("test.yaml")
 
         assert result == 2
-        mock_recorder.stop.assert_awaited_once()
+        mock_recorder.stop.assert_awaited_once_with(error=True)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("url", [
