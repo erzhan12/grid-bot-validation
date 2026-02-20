@@ -1,0 +1,23 @@
+database_url: "sqlite:///recorder.db"
+# run_id: "..."  # Optional: auto-discovers latest recording run
+symbol: "BTCUSDT"
+
+# Optional time range overrides (defaults to run's start/end)
+# start_ts: "2025-02-20T00:00:00"
+# end_ts: "2025-02-23T00:00:00"
+
+strategy:
+  tick_size: 0.1
+  grid_count: 50
+  grid_step: 0.2
+  amount: "x0.001"
+  commission_rate: 0.0002
+
+initial_balance: 10000
+enable_funding: true
+funding_rate: 0.0001
+wind_down_mode: "leave_open"
+
+output_dir: "results/replay"
+price_tolerance: 0
+qty_tolerance: 0.001

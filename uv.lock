@@ -13,6 +13,7 @@ members = [
     "gridbot",
     "gridcore",
     "recorder",
+    "replay",
 ]
 
 [[package]]
@@ -811,6 +812,31 @@ requires-dist = [
     { name = "event-saver", editable = "apps/event_saver" },
     { name = "grid-db", editable = "shared/db" },
     { name = "pydantic", specifier = ">=2.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
+]
+
+[[package]]
+name = "replay"
+version = "0.1.0"
+source = { editable = "apps/replay" }
+dependencies = [
+    { name = "backtest" },
+    { name = "comparator" },
+    { name = "grid-db" },
+    { name = "gridcore" },
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+    { name = "pyyaml" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "backtest", editable = "apps/backtest" },
+    { name = "comparator", editable = "apps/comparator" },
+    { name = "grid-db", editable = "shared/db" },
+    { name = "gridcore", editable = "packages/gridcore" },
+    { name = "pydantic", specifier = ">=2.0" },
+    { name = "pydantic-settings", specifier = ">=2.0" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]
 
