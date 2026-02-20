@@ -129,68 +129,8 @@ class Recorder:
                 gap_threshold_seconds=self._config.gap_threshold_seconds,
             )
 
-            # Initialize writers
-            writer_kwargs = {
-                "db": self._db,
-                "batch_size": self._config.batch_size,
-                "flush_interval": self._config.flush_interval,
-            }
-
-            self._trade_writer = TradeWriter(**writer_kwargs)
-            self._ticker_writer = TickerWriter(**writer_kwargs)
-            await self._trade_writer.start_auto_flush()
-            await self._ticker_writer.start_auto_flush()
-
-            if self._config.account:
-                # Seed DB parent records and create a Run for this session
-                self._run_id = await asyncio.to_thread(self._seed_db_records)
-
-                self._execution_writer = ExecutionWriter(**writer_kwargs)
-                self._order_writer = OrderWriter(**writer_kwargs)
-                self._position_writer = PositionWriter(**writer_kwargs)
-                self._wallet_writer = WalletWriter(**writer_kwargs)
-                await self._execution_writer.start_auto_flush()
-                await self._order_writer.start_auto_flush()
-                await self._position_writer.start_auto_flush()
-                await self._wallet_writer.start_auto_flush()
-
-            # Start public collector
-            self._public_collector = PublicCollector(
-                symbols=self._config.symbols,
-                on_ticker=self._handle_ticker,
-                on_trades=self._handle_trades,
-                on_gap_detected=self._handle_public_gap,
-                testnet=self._config.testnet,
-            )
-            await self._public_collector.start()
-
-            # Start private collector (optional)
-            if self._config.account:
-                environment = "testnet" if self._config.testnet else "mainnet"
-                context = AccountContext(
-                    account_id=_RECORDER_ACCOUNT_ID,
-                    user_id=_RECORDER_USER_ID,
-                    run_id=self._run_id,
-                    api_key=self._config.account.api_key.get_secret_value(),
-                    api_secret=self._config.account.api_secret.get_secret_value(),
-                    environment=environment,
-                    symbols=self._config.symbols,
-                )
-                self._private_collector = PrivateCollector(
-                    context=context,
-                    on_execution=self._handle_execution,
-                    on_order=lambda event: self._handle_order(
-                        _RECORDER_ACCOUNT_ID, event
-                    ),
-                    on_position=lambda msg: self._handle_position(
-                        _RECORDER_ACCOUNT_ID, msg
-                    ),
-                    on_wallet=lambda msg: self._handle_wallet(
-                        _RECORDER_ACCOUNT_ID, msg
-                    ),
-                    on_gap_detected=self._handle_private_gap,
-                )
-                await self._private_collector.start()
+            await self._init_writers()
+            await self._init_collectors()
 
             # Start health logging
             self._health_task = asyncio.create_task(self._health_log_loop())
@@ -206,6 +146,70 @@ class Recorder:
             f"Testnet: {self._config.testnet}, "
             f"Private: {self._config.account is not None}"
         )
+
+    async def _init_writers(self) -> None:
+        """Create writers and start their background flush loops."""
+        writer_kwargs = {
+            "db": self._db,
+            "batch_size": self._config.batch_size,
+            "flush_interval": self._config.flush_interval,
+        }
+
+        self._trade_writer = TradeWriter(**writer_kwargs)
+        self._ticker_writer = TickerWriter(**writer_kwargs)
+        await self._trade_writer.start_auto_flush()
+        await self._ticker_writer.start_auto_flush()
+
+        if self._config.account:
+            # Seed DB parent records and create a Run for this session
+            self._run_id = await asyncio.to_thread(self._seed_db_records)
+
+            self._execution_writer = ExecutionWriter(**writer_kwargs)
+            self._order_writer = OrderWriter(**writer_kwargs)
+            self._position_writer = PositionWriter(**writer_kwargs)
+            self._wallet_writer = WalletWriter(**writer_kwargs)
+            await self._execution_writer.start_auto_flush()
+            await self._order_writer.start_auto_flush()
+            await self._position_writer.start_auto_flush()
+            await self._wallet_writer.start_auto_flush()
+
+    async def _init_collectors(self) -> None:
+        """Create and start public/private WebSocket collectors."""
+        self._public_collector = PublicCollector(
+            symbols=self._config.symbols,
+            on_ticker=self._handle_ticker,
+            on_trades=self._handle_trades,
+            on_gap_detected=self._handle_public_gap,
+            testnet=self._config.testnet,
+        )
+        await self._public_collector.start()
+
+        if self._config.account:
+            environment = "testnet" if self._config.testnet else "mainnet"
+            context = AccountContext(
+                account_id=_RECORDER_ACCOUNT_ID,
+                user_id=_RECORDER_USER_ID,
+                run_id=self._run_id,
+                api_key=self._config.account.api_key.get_secret_value(),
+                api_secret=self._config.account.api_secret.get_secret_value(),
+                environment=environment,
+                symbols=self._config.symbols,
+            )
+            self._private_collector = PrivateCollector(
+                context=context,
+                on_execution=self._handle_execution,
+                on_order=lambda event: self._handle_order(
+                    _RECORDER_ACCOUNT_ID, event
+                ),
+                on_position=lambda msg: self._handle_position(
+                    _RECORDER_ACCOUNT_ID, msg
+                ),
+                on_wallet=lambda msg: self._handle_wallet(
+                    _RECORDER_ACCOUNT_ID, msg
+                ),
+                on_gap_detected=self._handle_private_gap,
+            )
+            await self._private_collector.start()
 
     async def stop(self, *, error: bool = False) -> None:
         """Stop all components gracefully.
@@ -357,7 +361,7 @@ class Recorder:
     @staticmethod
     def _log_future_error(label: str):
         """Return a done-callback that logs exceptions from fire-and-forget futures."""
-        def _cb(future):
+        def _cb(future: Future) -> None:
             if (exc := future.exception()) is not None:
                 logger.error("%s failed: %s", label, exc)
         return _cb
@@ -496,6 +500,7 @@ class Recorder:
         """Periodically log health stats."""
         while self._running:
             try:
+                self._health_check_complete.clear()
                 await asyncio.sleep(self._config.health_log_interval)
                 stats = self.get_stats()
                 logger.info(f"Health: {stats}")
