@@ -90,6 +90,7 @@ class Recorder:
         self._gap_count = 0
         self._gap_lock = threading.Lock()
         self._run_id: Optional[UUID] = None
+        self._health_check_complete = asyncio.Event()
 
     async def start(self) -> None:
         """Start all recording components."""
@@ -97,57 +98,63 @@ class Recorder:
             logger.warning("Recorder already running")
             return
 
-        self._shutdown_event.clear()
+        # Set _running early so stop() can clean up if start() raises
+        # partway through (e.g. after writers are started but before
+        # collectors connect).  Without this, stop() would no-op and
+        # leave orphaned writer flush-loop tasks.
+        self._running = True
 
-        if not self._config.symbols:
-            raise ValueError("symbols must not be empty")
+        try:
+            self._shutdown_event.clear()
 
-        logger.info("Starting Recorder...")
-        self._start_time = datetime.now(UTC)
-        self._event_loop = asyncio.get_running_loop()
+            if not self._config.symbols:
+                raise ValueError("symbols must not be empty")
 
-        # Initialize REST client for reconciliation (public endpoints only;
-        # empty credentials are intentional — no auth needed).
-        rest_client = BybitRestClient(
-            api_key="",
-            api_secret="",
-            testnet=self._config.testnet,
-        )
+            logger.info("Starting Recorder...")
+            self._start_time = datetime.now(UTC)
+            self._event_loop = asyncio.get_running_loop()
 
-        # Initialize reconciler
-        self._reconciler = GapReconciler(
-            db=self._db,
-            rest_client=rest_client,
-            gap_threshold_seconds=self._config.gap_threshold_seconds,
-        )
+            # Initialize REST client for reconciliation (public endpoints only;
+            # empty credentials are intentional — no auth needed).
+            rest_client = BybitRestClient(
+                api_key="",
+                api_secret="",
+                testnet=self._config.testnet,
+            )
 
-        # Initialize writers
-        writer_kwargs = {
-            "db": self._db,
-            "batch_size": self._config.batch_size,
-            "flush_interval": self._config.flush_interval,
-        }
+            # Initialize reconciler
+            self._reconciler = GapReconciler(
+                db=self._db,
+                rest_client=rest_client,
+                gap_threshold_seconds=self._config.gap_threshold_seconds,
+            )
 
-        self._trade_writer = TradeWriter(**writer_kwargs)
-        self._ticker_writer = TickerWriter(**writer_kwargs)
-        await self._trade_writer.start_auto_flush()
-        await self._ticker_writer.start_auto_flush()
+            # Initialize writers
+            writer_kwargs = {
+                "db": self._db,
+                "batch_size": self._config.batch_size,
+                "flush_interval": self._config.flush_interval,
+            }
 
-        if self._config.account:
-            # Seed DB parent records and create a Run for this session
-            self._run_id = await asyncio.to_thread(self._seed_db_records)
+            self._trade_writer = TradeWriter(**writer_kwargs)
+            self._ticker_writer = TickerWriter(**writer_kwargs)
+            await self._trade_writer.start_auto_flush()
+            await self._ticker_writer.start_auto_flush()
 
-            self._execution_writer = ExecutionWriter(**writer_kwargs)
-            self._order_writer = OrderWriter(**writer_kwargs)
-            self._position_writer = PositionWriter(**writer_kwargs)
-            self._wallet_writer = WalletWriter(**writer_kwargs)
-            await self._execution_writer.start_auto_flush()
-            await self._order_writer.start_auto_flush()
-            await self._position_writer.start_auto_flush()
-            await self._wallet_writer.start_auto_flush()
+            if self._config.account:
+                # Seed DB parent records and create a Run for this session
+                self._run_id = await asyncio.to_thread(self._seed_db_records)
 
-        # Start public collector
-        if self._config.symbols:
+                self._execution_writer = ExecutionWriter(**writer_kwargs)
+                self._order_writer = OrderWriter(**writer_kwargs)
+                self._position_writer = PositionWriter(**writer_kwargs)
+                self._wallet_writer = WalletWriter(**writer_kwargs)
+                await self._execution_writer.start_auto_flush()
+                await self._order_writer.start_auto_flush()
+                await self._position_writer.start_auto_flush()
+                await self._wallet_writer.start_auto_flush()
+
+            # Start public collector
             self._public_collector = PublicCollector(
                 symbols=self._config.symbols,
                 on_ticker=self._handle_ticker,
@@ -157,38 +164,42 @@ class Recorder:
             )
             await self._public_collector.start()
 
-        # Start private collector (optional)
-        if self._config.account:
-            environment = "testnet" if self._config.testnet else "mainnet"
-            context = AccountContext(
-                account_id=_RECORDER_ACCOUNT_ID,
-                user_id=_RECORDER_USER_ID,
-                run_id=self._run_id,
-                api_key=self._config.account.api_key.get_secret_value(),
-                api_secret=self._config.account.api_secret.get_secret_value(),
-                environment=environment,
-                symbols=self._config.symbols,
-            )
-            self._private_collector = PrivateCollector(
-                context=context,
-                on_execution=self._handle_execution,
-                on_order=lambda event: self._handle_order(
-                    _RECORDER_ACCOUNT_ID, event
-                ),
-                on_position=lambda msg: self._handle_position(
-                    _RECORDER_ACCOUNT_ID, msg
-                ),
-                on_wallet=lambda msg: self._handle_wallet(
-                    _RECORDER_ACCOUNT_ID, msg
-                ),
-                on_gap_detected=self._handle_private_gap,
-            )
-            await self._private_collector.start()
+            # Start private collector (optional)
+            if self._config.account:
+                environment = "testnet" if self._config.testnet else "mainnet"
+                context = AccountContext(
+                    account_id=_RECORDER_ACCOUNT_ID,
+                    user_id=_RECORDER_USER_ID,
+                    run_id=self._run_id,
+                    api_key=self._config.account.api_key.get_secret_value(),
+                    api_secret=self._config.account.api_secret.get_secret_value(),
+                    environment=environment,
+                    symbols=self._config.symbols,
+                )
+                self._private_collector = PrivateCollector(
+                    context=context,
+                    on_execution=self._handle_execution,
+                    on_order=lambda event: self._handle_order(
+                        _RECORDER_ACCOUNT_ID, event
+                    ),
+                    on_position=lambda msg: self._handle_position(
+                        _RECORDER_ACCOUNT_ID, msg
+                    ),
+                    on_wallet=lambda msg: self._handle_wallet(
+                        _RECORDER_ACCOUNT_ID, msg
+                    ),
+                    on_gap_detected=self._handle_private_gap,
+                )
+                await self._private_collector.start()
 
-        # Start health logging
-        self._health_task = asyncio.create_task(self._health_log_loop())
+            # Start health logging
+            self._health_task = asyncio.create_task(self._health_log_loop())
 
-        self._running = True
+        except Exception:
+            # _running stays True so stop(error=True) in main.py can
+            # clean up any partially-initialized resources.
+            raise
+
         logger.info(
             "Recorder started. "
             f"Symbols: {self._config.symbols}, "
@@ -281,7 +292,7 @@ class Recorder:
         environment = "testnet" if self._config.testnet else "mainnet"
         # Store first symbol in Strategy.symbol (VARCHAR(20) limit),
         # full list goes in config_json for reference.
-        primary_symbol = self._config.symbols[0] if self._config.symbols else "UNKNOWN"
+        primary_symbol = self._config.symbols[0]
 
         try:
             with self._db.get_session() as session:
@@ -488,6 +499,7 @@ class Recorder:
                 await asyncio.sleep(self._config.health_log_interval)
                 stats = self.get_stats()
                 logger.info(f"Health: {stats}")
+                self._health_check_complete.set()
 
             except asyncio.CancelledError:
                 break

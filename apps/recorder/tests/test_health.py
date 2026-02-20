@@ -42,7 +42,7 @@ class TestHealthLogging:
         await recorder.start()
 
         # Wait for at least one health log cycle
-        await asyncio.sleep(0.5)
+        await asyncio.wait_for(recorder._health_check_complete.wait(), timeout=1.0)
 
         # Health task should be running
         assert recorder._health_task is not None

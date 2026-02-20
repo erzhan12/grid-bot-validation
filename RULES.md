@@ -1573,7 +1573,7 @@ Standalone app that captures raw Bybit mainnet WebSocket data to SQLite for mult
    - Database URLs are sanitized via `_sanitize_url()` before logging (strips passwords from PostgreSQL URLs)
 
 9. **Lifecycle Safety Patterns**
-   - `self._running = True` is set at the **end** of `start()`, after all components succeed (not at the top)
+   - `self._running = True` is set at the **top** of `start()` (before resource init), inside a `try/except` that re-raises. This ensures `stop()` can clean up partially-initialized resources (e.g. writer flush-loop tasks) if `start()` raises midway. The `except` block intentionally leaves `_running = True` so `main.py`'s `stop(error=True)` proceeds with cleanup.
    - `stop(error=True)` marks the DB run as `"error"` instead of `"completed"` — called from the error path in `main.py`
    - `_seed_db_records()` wraps DB ops in try/except → raises `RuntimeError` with clear message
    - `_mark_run_status()` wraps DB ops in try/except → **logs** error (doesn't raise) to avoid interrupting shutdown
