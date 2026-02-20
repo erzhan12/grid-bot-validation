@@ -1,0 +1,27 @@
+# Data Recorder Configuration Example
+# Copy to recorder.yaml and update with your settings
+
+symbols:
+  - "BTCUSDT"
+
+# Database (SQLite file path)
+database_url: "sqlite:///recorder.db"
+
+# Use mainnet by default (set to true for testnet)
+testnet: false
+
+# Writer settings
+batch_size: 100
+flush_interval: 5.0
+
+# Gap reconciliation threshold (seconds)
+gap_threshold_seconds: 5.0
+
+# Health log interval (seconds)
+health_log_interval: 300  # log health every 5 minutes
+
+# Optional: uncomment to also capture private streams
+# IMPORTANT: chmod 600 recorder.yaml to protect credentials on shared hosts
+# account:
+#   api_key: "YOUR_API_KEY"
+#   api_secret: "YOUR_API_SECRET"

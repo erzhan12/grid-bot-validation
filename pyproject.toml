@@ -21,7 +21,7 @@ dev = [
 gridbot = { workspace = true }
 
 [tool.pytest.ini_options]
-pythonpath = ["packages/gridcore/src", "packages/bybit_adapter/src", "shared/db/src", "apps/event_saver/src", "apps/gridbot/src", "apps/backtest/src", "apps/comparator/src", "tests/integration"]
-testpaths = ["packages/gridcore/tests", "packages/bybit_adapter/tests", "shared/db/tests", "apps/event_saver/tests", "apps/gridbot/tests", "apps/backtest/tests", "apps/comparator/tests", "tests/integration"]
+pythonpath = ["packages/gridcore/src", "packages/bybit_adapter/src", "shared/db/src", "apps/event_saver/src", "apps/gridbot/src", "apps/backtest/src", "apps/comparator/src", "apps/recorder/src", "tests/integration"]
+testpaths = ["packages/gridcore/tests", "packages/bybit_adapter/tests", "shared/db/tests", "apps/event_saver/tests", "apps/gridbot/tests", "apps/backtest/tests", "apps/comparator/tests", "apps/recorder/tests", "tests/integration"]
 asyncio_mode = "auto"
 addopts = ["--import-mode=importlib"]
