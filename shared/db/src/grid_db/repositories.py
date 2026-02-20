@@ -383,7 +383,11 @@ class RunRepository(BaseRepository[Run]):
             .all()
         )
 
-    def get_latest_by_type(self, run_type: str) -> Optional[Run]:
+    def get_latest_by_type(
+        self,
+        run_type: str,
+        statuses: tuple[str, ...] = ("completed", "running"),
+    ) -> Optional[Run]:
         """Get the most recent run of a given type.
 
         Unlike other methods, does NOT filter by user_id — intended for
@@ -392,16 +396,19 @@ class RunRepository(BaseRepository[Run]):
 
         Args:
             run_type: Run type (e.g. 'recording', 'live', 'backtest').
+            statuses: Tuple of acceptable statuses to filter by.
+                Defaults to ("completed", "running") to skip failed runs.
 
         Returns:
             Most recent Run of that type, or None if none exist.
         """
-        return (
+        query = (
             self.session.query(Run)
             .filter(Run.run_type == run_type)
-            .order_by(Run.start_ts.desc())
-            .first()
         )
+        if statuses:
+            query = query.filter(Run.status.in_(statuses))
+        return query.order_by(Run.start_ts.desc()).first()
 
 
 class PublicTradeRepository(BaseRepository[PublicTrade]):

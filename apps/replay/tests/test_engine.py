@@ -196,11 +196,11 @@ class TestResolveRun:
             engine.run()
 
     @patch("replay.engine.InstrumentInfoProvider")
-    def test_explicit_run_id_requires_timestamps(self, mock_provider_cls, db):
-        """Raises ValueError when run_id is explicit but no timestamps given."""
+    def test_explicit_run_id_not_found_raises(self, mock_provider_cls, db):
+        """Raises ValueError when explicit run_id doesn't exist in DB."""
         config = ReplayConfig(
             database_url="sqlite:///:memory:",
-            run_id="some-run-id",
+            run_id="nonexistent-run-id",
             symbol="BTCUSDT",
             start_ts=None,
             end_ts=None,
@@ -209,8 +209,110 @@ class TestResolveRun:
 
         engine = ReplayEngine(config=config, db=db)
 
-        with pytest.raises(ValueError, match="start_ts and end_ts must be specified"):
+        with pytest.raises(ValueError, match="Run 'nonexistent-run-id' not found"):
             engine.run()
+
+    @patch("replay.engine.InstrumentInfoProvider")
+    def test_explicit_run_id_resolves_timestamps_from_db(self, mock_provider_cls, db, ts):
+        """Explicit run_id auto-resolves timestamps from DB row."""
+        # Seed prerequisite entities and run
+        with db.get_session() as session:
+            user = User(user_id="user-1", username="test")
+            account = BybitAccount(
+                account_id="acc-1", user_id="user-1",
+                account_name="test", environment="testnet",
+            )
+            strategy = Strategy(
+                strategy_id="strat-1", account_id="acc-1",
+                strategy_type="recorder", symbol="BTCUSDT",
+                config_json={},
+            )
+            run = Run(
+                run_id="explicit-run",
+                user_id="user-1",
+                account_id="acc-1",
+                strategy_id="strat-1",
+                run_type="recording",
+                status="completed",
+                start_ts=ts,
+                end_ts=ts + timedelta(hours=2),
+            )
+            session.add_all([user, account, strategy, run])
+            session.commit()
+
+        config = ReplayConfig(
+            database_url="sqlite:///:memory:",
+            run_id="explicit-run",
+            symbol="BTCUSDT",
+            start_ts=None,
+            end_ts=None,
+            strategy=ReplayStrategyConfig(tick_size=Decimal("0.1")),
+            enable_funding=False,
+        )
+
+        mock_info = MagicMock()
+        mock_info.qty_step = Decimal("0.001")
+        mock_info.tick_size = Decimal("0.1")
+        mock_info.round_qty = lambda q: max(Decimal("0.001"), q.quantize(Decimal("0.001")))
+        mock_provider_cls.return_value.get.return_value = mock_info
+
+        engine = ReplayEngine(config=config, db=db)
+        provider = InMemoryDataProvider([])
+
+        result = engine.run(data_provider=provider)
+
+        # Should resolve timestamps from DB without error
+        assert result is not None
+
+    @patch("replay.engine.InstrumentInfoProvider")
+    def test_active_run_uses_utcnow_for_end_ts(self, mock_provider_cls, db, ts):
+        """Auto-discovery against a running run (end_ts=None) succeeds with now() fallback."""
+        # Seed a running recording run with no end_ts
+        with db.get_session() as session:
+            user = User(user_id="user-1", username="test")
+            account = BybitAccount(
+                account_id="acc-1", user_id="user-1",
+                account_name="test", environment="testnet",
+            )
+            strategy = Strategy(
+                strategy_id="strat-1", account_id="acc-1",
+                strategy_type="recorder", symbol="BTCUSDT",
+                config_json={},
+            )
+            run = Run(
+                run_id="running-run",
+                user_id="user-1",
+                account_id="acc-1",
+                strategy_id="strat-1",
+                run_type="recording",
+                status="running",
+                start_ts=ts,
+                end_ts=None,  # Still active
+            )
+            session.add_all([user, account, strategy, run])
+            session.commit()
+
+        config = ReplayConfig(
+            database_url="sqlite:///:memory:",
+            run_id=None,  # auto-discover
+            symbol="BTCUSDT",
+            strategy=ReplayStrategyConfig(tick_size=Decimal("0.1")),
+            enable_funding=False,
+        )
+
+        mock_info = MagicMock()
+        mock_info.qty_step = Decimal("0.001")
+        mock_info.tick_size = Decimal("0.1")
+        mock_info.round_qty = lambda q: max(Decimal("0.001"), q.quantize(Decimal("0.001")))
+        mock_provider_cls.return_value.get.return_value = mock_info
+
+        engine = ReplayEngine(config=config, db=db)
+        provider = InMemoryDataProvider([])
+
+        result = engine.run(data_provider=provider)
+
+        # Should have resolved using now() as end_ts
+        assert result is not None
 
 
 class TestWindDown:

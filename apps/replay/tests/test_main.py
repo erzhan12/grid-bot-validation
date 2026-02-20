@@ -1,6 +1,6 @@
 """Tests for replay CLI."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -58,6 +58,18 @@ class TestParseDatetime:
         dt = parse_datetime("2025/02/20")
         assert dt == datetime(2025, 2, 20)
 
+    def test_iso_format_with_t(self):
+        dt = parse_datetime("2025-02-20T14:30:00")
+        assert dt == datetime(2025, 2, 20, 14, 30, 0)
+
+    def test_iso_format_with_utc_offset(self):
+        dt = parse_datetime("2025-02-20T14:30:00+00:00")
+        assert dt == datetime(2025, 2, 20, 14, 30, 0, tzinfo=timezone.utc)
+
+    def test_iso_format_with_z_suffix(self):
+        dt = parse_datetime("2025-02-20T14:30:00Z")
+        assert dt == datetime(2025, 2, 20, 14, 30, 0, tzinfo=timezone.utc)
+
     def test_invalid_format_raises(self):
         with pytest.raises(ValueError, match="Unable to parse"):
             parse_datetime("not-a-date")
@@ -111,6 +123,19 @@ class TestMain:
              patch("replay.engine.ReplayEngine") as mock_engine_cls:
             mock_engine_cls.return_value.run.side_effect = ValueError("bad config")
             result = main(["--config", "test.yaml"])
+
+        assert result == 1
+
+    @patch("replay.main.load_config")
+    def test_invalid_datetime_returns_1(self, mock_load_config):
+        """Invalid datetime in CLI args returns exit code 1 (not traceback)."""
+        mock_config = MagicMock()
+        mock_config.database_url = "sqlite:///test.db"
+        mock_config.symbol = "BTCUSDT"
+        mock_config.output_dir = "results/replay"
+        mock_load_config.return_value = mock_config
+
+        result = main(["--config", "test.yaml", "--start", "not-a-date"])
 
         assert result == 1
 

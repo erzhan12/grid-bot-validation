@@ -92,18 +92,28 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 def parse_datetime(s: str) -> datetime:
-    """Parse datetime string in various formats."""
-    formats = [
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d",
-        "%Y/%m/%d %H:%M:%S",
-        "%Y/%m/%d",
-    ]
-    for fmt in formats:
+    """Parse datetime string in ISO 8601 and common formats.
+
+    Accepts: ``2025-02-20T14:30:00+00:00``, ``2025-02-20T14:30:00Z``,
+    ``2025-02-20T14:30:00``, ``2025-02-20 14:30:00``, ``2025-02-20``,
+    ``2025/02/20 14:30:00``, ``2025/02/20``.
+    """
+    # Normalise the trailing "Z" shorthand to "+00:00" so fromisoformat works
+    normalized = s.replace("Z", "+00:00") if s.endswith("Z") else s
+
+    # Try Python's built-in ISO parser first (handles offsets like +00:00)
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        pass
+
+    # Fallback to strptime for non-ISO formats (slash separators etc.)
+    for fmt in ("%Y/%m/%d %H:%M:%S", "%Y/%m/%d"):
         try:
             return datetime.strptime(s, fmt)
         except ValueError:
             continue
+
     raise ValueError(f"Unable to parse datetime: {s}")
 
 
@@ -127,16 +137,18 @@ def main(argv=None) -> int:
         config.run_id = args.run_id
     if args.symbol:
         config.symbol = args.symbol
-    if args.start:
-        config.start_ts = parse_datetime(args.start)
-    if args.end:
-        config.end_ts = parse_datetime(args.end)
     if args.output:
         config.output_dir = args.output
 
     logger.info(f"Replay config: symbol={config.symbol}, db={config.database_url}")
 
     try:
+        # Parse datetime overrides (can raise ValueError)
+        if args.start:
+            config.start_ts = parse_datetime(args.start)
+        if args.end:
+            config.end_ts = parse_datetime(args.end)
+
         # Create database connection
         settings = DatabaseSettings(database_url=config.database_url)
         db = DatabaseFactory(settings)

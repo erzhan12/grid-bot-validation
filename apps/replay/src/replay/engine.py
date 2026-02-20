@@ -14,7 +14,9 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional
 
-from grid_db import DatabaseFactory, RunRepository
+from datetime import datetime, timezone
+
+from grid_db import DatabaseFactory, Run, RunRepository
 
 from gridcore import DirectionType
 
@@ -223,6 +225,7 @@ class ReplayEngine:
         run_id = config.run_id
 
         if run_id is None:
+            # Auto-discover latest recording run
             with self._db.get_session() as session:
                 repo = RunRepository(session)
                 run = repo.get_latest_by_type("recording")
@@ -240,12 +243,24 @@ class ReplayEngine:
         else:
             start_ts = config.start_ts
             end_ts = config.end_ts
+            # Fetch Run row if either timestamp is missing
+            if start_ts is None or end_ts is None:
+                with self._db.get_session() as session:
+                    run = session.get(Run, run_id)
+                    if run is None:
+                        raise ValueError(f"Run '{run_id}' not found in database")
+                    if start_ts is None:
+                        start_ts = run.start_ts
+                    if end_ts is None:
+                        end_ts = run.end_ts
 
-        if start_ts is None or end_ts is None:
-            raise ValueError(
-                "start_ts and end_ts must be specified when run_id is provided explicitly "
-                "(auto-discovery infers them from the Run row)"
-            )
+        # Handle active runs (end_ts still None → use utcnow)
+        if end_ts is None:
+            end_ts = datetime.now(timezone.utc)
+            logger.info(f"Run still active, using now as end_ts: {end_ts}")
+
+        if start_ts is None:
+            raise ValueError("start_ts could not be resolved")
 
         return run_id, start_ts, end_ts
 

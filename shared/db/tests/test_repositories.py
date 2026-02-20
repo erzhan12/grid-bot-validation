@@ -1,6 +1,5 @@
 """Tests for repository pattern with multi-tenant filtering."""
 
-import pytest
 from datetime import datetime, UTC
 
 from grid_db.repositories import (
@@ -420,6 +419,86 @@ class TestRunRepository:
         assert len(backtests) == 1
         assert backtests[0].run_type == "backtest"
 
+    def test_get_latest_by_type_skips_failed(
+        self, session, sample_user, sample_account, sample_strategy
+    ):
+        """get_latest_by_type() skips failed runs by default."""
+        from datetime import timedelta
+
+        now = datetime.now(UTC)
+
+        failed_run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="recording",
+            status="failed",
+            start_ts=now,
+        )
+        completed_run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="recording",
+            status="completed",
+            start_ts=now - timedelta(hours=1),
+        )
+        session.add_all([failed_run, completed_run])
+        session.flush()
+
+        repo = RunRepository(session)
+        result = repo.get_latest_by_type("recording")
+
+        # Should skip failed and return completed
+        assert result is not None
+        assert result.status == "completed"
+
+    def test_get_latest_by_type_returns_running(
+        self, session, sample_user, sample_account, sample_strategy
+    ):
+        """get_latest_by_type() returns running runs."""
+        now = datetime.now(UTC)
+
+        running_run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="recording",
+            status="running",
+            start_ts=now,
+        )
+        session.add(running_run)
+        session.flush()
+
+        repo = RunRepository(session)
+        result = repo.get_latest_by_type("recording")
+
+        assert result is not None
+        assert result.status == "running"
+
+    def test_get_latest_by_type_empty_statuses_returns_any(
+        self, session, sample_user, sample_account, sample_strategy
+    ):
+        """get_latest_by_type() with empty statuses returns any status."""
+        now = datetime.now(UTC)
+
+        failed_run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="recording",
+            status="failed",
+            start_ts=now,
+        )
+        session.add(failed_run)
+        session.flush()
+
+        repo = RunRepository(session)
+        result = repo.get_latest_by_type("recording", statuses=())
+
+        assert result is not None
+        assert result.status == "failed"
+
     def test_runs_ordered_by_start_ts(
         self, session, sample_user, sample_account, sample_strategy
     ):
@@ -544,7 +623,6 @@ class TestPrivateExecutionRepository:
         """Bulk insert inserts all executions when none exist."""
         from datetime import datetime, UTC
         from decimal import Decimal
-        from uuid import uuid4
 
         # Create a run first (required foreign key)
         sample_strategy = Strategy(
