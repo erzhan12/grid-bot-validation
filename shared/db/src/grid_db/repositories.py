@@ -394,6 +394,14 @@ class RunRepository(BaseRepository[Run]):
         standalone tools (e.g. replay engine) that need to auto-discover
         the latest recording run regardless of user.
 
+        Example::
+
+            repo = RunRepository(session)
+            run = repo.get_latest_by_type("recording")
+            if run is None:
+                raise ValueError("No recording runs found")
+            run_id, start_ts, end_ts = run.run_id, run.start_ts, run.end_ts
+
         Args:
             run_type: Run type (e.g. 'recording', 'live', 'backtest').
             statuses: Tuple of acceptable statuses to filter by.

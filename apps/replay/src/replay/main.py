@@ -140,7 +140,11 @@ def main(argv=None) -> int:
     if args.output:
         config.output_dir = args.output
 
-    logger.info(f"Replay config: symbol={config.symbol}, db={config.database_url}")
+    # Redact credentials from database URL before logging
+    from urllib.parse import urlparse
+    _parsed = urlparse(config.database_url)
+    db_display = _parsed.scheme + "://..." + _parsed.path if _parsed.password else config.database_url
+    logger.info(f"Replay config: symbol={config.symbol}, db={db_display}")
 
     try:
         # Parse datetime overrides (can raise ValueError)

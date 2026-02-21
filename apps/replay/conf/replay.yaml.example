@@ -1,3 +1,9 @@
+# Config auto-discovery search path (first match wins):
+#   1. --config CLI arg
+#   2. REPLAY_CONFIG_PATH env var
+#   3. conf/replay.yaml
+#   4. replay.yaml
+
 database_url: "sqlite:///recorder.db"
 # run_id: "..."  # Optional: auto-discovers latest recording run
 symbol: "BTCUSDT"

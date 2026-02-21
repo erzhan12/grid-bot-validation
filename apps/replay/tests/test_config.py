@@ -2,6 +2,7 @@
 
 import pytest
 from decimal import Decimal
+from pydantic import ValidationError
 from replay.config import load_config, ReplayConfig, ReplayStrategyConfig
 
 
@@ -20,7 +21,7 @@ class TestReplayStrategyConfig:
         assert config.tick_size == Decimal("0.01")
 
     def test_grid_count_minimum(self):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             ReplayStrategyConfig(tick_size=Decimal("0.1"), grid_count=2)
 
 

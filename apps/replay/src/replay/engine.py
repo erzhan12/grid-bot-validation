@@ -230,7 +230,14 @@ class ReplayEngine:
                 repo = RunRepository(session)
                 run = repo.get_latest_by_type("recording")
                 if run is None:
-                    raise ValueError("No recording runs found in database")
+                    from urllib.parse import urlparse
+                    raw_url = self._db.settings.get_database_url()
+                    _p = urlparse(raw_url)
+                    safe_url = _p.scheme + "://..." + _p.path if _p.password else raw_url
+                    raise ValueError(
+                        f"No recording runs found in database ({safe_url}). "
+                        "Ensure recorder has completed at least one run."
+                    )
                 # Extract values while still in session scope
                 run_id = run.run_id
                 run_start = run.start_ts
