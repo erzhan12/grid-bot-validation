@@ -1570,7 +1570,7 @@ Standalone app that captures raw Bybit mainnet WebSocket data to SQLite for mult
 8. **SecretStr for API Credentials**
    - `AccountConfig.api_key` and `api_secret` use Pydantic `SecretStr` to prevent accidental logging
    - Access secrets via `.get_secret_value()` at the call site (e.g., `config.account.api_key.get_secret_value()`)
-   - Database URLs are sanitized via `_sanitize_url()` before logging (strips passwords from PostgreSQL URLs)
+   - Database URLs are sanitized via `redact_db_url()` from `grid_db.utils` before logging (strips passwords from PostgreSQL URLs)
 
 9. **Lifecycle Safety Patterns**
    - `self._running = True` is set at the **top** of `start()` (before resource init), inside a `try/except` that re-raises. This ensures `stop()` can clean up partially-initialized resources (e.g. writer flush-loop tasks) if `start()` raises midway. The `except` block intentionally leaves `_running = True` so `main.py`'s `stop(error=True)` proceeds with cleanup.
@@ -1638,10 +1638,12 @@ Replay engine that reads recorded mainnet data from the recorder's database, fee
    - Parsing happens inside `try/except ValueError` block so invalid CLI input returns exit code 1
    - File: `apps/replay/src/replay/main.py`
 
-6. **Credential Redaction in Logs**
-   - Database URLs are checked for passwords before logging (`urlparse().password`)
-   - If password present, URL is redacted to `scheme://...path` in both `main.py` and `engine.py` error messages
-   - SQLite URLs (no credentials) pass through unchanged
+6. **Credential Redaction in Logs — `redact_db_url()`**
+   - Shared utility: `from grid_db import redact_db_url` (or `from grid_db.utils import redact_db_url`)
+   - Replaces password with `***`, preserves username/host/port/path — SQLite URLs pass through unchanged
+   - Used by: `apps/replay/src/replay/main.py`, `apps/replay/src/replay/engine.py`, `apps/recorder/src/recorder/main.py`
+   - **Always use this** when logging database URLs — never log `config.database_url` directly
+   - File: `shared/db/src/grid_db/utils.py`, tests: `shared/db/tests/test_utils.py`
 
 7. **Config Search Order**
    - `--config` CLI arg → `REPLAY_CONFIG_PATH` env var → `conf/replay.yaml` → `replay.yaml`
