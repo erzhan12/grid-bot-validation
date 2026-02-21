@@ -1596,6 +1596,70 @@ Standalone app that captures raw Bybit mainnet WebSocket data to SQLite for mult
 6. **Test fixture deduplication**: Shared `db` fixture lives in `conftest.py` — do not duplicate in individual test files. Same for `basic_config` and `config_with_account`.
 7. **Mock config completeness**: When using `MagicMock()` for config in tests, set all attributes that `main()` accesses before the code path under test. E.g., `mock_config.database_url = "sqlite:///test.db"` — bare MagicMock attributes break `urlparse()`.
 
+## Phase J: Replay Engine (`apps/replay/`)
+
+### Completed: 2026-02-21
+
+Replay engine that reads recorded mainnet data from the recorder's database, feeds it through GridEngine + simulated order book, and compares simulated trades against real recorded executions. Core shadow-mode validation pipeline: `record → replay → compare → report`.
+
+**Documentation**: See `docs/features/0009_PLAN.md` for architecture and `docs/features/0009_REVIEW.md` for review notes.
+
+### Key Implementation Notes
+
+1. **App Structure**
+   - Path: `apps/replay/` (workspace package)
+   - Entry point: `python -m replay.main` (`--config PATH`, `--run-id UUID`, `--start/--end`, `--debug`)
+   - Config: YAML-based with Pydantic validation (`replay.config`)
+   - Core orchestrator: `replay.engine.ReplayEngine`
+
+2. **Massive Reuse — No New Data/Matching Logic**
+   - `HistoricalDataProvider` (backtest) — reads TickerSnapshots from recorder DB
+   - `BacktestRunner` (backtest) — two-phase tick processing with GridEngine
+   - `BacktestOrderManager`, `TradeThroughFillSimulator`, `BacktestPositionTracker` (backtest)
+   - `LiveTradeLoader`, `BacktestTradeLoader`, `TradeMatcher`, `calculate_metrics` (comparator)
+   - `ComparatorReporter` (comparator) — CSV + console report
+   - Replay engine is a thin orchestrator wiring these together
+
+3. **Config Shape: Root-Level Replay Parameters**
+   - `initial_balance`, `enable_funding`, `wind_down_mode` live at **root level** of `ReplayConfig`, NOT nested under `strategy`
+   - They are backtest/replay parameters, not grid-strategy parameters
+   - `strategy:` block only contains grid config (tick_size, grid_count, grid_step, amount, commission_rate)
+   - File: `apps/replay/src/replay/config.py`
+
+4. **Run Resolution (`_resolve_run()`)**
+   - Auto-discover: queries `RunRepository.get_latest_by_type("recording")` — filters to `("completed", "running")` status by default
+   - Explicit `run_id`: looks up Run row from DB if timestamps are missing (no hard-fail)
+   - Active runs (`end_ts=None`): falls back to `datetime.now(timezone.utc)` instead of failing
+   - File: `apps/replay/src/replay/engine.py`
+
+5. **ISO Datetime Parsing**
+   - `parse_datetime()` uses `datetime.fromisoformat()` as primary parser — handles `T` separator, `Z` suffix, `+00:00` offsets
+   - Falls back to strptime for non-ISO formats (slash separators)
+   - Parsing happens inside `try/except ValueError` block so invalid CLI input returns exit code 1
+   - File: `apps/replay/src/replay/main.py`
+
+6. **Credential Redaction in Logs**
+   - Database URLs are checked for passwords before logging (`urlparse().password`)
+   - If password present, URL is redacted to `scheme://...path` in both `main.py` and `engine.py` error messages
+   - SQLite URLs (no credentials) pass through unchanged
+
+7. **Config Search Order**
+   - `--config` CLI arg → `REPLAY_CONFIG_PATH` env var → `conf/replay.yaml` → `replay.yaml`
+   - Same pattern as recorder
+
+8. **`RunRepository.get_latest_by_type()` Status Filter**
+   - Added `statuses` parameter defaulting to `("completed", "running")` — skips failed/errored runs
+   - Pass `statuses=()` to disable filtering (returns any status)
+   - File: `shared/db/src/grid_db/repositories.py`
+
+### Common Pitfalls (Replay-Specific)
+
+1. **InMemoryDataProvider for tests**: Use `data_provider=` parameter in `engine.run()` to bypass DB reads — avoids needing real TickerSnapshot rows in test DB.
+2. **InstrumentInfoProvider must be mocked**: Tests use `@patch("replay.engine.InstrumentInfoProvider")` — the provider tries to fetch real instrument info otherwise.
+3. **Run resolution needs full FK chain**: When seeding test DB for run resolution tests, must create User → BybitAccount → Strategy → Run (foreign key constraints).
+4. **`datetime.fromisoformat()` requires Python 3.11+** for full timezone offset support. Earlier versions don't handle `+00:00`.
+5. **Test for `ValidationError` not `Exception`**: Pydantic config validation tests should use `from pydantic import ValidationError` for specific assertions.
+
 ## Next Steps (Future Phases)
 
 - Phase I: Deployment & Monitoring
