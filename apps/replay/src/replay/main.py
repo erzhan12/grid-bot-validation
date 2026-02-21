@@ -12,7 +12,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from grid_db import DatabaseFactory, DatabaseSettings
+from grid_db import DatabaseFactory, DatabaseSettings, redact_db_url
 
 from comparator import ComparatorReporter
 
@@ -140,11 +140,7 @@ def main(argv=None) -> int:
     if args.output:
         config.output_dir = args.output
 
-    # Redact credentials from database URL before logging
-    from urllib.parse import urlparse
-    _parsed = urlparse(config.database_url)
-    db_display = _parsed.scheme + "://..." + _parsed.path if _parsed.password else config.database_url
-    logger.info(f"Replay config: symbol={config.symbol}, db={db_display}")
+    logger.info(f"Replay config: symbol={config.symbol}, db={redact_db_url(config.database_url)}")
 
     try:
         # Parse datetime overrides (can raise ValueError)

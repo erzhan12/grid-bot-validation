@@ -16,7 +16,7 @@ from typing import Optional
 
 from datetime import datetime, timezone
 
-from grid_db import DatabaseFactory, Run, RunRepository
+from grid_db import DatabaseFactory, Run, RunRepository, redact_db_url
 
 from gridcore import DirectionType
 
@@ -230,10 +230,7 @@ class ReplayEngine:
                 repo = RunRepository(session)
                 run = repo.get_latest_by_type("recording")
                 if run is None:
-                    from urllib.parse import urlparse
-                    raw_url = self._db.settings.get_database_url()
-                    _p = urlparse(raw_url)
-                    safe_url = _p.scheme + "://..." + _p.path if _p.password else raw_url
+                    safe_url = redact_db_url(self._db.settings.get_database_url())
                     raise ValueError(
                         f"No recording runs found in database ({safe_url}). "
                         "Ensure recorder has completed at least one run."
@@ -268,6 +265,12 @@ class ReplayEngine:
 
         if start_ts is None:
             raise ValueError("start_ts could not be resolved")
+
+        # Compare without tz info — SQLite may strip timezone from stored timestamps
+        if start_ts.replace(tzinfo=None) >= end_ts.replace(tzinfo=None):
+            raise ValueError(
+                f"Invalid time range: start_ts ({start_ts}) must be before end_ts ({end_ts})"
+            )
 
         return run_id, start_ts, end_ts
 

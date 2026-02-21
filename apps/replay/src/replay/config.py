@@ -15,6 +15,15 @@ from pydantic import BaseModel, Field, field_validator
 from backtest.config import WindDownMode
 
 
+def _parse_decimal(v):
+    """Convert string/numeric to Decimal for Pydantic field validators."""
+    if isinstance(v, str):
+        return Decimal(v)
+    if isinstance(v, (int, float)):
+        return Decimal(str(v))
+    return v
+
+
 class ReplayStrategyConfig(BaseModel):
     """Grid strategy configuration for replay simulation."""
 
@@ -38,21 +47,11 @@ class ReplayStrategyConfig(BaseModel):
         description="Commission rate per trade (0.0002 = 0.02% maker fee)",
     )
 
-    @field_validator("tick_size", mode="before")
+    @field_validator("tick_size", "commission_rate", mode="before")
     @classmethod
-    def parse_tick_size(cls, v):
-        """Convert string tick_size to Decimal."""
-        if isinstance(v, str):
-            return Decimal(v)
-        return v
-
-    @field_validator("commission_rate", mode="before")
-    @classmethod
-    def parse_commission_rate(cls, v):
-        """Convert string commission_rate to Decimal."""
-        if isinstance(v, str):
-            return Decimal(v)
-        return v
+    def parse_decimal_fields(cls, v):
+        """Convert string/numeric to Decimal."""
+        return _parse_decimal(v)
 
 
 class ReplayConfig(BaseModel):
@@ -116,35 +115,14 @@ class ReplayConfig(BaseModel):
         description="Quantity tolerance for breach detection",
     )
 
-    @field_validator("initial_balance", mode="before")
+    @field_validator(
+        "initial_balance", "funding_rate", "price_tolerance", "qty_tolerance",
+        mode="before",
+    )
     @classmethod
-    def parse_initial_balance(cls, v):
-        """Convert string initial_balance to Decimal."""
-        if isinstance(v, str):
-            return Decimal(v)
-        if isinstance(v, (int, float)):
-            return Decimal(str(v))
-        return v
-
-    @field_validator("funding_rate", mode="before")
-    @classmethod
-    def parse_funding_rate(cls, v):
-        """Convert string funding_rate to Decimal."""
-        if isinstance(v, str):
-            return Decimal(v)
-        if isinstance(v, (int, float)):
-            return Decimal(str(v))
-        return v
-
-    @field_validator("price_tolerance", "qty_tolerance", mode="before")
-    @classmethod
-    def parse_tolerance(cls, v):
-        """Convert string tolerances to Decimal."""
-        if isinstance(v, str):
-            return Decimal(v)
-        if isinstance(v, (int, float)):
-            return Decimal(str(v))
-        return v
+    def parse_decimal_fields(cls, v):
+        """Convert string/numeric to Decimal."""
+        return _parse_decimal(v)
 
 
 def load_config(config_path: Optional[str] = None) -> ReplayConfig:
