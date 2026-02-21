@@ -383,6 +383,41 @@ class RunRepository(BaseRepository[Run]):
             .all()
         )
 
+    def get_latest_by_type(
+        self,
+        run_type: str,
+        statuses: tuple[str, ...] = ("completed", "running"),
+    ) -> Optional[Run]:
+        """Get the most recent run of a given type.
+
+        Unlike other methods, does NOT filter by user_id — intended for
+        standalone tools (e.g. replay engine) that need to auto-discover
+        the latest recording run regardless of user.
+
+        Example::
+
+            repo = RunRepository(session)
+            run = repo.get_latest_by_type("recording")
+            if run is None:
+                raise ValueError("No recording runs found")
+            run_id, start_ts, end_ts = run.run_id, run.start_ts, run.end_ts
+
+        Args:
+            run_type: Run type (e.g. 'recording', 'live', 'backtest').
+            statuses: Tuple of acceptable statuses to filter by.
+                Defaults to ("completed", "running") to skip failed runs.
+
+        Returns:
+            Most recent Run of that type, or None if none exist.
+        """
+        query = (
+            self.session.query(Run)
+            .filter(Run.run_type == run_type)
+        )
+        if statuses:
+            query = query.filter(Run.status.in_(statuses))
+        return query.order_by(Run.start_ts.desc()).first()
+
 
 class PublicTradeRepository(BaseRepository[PublicTrade]):
     """Repository for PublicTrade operations.

@@ -14,6 +14,7 @@ test:
 	uv run pytest apps/gridbot/tests --cov=gridbot --cov-append -q
 	uv run pytest apps/comparator/tests --cov=comparator --cov-append -q
 	uv run pytest apps/recorder/tests --cov=recorder --cov-append -q
+	uv run pytest apps/replay/tests --cov=replay --cov-append -q
 	uv run pytest tests/integration/ --cov-append --cov-report=term-missing -v
 
 # Run cross-package integration tests only

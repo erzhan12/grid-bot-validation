@@ -21,6 +21,7 @@ from grid_db.models import (
     WalletSnapshot,
 )
 from grid_db.enums import RunType
+from grid_db.utils import redact_db_url
 from grid_db.repositories import (
     BaseRepository,
     UserRepository,
@@ -70,4 +71,6 @@ __all__ = [
     "OrderRepository",
     "PositionSnapshotRepository",
     "WalletSnapshotRepository",
+    # Utils
+    "redact_db_url",
 ]

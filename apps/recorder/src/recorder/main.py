@@ -11,26 +11,14 @@ import asyncio
 import logging
 import sys
 from typing import Optional
-from urllib.parse import urlparse, urlunparse
 
-from grid_db import DatabaseFactory, DatabaseSettings
+from grid_db import DatabaseFactory, DatabaseSettings, redact_db_url
 
 from recorder.config import load_config
 from recorder.recorder import Recorder
 
 
 logger = logging.getLogger(__name__)
-
-
-def _sanitize_url(url: str) -> str:
-    """Strip password from a database URL for safe logging."""
-    parsed = urlparse(url)
-    if not parsed.password:
-        return url
-    host = parsed.hostname or ""
-    if parsed.port:
-        host += f":{parsed.port}"
-    return urlunparse(parsed._replace(netloc=f"{parsed.username}:***@{host}"))
 
 
 def setup_logging(debug: bool = False) -> None:
@@ -80,7 +68,7 @@ async def main(config_path: Optional[str] = None) -> int:
     logger.info("Recorder configuration:")
     logger.info(f"  Symbols: {config.symbols}")
     logger.info(f"  Testnet: {config.testnet}")
-    logger.info(f"  Database: {_sanitize_url(config.database_url)}")
+    logger.info(f"  Database: {redact_db_url(config.database_url)}")
     logger.info(f"  Private streams: {config.account is not None}")
     logger.info(f"  Health log interval: {config.health_log_interval}s")
 
