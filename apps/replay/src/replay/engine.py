@@ -357,7 +357,7 @@ class ReplayEngine:
         runner: BacktestRunner,
         session: BacktestSession,
         last_price: Decimal,
-        last_timestamp,
+        last_timestamp: Optional[datetime],
     ) -> None:
         """Force close open positions at last price."""
         for direction, tracker, close_side in [
