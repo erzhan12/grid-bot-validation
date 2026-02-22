@@ -255,6 +255,9 @@ def _build_funding_fields(funding: FundingData, funding_max_pages: int) -> list[
     fields.append(_info_field(
         "Cum Funding (from tx log)",
         funding.cumulative_funding,
+    ))
+    fields.append(_info_field(
+        "Funding Record Count",
         f"{funding.transaction_count} records",
     ))
 
@@ -269,11 +272,11 @@ def _build_funding_fields(funding: FundingData, funding_max_pages: int) -> list[
 
     if funding.truncated:
         fields.append(FieldComparison(
-            field_name="Funding Data Warning",
+            field_name="Funding Data Truncated",
             bybit_value="—",
             our_value=f"Truncated at {funding_max_pages} pages; total may be incomplete",
             delta="—",
-            passed=None,
+            passed=False,
         ))
 
     return fields

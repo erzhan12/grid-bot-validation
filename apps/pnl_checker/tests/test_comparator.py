@@ -255,3 +255,14 @@ class TestCompare:
         assert result.all_passed is False
         field_names = [f.field_name for f in result.positions[0].fields]
         assert "Funding Fetch Error" in field_names
+
+    def test_truncated_funding_causes_fail(self):
+        """When funding data is truncated, comparison should fail."""
+        fetch, calc = self._make_test_data()
+        fetch.symbols[0].funding.truncated = True
+
+        result = compare(fetch, calc, tolerance=0.01)
+
+        assert result.all_passed is False
+        field_names = [f.field_name for f in result.positions[0].fields]
+        assert "Funding Data Truncated" in field_names
