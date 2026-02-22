@@ -14,7 +14,7 @@ from pnl_checker.comparator import ComparisonResult, PositionComparison, FieldCo
 
 def _make_config():
     return PnlCheckerConfig(
-        account={"api_key": "k", "api_secret": "s"},
+        account={"api_key": "test_key_0123456789", "api_secret": "test_secret_0123456789"},
         symbols=[{"symbol": "BTCUSDT", "tick_size": "0.1"}],
     )
 

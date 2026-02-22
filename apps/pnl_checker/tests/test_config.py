@@ -13,7 +13,7 @@ class TestPnlCheckerConfigDefaults:
 
     def _minimal_config(self, **overrides):
         data = {
-            "account": {"api_key": "k", "api_secret": "s"},
+            "account": {"api_key": "test_key_0123456789", "api_secret": "test_secret_0123456789"},
             "symbols": [{"symbol": "BTCUSDT", "tick_size": "0.1"}],
         }
         data.update(overrides)
@@ -47,7 +47,7 @@ class TestPnlCheckerConfigDefaults:
     def test_tick_size_from_float(self):
         """tick_size can be provided as a float and gets converted."""
         data = {
-            "account": {"api_key": "k", "api_secret": "s"},
+            "account": {"api_key": "test_key_0123456789", "api_secret": "test_secret_0123456789"},
             "symbols": [{"symbol": "BTCUSDT", "tick_size": 0.01}],
         }
         cfg = PnlCheckerConfig(**data)
@@ -67,7 +67,7 @@ class TestLoadConfig:
 
     def test_loads_from_path(self, tmp_path):
         config_data = {
-            "account": {"api_key": "mykey", "api_secret": "mysecret"},
+            "account": {"api_key": "mykey_0123456789", "api_secret": "mysecret_0123456789"},
             "symbols": [{"symbol": "ETHUSDT", "tick_size": "0.01"}],
             "tolerance": 0.05,
             "funding_max_pages": 10,
@@ -77,7 +77,7 @@ class TestLoadConfig:
 
         cfg = load_config(str(config_file))
 
-        assert cfg.account.api_key == "mykey"
+        assert cfg.account.api_key == "mykey_0123456789"
         assert cfg.tolerance == 0.05
         assert cfg.funding_max_pages == 10
         assert len(cfg.symbols) == 1
@@ -89,7 +89,7 @@ class TestLoadConfig:
 
     def test_env_var_path(self, tmp_path, monkeypatch):
         config_data = {
-            "account": {"api_key": "envkey", "api_secret": "envsecret"},
+            "account": {"api_key": "envkey_0123456789", "api_secret": "envsecret_0123456789"},
             "symbols": [{"symbol": "BTCUSDT", "tick_size": "0.1"}],
         }
         config_file = tmp_path / "env_config.yaml"
@@ -99,7 +99,7 @@ class TestLoadConfig:
 
         cfg = load_config()
 
-        assert cfg.account.api_key == "envkey"
+        assert cfg.account.api_key == "envkey_0123456789"
 
 
 class TestAccountEnvVars:
@@ -107,25 +107,25 @@ class TestAccountEnvVars:
 
     def _minimal_data(self):
         return {
-            "account": {"api_key": "yaml_key", "api_secret": "yaml_secret"},
+            "account": {"api_key": "yaml_key_0123456789", "api_secret": "yaml_secret_0123456789"},
             "symbols": [{"symbol": "BTCUSDT", "tick_size": "0.1"}],
         }
 
     def test_env_vars_override_yaml(self, monkeypatch):
-        monkeypatch.setenv("BYBIT_API_KEY", "env_key")
-        monkeypatch.setenv("BYBIT_API_SECRET", "env_secret")
+        monkeypatch.setenv("BYBIT_API_KEY", "env_key_0123456789")
+        monkeypatch.setenv("BYBIT_API_SECRET", "env_secret_0123456789")
         cfg = PnlCheckerConfig(**self._minimal_data())
 
-        assert cfg.account.api_key == "env_key"
-        assert cfg.account.api_secret == "env_secret"
+        assert cfg.account.api_key == "env_key_0123456789"
+        assert cfg.account.api_secret == "env_secret_0123456789"
 
     def test_partial_env_var_overrides_only_that_field(self, monkeypatch):
-        monkeypatch.setenv("BYBIT_API_KEY", "env_key")
+        monkeypatch.setenv("BYBIT_API_KEY", "env_key_0123456789")
         monkeypatch.delenv("BYBIT_API_SECRET", raising=False)
         cfg = PnlCheckerConfig(**self._minimal_data())
 
-        assert cfg.account.api_key == "env_key"
-        assert cfg.account.api_secret == "yaml_secret"
+        assert cfg.account.api_key == "env_key_0123456789"
+        assert cfg.account.api_secret == "yaml_secret_0123456789"
 
     def test_missing_credentials_raises(self, monkeypatch):
         monkeypatch.delenv("BYBIT_API_KEY", raising=False)
@@ -137,14 +137,34 @@ class TestAccountEnvVars:
         with pytest.raises(Exception, match="API credentials required"):
             PnlCheckerConfig(**data)
 
+    def test_short_api_key_rejected(self, monkeypatch):
+        monkeypatch.delenv("BYBIT_API_KEY", raising=False)
+        monkeypatch.delenv("BYBIT_API_SECRET", raising=False)
+        data = {
+            "account": {"api_key": "short", "api_secret": "valid_secret_0123456789"},
+            "symbols": [{"symbol": "BTCUSDT", "tick_size": "0.1"}],
+        }
+        with pytest.raises(Exception, match="api_key appears invalid"):
+            PnlCheckerConfig(**data)
+
+    def test_short_api_secret_rejected(self, monkeypatch):
+        monkeypatch.delenv("BYBIT_API_KEY", raising=False)
+        monkeypatch.delenv("BYBIT_API_SECRET", raising=False)
+        data = {
+            "account": {"api_key": "valid_key_0123456789", "api_secret": "short"},
+            "symbols": [{"symbol": "BTCUSDT", "tick_size": "0.1"}],
+        }
+        with pytest.raises(Exception, match="api_secret appears invalid"):
+            PnlCheckerConfig(**data)
+
     def test_env_only_no_yaml_credentials(self, monkeypatch):
-        monkeypatch.setenv("BYBIT_API_KEY", "env_key")
-        monkeypatch.setenv("BYBIT_API_SECRET", "env_secret")
+        monkeypatch.setenv("BYBIT_API_KEY", "env_key_0123456789")
+        monkeypatch.setenv("BYBIT_API_SECRET", "env_secret_0123456789")
         data = {
             "account": {},
             "symbols": [{"symbol": "BTCUSDT", "tick_size": "0.1"}],
         }
         cfg = PnlCheckerConfig(**data)
 
-        assert cfg.account.api_key == "env_key"
-        assert cfg.account.api_secret == "env_secret"
+        assert cfg.account.api_key == "env_key_0123456789"
+        assert cfg.account.api_secret == "env_secret_0123456789"

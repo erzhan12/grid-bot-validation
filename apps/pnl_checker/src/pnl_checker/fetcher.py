@@ -110,16 +110,26 @@ class BybitFetcher:
             FetchResult with positions, tickers, wallet, and funding data
         """
         result = FetchResult()
+        errors: list[str] = []
 
-        # Fetch wallet balance (account-level)
+        # Fetch wallet balance (account-level, optional — failure is non-fatal)
         try:
             result.wallet = self._fetch_wallet()
         except ConnectionError as e:
-            logger.warning(f"Network error fetching wallet balance: {e}", exc_info=True)
+            logger.warning("Failed to fetch wallet data", extra={
+                "error_type": type(e).__name__, "error_msg": str(e), "recoverable": True,
+            }, exc_info=True)
+            errors.append(f"wallet ({type(e).__name__})")
         except (ValueError, KeyError) as e:
-            logger.warning(f"Invalid wallet response data: {e}", exc_info=True)
+            logger.warning("Failed to fetch wallet data", extra={
+                "error_type": type(e).__name__, "error_msg": str(e), "recoverable": True,
+            }, exc_info=True)
+            errors.append(f"wallet ({type(e).__name__})")
         except Exception as e:
-            logger.warning(f"Failed to fetch wallet balance ({type(e).__name__}): {e}", exc_info=True)
+            logger.warning("Failed to fetch wallet data", extra={
+                "error_type": type(e).__name__, "error_msg": str(e), "recoverable": True,
+            }, exc_info=True)
+            errors.append(f"wallet ({type(e).__name__})")
 
         # Fetch per-symbol data
         for symbol in symbols:
@@ -128,6 +138,14 @@ class BybitFetcher:
                 result.symbols.append(symbol_result)
             else:
                 logger.info(f"No open positions for {symbol}, skipping")
+
+        # Fetch summary
+        ok_symbols = [s.symbol for s in result.symbols]
+        logger.info(
+            f"Fetch complete: {len(ok_symbols)} symbols with positions"
+            f"{', wallet OK' if result.wallet else ', wallet MISSING'}"
+            f"{', errors: ' + ', '.join(errors) if errors else ''}"
+        )
 
         return result
 
@@ -151,6 +169,10 @@ class BybitFetcher:
 
         for pos in raw_positions:
             size = Decimal(pos.get("size", "0"))
+            # Negative sizes should never occur (Bybit always returns >= 0).
+            # We log-and-skip rather than raising because this is a read-only
+            # validation tool — crashing would prevent the rest of the report
+            # from being generated for the remaining symbols.
             if size <= 0:
                 if size < 0:
                     logger.warning(f"Negative position size {size} for {symbol}")

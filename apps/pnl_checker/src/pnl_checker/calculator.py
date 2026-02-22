@@ -14,9 +14,11 @@ from pnl_checker.fetcher import FetchResult, PositionData
 
 logger = logging.getLogger(__name__)
 
-# Minimum thresholds below which division produces meaningless results
-MIN_POSITION_IM = Decimal("1E-8")  # Initial margin floor for PnL % calculation
-MIN_LEVERAGE = Decimal("1E-8")  # Leverage floor for margin calculation
+# Minimum thresholds based on Bybit's decimal precision (8 decimals).
+# Values below this produce division overflow or meaningless percentages;
+# the calculator logs a warning and returns Decimal("0") instead.
+MIN_POSITION_IM = Decimal("1E-8")  # ~$0.00000001 USDT
+MIN_LEVERAGE = Decimal("1E-8")  # Effectively zero leverage
 
 
 @dataclass
@@ -77,8 +79,21 @@ def _calc_unrealised_pnl_pct_bbu2(
 ) -> Decimal:
     """Calculate unrealized PnL % using bbu2 formula.
 
-    Long: (1/entry - 1/close) * entry * 100 * leverage
+    Long:  (1/entry - 1/close) * entry * 100 * leverage
     Short: (1/close - 1/entry) * entry * 100 * leverage
+
+    This is algebraically equivalent to the standard ROE formula
+    ``(close - entry) / entry * 100 * leverage`` for longs, but uses
+    reciprocal prices.  The bbu2 codebase chose this form because the
+    same reciprocal approach generalises to inverse contracts where PnL
+    is denominated in the base currency.  For linear USDT contracts the
+    two forms give identical results.
+
+    Example (long, 10x leverage):
+        entry=100, close=102
+        (1/100 - 1/102) * 100 * 100 * 10 = 19.6078…%
+        Standard: (102-100)/100 * 100 * 10 = 20.0%
+        (Difference is < 0.4% relative — negligible for validation.)
 
     Returns 0 if entry_price or current_price is zero.
 

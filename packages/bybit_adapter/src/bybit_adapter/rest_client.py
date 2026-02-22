@@ -78,6 +78,18 @@ class BybitRestClient:
         )
         self._rate_limiter = RateLimiter(config=self.rate_limit_config)
 
+    def get_rate_limit_status(self) -> dict[str, int | float]:
+        """Return current rate limit status for debugging/monitoring.
+
+        Returns:
+            Dict with available capacity per request type and backoff remaining.
+        """
+        return {
+            "query_available": self._rate_limiter.get_available_capacity("query"),
+            "order_available": self._rate_limiter.get_available_capacity("order"),
+            "backoff_remaining": self._rate_limiter.get_backoff_remaining(),
+        }
+
     def _wait_for_rate_limit(self, request_type: RequestType = "query") -> None:
         """Block until a request slot is available, then record the request."""
         wait = self._rate_limiter.wait_time(request_type)
@@ -616,6 +628,11 @@ class BybitRestClient:
         Returns:
             Tuple of (all transactions, truncated flag).
             truncated is True when max_pages was reached but more data exists.
+
+        Note:
+            If resumable pagination is needed in the future, consider
+            returning the final cursor as a third element so callers
+            can continue where this call left off.
         """
         all_transactions = []
         cursor = None

@@ -145,6 +145,8 @@ def _compare_position(
     ))
 
     # Unrealized PnL % (Bybit standard)
+    # Tolerance is scaled by 100x because ROE values are percentages (0-100+)
+    # while the base tolerance is in USDT (e.g., 0.01 USDT → 1.0% threshold)
     bybit_roe = Decimal("0")
     if pos_data.position_im > 0:
         bybit_roe = pos_data.unrealised_pnl / pos_data.position_im * Decimal("100")
@@ -335,7 +337,12 @@ def compare(
 
             pos_comp = _compare_position(pos_data, calc, tolerance)
 
-            # Attach funding fields only to the first position per symbol
+            # Funding data is per-symbol, but our output is per-position.
+            # In hedge mode a symbol has two positions (long + short); we
+            # attach funding to the first one only to avoid duplicating the
+            # same cumulative total in both rows.  A separate symbol-level
+            # section would be cleaner structurally but adds complexity to
+            # the reporter and JSON schema for little benefit.
             if not funding_attached:
                 pos_comp.fields.extend(_build_funding_fields(funding, funding_max_pages))
                 funding_attached = True

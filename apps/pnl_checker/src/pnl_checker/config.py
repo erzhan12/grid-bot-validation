@@ -38,6 +38,11 @@ class AccountConfig(BaseModel):
                 "API credentials required. Set BYBIT_API_KEY/BYBIT_API_SECRET "
                 "env vars or provide api_key/api_secret in config file."
             )
+        min_credential_length = 10
+        if len(self.api_key) < min_credential_length:
+            raise ValueError(f"api_key appears invalid (too short, got {len(self.api_key)} chars)")
+        if len(self.api_secret) < min_credential_length:
+            raise ValueError(f"api_secret appears invalid (too short, got {len(self.api_secret)} chars)")
         return self
 
 
