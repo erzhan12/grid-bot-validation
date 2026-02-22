@@ -1,27 +1,15 @@
 # 0010 Review: PnL Checker (Post-Fix Re-Review)
 
-## Findings (ordered by severity)
+## Findings
 
-1. **[P3] Cumulative funding is still informational, not a bybit-vs-ours comparison**
-   - The plan says each comparison field should include `bybit_value`, `our_value`, `delta`, and pass/fail, and explicitly maps cumulative funding as:
-     - Bybit: transaction log sum
-     - Ours: `size * mark * rate` snapshot
-     (`docs/features/0010_PLAN.md:142`, `docs/features/0010_PLAN.md:158`)
-   - Current implementation keeps funding as info-only fields:
-     - `Cum Funding (from tx log)` with only Bybit value (`apps/pnl_checker/src/pnl_checker/comparator.py:255`)
-     - `Funding Record Count` metadata (`apps/pnl_checker/src/pnl_checker/comparator.py:259`)
-     - Snapshot remains separate as another info field (`Funding Snapshot (cur rate)` in position comparison)
-   - Net effect: no numeric funding delta/pass check is produced.
-   - **Recommendation:** Either:
-     - implement a numeric funding comparison row (bybit vs snapshot with delta), or
-     - update the plan/docs to explicitly define funding as informational-only to match actual behavior.
+No actionable code findings were identified in the current implementation.
 
-## Resolved Since Last Review
+The previously reported funding comparison mismatch is now resolved at the spec level: `docs/features/0010_PLAN.md` explicitly defines cumulative funding and funding snapshot as informational-only fields, which matches current comparator behavior.
 
-- Prior issues were fixed:
-  - truncated funding now fails comparison,
-  - comparator test was added for truncated-funding failure,
-  - funding row labeling is clearer and no longer implies record count is "ours funding value."
+## Residual Risks / Testing Gaps
+
+- `main.py` and `reporter.py` are covered by tests but still have lower coverage than calculation/comparison modules (see coverage summary below).
+- This remains a read-only live-data tool; end-to-end behavior against real Bybit responses (timing drift, account-specific edge cases) is only partially represented by unit mocks.
 
 ## Validation Performed
 
