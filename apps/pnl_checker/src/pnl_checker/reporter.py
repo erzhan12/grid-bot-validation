@@ -171,12 +171,13 @@ def save_json(result: ComparisonResult, config: PnlCheckerConfig, output_dir: st
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    now = datetime.now(UTC)
+    timestamp = now.strftime("%Y%m%d_%H%M%S")
     filename = f"pnl_check_{timestamp}.json"
     filepath = output_path / filename
 
     data = {
-        "timestamp": datetime.now(UTC).isoformat(),
+        "timestamp": now.isoformat(),
         "tolerance": result.tolerance,
         "config": _redact_config(config),
         "summary": {

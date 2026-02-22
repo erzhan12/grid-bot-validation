@@ -30,6 +30,7 @@ def setup_logging(debug: bool = False) -> None:
     console_handler.setFormatter(console_formatter)
 
     root_logger = logging.getLogger()
+    root_logger.handlers.clear()
     root_logger.setLevel(logging.DEBUG if debug else logging.INFO)
     root_logger.addHandler(console_handler)
 

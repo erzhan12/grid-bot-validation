@@ -10,7 +10,7 @@ from pnl_checker.comparator import ComparisonResult, PositionComparison, FieldCo
 
 def _make_config(**overrides):
     data = {
-        "account": {"api_key": "real_key_123", "api_secret": "real_secret_456"},
+        "account": {"api_key": "real_key_0123456789", "api_secret": "real_secret_0123456789"},
         "symbols": [{"symbol": "BTCUSDT", "tick_size": "0.1"}],
     }
     data.update(overrides)
