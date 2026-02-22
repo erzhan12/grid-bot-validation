@@ -1,39 +1,31 @@
-# 0010 Review: PnL Checker (Post-Fix Pass)
+# 0010 Review: PnL Checker (Post-Fix Re-Review)
 
 ## Findings (ordered by severity)
 
-1. **[P2] "Cum Funding (from tx log)" does not show an "ours" funding value**
-   - `apps/pnl_checker/src/pnl_checker/comparator.py:255` creates the cumulative funding row.
-   - `apps/pnl_checker/src/pnl_checker/comparator.py:258` sets `our_value` to `"{transaction_count} records"` instead of a funding calculation.
-   - This means the `[Bybit | Ours | Delta | Status]` table is not actually comparing funding values for that row, and it diverges from the plan’s funding comparison intent.
-   - **Recommendation:** Put a numeric "ours" funding value on this row (or rename/split fields clearly so this is not interpreted as a value comparison).
+1. **[P3] Cumulative funding is still informational, not a bybit-vs-ours comparison**
+   - The plan says each comparison field should include `bybit_value`, `our_value`, `delta`, and pass/fail, and explicitly maps cumulative funding as:
+     - Bybit: transaction log sum
+     - Ours: `size * mark * rate` snapshot
+     (`docs/features/0010_PLAN.md:142`, `docs/features/0010_PLAN.md:158`)
+   - Current implementation keeps funding as info-only fields:
+     - `Cum Funding (from tx log)` with only Bybit value (`apps/pnl_checker/src/pnl_checker/comparator.py:255`)
+     - `Funding Record Count` metadata (`apps/pnl_checker/src/pnl_checker/comparator.py:259`)
+     - Snapshot remains separate as another info field (`Funding Snapshot (cur rate)` in position comparison)
+   - Net effect: no numeric funding delta/pass check is produced.
+   - **Recommendation:** Either:
+     - implement a numeric funding comparison row (bybit vs snapshot with delta), or
+     - update the plan/docs to explicitly define funding as informational-only to match actual behavior.
 
-2. **[P2] Truncated funding history can still produce overall PASS**
-   - `apps/pnl_checker/src/pnl_checker/comparator.py:270` adds `"Funding Data Warning"` with `passed=None`.
-   - `apps/pnl_checker/src/pnl_checker/comparator.py:73` defines `all_passed` only as `total_fail == 0`.
-   - Result: a run can report `ALL CHECKS PASSED` while funding data is explicitly marked incomplete.
-   - **Recommendation:** Treat truncation as a failure (`passed=False`) or fail earlier when truncation is detected.
+## Resolved Since Last Review
 
-3. **[P3] Missing comparator test coverage for truncated-funding behavior**
-   - `apps/pnl_checker/tests/test_fetcher.py:116` verifies `truncated=True` is captured by fetcher.
-   - `apps/pnl_checker/tests/test_comparator.py` has no test asserting comparator/verdict behavior when `funding.truncated=True`.
-   - **Recommendation:** Add a comparator test that verifies expected verdict semantics for truncated funding (warning-only vs fail).
-
-## Plan Compliance Summary
-
-- Previously reported core issues are fixed:
-  - mark-price snapshot mismatch fixed (calculator now uses position mark price),
-  - funding double-counting per hedge sides fixed (attached once per symbol),
-  - missing calculation now fails,
-  - funding pagination truncation is surfaced,
-  - JSON now includes redacted config,
-  - missing test modules were added,
-  - lint issues were resolved.
-- Remaining plan/behavior gap is funding comparison semantics for the cumulative funding row.
+- Prior issues were fixed:
+  - truncated funding now fails comparison,
+  - comparator test was added for truncated-funding failure,
+  - funding row labeling is clearer and no longer implies record count is "ours funding value."
 
 ## Validation Performed
 
-- `uv run pytest apps/pnl_checker/tests -q` -> **60 passed**
+- `uv run pytest apps/pnl_checker/tests -q` -> **61 passed**
 - `uv run pytest apps/pnl_checker/tests --cov=pnl_checker --cov-report=term-missing -q` -> **91% total coverage**
 - `uv run ruff check apps/pnl_checker/src apps/pnl_checker/tests` -> **all checks passed**
 - `uv run pytest packages/bybit_adapter/tests/test_rest_client.py -q` -> **56 passed**
