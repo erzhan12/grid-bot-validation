@@ -555,3 +555,130 @@ class TestInit:
             BybitRestClient(api_key="k", api_secret="s")
 
             mock_http.assert_called_once_with(testnet=True, api_key="k", api_secret="s")
+
+
+# ---------------------------------------------------------------------------
+# get_tickers
+# ---------------------------------------------------------------------------
+
+
+class TestGetTickers:
+    def test_returns_first_ticker(self, client, mock_session):
+        ticker = {"lastPrice": "100000", "markPrice": "100001", "fundingRate": "0.0001"}
+        mock_session.get_tickers.return_value = _ok_response({"list": [ticker]})
+
+        result = client.get_tickers(symbol="BTCUSDT")
+
+        assert result == ticker
+        mock_session.get_tickers.assert_called_once_with(
+            category="linear", symbol="BTCUSDT"
+        )
+
+    def test_empty_list_raises(self, client, mock_session):
+        mock_session.get_tickers.return_value = _ok_response({"list": []})
+
+        with pytest.raises(Exception, match="No ticker data"):
+            client.get_tickers(symbol="BTCUSDT")
+
+    def test_api_error_raises(self, client, mock_session):
+        mock_session.get_tickers.return_value = _error_response(10001, "Invalid symbol")
+
+        with pytest.raises(Exception, match="Invalid symbol"):
+            client.get_tickers(symbol="INVALID")
+
+
+# ---------------------------------------------------------------------------
+# get_transaction_log
+# ---------------------------------------------------------------------------
+
+
+class TestGetTransactionLog:
+    def test_returns_transactions_and_cursor(self, client, mock_session):
+        txns = [{"transactionTime": "1234", "funding": "-0.01"}]
+        mock_session.get_transaction_log.return_value = _ok_response(
+            {"list": txns, "nextPageCursor": "cursor456"}
+        )
+
+        result, cursor = client.get_transaction_log(symbol="BTCUSDT", type="SETTLEMENT")
+
+        assert result == txns
+        assert cursor == "cursor456"
+
+    def test_no_cursor_returns_none(self, client, mock_session):
+        mock_session.get_transaction_log.return_value = _ok_response(
+            {"list": [], "nextPageCursor": ""}
+        )
+
+        result, cursor = client.get_transaction_log(symbol="BTCUSDT")
+
+        assert result == []
+        assert cursor is None
+
+    def test_passes_optional_params(self, client, mock_session):
+        mock_session.get_transaction_log.return_value = _ok_response(
+            {"list": [], "nextPageCursor": ""}
+        )
+
+        client.get_transaction_log(
+            symbol="ETHUSDT", type="SETTLEMENT",
+            start_time=1000, end_time=2000, cursor="c1",
+        )
+
+        call_kwargs = mock_session.get_transaction_log.call_args[1]
+        assert call_kwargs["symbol"] == "ETHUSDT"
+        assert call_kwargs["type"] == "SETTLEMENT"
+        assert call_kwargs["startTime"] == 1000
+        assert call_kwargs["endTime"] == 2000
+        assert call_kwargs["cursor"] == "c1"
+
+    def test_api_error_raises(self, client, mock_session):
+        mock_session.get_transaction_log.return_value = _error_response(10002, "Auth failed")
+
+        with pytest.raises(Exception, match="Auth failed"):
+            client.get_transaction_log(symbol="BTCUSDT")
+
+
+# ---------------------------------------------------------------------------
+# get_transaction_log_all (pagination + truncated flag)
+# ---------------------------------------------------------------------------
+
+
+class TestGetTransactionLogAll:
+    def test_single_page(self, client, mock_session):
+        txns = [{"funding": "-0.01"}]
+        mock_session.get_transaction_log.return_value = _ok_response(
+            {"list": txns, "nextPageCursor": ""}
+        )
+
+        result, truncated = client.get_transaction_log_all(symbol="BTCUSDT")
+
+        assert result == txns
+        assert truncated is False
+        assert mock_session.get_transaction_log.call_count == 1
+
+    def test_multi_page_follows_cursor(self, client, mock_session):
+        page1 = [{"funding": "-0.01"}]
+        page2 = [{"funding": "-0.02"}]
+        mock_session.get_transaction_log.side_effect = [
+            _ok_response({"list": page1, "nextPageCursor": "cursor2"}),
+            _ok_response({"list": page2, "nextPageCursor": ""}),
+        ]
+
+        result, truncated = client.get_transaction_log_all(symbol="BTCUSDT")
+
+        assert len(result) == 2
+        assert truncated is False
+        assert mock_session.get_transaction_log.call_count == 2
+
+    def test_stops_at_max_pages_and_returns_truncated(self, client, mock_session):
+        mock_session.get_transaction_log.return_value = _ok_response(
+            {"list": [{"funding": "-0.01"}], "nextPageCursor": "more"}
+        )
+
+        result, truncated = client.get_transaction_log_all(
+            symbol="BTCUSDT", max_pages=3
+        )
+
+        assert len(result) == 3
+        assert truncated is True
+        assert mock_session.get_transaction_log.call_count == 3

@@ -15,12 +15,14 @@ Reference:
 - Wallet Balance: https://bybit-exchange.github.io/docs/v5/account/wallet-balance
 """
 
+import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Optional
 import logging
 
 from pybit.unified_trading import HTTP
+
+from bybit_adapter.rate_limiter import RateLimiter, RateLimitConfig, RequestType
 
 
 logger = logging.getLogger(__name__)
@@ -62,16 +64,39 @@ class BybitRestClient:
     api_key: str
     api_secret: str
     testnet: bool = True
+    rate_limit_config: RateLimitConfig = field(default_factory=lambda: RateLimitConfig(query_rate=10))
 
     _session: Optional[HTTP] = field(default=None, init=False, repr=False)
+    _rate_limiter: RateLimiter = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
-        """Initialize HTTP session."""
+        """Initialize HTTP session and rate limiter."""
         self._session = HTTP(
             testnet=self.testnet,
             api_key=self.api_key,
             api_secret=self.api_secret,
         )
+        self._rate_limiter = RateLimiter(config=self.rate_limit_config)
+
+    def get_rate_limit_status(self) -> dict[str, int | float]:
+        """Return current rate limit status for debugging/monitoring.
+
+        Returns:
+            Dict with available capacity per request type and backoff remaining.
+        """
+        return {
+            "query_available": self._rate_limiter.get_available_capacity("query"),
+            "order_available": self._rate_limiter.get_available_capacity("order"),
+            "backoff_remaining": self._rate_limiter.get_backoff_remaining(),
+        }
+
+    def _wait_for_rate_limit(self, request_type: RequestType = "query") -> None:
+        """Block until a request slot is available, then record the request."""
+        wait = self._rate_limiter.wait_time(request_type)
+        if wait > 0:
+            logger.debug(f"Rate limit: waiting {wait:.3f}s before {request_type} request")
+            time.sleep(wait)
+        self._rate_limiter.record_request(request_type)
 
     def get_recent_trades(
         self,
@@ -91,6 +116,7 @@ class BybitRestClient:
             Exception: If API call fails
         """
         logger.debug(f"Fetching recent trades for {symbol}, limit={limit}")
+        self._wait_for_rate_limit("query")
 
         response = self._session.get_public_trade_history(
             category="linear",
@@ -128,6 +154,7 @@ class BybitRestClient:
             Exception: If API call fails
         """
         logger.debug(f"Fetching executions for {symbol}, start={start_time}, end={end_time}")
+        self._wait_for_rate_limit("query")
 
         params = {
             "category": "linear",
@@ -217,6 +244,7 @@ class BybitRestClient:
             Exception: If API call fails
         """
         logger.debug(f"Fetching order history for {symbol}")
+        self._wait_for_rate_limit("query")
 
         params = {
             "category": "linear",
@@ -254,6 +282,7 @@ class BybitRestClient:
             Exception: If API call fails
         """
         logger.debug(f"Fetching positions for {symbol or 'all symbols'}")
+        self._wait_for_rate_limit("query")
 
         params = {
             "category": "linear",
@@ -282,6 +311,7 @@ class BybitRestClient:
             Exception: If API call fails
         """
         logger.debug(f"Fetching wallet balance for {account_type}")
+        self._wait_for_rate_limit("query")
 
         response = self._session.get_wallet_balance(accountType=account_type)
         self._check_response(response, "get_wallet_balance")
@@ -327,6 +357,7 @@ class BybitRestClient:
             bbu_reference/bbu2-master/bybit_api_usdt.py:315-329
         """
         logger.info(f"Placing {order_type} {side} order: {symbol} qty={qty} price={price}")
+        self._wait_for_rate_limit("order")
 
         params = {
             "category": "linear",
@@ -379,6 +410,7 @@ class BybitRestClient:
             raise ValueError("Either order_id or order_link_id must be provided")
 
         logger.info(f"Canceling order: {symbol} order_id={order_id} order_link_id={order_link_id}")
+        self._wait_for_rate_limit("order")
 
         params = {
             "category": "linear",
@@ -392,7 +424,7 @@ class BybitRestClient:
         try:
             response = self._session.cancel_order(**params)
             self._check_response(response, "cancel_order")
-            logger.info(f"Order cancelled successfully")
+            logger.info("Order cancelled successfully")
             return True
         except Exception as e:
             # Order may already be filled or cancelled
@@ -415,6 +447,7 @@ class BybitRestClient:
             bbu_reference/bbu2-master/bybit_api_usdt.py:450-452
         """
         logger.info(f"Canceling all orders for {symbol}")
+        self._wait_for_rate_limit("order")
 
         response = self._session.cancel_all_orders(
             category="linear",
@@ -453,9 +486,11 @@ class BybitRestClient:
         logger.debug(f"Fetching open orders for {symbol or 'all symbols'}")
 
         all_orders = []
+        # Note: _wait_for_rate_limit is called inside the loop before each page request
         cursor = None
 
         while True:
+            self._wait_for_rate_limit("query")
             params = {
                 "category": "linear",
                 "limit": min(limit, 50),
@@ -484,6 +519,142 @@ class BybitRestClient:
 
         logger.debug(f"Fetched {len(all_orders)} open {order_type} orders")
         return all_orders
+
+    def get_tickers(self, symbol: str) -> dict:
+        """Fetch ticker data for a symbol.
+
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+
+        Returns:
+            Ticker dict with lastPrice, markPrice, fundingRate, etc.
+
+        Raises:
+            Exception: If API call fails
+
+        Reference:
+            https://bybit-exchange.github.io/docs/v5/market/tickers
+        """
+        logger.debug(f"Fetching tickers for {symbol}")
+        self._wait_for_rate_limit("query")
+
+        response = self._session.get_tickers(
+            category="linear",
+            symbol=symbol,
+        )
+        self._check_response(response, "get_tickers")
+
+        tickers = response.get("result", {}).get("list", [])
+        if not tickers:
+            raise Exception(f"No ticker data returned for {symbol}")
+
+        logger.debug(f"Fetched ticker for {symbol}")
+        return tickers[0]
+
+    def get_transaction_log(
+        self,
+        symbol: Optional[str] = None,
+        type: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        limit: int = 50,
+        cursor: Optional[str] = None,
+    ) -> tuple[list[dict], Optional[str]]:
+        """Fetch transaction log (for funding fees, settlements, etc.).
+
+        Args:
+            symbol: Filter by symbol (optional)
+            type: Transaction type filter (e.g., "SETTLEMENT" for funding)
+            start_time: Start time in milliseconds (optional)
+            end_time: End time in milliseconds (optional)
+            limit: Maximum results per page (max 50)
+            cursor: Pagination cursor from previous call
+
+        Returns:
+            Tuple of (transactions list, next_cursor or None)
+
+        Raises:
+            Exception: If API call fails
+
+        Reference:
+            https://bybit-exchange.github.io/docs/v5/account/transaction-log
+        """
+        logger.debug(f"Fetching transaction log for {symbol}, type={type}")
+        self._wait_for_rate_limit("query")
+
+        params = {
+            "accountType": "UNIFIED",
+            "category": "linear",
+            "limit": min(limit, 50),
+        }
+        if symbol:
+            params["symbol"] = symbol
+        if type:
+            params["type"] = type
+        if start_time:
+            params["startTime"] = start_time
+        if end_time:
+            params["endTime"] = end_time
+        if cursor:
+            params["cursor"] = cursor
+
+        response = self._session.get_transaction_log(**params)
+        self._check_response(response, "get_transaction_log")
+
+        result = response.get("result", {})
+        transactions = result.get("list", [])
+        next_cursor = result.get("nextPageCursor")
+
+        logger.debug(f"Fetched {len(transactions)} transactions, has_more={bool(next_cursor)}")
+        return transactions, next_cursor if next_cursor else None
+
+    def get_transaction_log_all(
+        self,
+        symbol: Optional[str] = None,
+        type: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        max_pages: int = 20,
+    ) -> tuple[list[dict], bool]:
+        """Fetch all transaction log entries with automatic pagination.
+
+        Args:
+            symbol: Filter by symbol (optional)
+            type: Transaction type filter (e.g., "SETTLEMENT")
+            start_time: Start time in milliseconds (optional)
+            end_time: End time in milliseconds (optional)
+            max_pages: Maximum number of pages to fetch (safety limit)
+
+        Returns:
+            Tuple of (all transactions, truncated flag).
+            truncated is True when max_pages was reached but more data exists.
+
+        Note:
+            If resumable pagination is needed in the future, consider
+            returning the final cursor as a third element so callers
+            can continue where this call left off.
+        """
+        all_transactions = []
+        cursor = None
+        page = 0
+
+        while page < max_pages:
+            transactions, cursor = self.get_transaction_log(
+                symbol=symbol,
+                type=type,
+                start_time=start_time,
+                end_time=end_time,
+                cursor=cursor,
+            )
+            all_transactions.extend(transactions)
+            page += 1
+
+            if not cursor:
+                break
+
+        truncated = page >= max_pages and cursor is not None
+        logger.info(f"Fetched {len(all_transactions)} total transactions across {page} pages (truncated={truncated})")
+        return all_transactions, truncated
 
     def _check_response(self, response: dict, method: str) -> None:
         """Check API response for errors.

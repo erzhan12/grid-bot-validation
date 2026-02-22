@@ -1662,6 +1662,38 @@ Replay engine that reads recorded mainnet data from the recorder's database, fee
 4. **`datetime.fromisoformat()` requires Python 3.11+** for full timezone offset support. Earlier versions don't handle `+00:00`.
 5. **Test for `ValidationError` not `Exception`**: Pydantic config validation tests should use `from pydantic import ValidationError` for specific assertions.
 
+## Phase K: PnL Checker (`apps/pnl_checker/`)
+
+### Overview
+Read-only tool that fetches live Bybit data and compares our PnL/margin calculations against exchange-reported values.
+
+**Pipeline**: `fetcher.py` → `calculator.py` → `comparator.py` → `reporter.py`, orchestrated by `main.py`.
+
+### Key Implementation Notes
+
+1. **Mark Price Source**: Use `pos.mark_price` (from position endpoint) NOT `ticker.mark_price` (from ticker endpoint) for unrealized PnL — matches what Bybit uses for `unrealisedPnl` in the same API response.
+
+2. **Funding Data Is Informational**: Funding records from transaction log are display-only (no tolerance check). Attach funding fields to the first position per symbol only (avoid duplication in hedge mode).
+
+3. **Rate Limiting**: `BybitRestClient` integrates `RateLimiter` with 10 req/sec for queries (well under Bybit's 50 req/sec). All API methods call `_wait_for_rate_limit()` before making requests.
+
+4. **Division Guard Constants**: `MIN_POSITION_IM` and `MIN_LEVERAGE` in `calculator.py` prevent division by near-zero values. Warnings are logged when these guards activate.
+
+5. **Environment Variable Credentials**: `BYBIT_API_KEY`/`BYBIT_API_SECRET` env vars override YAML config values via Pydantic `model_validator`. Config file uses `default=""` to allow empty values when env vars are set.
+
+6. **Symbol Validation**: `_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{4,20}$")` in `config.py`. Bybit symbols are uppercase alphanumeric only.
+
+7. **`get_transaction_log_all()` Return Type**: Returns `tuple[list[dict], bool]` — the bool indicates whether data was truncated at `max_pages`. Callers must handle the truncation flag.
+
+8. **Config Redaction**: `_redact_config()` in `reporter.py` replaces API credentials with `[REDACTED]` before writing to JSON output. Never serialize raw `AccountConfig` to files.
+
+### Common Pitfalls (PnL Checker)
+
+1. **`liqPrice` can be empty string**: Bybit returns `""` for liq price when not applicable. Use `Decimal(pos.get("liqPrice", "0") or "0")` — the `or "0"` handles empty string.
+2. **Tolerance scaling for percentages**: PnL % values are 100x USDT values. Use `PERCENTAGE_TOLERANCE_MULTIPLIER = 100` in `comparator.py` to scale tolerance for ROE comparisons.
+3. **Test coverage**: Currently at 92%. Run: `uv run pytest apps/pnl_checker/tests --cov=pnl_checker --cov-report=term-missing -v`
+4. **Workspace dependency**: `pnl-checker` must be in root `pyproject.toml` dev deps AND `tool.uv.sources` for test discovery to work.
+
 ## Next Steps (Future Phases)
 
 - Phase I: Deployment & Monitoring
