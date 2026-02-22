@@ -3,7 +3,9 @@
 from decimal import Decimal
 from unittest.mock import patch, MagicMock
 
-from pnl_checker.main import main
+import pytest
+
+from pnl_checker.main import main, cli
 from pnl_checker.config import PnlCheckerConfig
 from pnl_checker.fetcher import FetchResult, SymbolFetchResult, PositionData, TickerData, FundingData, WalletData
 from pnl_checker.calculator import CalculationResult
@@ -157,3 +159,13 @@ class TestMain:
         mock_compare.return_value = _make_failing_comparison()
 
         assert main() == 1
+
+
+class TestCli:
+    """Test CLI argument validation."""
+
+    def test_negative_tolerance_rejected(self, monkeypatch):
+        """Negative tolerance should cause argparse error."""
+        monkeypatch.setattr("sys.argv", ["pnl_checker", "--tolerance", "-0.5"])
+        with pytest.raises(SystemExit, match="2"):
+            cli()

@@ -147,6 +147,9 @@ def cli() -> None:
 
     args = parser.parse_args()
 
+    if args.tolerance is not None and args.tolerance < 0:
+        parser.error("Tolerance must be non-negative")
+
     try:
         exit_code = main(
             config_path=args.config,

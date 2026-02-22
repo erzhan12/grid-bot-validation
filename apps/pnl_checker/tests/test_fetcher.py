@@ -137,3 +137,13 @@ class TestBybitFetcher:
             type="SETTLEMENT",
             max_pages=5,
         )
+
+    def test_wallet_fetch_failure_returns_none(self):
+        client = self._make_client()
+        client.get_wallet_balance.side_effect = Exception("Auth failed")
+        fetcher = BybitFetcher(client)
+        result = fetcher.fetch_all(["BTCUSDT"])
+
+        assert result.wallet is None
+        # Positions should still be fetched successfully
+        assert len(result.symbols) == 1

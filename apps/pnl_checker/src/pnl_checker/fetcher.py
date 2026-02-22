@@ -112,7 +112,10 @@ class BybitFetcher:
         result = FetchResult()
 
         # Fetch wallet balance (account-level)
-        result.wallet = self._fetch_wallet()
+        try:
+            result.wallet = self._fetch_wallet()
+        except Exception as e:
+            logger.warning(f"Failed to fetch wallet balance: {e}")
 
         # Fetch per-symbol data
         for symbol in symbols:
