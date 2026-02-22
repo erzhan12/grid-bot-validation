@@ -1,0 +1,24 @@
+# PnL Checker Configuration
+# Copy to conf/pnl_checker.yaml and fill in your API credentials
+
+account:
+  api_key: "YOUR_API_KEY"
+  api_secret: "YOUR_API_SECRET"
+
+symbols:
+  - symbol: "BTCUSDT"
+    tick_size: "0.1"
+  - symbol: "ETHUSDT"
+    tick_size: "0.01"
+
+risk_params:
+  min_liq_ratio: 0.8
+  max_liq_ratio: 1.2
+  max_margin: 8.0
+  min_total_margin: 0.15
+
+# Max pages to fetch for funding transaction log (50 records per page)
+funding_max_pages: 20
+
+# USDT tolerance for pass/fail (can be overridden with --tolerance CLI arg)
+tolerance: 0.01

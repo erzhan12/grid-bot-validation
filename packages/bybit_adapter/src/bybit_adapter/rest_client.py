@@ -485,6 +485,135 @@ class BybitRestClient:
         logger.debug(f"Fetched {len(all_orders)} open {order_type} orders")
         return all_orders
 
+    def get_tickers(self, symbol: str) -> dict:
+        """Fetch ticker data for a symbol.
+
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+
+        Returns:
+            Ticker dict with lastPrice, markPrice, fundingRate, etc.
+
+        Raises:
+            Exception: If API call fails
+
+        Reference:
+            https://bybit-exchange.github.io/docs/v5/market/tickers
+        """
+        logger.debug(f"Fetching tickers for {symbol}")
+
+        response = self._session.get_tickers(
+            category="linear",
+            symbol=symbol,
+        )
+        self._check_response(response, "get_tickers")
+
+        tickers = response.get("result", {}).get("list", [])
+        if not tickers:
+            raise Exception(f"No ticker data returned for {symbol}")
+
+        logger.debug(f"Fetched ticker for {symbol}")
+        return tickers[0]
+
+    def get_transaction_log(
+        self,
+        symbol: Optional[str] = None,
+        type: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        limit: int = 50,
+        cursor: Optional[str] = None,
+    ) -> tuple[list[dict], Optional[str]]:
+        """Fetch transaction log (for funding fees, settlements, etc.).
+
+        Args:
+            symbol: Filter by symbol (optional)
+            type: Transaction type filter (e.g., "SETTLEMENT" for funding)
+            start_time: Start time in milliseconds (optional)
+            end_time: End time in milliseconds (optional)
+            limit: Maximum results per page (max 50)
+            cursor: Pagination cursor from previous call
+
+        Returns:
+            Tuple of (transactions list, next_cursor or None)
+
+        Raises:
+            Exception: If API call fails
+
+        Reference:
+            https://bybit-exchange.github.io/docs/v5/account/transaction-log
+        """
+        logger.debug(f"Fetching transaction log for {symbol}, type={type}")
+
+        params = {
+            "accountType": "UNIFIED",
+            "category": "linear",
+            "limit": min(limit, 50),
+        }
+        if symbol:
+            params["symbol"] = symbol
+        if type:
+            params["type"] = type
+        if start_time:
+            params["startTime"] = start_time
+        if end_time:
+            params["endTime"] = end_time
+        if cursor:
+            params["cursor"] = cursor
+
+        response = self._session.get_transaction_log(**params)
+        self._check_response(response, "get_transaction_log")
+
+        result = response.get("result", {})
+        transactions = result.get("list", [])
+        next_cursor = result.get("nextPageCursor")
+
+        logger.debug(f"Fetched {len(transactions)} transactions, has_more={bool(next_cursor)}")
+        return transactions, next_cursor if next_cursor else None
+
+    def get_transaction_log_all(
+        self,
+        symbol: Optional[str] = None,
+        type: Optional[str] = None,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        max_pages: int = 20,
+    ) -> tuple[list[dict], bool]:
+        """Fetch all transaction log entries with automatic pagination.
+
+        Args:
+            symbol: Filter by symbol (optional)
+            type: Transaction type filter (e.g., "SETTLEMENT")
+            start_time: Start time in milliseconds (optional)
+            end_time: End time in milliseconds (optional)
+            max_pages: Maximum number of pages to fetch (safety limit)
+
+        Returns:
+            Tuple of (all transactions, truncated flag).
+            truncated is True when max_pages was reached but more data exists.
+        """
+        all_transactions = []
+        cursor = None
+        page = 0
+
+        while page < max_pages:
+            transactions, cursor = self.get_transaction_log(
+                symbol=symbol,
+                type=type,
+                start_time=start_time,
+                end_time=end_time,
+                cursor=cursor,
+            )
+            all_transactions.extend(transactions)
+            page += 1
+
+            if not cursor:
+                break
+
+        truncated = page >= max_pages and cursor is not None
+        logger.info(f"Fetched {len(all_transactions)} total transactions across {page} pages (truncated={truncated})")
+        return all_transactions, truncated
+
     def _check_response(self, response: dict, method: str) -> None:
         """Check API response for errors.
 
