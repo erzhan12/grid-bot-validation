@@ -115,16 +115,6 @@ class BybitFetcher:
         # Fetch wallet balance (account-level, optional — failure is non-fatal)
         try:
             result.wallet = self._fetch_wallet()
-        except ConnectionError as e:
-            logger.warning("Failed to fetch wallet data", extra={
-                "error_type": type(e).__name__, "error_msg": str(e), "recoverable": True,
-            }, exc_info=True)
-            errors.append(f"wallet ({type(e).__name__})")
-        except (ValueError, KeyError) as e:
-            logger.warning("Failed to fetch wallet data", extra={
-                "error_type": type(e).__name__, "error_msg": str(e), "recoverable": True,
-            }, exc_info=True)
-            errors.append(f"wallet ({type(e).__name__})")
         except Exception as e:
             logger.warning("Failed to fetch wallet data", extra={
                 "error_type": type(e).__name__, "error_msg": str(e), "recoverable": True,
