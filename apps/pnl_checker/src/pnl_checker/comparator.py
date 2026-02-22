@@ -9,6 +9,9 @@ from pnl_checker.calculator import CalculationResult, PositionCalcResult
 
 logger = logging.getLogger(__name__)
 
+# PnL % values are 100x larger than USDT values, so tolerance scales accordingly
+PERCENTAGE_TOLERANCE_MULTIPLIER = 100
+
 
 @dataclass
 class FieldComparison:
@@ -149,7 +152,7 @@ def _compare_position(
         "Unrealized PnL % (Bybit ROE)",
         bybit_roe,
         calc.unrealised_pnl_pct_bybit,
-        tolerance * 100,  # % tolerance is wider
+        tolerance * PERCENTAGE_TOLERANCE_MULTIPLIER,
     ))
 
     # --- Informational fields (no check) ---

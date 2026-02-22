@@ -2,6 +2,8 @@
 # Copy to conf/pnl_checker.yaml and fill in your API credentials
 # IMPORTANT: conf/pnl_checker.yaml is in .gitignore — never commit real credentials
 
+# Credentials can also be set via BYBIT_API_KEY / BYBIT_API_SECRET env vars
+# (env vars take precedence over values below)
 account:
   api_key: "YOUR_API_KEY"
   api_secret: "YOUR_API_SECRET"

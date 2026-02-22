@@ -15,12 +15,14 @@ Reference:
 - Wallet Balance: https://bybit-exchange.github.io/docs/v5/account/wallet-balance
 """
 
+import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Optional
 import logging
 
 from pybit.unified_trading import HTTP
+
+from bybit_adapter.rate_limiter import RateLimiter, RateLimitConfig, RequestType
 
 
 logger = logging.getLogger(__name__)
@@ -62,16 +64,27 @@ class BybitRestClient:
     api_key: str
     api_secret: str
     testnet: bool = True
+    rate_limit_config: RateLimitConfig = field(default_factory=lambda: RateLimitConfig(query_rate=10))
 
     _session: Optional[HTTP] = field(default=None, init=False, repr=False)
+    _rate_limiter: RateLimiter = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
-        """Initialize HTTP session."""
+        """Initialize HTTP session and rate limiter."""
         self._session = HTTP(
             testnet=self.testnet,
             api_key=self.api_key,
             api_secret=self.api_secret,
         )
+        self._rate_limiter = RateLimiter(config=self.rate_limit_config)
+
+    def _wait_for_rate_limit(self, request_type: RequestType = "query") -> None:
+        """Block until a request slot is available, then record the request."""
+        wait = self._rate_limiter.wait_time(request_type)
+        if wait > 0:
+            logger.debug(f"Rate limit: waiting {wait:.3f}s before {request_type} request")
+            time.sleep(wait)
+        self._rate_limiter.record_request(request_type)
 
     def get_recent_trades(
         self,
@@ -91,6 +104,7 @@ class BybitRestClient:
             Exception: If API call fails
         """
         logger.debug(f"Fetching recent trades for {symbol}, limit={limit}")
+        self._wait_for_rate_limit("query")
 
         response = self._session.get_public_trade_history(
             category="linear",
@@ -128,6 +142,7 @@ class BybitRestClient:
             Exception: If API call fails
         """
         logger.debug(f"Fetching executions for {symbol}, start={start_time}, end={end_time}")
+        self._wait_for_rate_limit("query")
 
         params = {
             "category": "linear",
@@ -217,6 +232,7 @@ class BybitRestClient:
             Exception: If API call fails
         """
         logger.debug(f"Fetching order history for {symbol}")
+        self._wait_for_rate_limit("query")
 
         params = {
             "category": "linear",
@@ -254,6 +270,7 @@ class BybitRestClient:
             Exception: If API call fails
         """
         logger.debug(f"Fetching positions for {symbol or 'all symbols'}")
+        self._wait_for_rate_limit("query")
 
         params = {
             "category": "linear",
@@ -282,6 +299,7 @@ class BybitRestClient:
             Exception: If API call fails
         """
         logger.debug(f"Fetching wallet balance for {account_type}")
+        self._wait_for_rate_limit("query")
 
         response = self._session.get_wallet_balance(accountType=account_type)
         self._check_response(response, "get_wallet_balance")
@@ -327,6 +345,7 @@ class BybitRestClient:
             bbu_reference/bbu2-master/bybit_api_usdt.py:315-329
         """
         logger.info(f"Placing {order_type} {side} order: {symbol} qty={qty} price={price}")
+        self._wait_for_rate_limit("order")
 
         params = {
             "category": "linear",
@@ -379,6 +398,7 @@ class BybitRestClient:
             raise ValueError("Either order_id or order_link_id must be provided")
 
         logger.info(f"Canceling order: {symbol} order_id={order_id} order_link_id={order_link_id}")
+        self._wait_for_rate_limit("order")
 
         params = {
             "category": "linear",
@@ -392,7 +412,7 @@ class BybitRestClient:
         try:
             response = self._session.cancel_order(**params)
             self._check_response(response, "cancel_order")
-            logger.info(f"Order cancelled successfully")
+            logger.info("Order cancelled successfully")
             return True
         except Exception as e:
             # Order may already be filled or cancelled
@@ -415,6 +435,7 @@ class BybitRestClient:
             bbu_reference/bbu2-master/bybit_api_usdt.py:450-452
         """
         logger.info(f"Canceling all orders for {symbol}")
+        self._wait_for_rate_limit("order")
 
         response = self._session.cancel_all_orders(
             category="linear",
@@ -453,9 +474,11 @@ class BybitRestClient:
         logger.debug(f"Fetching open orders for {symbol or 'all symbols'}")
 
         all_orders = []
+        # Note: _wait_for_rate_limit is called inside the loop before each page request
         cursor = None
 
         while True:
+            self._wait_for_rate_limit("query")
             params = {
                 "category": "linear",
                 "limit": min(limit, 50),
@@ -501,6 +524,7 @@ class BybitRestClient:
             https://bybit-exchange.github.io/docs/v5/market/tickers
         """
         logger.debug(f"Fetching tickers for {symbol}")
+        self._wait_for_rate_limit("query")
 
         response = self._session.get_tickers(
             category="linear",
@@ -544,6 +568,7 @@ class BybitRestClient:
             https://bybit-exchange.github.io/docs/v5/account/transaction-log
         """
         logger.debug(f"Fetching transaction log for {symbol}, type={type}")
+        self._wait_for_rate_limit("query")
 
         params = {
             "accountType": "UNIFIED",

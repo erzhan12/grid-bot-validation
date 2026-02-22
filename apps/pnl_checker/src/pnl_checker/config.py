@@ -4,19 +4,44 @@ Loads PnL checker configuration from YAML file with Pydantic validation.
 """
 
 import os
+import re
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class AccountConfig(BaseModel):
-    """Bybit account credentials."""
+    """Bybit account credentials.
 
-    api_key: str = Field(..., description="Bybit API key")
-    api_secret: str = Field(..., description="Bybit API secret")
+    Values can be provided via YAML config or environment variables.
+    Env vars (BYBIT_API_KEY, BYBIT_API_SECRET) take precedence over
+    config file values when set.
+    """
+
+    api_key: str = Field(default="", description="Bybit API key")
+    api_secret: str = Field(default="", description="Bybit API secret")
+
+    @model_validator(mode="after")
+    def apply_env_overrides(self):
+        """Override credentials with env vars when available."""
+        env_key = os.environ.get("BYBIT_API_KEY")
+        if env_key:
+            self.api_key = env_key
+        env_secret = os.environ.get("BYBIT_API_SECRET")
+        if env_secret:
+            self.api_secret = env_secret
+        if not self.api_key or not self.api_secret:
+            raise ValueError(
+                "API credentials required. Set BYBIT_API_KEY/BYBIT_API_SECRET "
+                "env vars or provide api_key/api_secret in config file."
+            )
+        return self
+
+
+_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{4,20}$")
 
 
 class SymbolConfig(BaseModel):
@@ -25,12 +50,23 @@ class SymbolConfig(BaseModel):
     symbol: str = Field(..., description="Trading pair (e.g., BTCUSDT)")
     tick_size: Decimal = Field(..., description="Price tick size")
 
+    @field_validator("symbol")
+    @classmethod
+    def validate_symbol_format(cls, v: str) -> str:
+        if not _SYMBOL_PATTERN.match(v):
+            raise ValueError(
+                f"Invalid symbol format '{v}'. "
+                "Expected uppercase alphanumeric, 4-20 chars (e.g., BTCUSDT)."
+            )
+        return v
+
     @field_validator("tick_size", mode="before")
     @classmethod
     def parse_tick_size(cls, v):
-        if isinstance(v, str):
-            return Decimal(v)
-        return v
+        value = Decimal(v) if isinstance(v, str) else v
+        if value <= 0:
+            raise ValueError("tick_size must be positive")
+        return value
 
 
 class RiskParamsConfig(BaseModel):

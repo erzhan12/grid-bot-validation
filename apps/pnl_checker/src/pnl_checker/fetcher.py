@@ -114,8 +114,12 @@ class BybitFetcher:
         # Fetch wallet balance (account-level)
         try:
             result.wallet = self._fetch_wallet()
+        except ConnectionError as e:
+            logger.warning(f"Network error fetching wallet balance: {e}", exc_info=True)
+        except (ValueError, KeyError) as e:
+            logger.warning(f"Invalid wallet response data: {e}", exc_info=True)
         except Exception as e:
-            logger.warning(f"Failed to fetch wallet balance: {e}")
+            logger.warning(f"Failed to fetch wallet balance ({type(e).__name__}): {e}", exc_info=True)
 
         # Fetch per-symbol data
         for symbol in symbols:
@@ -147,7 +151,9 @@ class BybitFetcher:
 
         for pos in raw_positions:
             size = Decimal(pos.get("size", "0"))
-            if size == 0:
+            if size <= 0:
+                if size < 0:
+                    logger.warning(f"Negative position size {size} for {symbol}")
                 continue
 
             positions.append(PositionData(
@@ -189,8 +195,24 @@ class BybitFetcher:
                 type="SETTLEMENT",
                 max_pages=self._funding_max_pages,
             )
+        except ConnectionError as e:
+            logger.warning(f"Network error fetching funding for {symbol}: {e}", exc_info=True)
+            return FundingData(
+                symbol=symbol,
+                cumulative_funding=Decimal("0"),
+                transaction_count=0,
+                fetch_error=f"Network error: {e}",
+            )
+        except (ValueError, KeyError) as e:
+            logger.warning(f"Invalid funding response for {symbol}: {e}", exc_info=True)
+            return FundingData(
+                symbol=symbol,
+                cumulative_funding=Decimal("0"),
+                transaction_count=0,
+                fetch_error=f"Data error: {e}",
+            )
         except Exception as e:
-            logger.warning(f"Failed to fetch funding for {symbol}: {e}")
+            logger.warning(f"Failed to fetch funding for {symbol} ({type(e).__name__}): {e}", exc_info=True)
             return FundingData(
                 symbol=symbol,
                 cumulative_funding=Decimal("0"),
@@ -205,6 +227,11 @@ class BybitFetcher:
                 cumulative += Decimal(funding_str)
 
         logger.info(f"Fetched {len(transactions)} funding records for {symbol}, cumulative={cumulative}")
+        if truncated:
+            logger.warning(
+                f"Funding data for {symbol} truncated at {self._funding_max_pages} pages "
+                f"({len(transactions)} records). Consider increasing funding_max_pages."
+            )
         return FundingData(
             symbol=symbol,
             cumulative_funding=cumulative,

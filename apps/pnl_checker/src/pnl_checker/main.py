@@ -42,7 +42,7 @@ def setup_logging(debug: bool = False) -> None:
 logger = logging.getLogger(__name__)
 
 
-def main(config_path: str = None, tolerance: float = None, output_dir: str = "output", debug: bool = False) -> int:
+def main(config_path: str | None = None, tolerance: float | None = None, output_dir: str = "output", debug: bool = False) -> int:
     """Main entry point.
 
     Args:
@@ -92,8 +92,14 @@ def main(config_path: str = None, tolerance: float = None, output_dir: str = "ou
 
     try:
         fetch_result = fetcher.fetch_all(symbols)
+    except ConnectionError as e:
+        logger.error(f"Network error — check internet connection and Bybit API status: {e}")
+        return 1
+    except ValueError as e:
+        logger.error(f"Invalid API response — check API credentials and symbol config: {e}")
+        return 1
     except Exception as e:
-        logger.error(f"Failed to fetch data: {e}")
+        logger.error(f"Failed to fetch data ({type(e).__name__}): {e}")
         return 1
 
     if not fetch_result.symbols:

@@ -6,12 +6,17 @@ Computes values independently from Bybit so they can be compared.
 import logging
 from dataclasses import dataclass, field
 from decimal import Decimal
+from enum import Enum
 
 from gridcore.position import Position, RiskConfig, PositionState
 
 from pnl_checker.fetcher import FetchResult, PositionData
 
 logger = logging.getLogger(__name__)
+
+# Minimum thresholds below which division produces meaningless results
+MIN_POSITION_IM = Decimal("1E-8")  # Initial margin floor for PnL % calculation
+MIN_LEVERAGE = Decimal("1E-8")  # Leverage floor for margin calculation
 
 
 @dataclass
@@ -74,6 +79,8 @@ def _calc_unrealised_pnl_pct_bbu2(
 
     Long: (1/entry - 1/close) * entry * 100 * leverage
     Short: (1/close - 1/entry) * entry * 100 * leverage
+
+    Returns 0 if entry_price or current_price is zero.
 
     Reference: backtest/position_tracker.py:calculate_unrealized_pnl_percent()
     """
@@ -145,6 +152,23 @@ def _calc_risk_multipliers(
     return results
 
 
+class RiskMultiplier(Enum):
+    """Known risk multiplier values from gridcore/position.py."""
+
+    NONE = 1.0
+    HIGH_LIQ_RISK = 1.5
+    MODERATE_RISK = 0.5
+    POSITION_RATIO = 2.0
+
+
+# Map multiplier values to human-readable labels
+_RISK_LABELS: dict[float, str] = {
+    RiskMultiplier.HIGH_LIQ_RISK.value: "high_liq_risk",
+    RiskMultiplier.MODERATE_RISK.value: "moderate_liq_risk or low_margin",
+    RiskMultiplier.POSITION_RATIO.value: "position_ratio_adjustment",
+}
+
+
 def _detect_risk_rule(multipliers: dict[str, float]) -> str:
     """Detect which risk rule was triggered based on multiplier values.
 
@@ -155,22 +179,15 @@ def _detect_risk_rule(multipliers: dict[str, float]) -> str:
     buy = multipliers["Buy"]
     sell = multipliers["Sell"]
 
-    if buy == 1.0 and sell == 1.0:
+    if buy == RiskMultiplier.NONE.value and sell == RiskMultiplier.NONE.value:
         return "none"
 
-    # Map known multiplier values to rule descriptions
-    _KNOWN = {
-        1.5: "high_liq_risk",
-        0.5: "moderate_liq_risk or low_margin",
-        2.0: "position_ratio_adjustment",
-    }
-
     parts = []
-    if buy != 1.0:
-        label = _KNOWN.get(buy, "adjusted")
+    if buy != RiskMultiplier.NONE.value:
+        label = _RISK_LABELS.get(buy, "adjusted")
         parts.append(f"{label} (buy {buy}x)")
-    if sell != 1.0:
-        label = _KNOWN.get(sell, "adjusted")
+    if sell != RiskMultiplier.NONE.value:
+        label = _RISK_LABELS.get(sell, "adjusted")
         parts.append(f"{label} (sell {sell}x)")
 
     return ", ".join(parts)
@@ -216,14 +233,18 @@ def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> Calculation
 
             # Unrealized PnL % (Bybit standard)
             pct_bybit = Decimal("0")
-            if pos.position_im > 0:
+            if pos.position_im >= MIN_POSITION_IM:
                 pct_bybit = unrealised_mark / pos.position_im * Decimal("100")
+            else:
+                logger.warning(f"{pos.symbol} {pos.direction}: position_im={pos.position_im} too small for PnL % calc")
 
             # Position value and margin
             position_value_mark = pos.size * mark
             initial_margin = Decimal("0")
-            if pos.leverage > 0:
+            if pos.leverage >= MIN_LEVERAGE:
                 initial_margin = position_value_mark / pos.leverage
+            else:
+                logger.warning(f"{pos.symbol} {pos.direction}: leverage={pos.leverage} too small for margin calc")
 
             # Liquidation ratio
             liq_ratio = 0.0

@@ -31,11 +31,13 @@ class _DecimalEncoder(json.JSONEncoder):
         return super().default(obj)
 
 
+DECIMAL_PRECISION = 8
+
+
 def _format_value(val: Decimal | str) -> str:
     """Format a value for display."""
     if isinstance(val, Decimal):
-        # Show up to 8 decimal places, strip trailing zeros
-        return f"{val:.8f}".rstrip("0").rstrip(".")
+        return f"{val:.{DECIMAL_PRECISION}f}".rstrip("0").rstrip(".")
     return str(val)
 
 
