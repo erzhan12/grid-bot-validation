@@ -1,5 +1,6 @@
 # PnL Checker Configuration
 # Copy to conf/pnl_checker.yaml and fill in your API credentials
+# IMPORTANT: conf/pnl_checker.yaml is in .gitignore — never commit real credentials
 
 account:
   api_key: "YOUR_API_KEY"

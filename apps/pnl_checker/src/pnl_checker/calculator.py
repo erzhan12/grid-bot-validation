@@ -146,25 +146,34 @@ def _calc_risk_multipliers(
 
 
 def _detect_risk_rule(multipliers: dict[str, float]) -> str:
-    """Detect which risk rule was triggered based on multiplier values."""
+    """Detect which risk rule was triggered based on multiplier values.
+
+    Multiplier values are defined in gridcore/position.py
+    (Position.calculate_amount_multiplier). If new values are added
+    there, the fallback branch reports them as "adjusted".
+    """
     buy = multipliers["Buy"]
     sell = multipliers["Sell"]
 
     if buy == 1.0 and sell == 1.0:
         return "none"
-    if sell == 1.5:
-        return "high_liq_risk (sell 1.5x)"
-    if buy == 1.5:
-        return "high_liq_risk (buy 1.5x)"
-    if buy == 0.5:
-        return "moderate_liq_risk or low_margin (buy 0.5x)"
-    if sell == 0.5:
-        return "moderate_liq_risk or low_margin (sell 0.5x)"
-    if buy == 2.0:
-        return "position_ratio_adjustment (buy 2x)"
-    if sell == 2.0:
-        return "position_ratio_adjustment (sell 2x)"
-    return f"custom (buy={buy}, sell={sell})"
+
+    # Map known multiplier values to rule descriptions
+    _KNOWN = {
+        1.5: "high_liq_risk",
+        0.5: "moderate_liq_risk or low_margin",
+        2.0: "position_ratio_adjustment",
+    }
+
+    parts = []
+    if buy != 1.0:
+        label = _KNOWN.get(buy, "adjusted")
+        parts.append(f"{label} (buy {buy}x)")
+    if sell != 1.0:
+        label = _KNOWN.get(sell, "adjusted")
+        parts.append(f"{label} (sell {sell}x)")
+
+    return ", ".join(parts)
 
 
 def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> CalculationResult:
