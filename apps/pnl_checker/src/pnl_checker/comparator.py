@@ -136,12 +136,12 @@ def _compare_position(
         tolerance,
     ))
 
-    # Initial Margin
-    comp.fields.append(_compare_field(
+    # Initial Margin (informational — Bybit UTA hedge mode reports optimized
+    # positionIM that differs from standard positionValue/leverage formula)
+    comp.fields.append(_info_field(
         "Initial Margin",
         pos_data.position_im,
         calc.initial_margin,
-        tolerance,
     ))
 
     # Unrealized PnL % (Bybit standard)
