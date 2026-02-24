@@ -41,7 +41,7 @@ class PositionState:
     size: Decimal = Decimal('0')
     entry_price: Optional[Decimal] = None
     unrealized_pnl: Decimal = Decimal('0')
-    margin: Decimal = Decimal('0')
+    margin: Decimal = Decimal('0')  # positionValue / walletBalance (ratio, not dollar amount)
     liquidation_price: Decimal = Decimal('0')
     leverage: int = 1
     position_value: Decimal = Decimal('0')
@@ -195,7 +195,8 @@ class Position:
         entry_price = float(position.entry_price)
         leverage = position.leverage
 
-        # Calculate unrealized PnL percentage
+        # Calculate unrealized PnL percentage (float arithmetic for risk management)
+        # NOTE: Canonical Decimal version is in gridcore.pnl.calc_unrealised_pnl_pct
         if self.direction == self.DIRECTION_LONG:
             unrealized_pnl_pct = (1 / entry_price - 1 / last_close) * entry_price * 100 * leverage
         else:  # short

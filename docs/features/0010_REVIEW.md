@@ -84,7 +84,7 @@ Calculator correctly uses `pos.mark_price` (from position endpoint) for the prim
 | Credential redaction | Present | `_redact_config()` in `reporter.py` replaces credentials with `[REDACTED]` |
 | Logging style | f-strings | Consistent with recorder pattern (acceptable for one-shot CLI tool) |
 | Config pattern | YAML + Pydantic | Matches gridbot/recorder pattern |
-| No `conf/pnl_checker.yaml.example` | Missing | Other apps ship example configs; not present here |
+| Example config | Present | `apps/pnl_checker/conf/pnl_checker.yaml.example` (same pattern as other apps) |
 | `AccountConfig` uses `str` not `SecretStr` | Inconsistent | Recorder uses `SecretStr` for credentials; pnl_checker uses plain `str`. Lower risk for a CLI tool, but inconsistent. |
 
 ---

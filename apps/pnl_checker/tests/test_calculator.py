@@ -3,8 +3,6 @@
 from decimal import Decimal
 
 from pnl_checker.calculator import (
-    _calc_unrealised_pnl,
-    _calc_unrealised_pnl_pct_bbu2,
     _detect_risk_rule,
     calculate,
 )
@@ -17,69 +15,6 @@ from pnl_checker.fetcher import (
     WalletData,
 )
 from gridcore.position import RiskConfig
-
-
-class TestUnrealisedPnl:
-    """Test unrealized PnL calculation (absolute)."""
-
-    def test_long_profit(self):
-        """Long position in profit: current > entry."""
-        result = _calc_unrealised_pnl("long", Decimal("50000"), Decimal("51000"), Decimal("0.1"))
-        assert result == Decimal("100")  # (51000 - 50000) * 0.1
-
-    def test_long_loss(self):
-        """Long position in loss: current < entry."""
-        result = _calc_unrealised_pnl("long", Decimal("50000"), Decimal("49000"), Decimal("0.1"))
-        assert result == Decimal("-100")
-
-    def test_short_profit(self):
-        """Short position in profit: current < entry."""
-        result = _calc_unrealised_pnl("short", Decimal("50000"), Decimal("49000"), Decimal("0.1"))
-        assert result == Decimal("100")
-
-    def test_short_loss(self):
-        """Short position in loss: current > entry."""
-        result = _calc_unrealised_pnl("short", Decimal("50000"), Decimal("51000"), Decimal("0.1"))
-        assert result == Decimal("-100")
-
-    def test_breakeven(self):
-        """Position at breakeven: current == entry."""
-        result = _calc_unrealised_pnl("long", Decimal("50000"), Decimal("50000"), Decimal("0.1"))
-        assert result == Decimal("0")
-
-
-class TestUnrealisedPnlPctBbu2:
-    """Test bbu2 ROE formula."""
-
-    def test_long_profit_10x(self):
-        """Long 10x leverage, price up 1%."""
-        result = _calc_unrealised_pnl_pct_bbu2(
-            "long", Decimal("50000"), Decimal("50500"), Decimal("10")
-        )
-        # (1/50000 - 1/50500) * 50000 * 100 * 10 ≈ 9.90099%
-        assert abs(result - Decimal("9.900990099009901")) < Decimal("0.001")
-
-    def test_short_profit_10x(self):
-        """Short 10x leverage, price down 1%."""
-        result = _calc_unrealised_pnl_pct_bbu2(
-            "short", Decimal("50000"), Decimal("49500"), Decimal("10")
-        )
-        # (1/49500 - 1/50000) * 50000 * 100 * 10 ≈ 10.1010%
-        assert abs(result - Decimal("10.10101010101010")) < Decimal("0.001")
-
-    def test_zero_entry(self):
-        """Zero entry price returns 0."""
-        result = _calc_unrealised_pnl_pct_bbu2(
-            "long", Decimal("0"), Decimal("50000"), Decimal("10")
-        )
-        assert result == Decimal("0")
-
-    def test_zero_current(self):
-        """Zero current price returns 0."""
-        result = _calc_unrealised_pnl_pct_bbu2(
-            "long", Decimal("50000"), Decimal("0"), Decimal("10")
-        )
-        assert result == Decimal("0")
 
 
 class TestDetectRiskRule:

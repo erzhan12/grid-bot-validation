@@ -116,7 +116,7 @@ class TestCompare:
                 unrealised_pnl_pct_bbu2_mark=Decimal("19.6"),
                 unrealised_pnl_pct_bbu2_last=Decimal("19.6"),
                 unrealised_pnl_pct_bybit=Decimal("19.6"),
-                position_value_mark=Decimal("510"),
+                position_value=Decimal("510"),
                 initial_margin=Decimal("51"),
                 liq_ratio=0.8824,
                 funding_snapshot=Decimal("0.0051"),
@@ -206,7 +206,7 @@ class TestCompare:
                 unrealised_pnl_pct_bbu2_mark=Decimal("19.6"),
                 unrealised_pnl_pct_bbu2_last=Decimal("19.6"),
                 unrealised_pnl_pct_bybit=Decimal("19.6"),
-                position_value_mark=Decimal("510"), initial_margin=Decimal("51"),
+                position_value=Decimal("510"), initial_margin=Decimal("51"),
                 liq_ratio=0.8824, funding_snapshot=Decimal("0.0051"),
             ),
             PositionCalcResult(
@@ -215,7 +215,7 @@ class TestCompare:
                 unrealised_pnl_pct_bbu2_mark=Decimal("19.6"),
                 unrealised_pnl_pct_bbu2_last=Decimal("19.6"),
                 unrealised_pnl_pct_bybit=Decimal("19.6"),
-                position_value_mark=Decimal("510"), initial_margin=Decimal("51"),
+                position_value=Decimal("510"), initial_margin=Decimal("51"),
                 liq_ratio=1.1373, funding_snapshot=Decimal("0.0051"),
             ),
         ])

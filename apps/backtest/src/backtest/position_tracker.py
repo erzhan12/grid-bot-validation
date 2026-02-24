@@ -10,6 +10,7 @@ from decimal import Decimal
 from typing import Optional
 
 from gridcore import DirectionType, SideType
+from gridcore.pnl import calc_unrealised_pnl, calc_unrealised_pnl_pct
 
 
 logger = logging.getLogger(__name__)
@@ -138,12 +139,9 @@ class BacktestPositionTracker:
         close_qty = min(qty, self.state.size)
 
         # Calculate realized PnL
-        # Long: (exit - entry) * qty
-        # Short: (entry - exit) * qty
-        if self.direction == DirectionType.LONG:
-            realized_pnl = (price - self.state.avg_entry_price) * close_qty
-        else:  # short
-            realized_pnl = (self.state.avg_entry_price - price) * close_qty
+        realized_pnl = calc_unrealised_pnl(
+            self.direction, self.state.avg_entry_price, price, close_qty
+        )
 
         self.state.realized_pnl += realized_pnl
         self.state.size -= close_qty
@@ -167,11 +165,9 @@ class BacktestPositionTracker:
             self.state.unrealized_pnl = Decimal("0")
             return Decimal("0")
 
-        if self.direction == DirectionType.LONG:
-            unrealized = (current_price - self.state.avg_entry_price) * self.state.size
-        else:  # short
-            unrealized = (self.state.avg_entry_price - current_price) * self.state.size
-
+        unrealized = calc_unrealised_pnl(
+            self.direction, self.state.avg_entry_price, current_price, self.state.size
+        )
         self.state.unrealized_pnl = unrealized
         return unrealized
 
@@ -195,23 +191,9 @@ class BacktestPositionTracker:
             self.state.unrealized_pnl_percent = Decimal("0")
             return Decimal("0")
 
-        entry = self.state.avg_entry_price
-
-        if self.direction == DirectionType.LONG:
-            pnl_percent = (
-                (Decimal("1") / entry - Decimal("1") / current_price)
-                * entry
-                * Decimal("100")
-                * leverage
-            )
-        else:  # short
-            pnl_percent = (
-                (Decimal("1") / current_price - Decimal("1") / entry)
-                * entry
-                * Decimal("100")
-                * leverage
-            )
-
+        pnl_percent = calc_unrealised_pnl_pct(
+            self.direction, self.state.avg_entry_price, current_price, leverage
+        )
         self.state.unrealized_pnl_percent = pnl_percent
         return pnl_percent
 

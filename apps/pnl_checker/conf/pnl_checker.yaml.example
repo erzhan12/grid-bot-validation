@@ -1,6 +1,6 @@
 # PnL Checker Configuration
-# Copy to conf/pnl_checker.yaml and fill in your API credentials
-# IMPORTANT: conf/pnl_checker.yaml is in .gitignore — never commit real credentials
+# Copy to apps/pnl_checker/conf/pnl_checker.yaml and fill in your API credentials
+# IMPORTANT: apps/pnl_checker/conf/pnl_checker.yaml is in .gitignore — never commit real credentials
 
 # Credentials can also be set via BYBIT_API_KEY / BYBIT_API_SECRET env vars
 # (env vars take precedence over values below)

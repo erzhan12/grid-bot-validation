@@ -9,6 +9,13 @@ from decimal import Decimal
 from enum import Enum
 
 from gridcore.position import Position, RiskConfig, PositionState
+from gridcore.pnl import (
+    calc_unrealised_pnl,
+    calc_unrealised_pnl_pct,
+    calc_position_value,
+    calc_initial_margin,
+    calc_liq_ratio,
+)
 
 from pnl_checker.fetcher import FetchResult, PositionData
 
@@ -38,7 +45,7 @@ class PositionCalcResult:
     unrealised_pnl_pct_bybit: Decimal  # Bybit standard: unrealised / IM * 100
 
     # Position value and margin
-    position_value_mark: Decimal  # size * mark_price
+    position_value: Decimal  # size * avg_entry_price (matches Bybit positionValue)
     initial_margin: Decimal  # position_value / leverage
 
     # Liquidation
@@ -60,64 +67,18 @@ class CalculationResult:
     positions: list[PositionCalcResult] = field(default_factory=list)
 
 
-def _calc_unrealised_pnl(
-    direction: str, entry_price: Decimal, current_price: Decimal, size: Decimal
-) -> Decimal:
-    """Calculate unrealized PnL (absolute).
-
-    Long: (current - entry) * size
-    Short: (entry - current) * size
-    """
-    if direction == "long":
-        return (current_price - entry_price) * size
-    else:
-        return (entry_price - current_price) * size
-
-
-def _calc_unrealised_pnl_pct_bbu2(
-    direction: str, entry_price: Decimal, current_price: Decimal, leverage: Decimal
-) -> Decimal:
-    """Calculate unrealized PnL % using bbu2 formula.
-
-    Long:  (1/entry - 1/close) * entry * 100 * leverage
-    Short: (1/close - 1/entry) * entry * 100 * leverage
-
-    This is algebraically equivalent to the standard ROE formula
-    ``(close - entry) / entry * 100 * leverage`` for longs, but uses
-    reciprocal prices.  The bbu2 codebase chose this form because the
-    same reciprocal approach generalises to inverse contracts where PnL
-    is denominated in the base currency.  For linear USDT contracts the
-    two forms give identical results.
-
-    Example (long, 10x leverage):
-        entry=100, close=102
-        (1/100 - 1/102) * 100 * 100 * 10 = 19.6078…%
-        Standard: (102-100)/100 * 100 * 10 = 20.0%
-        (Difference is < 0.4% relative — negligible for validation.)
-
-    Returns 0 if entry_price or current_price is zero.
-
-    Reference: backtest/position_tracker.py:calculate_unrealized_pnl_percent()
-    """
-    if entry_price == 0 or current_price == 0:
-        return Decimal("0")
-
-    one = Decimal("1")
-    hundred = Decimal("100")
-
-    if direction == "long":
-        return (one / entry_price - one / current_price) * entry_price * hundred * leverage
-    else:
-        return (one / current_price - one / entry_price) * entry_price * hundred * leverage
-
-
 def _calc_risk_multipliers(
     long_pos: PositionData | None,
     short_pos: PositionData | None,
     last_price: float,
     risk_config: RiskConfig,
+    wallet_balance: Decimal,
 ) -> dict[str, tuple[float, float, str]]:
     """Calculate position risk multipliers using gridcore.Position.
+
+    Args:
+        wallet_balance: USDT wallet balance for margin ratio calculation.
+            margin = positionValue / walletBalance (matches bbu2 pattern).
 
     Returns:
         Dict keyed by direction ('long'/'short') with tuple of
@@ -125,12 +86,18 @@ def _calc_risk_multipliers(
     """
     long_mgr, short_mgr = Position.create_linked_pair(risk_config)
 
+    def _margin_ratio(pos: PositionData | None) -> Decimal:
+        """Compute margin as positionValue / walletBalance (bbu2 pattern)."""
+        if pos is None or wallet_balance <= 0:
+            return Decimal("0")
+        return pos.position_value / wallet_balance
+
     # Build PositionState for each direction
     long_state = PositionState(
         direction="long",
         size=long_pos.size if long_pos else Decimal("0"),
         entry_price=long_pos.avg_price if long_pos else None,
-        margin=long_pos.position_im if long_pos else Decimal("0"),
+        margin=_margin_ratio(long_pos),
         liquidation_price=long_pos.liq_price if long_pos else Decimal("0"),
         leverage=int(long_pos.leverage) if long_pos else 1,
         position_value=long_pos.position_value if long_pos else Decimal("0"),
@@ -140,7 +107,7 @@ def _calc_risk_multipliers(
         direction="short",
         size=short_pos.size if short_pos else Decimal("0"),
         entry_price=short_pos.avg_price if short_pos else None,
-        margin=short_pos.position_im if short_pos else Decimal("0"),
+        margin=_margin_ratio(short_pos),
         liquidation_price=short_pos.liq_price if short_pos else Decimal("0"),
         leverage=int(short_pos.leverage) if short_pos else 1,
         position_value=short_pos.position_value if short_pos else Decimal("0"),
@@ -230,7 +197,8 @@ def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> Calculation
 
         # Calculate risk multipliers (needs both positions together)
         risk_multipliers = _calc_risk_multipliers(
-            long_pos, short_pos, float(ticker.last_price), risk_config
+            long_pos, short_pos, float(ticker.last_price), risk_config,
+            wallet_balance=fetch_result.wallet.usdt_wallet_balance,
         )
 
         # Calculate per-position values
@@ -239,12 +207,12 @@ def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> Calculation
             last = ticker.last_price
 
             # Unrealized PnL
-            unrealised_mark = _calc_unrealised_pnl(pos.direction, pos.avg_price, mark, pos.size)
-            unrealised_last = _calc_unrealised_pnl(pos.direction, pos.avg_price, last, pos.size)
+            unrealised_mark = calc_unrealised_pnl(pos.direction, pos.avg_price, mark, pos.size)
+            unrealised_last = calc_unrealised_pnl(pos.direction, pos.avg_price, last, pos.size)
 
             # Unrealized PnL % (bbu2 formula)
-            pct_bbu2_mark = _calc_unrealised_pnl_pct_bbu2(pos.direction, pos.avg_price, mark, pos.leverage)
-            pct_bbu2_last = _calc_unrealised_pnl_pct_bbu2(pos.direction, pos.avg_price, last, pos.leverage)
+            pct_bbu2_mark = calc_unrealised_pnl_pct(pos.direction, pos.avg_price, mark, pos.leverage)
+            pct_bbu2_last = calc_unrealised_pnl_pct(pos.direction, pos.avg_price, last, pos.leverage)
 
             # Unrealized PnL % (Bybit standard)
             pct_bybit = Decimal("0")
@@ -253,18 +221,16 @@ def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> Calculation
             else:
                 logger.warning(f"{pos.symbol} {pos.direction}: position_im={pos.position_im} too small for PnL % calc")
 
-            # Position value and margin
-            position_value_mark = pos.size * mark
+            # Position value and initial margin
+            position_value = calc_position_value(pos.size, pos.avg_price)
             initial_margin = Decimal("0")
             if pos.leverage >= MIN_LEVERAGE:
-                initial_margin = position_value_mark / pos.leverage
+                initial_margin = calc_initial_margin(position_value, pos.leverage)
             else:
                 logger.warning(f"{pos.symbol} {pos.direction}: leverage={pos.leverage} too small for margin calc")
 
             # Liquidation ratio
-            liq_ratio = 0.0
-            if last > 0:
-                liq_ratio = float(pos.liq_price) / float(last)
+            liq_ratio = calc_liq_ratio(pos.liq_price, last) if last > 0 else 0.0
 
             # Funding snapshot
             funding_snapshot = pos.size * mark * ticker.funding_rate
@@ -282,7 +248,7 @@ def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> Calculation
                 unrealised_pnl_pct_bbu2_mark=pct_bbu2_mark,
                 unrealised_pnl_pct_bbu2_last=pct_bbu2_last,
                 unrealised_pnl_pct_bybit=pct_bybit,
-                position_value_mark=position_value_mark,
+                position_value=position_value,
                 initial_margin=initial_margin,
                 liq_ratio=liq_ratio,
                 funding_snapshot=funding_snapshot,

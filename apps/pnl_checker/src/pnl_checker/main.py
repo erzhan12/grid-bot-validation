@@ -1,8 +1,8 @@
 """Main entry point for pnl_checker.
 
 Usage:
-    python -m pnl_checker.main --config conf/pnl_checker.yaml
-    python -m pnl_checker.main -c conf/pnl_checker.yaml --tolerance 0.001 --debug
+    python -m pnl_checker.main --config apps/pnl_checker/conf/pnl_checker.yaml
+    python -m pnl_checker.main -c apps/pnl_checker/conf/pnl_checker.yaml --tolerance 0.001 --debug
 """
 
 import argparse
@@ -132,7 +132,7 @@ def cli() -> None:
         "--config", "-c",
         type=str,
         default=None,
-        help="Path to YAML config file (default: conf/pnl_checker.yaml)",
+        help="Path to YAML config file (default: apps/pnl_checker/conf/pnl_checker.yaml)",
     )
     parser.add_argument(
         "--tolerance", "-t",

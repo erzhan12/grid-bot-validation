@@ -101,6 +101,52 @@ class TestLoadConfig:
 
         assert cfg.account.api_key == "envkey_0123456789"
 
+    def test_dotenv_is_loaded_for_credentials(self, tmp_path, monkeypatch):
+        config_data = {
+            "account": {},
+            "symbols": [{"symbol": "BTCUSDT", "tick_size": "0.1"}],
+        }
+        config_file = tmp_path / "dotenv_config.yaml"
+        config_file.write_text(yaml.dump(config_data))
+        (tmp_path / ".env").write_text(
+            'BYBIT_API_KEY="dotenv_key_0123456789"\n'
+            'BYBIT_API_SECRET="dotenv_secret_0123456789"\n'
+        )
+
+        monkeypatch.delenv("BYBIT_API_KEY", raising=False)
+        monkeypatch.delenv("BYBIT_API_SECRET", raising=False)
+        run_dir = tmp_path / "nested" / "working_dir"
+        run_dir.mkdir(parents=True)
+        monkeypatch.chdir(run_dir)
+
+        cfg = load_config(str(config_file))
+
+        assert cfg.account.api_key == "dotenv_key_0123456789"
+        assert cfg.account.api_secret == "dotenv_secret_0123456789"
+
+    def test_exported_env_overrides_dotenv(self, tmp_path, monkeypatch):
+        config_data = {
+            "account": {},
+            "symbols": [{"symbol": "BTCUSDT", "tick_size": "0.1"}],
+        }
+        config_file = tmp_path / "dotenv_config.yaml"
+        config_file.write_text(yaml.dump(config_data))
+        (tmp_path / ".env").write_text(
+            'BYBIT_API_KEY="dotenv_key_0123456789"\n'
+            'BYBIT_API_SECRET="dotenv_secret_0123456789"\n'
+        )
+
+        monkeypatch.setenv("BYBIT_API_KEY", "exported_key_0123456789")
+        monkeypatch.setenv("BYBIT_API_SECRET", "exported_secret_0123456789")
+        run_dir = tmp_path / "nested" / "working_dir"
+        run_dir.mkdir(parents=True)
+        monkeypatch.chdir(run_dir)
+
+        cfg = load_config(str(config_file))
+
+        assert cfg.account.api_key == "exported_key_0123456789"
+        assert cfg.account.api_secret == "exported_secret_0123456789"
+
 
 class TestAccountEnvVars:
     """Test environment variable overrides for credentials."""

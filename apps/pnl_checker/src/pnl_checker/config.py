@@ -93,13 +93,44 @@ class PnlCheckerConfig(BaseModel):
     funding_max_pages: int = Field(default=20, gt=0, description="Max pages for funding tx log pagination")
 
 
+def _load_dotenv_file(dotenv_path: Path) -> None:
+    """Load KEY=VALUE pairs from .env into os.environ without overriding exported vars."""
+    for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        elif " #" in value:
+            value = value.split(" #", 1)[0].rstrip()
+        os.environ.setdefault(key, value)
+
+
+def _autoload_dotenv(search_root: Path) -> None:
+    """Load the first .env found while walking up from a search root."""
+    for directory in [search_root.resolve(), *search_root.resolve().parents]:
+        dotenv_path = directory / ".env"
+        if dotenv_path.exists():
+            _load_dotenv_file(dotenv_path)
+            return
+
+
 def load_config(config_path: Optional[str] = None) -> PnlCheckerConfig:
     """Load configuration from YAML file.
 
     Args:
         config_path: Path to config file. If None, checks:
             1. PNL_CHECKER_CONFIG_PATH environment variable
-            2. conf/pnl_checker.yaml
+            2. apps/pnl_checker/conf/pnl_checker.yaml
 
     Returns:
         Validated PnlCheckerConfig
@@ -113,7 +144,9 @@ def load_config(config_path: Optional[str] = None) -> PnlCheckerConfig:
 
     if config_path is None:
         search_paths = [
-            Path("conf/pnl_checker.yaml"),
+            Path(__file__).resolve().parents[2] / "conf" / "pnl_checker.yaml",  # always works
+            Path("apps/pnl_checker/conf/pnl_checker.yaml"),
+            Path("conf/pnl_checker.yaml"),  # apps/pnl_checker cwd
             Path("pnl_checker.yaml"),
         ]
         for path in search_paths:
@@ -123,12 +156,15 @@ def load_config(config_path: Optional[str] = None) -> PnlCheckerConfig:
 
     if config_path is None:
         raise FileNotFoundError(
-            "No config file found. Set PNL_CHECKER_CONFIG_PATH or create conf/pnl_checker.yaml"
+            "No config file found. Set PNL_CHECKER_CONFIG_PATH or create apps/pnl_checker/conf/pnl_checker.yaml"
         )
 
     path = Path(config_path)
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
+
+    # Support local development where credentials are kept in a .env file.
+    _autoload_dotenv(path.parent)
 
     with open(path) as f:
         data = yaml.safe_load(f)

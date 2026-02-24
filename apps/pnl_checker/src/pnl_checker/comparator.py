@@ -132,7 +132,7 @@ def _compare_position(
     comp.fields.append(_compare_field(
         "Position Value",
         pos_data.position_value,
-        calc.position_value_mark,
+        calc.position_value,
         tolerance,
     ))
 

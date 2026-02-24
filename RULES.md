@@ -913,7 +913,8 @@ Successfully implemented a multi-tenant grid trading bot using gridcore strategy
 
 1. **BybitNormalizer Import**: Use `from bybit_adapter.normalizer import BybitNormalizer`, not `Normalizer`
 2. **RiskConfig Parameters**: `max_margin`, not `min_margin` (see `gridcore.position.RiskConfig`)
-3. **PositionState.direction**: Required parameter, use `"long"` or `"short"`
+3. **PositionState.margin is a RATIO, not a dollar amount**: `margin = positionValue / walletBalance` (bbu2 pattern). NOT Bybit's `positionIM`. All threshold configs (`max_margin`, `min_total_margin`) are ratio-based. See bbu2-master/position.py:105.
+4. **PositionState.direction**: Required parameter, use `"long"` or `"short"`
 4. **Test Isolation**: Run test suites separately due to conftest conflicts
 5. **Position WebSocket-First Pattern (2026-01-26)**: Position updates use WebSocket as primary source, REST as fallback
    - **Original bbu2 pattern**: `handle_position()` stores WS data → `__get_position_status()` uses WS first, REST fallback
@@ -1662,10 +1663,51 @@ Replay engine that reads recorded mainnet data from the recorder's database, fee
 4. **`datetime.fromisoformat()` requires Python 3.11+** for full timezone offset support. Earlier versions don't handle `+00:00`.
 5. **Test for `ValidationError` not `Exception`**: Pydantic config validation tests should use `from pydantic import ValidationError` for specific assertions.
 
+## PnL Calculation Functions (`packages/gridcore/src/gridcore/pnl.py`) — Added 2026-02-24
+
+Pure PnL calculation functions extracted into gridcore as the single source of truth.
+
+**Functions exported from gridcore:**
+- `calc_unrealised_pnl(direction, entry_price, current_price, size)` — Absolute PnL
+- `calc_unrealised_pnl_pct(direction, entry_price, current_price, leverage)` — bbu2 ROE %
+- `calc_position_value(size, entry_price)` — Notional value (entry-based, matches Bybit)
+- `calc_initial_margin(position_value, leverage)` — Initial margin
+- `calc_liq_ratio(liq_price, current_price)` — Liquidation ratio
+
+**Consumers:**
+- `apps/pnl_checker/src/pnl_checker/calculator.py` — Imports from `gridcore.pnl`
+- `apps/backtest/src/backtest/position_tracker.py` — Imports from `gridcore.pnl`
+- `packages/gridcore/src/gridcore/position.py` — Has float copy for risk mgmt (cross-referenced)
+
+**Key decisions:**
+- `position.py` keeps its float-arithmetic copy (lines 199-202) for risk management performance
+- `funding_snapshot` stays in pnl_checker (one-liner, single consumer)
+- All functions take Decimal inputs, except `calc_liq_ratio` which returns float
+- `calc_initial_margin` is only used for display/comparison (not risk engine)
+
+## Margin Ratio vs Bybit positionIM — Critical Distinction
+
+**`PositionState.margin` = `positionValue / walletBalance`** (a ratio, e.g., 0.26)
+
+This is the bbu2 pattern (bbu2-master/position.py:105). It represents what fraction of wallet this position uses. All risk config thresholds (`max_margin=8`, `min_total_margin=0.15`) are ratios.
+
+**Bybit's `positionIM`** is a dollar amount (e.g., $0.52) — completely different. In UTA hedge mode, Bybit applies margin optimization: the winning side carries full IM, the losing side is reduced to just closing fees. Do NOT use `positionIM` as `margin` in the risk engine.
+
+**Who uses what:**
+| Consumer | margin calculation | Status |
+|----------|-------------------|--------|
+| gridbot (live) | `positionValue / walletBalance` | Correct (runner.py:478) |
+| pnl_checker | `positionValue / walletBalance` | Fixed 2026-02-24 (was using positionIM) |
+| backtest | Not implemented yet | Does NOT use gridcore Position risk mgmt |
+
+**Backtest gap**: The backtest engine does not integrate gridcore's `Position` risk manager. It uses `BacktestPositionTracker` (PnL only) and `GridEngine` (grid logic only). Risk-based order size multipliers are not applied in backtests.
+
 ## Phase K: PnL Checker (`apps/pnl_checker/`)
 
 ### Overview
 Read-only tool that fetches live Bybit data and compares our PnL/margin calculations against exchange-reported values.
+
+**Config layout (matches other apps)**: Example config lives at `apps/pnl_checker/conf/pnl_checker.yaml.example`. Copy to `apps/pnl_checker/conf/pnl_checker.yaml` for runtime; that path is in `.gitignore`.
 
 **Pipeline**: `fetcher.py` → `calculator.py` → `comparator.py` → `reporter.py`, orchestrated by `main.py`.
 
@@ -1693,6 +1735,7 @@ Read-only tool that fetches live Bybit data and compares our PnL/margin calculat
 2. **Tolerance scaling for percentages**: PnL % values are 100x USDT values. Use `PERCENTAGE_TOLERANCE_MULTIPLIER = 100` in `comparator.py` to scale tolerance for ROE comparisons.
 3. **Test coverage**: Currently at 92%. Run: `uv run pytest apps/pnl_checker/tests --cov=pnl_checker --cov-report=term-missing -v`
 4. **Workspace dependency**: `pnl-checker` must be in root `pyproject.toml` dev deps AND `tool.uv.sources` for test discovery to work.
+5. **Initial Margin comparison (known mismatch)**: Our `calc_initial_margin` uses `positionValue / leverage` (entry-based). Bybit UTA cross-margin uses mark_price and hedge optimization. The IM comparison will show FAIL in hedge mode — this is expected. The comparison exists for visibility, not accuracy validation.
 
 ## Next Steps (Future Phases)
 

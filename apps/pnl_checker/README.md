@@ -24,10 +24,10 @@ uv sync
 Copy the example config and add your API credentials:
 
 ```bash
-cp conf/pnl_checker.yaml.example conf/pnl_checker.yaml
+cp apps/pnl_checker/conf/pnl_checker.yaml.example apps/pnl_checker/conf/pnl_checker.yaml
 ```
 
-Edit `conf/pnl_checker.yaml` with your Bybit API key and secret. Alternatively, set environment variables:
+Edit `apps/pnl_checker/conf/pnl_checker.yaml` with your Bybit API key and secret. Alternatively, set environment variables:
 
 ```bash
 export BYBIT_API_KEY="your_key"
@@ -38,7 +38,7 @@ Environment variables take precedence over config file values.
 
 ### 3. Configure symbols
 
-Edit `conf/pnl_checker.yaml` to list the symbols you want to validate:
+Edit `apps/pnl_checker/conf/pnl_checker.yaml` to list the symbols you want to validate:
 
 ```yaml
 symbols:
@@ -51,11 +51,11 @@ symbols:
 ## Usage
 
 ```bash
-# Basic run (uses conf/pnl_checker.yaml)
+# Basic run (uses apps/pnl_checker/conf/pnl_checker.yaml)
 uv run python -m pnl_checker.main
 
 # Specify config path
-uv run python -m pnl_checker.main --config conf/pnl_checker.yaml
+uv run python -m pnl_checker.main --config apps/pnl_checker/conf/pnl_checker.yaml
 
 # Override tolerance (in USDT)
 uv run python -m pnl_checker.main --tolerance 0.001
@@ -125,7 +125,7 @@ uv run pytest apps/pnl_checker/tests --cov=pnl_checker --cov-report=term-missing
 
 | Problem | Solution |
 |---------|----------|
-| `Config file not found` | Set `PNL_CHECKER_CONFIG_PATH` env var or create `conf/pnl_checker.yaml` |
+| `Config file not found` | Set `PNL_CHECKER_CONFIG_PATH` env var or create `apps/pnl_checker/conf/pnl_checker.yaml` |
 | `API credentials required` | Add credentials to config file or set `BYBIT_API_KEY`/`BYBIT_API_SECRET` |
 | `Network error` | Check internet connection and Bybit API status |
 | `No open positions found` | Verify you have open positions for the configured symbols |
