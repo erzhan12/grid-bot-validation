@@ -1,8 +1,10 @@
 """Tests for PnL calculator."""
 
+import logging
 from decimal import Decimal
 
 from pnl_checker.calculator import (
+    _calc_risk_multipliers,
     _detect_risk_rule,
     calculate,
 )
@@ -157,3 +159,70 @@ class TestCalculate:
         long_calc = next(p for p in result.positions if p.direction == "long")
         # 0.01 * 51000 * 0.0001 = 0.051 (size * mark * rate = funding per 8h)
         assert long_calc.funding_snapshot == Decimal("0.051")
+
+
+class TestMarginRatioEdgeCases:
+    """Test _margin_ratio edge cases via _calc_risk_multipliers."""
+
+    def _make_position(self, side="Buy", size="0.01") -> PositionData:
+        return PositionData(
+            symbol="BTCUSDT",
+            side=side,
+            size=Decimal(size),
+            avg_price=Decimal("50000"),
+            mark_price=Decimal("50000"),
+            liq_price=Decimal("45000"),
+            leverage=Decimal("10"),
+            position_value=Decimal("500"),
+            position_im=Decimal("50"),
+            position_mm=Decimal("5"),
+            unrealised_pnl=Decimal("0"),
+            cur_realised_pnl=Decimal("0"),
+            cum_realised_pnl=Decimal("0"),
+            position_idx=1 if side == "Buy" else 2,
+        )
+
+    def _risk_config(self) -> RiskConfig:
+        return RiskConfig(
+            min_liq_ratio=0.8,
+            max_liq_ratio=1.2,
+            max_margin=8.0,
+            min_total_margin=0.15,
+        )
+
+    def test_none_position_returns_default_multipliers(self):
+        """No position means no multipliers calculated for that direction."""
+        result = _calc_risk_multipliers(
+            long_pos=None,
+            short_pos=None,
+            last_price=50000.0,
+            risk_config=self._risk_config(),
+            wallet_balance=Decimal("10000"),
+        )
+        assert result == {}
+
+    def test_zero_wallet_balance_logs_warning(self, caplog):
+        """Zero wallet balance triggers warning log."""
+        pos = self._make_position()
+        with caplog.at_level(logging.WARNING, logger="pnl_checker.calculator"):
+            _calc_risk_multipliers(
+                long_pos=pos,
+                short_pos=None,
+                last_price=50000.0,
+                risk_config=self._risk_config(),
+                wallet_balance=Decimal("0"),
+            )
+        assert "Zero or negative wallet balance" in caplog.text
+
+    def test_negative_wallet_balance_logs_warning(self, caplog):
+        """Negative wallet balance triggers warning log."""
+        pos = self._make_position()
+        with caplog.at_level(logging.WARNING, logger="pnl_checker.calculator"):
+            _calc_risk_multipliers(
+                long_pos=pos,
+                short_pos=None,
+                last_price=50000.0,
+                risk_config=self._risk_config(),
+                wallet_balance=Decimal("-100"),
+            )
+        assert "Zero or negative wallet balance" in caplog.text

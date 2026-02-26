@@ -9,9 +9,12 @@ import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from gridcore.pnl import MMTiers, MM_TIERS, MM_TIERS_DEFAULT, parse_risk_limit_tiers
+
+if TYPE_CHECKING:
+    from bybit_adapter.rest_client import BybitRestClient
 
 logger = logging.getLogger(__name__)
 
@@ -23,42 +26,48 @@ class RiskLimitProvider:
     """Fetches and caches risk limit tier tables.
 
     Tries cache first, then Bybit API, falls back to hardcoded tiers.
+
+    Example:
+        from bybit_adapter.rest_client import BybitRestClient
+
+        client = BybitRestClient(api_key="...", api_secret="...", testnet=False)
+        provider = RiskLimitProvider(rest_client=client)
+        tiers = provider.get("BTCUSDT")
     """
 
     def __init__(
         self,
         cache_path: Path = DEFAULT_CACHE_PATH,
         cache_ttl: timedelta = timedelta(hours=24),
+        rest_client: Optional["BybitRestClient"] = None,
     ):
         self.cache_path = cache_path
         self.cache_ttl = cache_ttl
+        self._rest_client = rest_client
 
     def fetch_from_bybit(self, symbol: str) -> Optional[MMTiers]:
-        """Fetch risk limit tiers from Bybit API using pybit.
+        """Fetch risk limit tiers from Bybit API via BybitRestClient.
+
+        Uses the injected rest_client if available (recommended — goes through
+        the shared rate limiter). Returns None if no client is configured.
 
         Args:
             symbol: Trading pair (e.g., "BTCUSDT")
 
         Returns:
-            MMTiers if successful, None if failed
+            MMTiers if successful, None if failed or no client configured
         """
+        if self._rest_client is None:
+            logger.debug("No rest_client configured, skipping API fetch")
+            return None
+
         try:
-            from pybit.unified_trading import HTTP
-
-            # Create session without API keys (public endpoint)
-            session = HTTP()
-            response = session.get_risk_limit(category="linear", symbol=symbol)
-
-            if response.get("retCode") != 0:
-                logger.warning(f"Bybit API error: {response.get('retMsg')}")
-                return None
-
-            api_tiers = response.get("result", {}).get("list", [])
-            if not api_tiers:
+            raw_tiers = self._rest_client.get_risk_limit(symbol=symbol)
+            if not raw_tiers:
                 logger.warning(f"No risk limit tiers returned for {symbol}")
                 return None
 
-            tiers = parse_risk_limit_tiers(api_tiers)
+            tiers = parse_risk_limit_tiers(raw_tiers)
             logger.info(f"Fetched {len(tiers)} risk limit tiers for {symbol}")
             return tiers
 
@@ -160,6 +169,11 @@ class RiskLimitProvider:
 
         Returns:
             MMTiers (from API, cache, or hardcoded fallback)
+
+        Example:
+            >>> provider = RiskLimitProvider(rest_client=client)
+            >>> tiers = provider.get("BTCUSDT")
+            >>> provider.get("BTCUSDT", force_fetch=True)  # bypass cache
         """
         # Try cache first (unless force_fetch or stale)
         if not force_fetch:

@@ -128,78 +128,54 @@ class TestRiskLimitProvider:
 
     # --- fetch_from_bybit ---
 
-    @patch("backtest.risk_limit_info.RiskLimitProvider.fetch_from_bybit")
-    def test_fetch_from_bybit_success(self, mock_fetch):
-        """Returns MMTiers on successful API call."""
-        mock_fetch.return_value = SAMPLE_TIERS
+    def test_fetch_from_bybit_no_client(self, provider):
+        """Returns None when no rest_client is configured."""
+        assert provider._rest_client is None
+        result = provider.fetch_from_bybit("BTCUSDT")
+        assert result is None
 
-        provider = RiskLimitProvider()
+    def test_fetch_from_bybit_with_rest_client(self, cache_path):
+        """Fetches and parses tiers via injected BybitRestClient."""
+        mock_client = MagicMock()
+        mock_client.get_risk_limit.return_value = [
+            {
+                "riskLimitValue": "200000",
+                "maintenanceMargin": "0.01",
+                "mmDeduction": "0",
+            },
+            {
+                "riskLimitValue": "1000000",
+                "maintenanceMargin": "0.025",
+                "mmDeduction": "3000",
+            },
+        ]
+
+        provider = RiskLimitProvider(cache_path=cache_path, rest_client=mock_client)
         result = provider.fetch_from_bybit("BTCUSDT")
 
-        assert result is not None
-        assert len(result) == 3
-
-    def test_fetch_from_bybit_api_error(self, provider):
-        """Returns None when API returns error code."""
-        mock_session = MagicMock()
-        mock_session.get_risk_limit.return_value = {
-            "retCode": 10001,
-            "retMsg": "Invalid symbol",
-        }
-
-        with patch("pybit.unified_trading.HTTP", return_value=mock_session):
-            result = provider.fetch_from_bybit("INVALID")
-
-        assert result is None
-
-    def test_fetch_from_bybit_empty_list(self, provider):
-        """Returns None when API returns empty tier list."""
-        mock_session = MagicMock()
-        mock_session.get_risk_limit.return_value = {
-            "retCode": 0,
-            "retMsg": "OK",
-            "result": {"list": []},
-        }
-
-        with patch("pybit.unified_trading.HTTP", return_value=mock_session):
-            result = provider.fetch_from_bybit("BTCUSDT")
-
-        assert result is None
-
-    def test_fetch_from_bybit_parses_response(self, provider):
-        """Parses tier data from API response."""
-        mock_session = MagicMock()
-        mock_session.get_risk_limit.return_value = {
-            "retCode": 0,
-            "retMsg": "OK",
-            "result": {
-                "list": [
-                    {
-                        "riskLimitValue": "200000",
-                        "maintenanceMargin": "0.01",
-                        "mmDeduction": "0",
-                    },
-                    {
-                        "riskLimitValue": "1000000",
-                        "maintenanceMargin": "0.025",
-                        "mmDeduction": "3000",
-                    },
-                ]
-            },
-        }
-
-        with patch("pybit.unified_trading.HTTP", return_value=mock_session):
-            result = provider.fetch_from_bybit("BTCUSDT")
-
+        mock_client.get_risk_limit.assert_called_once_with(symbol="BTCUSDT")
         assert result is not None
         assert len(result) == 2
         assert result[0] == (Decimal("200000"), Decimal("0.01"), Decimal("0"))
         assert result[1] == (Decimal("Infinity"), Decimal("0.025"), Decimal("3000"))
 
-    def test_fetch_from_bybit_network_exception(self, provider):
-        """Returns None on network/connection error."""
-        with patch("pybit.unified_trading.HTTP", side_effect=ConnectionError("timeout")):
-            result = provider.fetch_from_bybit("BTCUSDT")
+    def test_fetch_from_bybit_empty_list(self, cache_path):
+        """Returns None when API returns empty tier list."""
+        mock_client = MagicMock()
+        mock_client.get_risk_limit.return_value = []
+
+        provider = RiskLimitProvider(cache_path=cache_path, rest_client=mock_client)
+        result = provider.fetch_from_bybit("BTCUSDT")
+
+        assert result is None
+
+    def test_fetch_from_bybit_client_exception(self, cache_path):
+        """Returns None when rest_client raises an exception."""
+        mock_client = MagicMock()
+        mock_client.get_risk_limit.side_effect = ConnectionError("timeout")
+
+        provider = RiskLimitProvider(cache_path=cache_path, rest_client=mock_client)
+        result = provider.fetch_from_bybit("BTCUSDT")
 
         assert result is None
 

@@ -170,10 +170,9 @@ class BybitFetcher:
 
         for pos in raw_positions:
             size = Decimal(pos.get("size", "0"))
-            # Negative sizes should never occur (Bybit always returns >= 0).
-            # We log-and-skip rather than raising because this is a read-only
-            # validation tool — crashing would prevent the rest of the report
-            # from being generated for the remaining symbols.
+            # Defensive check: Bybit should always return size >= 0, but we
+            # handle negative values gracefully in this read-only tool to avoid
+            # breaking the entire report.
             if size <= 0:
                 if size < 0:
                     logger.warning(f"Negative position size {size} for {symbol}")

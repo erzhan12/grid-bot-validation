@@ -104,7 +104,10 @@ def _calc_risk_multipliers(
 
     def _margin_ratio(pos: PositionData | None) -> Decimal:
         """Compute margin as positionValue / walletBalance (bbu2 pattern)."""
-        if pos is None or wallet_balance <= 0:
+        if pos is None:
+            return Decimal("0")
+        if wallet_balance <= 0:
+            logger.warning("Zero or negative wallet balance in margin calculation")
             return Decimal("0")
         return pos.position_value / wallet_balance
 
