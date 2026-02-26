@@ -235,6 +235,7 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
     for tier in sorted_tiers:
         max_val = Decimal(tier["riskLimitValue"])
         mmr_rate = Decimal(tier["maintenanceMargin"])
+        # mmDeduction can be empty string "" or missing for tier 0 (no deduction)
         deduction_str = tier.get("mmDeduction", "") or "0"
         deduction = Decimal(deduction_str)
         result.append((max_val, mmr_rate, deduction))

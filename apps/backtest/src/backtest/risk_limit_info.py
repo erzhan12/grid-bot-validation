@@ -95,8 +95,12 @@ class RiskLimitProvider:
                 tiers = _tiers_from_dict(cache[symbol].get("tiers", []))
                 return tiers if tiers else None
 
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            logger.warning(f"Error reading risk limit cache: {e}")
+        except json.JSONDecodeError as e:
+            logger.warning(f"Corrupted cache file {self.cache_path}: {e}")
+        except KeyError as e:
+            logger.warning(f"Missing required field in cache for {symbol}: {e}")
+        except ValueError as e:
+            logger.warning(f"Invalid tier data format in cache for {symbol}: {e}")
 
         return None
 
@@ -116,6 +120,10 @@ class RiskLimitProvider:
                     cache = json.load(f)
             except (json.JSONDecodeError, ValueError):
                 pass
+
+        # Skip write if tiers haven't changed
+        if symbol in cache and cache[symbol].get("tiers") == _tiers_to_dict(tiers):
+            return
 
         # Update cache with timestamp
         cache[symbol] = {
@@ -201,7 +209,7 @@ class RiskLimitProvider:
         return MM_TIERS.get(symbol, MM_TIERS_DEFAULT)
 
 
-def _tiers_to_dict(tiers: MMTiers) -> list[dict]:
+def _tiers_to_dict(tiers: MMTiers) -> list[dict[str, str]]:
     """Serialize MMTiers to JSON-compatible list of dicts."""
     return [
         {
@@ -213,7 +221,7 @@ def _tiers_to_dict(tiers: MMTiers) -> list[dict]:
     ]
 
 
-def _tiers_from_dict(tier_dicts: list[dict]) -> MMTiers:
+def _tiers_from_dict(tier_dicts: list[dict[str, str]]) -> MMTiers:
     """Deserialize MMTiers from cached list of dicts."""
     return [
         (

@@ -52,3 +52,25 @@ tiers = provider.get("BTCUSDT", force_fetch=True)
 ### Without API Access
 
 When no `rest_client` is provided (e.g., offline backtesting), the provider uses cached data or falls back to hardcoded tier tables. No API calls are attempted.
+
+### Troubleshooting
+
+**Corrupted cache file**
+
+If the cache file becomes corrupted (e.g., partial write, manual edit error), delete it and let the provider rebuild it:
+
+```bash
+rm conf/risk_limits_cache.json
+```
+
+The provider will fetch fresh tiers from the API on the next run, or fall back to hardcoded tiers if the API is unavailable.
+
+**API rate limits**
+
+If Bybit rate limits are hit during tier fetching, the provider logs a warning and falls back to cached or hardcoded tiers. To reduce API calls:
+- Increase `cache_ttl` (default is 24 hours)
+- Use `force_fetch=False` (default) to prefer cached data
+
+**Using hardcoded fallback tiers**
+
+When both the API and cache are unavailable, the provider uses hardcoded tier tables from `gridcore.pnl.MM_TIERS`. These are static snapshots and may become outdated if Bybit changes their risk limits. If you see the log message "using hardcoded fallback", ensure API access is restored to get accurate margin calculations.
