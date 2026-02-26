@@ -69,13 +69,49 @@ jobs:
                - Verify README updates for new features
                - Check API documentation accuracy
 
-            Provide detailed feedback using inline comments for specific issues.
-            Use top-level comments for general observations or praise.
-
             Use the repository's CLAUDE.md for guidance on style and conventions. Be constructive and helpful in your feedback.
 
-            Use `gh pr review` with your Bash tool to leave inline comments on specific code lines.
-            Use `gh pr comment` with your Bash tool to leave top-level comments on the PR.
+            ## Output Instructions
+
+            1. Review all changed files in the PR thoroughly.
+            2. Post exactly ONE top-level comment using `gh pr comment` containing ALL findings.
+            3. Do NOT use `gh pr review` with inline comments.
+            4. Do NOT post multiple comments. Everything must be in a SINGLE `gh pr comment`.
+
+            ## Comment Format
+
+            The comment must follow this exact structure:
+            ```markdown
+            ## Code Review Summary
+
+            <2-3 sentence overall assessment>
+
+            ## Actionable Fixes
+
+            Copy everything below the line and pass it to Claude Code:
+
+            ---
+
+            In this repository, please make the following changes:
+
+            1. **[SECURITY]** File `path/to/file.ts`, line 42: <specific instruction>
+            2. **[BUG]** File `path/to/file.ts`, line 87: <specific instruction>
+            3. **[PERFORMANCE]** File `path/to/other.py`, line 15: <specific instruction>
+            4. **[QUALITY]** File `path/to/file.ts`, line 33: <specific instruction>
+            5. **[TESTING]** File `path/to/test.ts`: <specific instruction>
+            6. **[DOCS]** File `README.md`: <specific instruction>
+
+            After making all changes, run the existing tests to make sure nothing is broken.
+            ```
+
+            ## Rules
+            - Everything in ONE `gh pr comment` call, no inline comments
+            - Use exact file paths relative to repo root with line numbers from the diff
+            - Each fix must be a specific actionable instruction, not vague advice
+            - Use category tags: [SECURITY], [BUG], [PERFORMANCE], [QUALITY], [TESTING], [DOCS]
+            - Order by priority: security > bugs > performance > quality > testing > docs
+            - Skip praise or observations that require no code changes
+            - If no fixes needed, say "No actionable fixes required"
 
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
