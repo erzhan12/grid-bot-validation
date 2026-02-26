@@ -245,13 +245,13 @@ class TestBacktestPositionTracker:
         leverage = Decimal("10")
         pnl_percent = tracker.calculate_unrealized_pnl_percent(Decimal("51000"), leverage)
 
-        # Formula: (1/entry - 1/close) * entry * 100 * leverage
-        # (1/50000 - 1/51000) * 50000 * 100 * 10 ≈ 19.6%
+        # Formula: (close - entry) / entry * leverage * 100
+        # (51000 - 50000) / 50000 * 10 * 100 = 20.0%
         expected = (
-            (Decimal("1") / Decimal("50000") - Decimal("1") / Decimal("51000"))
-            * Decimal("50000")
-            * Decimal("100")
+            (Decimal("51000") - Decimal("50000"))
+            / Decimal("50000")
             * leverage
+            * Decimal("100")
         )
         assert pnl_percent == expected
         assert pnl_percent > Decimal("0")  # Profit
@@ -282,12 +282,13 @@ class TestBacktestPositionTracker:
         leverage = Decimal("10")
         pnl_percent = tracker.calculate_unrealized_pnl_percent(Decimal("49000"), leverage)
 
-        # Formula: (1/close - 1/entry) * entry * 100 * leverage
+        # Formula: (entry - close) / entry * leverage * 100
+        # (50000 - 49000) / 50000 * 10 * 100 = 20.0%
         expected = (
-            (Decimal("1") / Decimal("49000") - Decimal("1") / Decimal("50000"))
-            * Decimal("50000")
-            * Decimal("100")
+            (Decimal("50000") - Decimal("49000"))
+            / Decimal("50000")
             * leverage
+            * Decimal("100")
         )
         assert pnl_percent == expected
         assert pnl_percent > Decimal("0")  # Profit

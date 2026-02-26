@@ -320,6 +320,51 @@ class BybitRestClient:
         logger.debug("Fetched wallet balance")
         return result
 
+    def get_account_info(self) -> dict:
+        """Fetch account info (margin mode, etc.).
+
+        Returns:
+            Account info dict with marginMode, unifiedMarginStatus, etc.
+
+        Raises:
+            Exception: If API call fails
+        """
+        logger.debug("Fetching account info")
+        self._wait_for_rate_limit("query")
+
+        response = self._session.get_account_info()
+        self._check_response(response, "get_account_info")
+
+        result = response.get("result", {})
+        logger.debug(f"Fetched account info: marginMode={result.get('marginMode')}")
+        return result
+
+    def get_risk_limit(self, symbol: str, category: str = "linear") -> list[dict]:
+        """Fetch risk limit tiers for a symbol.
+
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+            category: Product type (default "linear")
+
+        Returns:
+            List of tier dicts with riskLimitValue, maintenanceMargin, mmDeduction, etc.
+
+        Raises:
+            Exception: If API call fails
+
+        Reference:
+            https://bybit-exchange.github.io/docs/v5/market/risk-limit
+        """
+        logger.debug(f"Fetching risk limit tiers for {symbol}")
+        self._wait_for_rate_limit("query")
+
+        response = self._session.get_risk_limit(category=category, symbol=symbol)
+        self._check_response(response, "get_risk_limit")
+
+        tiers = response.get("result", {}).get("list", [])
+        logger.debug(f"Fetched {len(tiers)} risk limit tiers for {symbol}")
+        return tiers
+
     # -------------------------------------------------------------------------
     # Order Management Methods
     # -------------------------------------------------------------------------

@@ -1187,8 +1187,8 @@ Successfully implemented a backtest system using gridcore's GridEngine with trad
 **Unrealized PnL % (ROE) for Risk Management:**
 
 1. **Added `calculate_unrealized_pnl_percent(current_price, leverage)` to BacktestPositionTracker**
-   - Uses exact bbu2 formula: `(1/entry - 1/close) * entry * 100 * leverage` (long)
-   - Short formula: `(1/close - 1/entry) * entry * 100 * leverage`
+   - Uses standard Bybit ROE formula: `(close - entry) / entry * leverage * 100` (long)
+   - Short formula: `(entry - close) / entry * leverage * 100`
    - Added `unrealized_pnl_percent` field to `PositionState` dataclass
    - **File**: `apps/backtest/src/backtest/position_tracker.py:167-203`
 
@@ -1669,7 +1669,7 @@ Pure PnL calculation functions extracted into gridcore as the single source of t
 
 **Functions exported from gridcore:**
 - `calc_unrealised_pnl(direction, entry_price, current_price, size)` — Absolute PnL
-- `calc_unrealised_pnl_pct(direction, entry_price, current_price, leverage)` — bbu2 ROE %
+- `calc_unrealised_pnl_pct(direction, entry_price, current_price, leverage)` — Standard Bybit ROE %
 - `calc_position_value(size, entry_price)` — Notional value (entry-based, matches Bybit)
 - `calc_initial_margin(position_value, leverage)` — Initial margin
 - `calc_liq_ratio(liq_price, current_price)` — Liquidation ratio

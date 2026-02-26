@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Optional
 
 from bybit_adapter.rest_client import BybitRestClient
+from gridcore.pnl import MMTiers, parse_risk_limit_tiers
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,10 @@ class WalletData:
     total_perp_upl: Decimal
     total_initial_margin: Decimal
     total_maintenance_margin: Decimal
+    # Account margin rates (from Bybit API)
+    account_im_rate: Decimal  # Bybit's reported account IM rate
+    account_mm_rate: Decimal  # Bybit's reported account MM rate
+    margin_mode: str  # "REGULAR_MARGIN" or "PORTFOLIO_MARGIN"
     # USDT coin-level
     usdt_wallet_balance: Decimal
     usdt_unrealised_pnl: Decimal
@@ -83,6 +88,7 @@ class SymbolFetchResult:
     positions: list[PositionData]  # Up to 2 (long + short) in hedge mode
     ticker: TickerData
     funding: FundingData
+    risk_limit_tiers: MMTiers | None = None
 
 
 @dataclass
@@ -145,11 +151,16 @@ class BybitFetcher:
         ticker = self._fetch_ticker(symbol)
         funding = self._fetch_funding(symbol)
 
+        # Only fetch risk limits when there are open positions
+        # (avoids wasting an API call + rate limit slot)
+        risk_limit_tiers = self._fetch_risk_limits(symbol) if positions else None
+
         return SymbolFetchResult(
             symbol=symbol,
             positions=positions,
             ticker=ticker,
             funding=funding,
+            risk_limit_tiers=risk_limit_tiers,
         )
 
     def _fetch_positions(self, symbol: str) -> list[PositionData]:
@@ -251,6 +262,21 @@ class BybitFetcher:
             truncated=truncated,
         )
 
+    def _fetch_risk_limits(self, symbol: str) -> MMTiers | None:
+        """Fetch and parse risk limit tiers for a symbol.
+
+        Returns None on any failure (non-fatal — calculator falls back
+        to hardcoded tiers).
+        """
+        try:
+            raw_tiers = self._client.get_risk_limit(symbol=symbol)
+            tiers = parse_risk_limit_tiers(raw_tiers)
+            logger.info(f"Fetched {len(tiers)} risk limit tiers for {symbol}")
+            return tiers
+        except Exception as e:
+            logger.warning(f"Failed to fetch risk limits for {symbol}: {e}")
+            return None
+
     def _fetch_wallet(self) -> WalletData:
         """Fetch account wallet balance."""
         raw = self._client.get_wallet_balance(account_type="UNIFIED")
@@ -261,6 +287,14 @@ class BybitFetcher:
             raise Exception("No wallet data returned")
 
         account = account_list[0]
+
+        # Fetch margin mode from account info endpoint
+        margin_mode = "UNKNOWN"
+        try:
+            account_info = self._client.get_account_info()
+            margin_mode = account_info.get("marginMode", "UNKNOWN")
+        except Exception as e:
+            logger.warning(f"Failed to fetch account info: {e}")
 
         # Find USDT coin data
         usdt_data = {}
@@ -277,6 +311,9 @@ class BybitFetcher:
             total_perp_upl=Decimal(account.get("totalPerpUPL", "0")),
             total_initial_margin=Decimal(account.get("totalInitialMargin", "0")),
             total_maintenance_margin=Decimal(account.get("totalMaintenanceMargin", "0")),
+            account_im_rate=Decimal(account.get("accountIMRate", "0")),
+            account_mm_rate=Decimal(account.get("accountMMRate", "0")),
+            margin_mode=margin_mode,
             usdt_wallet_balance=Decimal(usdt_data.get("walletBalance", "0")),
             usdt_unrealised_pnl=Decimal(usdt_data.get("unrealisedPnl", "0")),
             usdt_cum_realised_pnl=Decimal(usdt_data.get("cumRealisedPnl", "0")),

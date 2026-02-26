@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 
 from pnl_checker.fetcher import FetchResult, FundingData, PositionData, WalletData
-from pnl_checker.calculator import CalculationResult, PositionCalcResult
+from pnl_checker.calculator import AccountCalcResult, CalculationResult, PositionCalcResult
 
 logger = logging.getLogger(__name__)
 
@@ -66,11 +66,15 @@ class ComparisonResult:
 
     @property
     def total_pass(self) -> int:
-        return sum(p.pass_count for p in self.positions)
+        pos_pass = sum(p.pass_count for p in self.positions)
+        acct_pass = sum(1 for f in self.account.fields if f.passed is True)
+        return pos_pass + acct_pass
 
     @property
     def total_fail(self) -> int:
-        return sum(p.fail_count for p in self.positions)
+        pos_fail = sum(p.fail_count for p in self.positions)
+        acct_fail = sum(1 for f in self.account.fields if f.passed is False)
+        return pos_fail + acct_fail
 
     @property
     def all_passed(self) -> bool:
@@ -166,18 +170,18 @@ def _compare_position(
         calc.unrealised_pnl_last,
     ))
 
-    # PnL % bbu2 formula (mark)
+    # PnL % standard formula (mark)
     comp.fields.append(_info_field(
-        "PnL % bbu2 (mark)",
+        "PnL % standard (mark)",
         "—",
-        calc.unrealised_pnl_pct_bbu2_mark,
+        calc.unrealised_pnl_pct_mark,
     ))
 
-    # PnL % bbu2 formula (last)
+    # PnL % standard formula (last)
     comp.fields.append(_info_field(
-        "PnL % bbu2 (last)",
+        "PnL % standard (last)",
         "—",
-        calc.unrealised_pnl_pct_bbu2_last,
+        calc.unrealised_pnl_pct_last,
     ))
 
     # Entry price
@@ -197,8 +201,17 @@ def _compare_position(
         f"{calc.liq_ratio:.4f}",
     ))
 
-    # Maintenance margin
-    comp.fields.append(_info_field("Maintenance Margin", pos_data.position_mm))
+    # Maintenance margin (Bybit vs our tier-based calc)
+    comp.fields.append(_info_field(
+        "Maintenance Margin",
+        pos_data.position_mm,
+        calc.maintenance_margin,
+    ))
+    comp.fields.append(_info_field(
+        "MMR Rate (tier)",
+        "—",
+        f"{calc.mmr_rate * 100:.2f}%",
+    ))
 
     # Realized PnL
     comp.fields.append(_info_field("Cur Realized PnL", pos_data.cur_realised_pnl))
@@ -231,10 +244,15 @@ def _compare_position(
     return comp
 
 
-def _build_account_comparison(wallet: WalletData) -> AccountComparison:
-    """Build account-level summary (informational only)."""
+def _build_account_comparison(
+    wallet: WalletData,
+    account_calc: AccountCalcResult | None = None,
+    tolerance: float = 0.01,
+) -> AccountComparison:
+    """Build account-level summary with optional IMR%/MMR% comparison."""
     comp = AccountComparison()
     comp.fields = [
+        _info_field("Margin Mode", wallet.margin_mode),
         _info_field("Total Equity", wallet.total_equity),
         _info_field("Total Wallet Balance", wallet.total_wallet_balance),
         _info_field("Total Margin Balance", wallet.total_margin_balance),
@@ -246,6 +264,37 @@ def _build_account_comparison(wallet: WalletData) -> AccountComparison:
         _info_field("USDT Unrealized PnL", wallet.usdt_unrealised_pnl),
         _info_field("USDT Cum Realized PnL", wallet.usdt_cum_realised_pnl),
     ]
+
+    # IMR% / MMR% comparison (checked — valid for Regular Margin mode)
+    if account_calc is not None:
+        pct_tolerance = tolerance * PERCENTAGE_TOLERANCE_MULTIPLIER
+        bybit_imr_pct = wallet.account_im_rate * Decimal("100")
+        bybit_mmr_pct = wallet.account_mm_rate * Decimal("100")
+        comp.fields.append(_compare_field(
+            "Account IMR%",
+            bybit_imr_pct,
+            account_calc.imr_pct,
+            pct_tolerance,
+        ))
+        comp.fields.append(_compare_field(
+            "Account MMR%",
+            bybit_mmr_pct,
+            account_calc.mmr_pct,
+            pct_tolerance,
+        ))
+        comp.fields.append(_compare_field(
+            "Total IM (sum positions)",
+            wallet.total_initial_margin,
+            account_calc.total_im,
+            tolerance,
+        ))
+        comp.fields.append(_compare_field(
+            "Total MM (sum positions)",
+            wallet.total_maintenance_margin,
+            account_calc.total_mm,
+            tolerance,
+        ))
+
     return comp
 
 
@@ -351,6 +400,8 @@ def compare(
 
     # Account summary
     if fetch_result.wallet:
-        result.account = _build_account_comparison(fetch_result.wallet)
+        result.account = _build_account_comparison(
+            fetch_result.wallet, calc_result.account, tolerance
+        )
 
     return result

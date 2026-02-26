@@ -15,6 +15,9 @@ from gridcore.pnl import (
     calc_position_value,
     calc_initial_margin,
     calc_liq_ratio,
+    calc_maintenance_margin,
+    calc_imr_pct,
+    calc_mmr_pct,
 )
 
 from pnl_checker.fetcher import FetchResult, PositionData
@@ -40,13 +43,15 @@ class PositionCalcResult:
     unrealised_pnl_last: Decimal  # Using last traded price
 
     # Unrealized PnL % (ROE)
-    unrealised_pnl_pct_bbu2_mark: Decimal  # bbu2 formula, mark price
-    unrealised_pnl_pct_bbu2_last: Decimal  # bbu2 formula, last price
+    unrealised_pnl_pct_mark: Decimal  # standard formula, mark price
+    unrealised_pnl_pct_last: Decimal  # standard formula, last price
     unrealised_pnl_pct_bybit: Decimal  # Bybit standard: unrealised / IM * 100
 
     # Position value and margin
     position_value: Decimal  # size * avg_entry_price (matches Bybit positionValue)
     initial_margin: Decimal  # position_value / leverage
+    maintenance_margin: Decimal  # tier-based MM amount
+    mmr_rate: Decimal  # tier MMR rate used
 
     # Liquidation
     liq_ratio: float  # liq_price / last_price
@@ -61,10 +66,21 @@ class PositionCalcResult:
 
 
 @dataclass
+class AccountCalcResult:
+    """Account-level margin rate calculations."""
+
+    imr_pct: Decimal  # our calc: total_IM / margin_balance * 100
+    mmr_pct: Decimal  # our calc: total_MM / margin_balance * 100
+    total_im: Decimal  # sum of per-position initial margins
+    total_mm: Decimal  # sum of per-position maintenance margins
+
+
+@dataclass
 class CalculationResult:
     """All calculated values across positions."""
 
     positions: list[PositionCalcResult] = field(default_factory=list)
+    account: AccountCalcResult | None = None
 
 
 def _calc_risk_multipliers(
@@ -210,9 +226,9 @@ def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> Calculation
             unrealised_mark = calc_unrealised_pnl(pos.direction, pos.avg_price, mark, pos.size)
             unrealised_last = calc_unrealised_pnl(pos.direction, pos.avg_price, last, pos.size)
 
-            # Unrealized PnL % (bbu2 formula)
-            pct_bbu2_mark = calc_unrealised_pnl_pct(pos.direction, pos.avg_price, mark, pos.leverage)
-            pct_bbu2_last = calc_unrealised_pnl_pct(pos.direction, pos.avg_price, last, pos.leverage)
+            # Unrealized PnL % (standard formula)
+            pct_mark = calc_unrealised_pnl_pct(pos.direction, pos.avg_price, mark, pos.leverage)
+            pct_last = calc_unrealised_pnl_pct(pos.direction, pos.avg_price, last, pos.leverage)
 
             # Unrealized PnL % (Bybit standard)
             pct_bybit = Decimal("0")
@@ -228,6 +244,11 @@ def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> Calculation
                 initial_margin = calc_initial_margin(position_value, pos.leverage)
             else:
                 logger.warning(f"{pos.symbol} {pos.direction}: leverage={pos.leverage} too small for margin calc")
+
+            # Maintenance margin (tier-based, uses dynamic tiers when available)
+            maintenance_margin, mmr_rate = calc_maintenance_margin(
+                position_value, pos.symbol, tiers=symbol_data.risk_limit_tiers
+            )
 
             # Liquidation ratio
             liq_ratio = calc_liq_ratio(pos.liq_price, last) if last > 0 else 0.0
@@ -245,16 +266,30 @@ def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> Calculation
                 direction=pos.direction,
                 unrealised_pnl_mark=unrealised_mark,
                 unrealised_pnl_last=unrealised_last,
-                unrealised_pnl_pct_bbu2_mark=pct_bbu2_mark,
-                unrealised_pnl_pct_bbu2_last=pct_bbu2_last,
+                unrealised_pnl_pct_mark=pct_mark,
+                unrealised_pnl_pct_last=pct_last,
                 unrealised_pnl_pct_bybit=pct_bybit,
                 position_value=position_value,
                 initial_margin=initial_margin,
+                maintenance_margin=maintenance_margin,
+                mmr_rate=mmr_rate,
                 liq_ratio=liq_ratio,
                 funding_snapshot=funding_snapshot,
                 buy_multiplier=buy_mult,
                 sell_multiplier=sell_mult,
                 risk_rule_triggered=risk_rule,
             ))
+
+    # Account-level margin rate calculations
+    if fetch_result.wallet:
+        total_im = sum(p.initial_margin for p in result.positions)
+        total_mm = sum(p.maintenance_margin for p in result.positions)
+        margin_balance = fetch_result.wallet.total_margin_balance
+        result.account = AccountCalcResult(
+            imr_pct=calc_imr_pct(total_im, margin_balance),
+            mmr_pct=calc_mmr_pct(total_mm, margin_balance),
+            total_im=total_im,
+            total_mm=total_mm,
+        )
 
     return result

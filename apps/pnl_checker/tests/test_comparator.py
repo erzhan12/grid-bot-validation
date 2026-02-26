@@ -15,7 +15,7 @@ from pnl_checker.fetcher import (
     FundingData,
     WalletData,
 )
-from pnl_checker.calculator import CalculationResult, PositionCalcResult
+from pnl_checker.calculator import AccountCalcResult, CalculationResult, PositionCalcResult
 
 
 class TestCompareField:
@@ -99,32 +99,45 @@ class TestCompare:
                 total_margin_balance=Decimal("10000"),
                 total_available_balance=Decimal("9900"),
                 total_perp_upl=Decimal("20"),
-                total_initial_margin=Decimal("102"),
-                total_maintenance_margin=Decimal("10.2"),
+                total_initial_margin=Decimal("51"),
+                total_maintenance_margin=Decimal("2.55"),
+                account_im_rate=Decimal("0.0051"),
+                account_mm_rate=Decimal("0.000255"),
+                margin_mode="REGULAR_MARGIN",
                 usdt_wallet_balance=Decimal("9980"),
                 usdt_unrealised_pnl=Decimal("20"),
                 usdt_cum_realised_pnl=Decimal("0"),
             ),
         )
 
-        calc = CalculationResult(positions=[
-            PositionCalcResult(
-                symbol="BTCUSDT",
-                direction="long",
-                unrealised_pnl_mark=Decimal("10"),
-                unrealised_pnl_last=Decimal("10"),
-                unrealised_pnl_pct_bbu2_mark=Decimal("19.6"),
-                unrealised_pnl_pct_bbu2_last=Decimal("19.6"),
-                unrealised_pnl_pct_bybit=Decimal("19.6"),
-                position_value=Decimal("510"),
-                initial_margin=Decimal("51"),
-                liq_ratio=0.8824,
-                funding_snapshot=Decimal("0.0051"),
-                buy_multiplier=1.0,
-                sell_multiplier=1.0,
-                risk_rule_triggered="none",
+        calc = CalculationResult(
+            positions=[
+                PositionCalcResult(
+                    symbol="BTCUSDT",
+                    direction="long",
+                    unrealised_pnl_mark=Decimal("10"),
+                    unrealised_pnl_last=Decimal("10"),
+                    unrealised_pnl_pct_mark=Decimal("19.6"),
+                    unrealised_pnl_pct_last=Decimal("19.6"),
+                    unrealised_pnl_pct_bybit=Decimal("19.6"),
+                    position_value=Decimal("510"),
+                    initial_margin=Decimal("51"),
+                    maintenance_margin=Decimal("2.55"),
+                    mmr_rate=Decimal("0.005"),
+                    liq_ratio=0.8824,
+                    funding_snapshot=Decimal("0.0051"),
+                    buy_multiplier=1.0,
+                    sell_multiplier=1.0,
+                    risk_rule_triggered="none",
+                ),
+            ],
+            account=AccountCalcResult(
+                imr_pct=Decimal("0.51"),
+                mmr_pct=Decimal("0.0255"),
+                total_im=Decimal("51"),
+                total_mm=Decimal("2.55"),
             ),
-        ])
+        )
 
         return fetch, calc
 
@@ -203,19 +216,21 @@ class TestCompare:
             PositionCalcResult(
                 symbol="BTCUSDT", direction="long",
                 unrealised_pnl_mark=Decimal("10"), unrealised_pnl_last=Decimal("10"),
-                unrealised_pnl_pct_bbu2_mark=Decimal("19.6"),
-                unrealised_pnl_pct_bbu2_last=Decimal("19.6"),
+                unrealised_pnl_pct_mark=Decimal("19.6"),
+                unrealised_pnl_pct_last=Decimal("19.6"),
                 unrealised_pnl_pct_bybit=Decimal("19.6"),
                 position_value=Decimal("510"), initial_margin=Decimal("51"),
+                maintenance_margin=Decimal("2.55"), mmr_rate=Decimal("0.005"),
                 liq_ratio=0.8824, funding_snapshot=Decimal("0.0051"),
             ),
             PositionCalcResult(
                 symbol="BTCUSDT", direction="short",
                 unrealised_pnl_mark=Decimal("10"), unrealised_pnl_last=Decimal("10"),
-                unrealised_pnl_pct_bbu2_mark=Decimal("19.6"),
-                unrealised_pnl_pct_bbu2_last=Decimal("19.6"),
+                unrealised_pnl_pct_mark=Decimal("19.6"),
+                unrealised_pnl_pct_last=Decimal("19.6"),
                 unrealised_pnl_pct_bybit=Decimal("19.6"),
                 position_value=Decimal("510"), initial_margin=Decimal("51"),
+                maintenance_margin=Decimal("2.55"), mmr_rate=Decimal("0.005"),
                 liq_ratio=1.1373, funding_snapshot=Decimal("0.0051"),
             ),
         ])
@@ -266,3 +281,52 @@ class TestCompare:
         assert result.all_passed is False
         field_names = [f.field_name for f in result.positions[0].fields]
         assert "Funding Data Truncated" in field_names
+
+    def test_account_imr_mmr_fields_present(self):
+        """Account comparison should include IMR% and MMR% fields."""
+        fetch, calc = self._make_test_data()
+        result = compare(fetch, calc, tolerance=0.01)
+
+        field_names = [f.field_name for f in result.account.fields]
+        assert "Account IMR%" in field_names
+        assert "Account MMR%" in field_names
+        assert "Total IM (sum positions)" in field_names
+        assert "Total MM (sum positions)" in field_names
+
+    def test_account_imr_mmr_values(self):
+        """Account IMR%/MMR% should show Bybit vs our calc values with pass/fail."""
+        fetch, calc = self._make_test_data()
+        result = compare(fetch, calc, tolerance=0.01)
+
+        imr_field = next(f for f in result.account.fields if f.field_name == "Account IMR%")
+        mmr_field = next(f for f in result.account.fields if f.field_name == "Account MMR%")
+        # Bybit: account_im_rate=0.0051 → 0.51%
+        assert imr_field.bybit_value == Decimal("0.51")
+        # Our calc: 51 / 10000 * 100 = 0.51%
+        assert imr_field.our_value == Decimal("0.51")
+        # These are now checked fields (pass/fail)
+        assert imr_field.passed is not None
+        assert mmr_field.passed is not None
+
+    def test_maintenance_margin_in_position(self):
+        """Position comparison should include MM and MMR tier rate."""
+        fetch, calc = self._make_test_data()
+        result = compare(fetch, calc, tolerance=0.01)
+
+        field_names = [f.field_name for f in result.positions[0].fields]
+        assert "Maintenance Margin" in field_names
+        assert "MMR Rate (tier)" in field_names
+
+        mm_field = next(f for f in result.positions[0].fields if f.field_name == "Maintenance Margin")
+        assert mm_field.bybit_value == Decimal("5.1")  # from pos_data
+        assert mm_field.our_value == Decimal("2.55")  # from calc
+
+    def test_no_account_calc_skips_imr_mmr(self):
+        """When account calc is None, IMR%/MMR% fields should not appear."""
+        fetch, calc = self._make_test_data()
+        calc.account = None
+        result = compare(fetch, calc, tolerance=0.01)
+
+        field_names = [f.field_name for f in result.account.fields]
+        assert "Account IMR%" not in field_names
+        assert "Total IM (sum positions)" not in field_names
