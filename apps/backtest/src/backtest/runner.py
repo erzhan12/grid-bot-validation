@@ -284,6 +284,14 @@ class BacktestRunner:
         short_pnl = self._short_tracker.calculate_unrealized_pnl(current_price)
         return long_pnl + short_pnl
 
+    def get_total_im(self) -> Decimal:
+        """Get combined initial margin from both directions."""
+        return self._long_tracker.state.initial_margin + self._short_tracker.state.initial_margin
+
+    def get_total_mm(self) -> Decimal:
+        """Get combined maintenance margin from both directions."""
+        return self._long_tracker.state.maintenance_margin + self._short_tracker.state.maintenance_margin
+
     def apply_funding(self, rate: Decimal, current_price: Decimal) -> Decimal:
         """Apply funding payment to positions.
 

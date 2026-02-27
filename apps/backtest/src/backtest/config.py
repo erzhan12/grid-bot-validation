@@ -36,6 +36,7 @@ class BacktestStrategyConfig(BaseModel):
         default="x0.001",
         description="Order amount: fixed USDT, 'x0.001' for wallet fraction, 'b0.001' for BTC equivalent",
     )
+    leverage: int = Field(default=10, ge=1, description="Position leverage for margin calculations")
     max_margin: float = Field(default=8.0, gt=0, description="Maximum margin per position")
     long_koef: float = Field(default=1.0, gt=0, description="Long/short bias multiplier")
 

@@ -113,6 +113,7 @@ Successfully extracted pure strategy logic from `bbu2-master` into `packages/gri
    │   ├── grid.py              # Grid calculations (from greed.py)
    │   ├── engine.py            # GridEngine (from strat.py)
    │   ├── position.py          # Position risk management
+   │   ├── pnl.py               # Pure PnL formulas + MMTiers + parse_risk_limit_tiers
    │   └── persistence.py       # Grid anchor persistence
    └── tests/
        ├── test_grid.py         # Grid calculation tests
@@ -1673,6 +1674,10 @@ Pure PnL calculation functions extracted into gridcore as the single source of t
 - `calc_position_value(size, entry_price)` — Notional value (entry-based, matches Bybit)
 - `calc_initial_margin(position_value, leverage)` — Initial margin
 - `calc_liq_ratio(liq_price, current_price)` — Liquidation ratio
+- `calc_maintenance_margin(position_value, symbol, tiers=None)` — Tier-based MM (supports dynamic tiers)
+- `calc_imr_pct(total_im, margin_balance)` — Account IMR %
+- `calc_mmr_pct(total_mm, margin_balance)` — Account MMR %
+- `parse_risk_limit_tiers(api_tiers)` — Bybit API response → `MMTiers`
 
 **Consumers:**
 - `apps/pnl_checker/src/pnl_checker/calculator.py` — Imports from `gridcore.pnl`
@@ -1701,6 +1706,35 @@ This is the bbu2 pattern (bbu2-master/position.py:105). It represents what fract
 | backtest | Not implemented yet | Does NOT use gridcore Position risk mgmt |
 
 **Backtest gap**: The backtest engine does not integrate gridcore's `Position` risk manager. It uses `BacktestPositionTracker` (PnL only) and `GridEngine` (grid logic only). Risk-based order size multipliers are not applied in backtests.
+
+## Dynamic Risk Limit Tiers (2026-02-26)
+
+Per-symbol maintenance-margin tiers are now fetched from Bybit's `/v5/market/risk-limit` API instead of relying solely on hardcoded tables. This fixed LTCUSDT MM mismatch (our DEFAULT used 1% MMR at $1M, Bybit actual is 1% at $200k).
+
+### Architecture
+
+- **`gridcore/pnl.py`** — Single source of truth. `calc_maintenance_margin()` accepts optional `tiers: MMTiers` param. When `None`, falls back to hardcoded lookup. Hardcoded tables (`MM_TIERS_BTCUSDT`, `MM_TIERS_ETHUSDT`, `MM_TIERS_DEFAULT`) remain as fallback.
+- **`MMTiers`** type alias: `list[tuple[Decimal, Decimal, Decimal]]` — `(max_position_value, mmr_rate, deduction)`
+- **`parse_risk_limit_tiers()`** — Converts Bybit API response to `MMTiers`. Sorts by `riskLimitValue`, handles empty/missing `mmDeduction`, replaces last tier cap with `Infinity`.
+
+### Consumers
+
+| Consumer | How tiers are fetched | Fallback |
+|----------|----------------------|----------|
+| pnl_checker | `BybitRestClient.get_risk_limit()` in `fetcher.py` → passed as `tiers=` to `calc_maintenance_margin` | Hardcoded tables |
+| backtest | `RiskLimitProvider` with local JSON cache (24h TTL) | Cache → hardcoded tables |
+
+### Key patterns
+
+1. **`RiskLimitProvider` uses dependency injection** — accepts `rest_client: Optional[BybitRestClient]` in `__init__()`. Without a client, it uses cache-only/hardcoded fallback (no API calls). File: `apps/backtest/src/backtest/risk_limit_info.py`
+2. **Non-fatal failure** — Risk limit fetch failures return `None` everywhere. `calc_maintenance_margin(tiers=None)` gracefully falls back to hardcoded tables. No crash path.
+3. **Cache strategy** — `RiskLimitProvider.get()`: fresh cache → API → stale cache → hardcoded fallback. Cache at `conf/risk_limits_cache.json`, 24h TTL. Force refresh: `provider.get("BTCUSDT", force_fetch=True)`.
+4. **`get_risk_limit()` is a public endpoint** — No API keys needed. In pnl_checker it goes through the authenticated `BybitRestClient` (shared rate limiter). In backtest it uses the injected client.
+
+### Pitfalls
+
+1. **`claude-code-action` workflow file must match default branch** — The `.github/workflows/claude-code-review.yml` on a PR branch must be identical to the version on `main`. Modify it on `main` first, then all future PRs pick it up. If you change it on a feature branch, the OIDC token validation fails with "Workflow validation failed."
+2. **`_margin_ratio` in calculator.py** — Distinguishes `pos is None` (no position, returns 0 silently) from `wallet_balance <= 0` (logs warning then returns 0). This aids debugging when wallet data is missing.
 
 ## Phase K: PnL Checker (`apps/pnl_checker/`)
 
