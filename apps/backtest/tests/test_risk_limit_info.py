@@ -1,5 +1,6 @@
 """Tests for risk limit info provider."""
 
+import gc
 import json
 import logging
 import threading
@@ -117,6 +118,51 @@ class TestRiskLimitProvider:
 
         assert provider.load_from_cache("BTCUSDT") is None
 
+    def test_load_from_cache_missing_tier_keys_returns_none(self, provider, cache_path, caplog):
+        """Missing required tier keys are treated as invalid cache data."""
+        cache_path.write_text(json.dumps({
+            "BTCUSDT": {
+                "tiers": [{"max_value": "200000"}],  # missing mmr_rate/deduction
+                "cached_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }))
+
+        with caplog.at_level(logging.WARNING):
+            result = provider.load_from_cache("BTCUSDT")
+
+        assert result is None
+        assert any("Invalid cache data for BTCUSDT" in r.message for r in caplog.records)
+
+    def test_load_from_cache_invalid_decimal_returns_none(self, provider, cache_path, caplog):
+        """Invalid decimal strings are treated as invalid cache data."""
+        cache_path.write_text(json.dumps({
+            "BTCUSDT": {
+                "tiers": [{
+                    "max_value": "200000",
+                    "mmr_rate": "not-a-decimal",
+                    "deduction": "0",
+                    "imr_rate": "0.02",
+                }],
+                "cached_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }))
+
+        with caplog.at_level(logging.WARNING):
+            result = provider.load_from_cache("BTCUSDT")
+
+        assert result is None
+        assert any("Invalid cache data for BTCUSDT" in r.message for r in caplog.records)
+
+    def test_load_from_cache_oversized_logs_size_error(self, provider, cache_path, caplog):
+        """Oversized cache file logs size-specific warning and returns None."""
+        cache_path.write_text("x" * (provider.max_cache_size_bytes + 1))
+
+        with caplog.at_level(logging.WARNING):
+            result = provider.load_from_cache("BTCUSDT")
+
+        assert result is None
+        assert any("Cache file exceeds" in r.message for r in caplog.records)
+
     # --- save_to_cache ---
 
     def test_save_to_cache_creates_file(self, provider, cache_path):
@@ -157,6 +203,18 @@ class TestRiskLimitProvider:
         cache = json.loads(cache_path.read_text())
         assert isinstance(cache["BTCUSDT"]["tiers"], list)
         assert len(cache["BTCUSDT"]["tiers"]) == 3
+
+    def test_save_to_cache_non_dict_root_overwrites(self, provider, cache_path, caplog):
+        """Non-dict cache root is treated as corrupted and overwritten."""
+        cache_path.write_text(json.dumps([{"unexpected": "list-root"}]))
+
+        with caplog.at_level(logging.WARNING):
+            provider.save_to_cache("BTCUSDT", SAMPLE_TIERS)
+
+        cache = json.loads(cache_path.read_text())
+        assert isinstance(cache, dict)
+        assert "BTCUSDT" in cache
+        assert any("Invalid cache root" in r.message for r in caplog.records)
 
     # --- fetch_from_bybit ---
 
@@ -412,6 +470,39 @@ class TestRiskLimitProvider:
         assert target.read_text() == original
         assert any("must not be a symlink" in r.message for r in caplog.records)
 
+    def test_save_to_cache_rejects_symlink_lock_path(self, tmp_path, caplog):
+        """Cache writes are rejected when sidecar lock path is a symlink."""
+        cache_path = tmp_path / "cache.json"
+        lock_target = tmp_path / "real_lock_target"
+        lock_target.write_text("lock")
+        lock_symlink = cache_path.with_suffix(f"{cache_path.suffix}.lock")
+        try:
+            lock_symlink.symlink_to(lock_target)
+        except OSError as e:
+            pytest.skip(f"Symlinks not supported in test environment: {e}")
+
+        provider = RiskLimitProvider(cache_path=cache_path)
+        with caplog.at_level(logging.WARNING):
+            provider.save_to_cache("BTCUSDT", SAMPLE_TIERS)
+
+        assert not cache_path.exists()
+        assert any("Cache lock path must not be a symlink" in r.message for r in caplog.records)
+
+    def test_close_makes_provider_unusable(self, tmp_path):
+        """A closed provider raises RuntimeError on further use."""
+        cache_path = tmp_path / "cache.json"
+        provider = RiskLimitProvider(cache_path=cache_path)
+        provider.save_to_cache("BTCUSDT", SAMPLE_TIERS)
+
+        provider.close()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            provider.load_from_cache("BTCUSDT")
+        with pytest.raises(RuntimeError, match="closed"):
+            provider.save_to_cache("ETHUSDT", SAMPLE_TIERS)
+        with pytest.raises(RuntimeError, match="closed"):
+            provider.get("BTCUSDT")
+
 
 class TestEdgeCases:
     """Edge case tests for risk limit parsing and caching."""
@@ -539,6 +630,86 @@ class TestConcurrentCacheAccess:
         # Cache file should be valid JSON
         cache = json.loads(cache_path.read_text())
         assert isinstance(cache, dict)
+
+    def test_concurrent_writes_across_instances_no_corruption(self, tmp_path):
+        """Two provider instances sharing one cache path coordinate writes safely."""
+        cache_path = tmp_path / "cache.json"
+        provider_a = RiskLimitProvider(cache_path=cache_path)
+        provider_b = RiskLimitProvider(cache_path=cache_path)
+        errors: list[Exception] = []
+
+        tiers_a: MMTiers = [
+            (Decimal("100000"), Decimal("0.01"), Decimal("0"), Decimal("0.02")),
+            (Decimal("Infinity"), Decimal("0.025"), Decimal("1500"), Decimal("0.05")),
+        ]
+        tiers_b: MMTiers = [
+            (Decimal("500000"), Decimal("0.005"), Decimal("0"), Decimal("0.01")),
+            (Decimal("Infinity"), Decimal("0.01"), Decimal("2500"), Decimal("0.02")),
+        ]
+
+        def write_symbol(provider, symbol, tiers):
+            try:
+                for _ in range(20):
+                    provider.save_to_cache(symbol, tiers)
+            except Exception as e:
+                errors.append(e)
+
+        t1 = threading.Thread(target=write_symbol, args=(provider_a, "AAAUSDT", tiers_a))
+        t2 = threading.Thread(target=write_symbol, args=(provider_b, "BBBUSDT", tiers_b))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert errors == [], f"Thread errors: {errors}"
+        cache = json.loads(cache_path.read_text())
+        assert "AAAUSDT" in cache
+        assert "BBBUSDT" in cache
+
+    def test_lock_registry_released_when_instances_deleted(self, tmp_path):
+        """In-process lock entry is cleaned up when providers are deleted."""
+        import backtest.risk_limit_info as risk_limit_info_module
+
+        cache_path = tmp_path / "cache.json"
+        key = str(cache_path.resolve())
+        provider_a = RiskLimitProvider(cache_path=cache_path)
+        provider_b = RiskLimitProvider(cache_path=cache_path)
+
+        assert key in risk_limit_info_module._IN_PROCESS_LOCKS
+        assert risk_limit_info_module._IN_PROCESS_LOCKS[key][1] >= 2
+
+        del provider_a
+        del provider_b
+        gc.collect()
+
+        assert key not in risk_limit_info_module._IN_PROCESS_LOCKS
+
+    def test_close_then_new_provider_keeps_lock_registry_consistent(self, tmp_path):
+        """Closed providers cannot be reused; new providers share one lock entry."""
+        import backtest.risk_limit_info as risk_limit_info_module
+
+        cache_path = tmp_path / "cache.json"
+        key = str(cache_path.resolve())
+        provider_a = RiskLimitProvider(cache_path=cache_path)
+        provider_b = RiskLimitProvider(cache_path=cache_path)
+        assert key in risk_limit_info_module._IN_PROCESS_LOCKS
+        assert risk_limit_info_module._IN_PROCESS_LOCKS[key][1] >= 2
+
+        provider_a.close()
+        assert risk_limit_info_module._IN_PROCESS_LOCKS[key][1] == 1
+
+        with pytest.raises(RuntimeError, match="closed"):
+            provider_a.save_to_cache("AAAUSDT", SAMPLE_TIERS)
+
+        provider_c = RiskLimitProvider(cache_path=cache_path)
+        assert risk_limit_info_module._IN_PROCESS_LOCKS[key][1] == 2
+
+        provider_b.save_to_cache("BBBUSDT", SAMPLE_TIERS)
+        provider_c.save_to_cache("CCCUSDT", SAMPLE_TIERS)
+
+        cache = json.loads(cache_path.read_text())
+        assert "BBBUSDT" in cache
+        assert "CCCUSDT" in cache
 
 
 class TestPathTraversalValidation:

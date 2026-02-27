@@ -123,6 +123,14 @@ class TestDatabaseSettings:
         assert settings.db_host == "test-host"
         assert settings.db_user == "test-user"
 
+    def test_unrelated_gridbot_env_vars_are_ignored(self, monkeypatch):
+        """Unknown GRIDBOT_* keys should not break settings loading."""
+        monkeypatch.setenv("GRIDBOT_BYBIT_API_KEY", "dummy")
+        monkeypatch.setenv("GRIDBOT_BYBIT_API_SECRET", "dummy")
+
+        settings = DatabaseSettings(db_type="sqlite", db_name=":memory:")
+        assert settings.get_database_url() == "sqlite+pysqlite:///:memory:"
+
 
 class TestDatabaseFactory:
     """Tests for DatabaseFactory."""

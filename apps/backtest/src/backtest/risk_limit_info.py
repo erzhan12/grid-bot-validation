@@ -7,6 +7,8 @@ Falls back to cache or hardcoded tiers if network unavailable.
 import json
 import logging
 import os
+import threading
+import weakref
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -24,6 +26,9 @@ DEFAULT_CACHE_PATH = Path(__file__).parent.parent.parent.parent / "conf" / "risk
 
 # Maximum allowed cache file size (bytes) to prevent DoS via bloated files
 MAX_CACHE_SIZE_BYTES = 10_000_000
+
+_IN_PROCESS_LOCKS: dict[str, tuple[threading.Lock, int]] = {}
+_IN_PROCESS_LOCKS_GUARD = threading.Lock()
 
 
 class RiskLimitProvider:
@@ -44,8 +49,8 @@ class RiskLimitProvider:
     Error handling:
       - Corrupted cache files are logged and skipped (non-fatal).
       - API errors trigger fallback to cache or hardcoded tiers.
-      - All errors are logged but never raised — ``get()`` always returns
-        a valid ``MMTiers`` list.
+      - ``get()`` returns a valid ``MMTiers`` list unless the provider has
+        been closed via ``close()`` (then methods raise ``RuntimeError``).
       - Cache files exceeding ``max_cache_size_bytes`` (default 10 MB) are rejected to prevent DoS.
 
     Example:
@@ -73,6 +78,26 @@ class RiskLimitProvider:
         self.cache_ttl = cache_ttl
         self._rest_client = rest_client
         self.max_cache_size_bytes = max_cache_size_bytes
+        self._in_process_lock_key, self._in_process_lock = _acquire_in_process_lock(
+            self.cache_path
+        )
+        self._closed = False
+        # Deterministic cleanup without relying on __del__ timing.
+        self._lock_finalizer = weakref.finalize(
+            self, _release_in_process_lock, self._in_process_lock_key
+        )
+
+    def close(self) -> None:
+        """Release in-process lock reference and mark provider closed."""
+        with self._in_process_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._lock_finalizer()
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("RiskLimitProvider is closed")
 
     def _cache_path_is_symlink(self) -> bool:
         return self._configured_cache_path.is_symlink() or self.cache_path.is_symlink()
@@ -89,6 +114,7 @@ class RiskLimitProvider:
         Returns:
             MMTiers if successful, None if failed or no client configured
         """
+        self._ensure_open()
         if self._rest_client is None:
             logger.debug("No rest_client configured, skipping API fetch")
             return None
@@ -116,6 +142,7 @@ class RiskLimitProvider:
         Returns:
             MMTiers if found in cache, None otherwise
         """
+        self._ensure_open()
         tiers, _cached_at_str = self._load_cache_entry(symbol)
         return tiers
 
@@ -134,6 +161,8 @@ class RiskLimitProvider:
                 )
             with open(self.cache_path) as f:
                 cache = json.load(f)
+            if not isinstance(cache, dict):
+                raise ValueError("Cache root must be a JSON object")
 
             entry = cache.get(symbol)
             if not isinstance(entry, dict):
@@ -146,10 +175,11 @@ class RiskLimitProvider:
 
         except json.JSONDecodeError as e:
             logger.warning(f"Corrupted cache file {self.cache_path}: {e}")
-        except TypeError as e:
-            logger.warning(f"Invalid tier data format in cache for {symbol}: {e}")
-        except ValueError as e:
-            logger.warning(f"Invalid tier data format in cache for {symbol}: {e}")
+        except (TypeError, ValueError, KeyError, ArithmeticError) as e:
+            if str(e).startswith("Cache file exceeds"):
+                logger.warning(str(e))
+            else:
+                logger.warning(f"Invalid cache data for {symbol}: {e}")
 
         return None, None
 
@@ -163,6 +193,7 @@ class RiskLimitProvider:
             symbol: Trading pair
             tiers: Parsed tier table to cache
         """
+        self._ensure_open()
         try:
             self._save_to_cache_impl(symbol, tiers)
         except (PermissionError, OSError, ValueError) as e:
@@ -180,48 +211,58 @@ class RiskLimitProvider:
             )
         try:
             with open(self.cache_path) as f:
-                return json.load(f)
+                cache = json.load(f)
+            if not isinstance(cache, dict):
+                logger.warning(
+                    f"Invalid cache root in {self.cache_path}: expected JSON object, got "
+                    f"{type(cache).__name__}; overwriting"
+                )
+                return {}
+            return cache
         except (json.JSONDecodeError, ValueError) as e:
             logger.warning(f"Corrupted cache file {self.cache_path}, overwriting: {e}")
             return {}
 
     def _save_to_cache_impl(self, symbol: str, tiers: MMTiers) -> None:
-        if self._cache_path_is_symlink():
-            raise ValueError("Cache path must not be a symlink")
+        # Serialize same-process writers; file lock handles cross-process writers.
+        with self._in_process_lock:
+            self._ensure_open()
+            if self._cache_path_is_symlink():
+                raise ValueError("Cache path must not be a symlink")
 
-        # Ensure directory exists before creating lock/cache files.
-        self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            # Ensure directory exists before creating lock/cache files.
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
 
-        lock_path = self.cache_path.with_suffix(f"{self.cache_path.suffix}.lock")
-        with open(lock_path, "a+b") as lock_file:
-            _acquire_file_lock(lock_file)
-            try:
-                # Read-modify-write must be atomic across processes.
-                cache = self._load_existing_cache()
+            lock_path = self.cache_path.with_suffix(f"{self.cache_path.suffix}.lock")
+            with _open_lock_file(lock_path) as lock_file:
+                _acquire_file_lock(lock_file)
+                try:
+                    # Read-modify-write must be atomic across processes.
+                    cache = self._load_existing_cache()
 
-                # Skip write if tiers haven't changed (direct equality check)
-                existing = cache.get(symbol)
-                new_tiers_dict = _tiers_to_dict(tiers)
-                if (
-                    existing
-                    and isinstance(existing, dict)
-                    and isinstance(existing.get("tiers"), list)
-                    and "cached_at" in existing
-                    and existing["tiers"] == new_tiers_dict
-                ):
-                    return
+                    # Skip write if tiers haven't changed (direct equality check)
+                    existing = cache.get(symbol)
+                    new_tiers_dict = _tiers_to_dict(tiers)
+                    if (
+                        existing
+                        and isinstance(existing, dict)
+                        and isinstance(existing.get("tiers"), list)
+                        and "cached_at" in existing
+                        and existing["tiers"] == new_tiers_dict
+                    ):
+                        return
 
-                # Update cache with timestamp
-                cache[symbol] = {
-                    "tiers": new_tiers_dict,
-                    "cached_at": datetime.now(timezone.utc).isoformat(),
-                }
+                    # Update cache with timestamp
+                    cache[symbol] = {
+                        "tiers": new_tiers_dict,
+                        "cached_at": datetime.now(timezone.utc).isoformat(),
+                    }
 
-                # Write cache
-                with open(self.cache_path, "w") as f:
-                    json.dump(cache, f, indent=2)
-            finally:
-                _release_file_lock(lock_file)
+                    # Write cache
+                    with open(self.cache_path, "w") as f:
+                        json.dump(cache, f, indent=2)
+                finally:
+                    _release_file_lock(lock_file)
 
         logger.info(f"Cached risk limit tiers for {symbol}")
 
@@ -282,6 +323,7 @@ class RiskLimitProvider:
             >>> tiers = provider.get("BTCUSDT")
             >>> provider.get("BTCUSDT", force_fetch=True)  # bypass cache
         """
+        self._ensure_open()
         cached: Optional[MMTiers] = None
         cached_at_str: Optional[str] = None
 
@@ -323,6 +365,64 @@ def _tiers_to_dict(tiers: MMTiers) -> list[dict[str, str]]:
         }
         for max_val, mmr_rate, deduction, imr_rate in tiers
     ]
+
+
+def _acquire_in_process_lock(path: Path) -> tuple[str, threading.Lock]:
+    key = str(path)
+    with _IN_PROCESS_LOCKS_GUARD:
+        entry = _IN_PROCESS_LOCKS.get(key)
+        if entry is None:
+            lock = threading.Lock()
+            _IN_PROCESS_LOCKS[key] = (lock, 1)
+        else:
+            lock, ref_count = entry
+            _IN_PROCESS_LOCKS[key] = (lock, ref_count + 1)
+    return key, lock
+
+
+def _release_in_process_lock(key: str) -> None:
+    with _IN_PROCESS_LOCKS_GUARD:
+        entry = _IN_PROCESS_LOCKS.get(key)
+        if entry is None:
+            return
+        lock, ref_count = entry
+        if ref_count <= 1:
+            del _IN_PROCESS_LOCKS[key]
+        else:
+            _IN_PROCESS_LOCKS[key] = (lock, ref_count - 1)
+
+
+def _open_lock_file(lock_path: Path):
+    """Open lock file safely; reject symlink lock paths."""
+    if lock_path.is_symlink():
+        raise ValueError("Cache lock path must not be a symlink")
+
+    flags = os.O_RDWR | os.O_CREAT
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow:
+        flags |= nofollow
+
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except OSError as e:
+        if lock_path.is_symlink():
+            raise ValueError("Cache lock path must not be a symlink") from e
+        raise
+
+    # On platforms without O_NOFOLLOW, verify path identity after open.
+    if not nofollow:
+        try:
+            if lock_path.is_symlink():
+                raise ValueError("Cache lock path must not be a symlink")
+            path_stat = os.stat(lock_path, follow_symlinks=False)
+            fd_stat = os.fstat(fd)
+            if (path_stat.st_dev, path_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):
+                raise ValueError("Cache lock path changed during open")
+        except Exception:
+            os.close(fd)
+            raise
+
+    return os.fdopen(fd, "a+b")
 
 
 def _acquire_file_lock(lock_file) -> None:

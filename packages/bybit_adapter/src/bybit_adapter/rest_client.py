@@ -371,8 +371,22 @@ class BybitRestClient:
         # where outer list contains one entry per symbol, each with an inner "list" of tiers.
         # We unwrap the first symbol's inner tier list since we query one symbol at a time.
         outer_list = response.get("result", {}).get("list", [])
-        if outer_list and isinstance(outer_list[0], dict) and "list" in outer_list[0]:
+        if not isinstance(outer_list, list):
+            logger.warning(
+                "Unexpected risk limit API structure for %s, expected list but got %s",
+                symbol,
+                type(outer_list).__name__,
+            )
+            tiers = []
+        elif outer_list and isinstance(outer_list[0], dict) and "list" in outer_list[0]:
             tiers = outer_list[0].get("list", [])
+            if not isinstance(tiers, list):
+                logger.warning(
+                    "Unexpected risk limit API structure for %s, inner list is %s",
+                    symbol,
+                    type(tiers).__name__,
+                )
+                tiers = []
         else:
             if outer_list:
                 logger.warning(

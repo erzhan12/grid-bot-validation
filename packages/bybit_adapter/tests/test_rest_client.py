@@ -1,5 +1,6 @@
 """Tests for BybitRestClient."""
 
+import logging
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -691,6 +692,43 @@ class TestGetRiskLimit:
 
         mock_session.get_risk_limit.assert_called_once_with(
             category="inverse", symbol="BTCUSDT"
+        )
+
+    def test_unexpected_structure_logs_warning_and_falls_back(self, client, mock_session, caplog):
+        tiers = [
+            {"id": 1, "symbol": "BTCUSDT", "riskLimitValue": "2000000"},
+            {"id": 2, "symbol": "BTCUSDT", "riskLimitValue": "4000000"},
+        ]
+        mock_session.get_risk_limit.return_value = _ok_response({"list": tiers})
+
+        with caplog.at_level(logging.WARNING):
+            result = client.get_risk_limit(symbol="BTCUSDT")
+
+        assert result == tiers
+        assert any(
+            "Unexpected risk limit API structure" in record.message for record in caplog.records
+        )
+
+    def test_non_list_structure_logs_warning_and_returns_empty(self, client, mock_session, caplog):
+        mock_session.get_risk_limit.return_value = _ok_response({"list": {"unexpected": "shape"}})
+
+        with caplog.at_level(logging.WARNING):
+            result = client.get_risk_limit(symbol="BTCUSDT")
+
+        assert result == []
+        assert any(
+            "expected list but got dict" in record.message for record in caplog.records
+        )
+
+    def test_non_list_inner_list_logs_warning_and_returns_empty(self, client, mock_session, caplog):
+        mock_session.get_risk_limit.return_value = _ok_response({"list": [{"list": "bad-inner"}]})
+
+        with caplog.at_level(logging.WARNING):
+            result = client.get_risk_limit(symbol="BTCUSDT")
+
+        assert result == []
+        assert any(
+            "inner list is str" in record.message for record in caplog.records
         )
 
 
