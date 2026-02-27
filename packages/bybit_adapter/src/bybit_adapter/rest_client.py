@@ -13,6 +13,7 @@ Reference:
 - Order History: https://bybit-exchange.github.io/docs/v5/order/order-list
 - Position List: https://bybit-exchange.github.io/docs/v5/position
 - Wallet Balance: https://bybit-exchange.github.io/docs/v5/account/wallet-balance
+- Risk Limit: https://bybit-exchange.github.io/docs/v5/market/risk-limit
 """
 
 import time
@@ -472,8 +473,12 @@ class BybitRestClient:
             logger.info("Order cancelled successfully")
             return True
         except Exception as e:
-            # Order may already be filled or cancelled
-            logger.warning(f"Cancel order failed: {e}")
+            err_msg = str(e).lower()
+            # Expected: order already filled, cancelled, or not found
+            if any(phrase in err_msg for phrase in ("not found", "not exist", "already filled", "already cancelled")):
+                logger.warning(f"Cancel order failed (expected): {e}")
+            else:
+                logger.error(f"Cancel order failed (unexpected): {e}")
             return False
 
     def cancel_all_orders(self, symbol: str) -> int:
@@ -511,6 +516,7 @@ class BybitRestClient:
         symbol: Optional[str] = None,
         order_type: str = "Limit",
         limit: int = 50,
+        max_pages: int = 10,
     ) -> list[dict]:
         """Fetch all open orders with pagination.
 
@@ -518,6 +524,7 @@ class BybitRestClient:
             symbol: Filter by symbol (optional)
             order_type: Filter by order type (default "Limit")
             limit: Results per page (max 50)
+            max_pages: Maximum number of pages to fetch (safety limit)
 
         Returns:
             List of open order dicts
@@ -533,8 +540,9 @@ class BybitRestClient:
         all_orders = []
         # Note: _wait_for_rate_limit is called inside the loop before each page request
         cursor = None
+        page = 0
 
-        while True:
+        while page < max_pages:
             self._wait_for_rate_limit("query")
             params = {
                 "category": "linear",
@@ -559,10 +567,14 @@ class BybitRestClient:
             all_orders.extend(filtered)
 
             cursor = result.get("nextPageCursor")
+            page += 1
             if not cursor:
                 break
 
-        logger.debug(f"Fetched {len(all_orders)} open {order_type} orders")
+        if page >= max_pages and cursor:
+            logger.warning(f"get_open_orders reached max_pages={max_pages} with more data available")
+
+        logger.debug(f"Fetched {len(all_orders)} open {order_type} orders across {page} pages")
         return all_orders
 
     def get_tickers(self, symbol: str) -> dict:

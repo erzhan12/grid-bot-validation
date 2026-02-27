@@ -210,7 +210,15 @@ class BybitFetcher:
         )
 
     def _fetch_funding(self, symbol: str) -> FundingData:
-        """Fetch cumulative funding fees from transaction log."""
+        """Fetch cumulative funding fees from transaction log.
+
+        Iterates all SETTLEMENT transactions for the symbol via paginated
+        ``get_transaction_log_all``.  Each page returns up to 50 records,
+        so the total records fetched is at most ``funding_max_pages * 50``.
+        For accounts with a long funding history (thousands of 8-hour
+        settlements), consider increasing *funding_max_pages* passed to
+        ``BybitFetcher.__init__`` to avoid truncated results.
+        """
         try:
             transactions, truncated = self._client.get_transaction_log_all(
                 symbol=symbol,

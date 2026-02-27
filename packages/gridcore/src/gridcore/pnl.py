@@ -237,6 +237,21 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
     The returned list is sorted by ascending ``riskLimitValue``, with the
     last tier's cap replaced by ``Infinity``.
 
+    Example::
+
+        >>> api_tiers = [
+        ...     {"riskLimitValue": "200000", "maintenanceMargin": "0.005",
+        ...      "mmDeduction": "0", "initialMargin": "0.01"},
+        ...     {"riskLimitValue": "1000000", "maintenanceMargin": "0.01",
+        ...      "mmDeduction": "1000", "initialMargin": "0.02"},
+        ... ]
+        >>> parse_risk_limit_tiers(api_tiers)
+        [
+            (Decimal('200000'), Decimal('0.005'), Decimal('0'), Decimal('0.01')),
+            (Decimal('Infinity'), Decimal('0.01'), Decimal('1000'), Decimal('0.02')),
+        ]
+        # Each tuple: (max_position_value, mmr_rate, deduction, imr_rate)
+
     Args:
         api_tiers: List of tier dicts from Bybit API response.
 
@@ -259,7 +274,9 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
         # mmDeduction can be empty string "" or missing for tier 0 (no deduction)
         deduction_str = tier.get("mmDeduction", "") or "0"
         deduction = Decimal(deduction_str)
-        # initialMargin may be missing in old test data
+        # initialMargin may be missing in old test data or returned as ""
+        # by the Bybit API for the lowest tier.  The ``or "0"`` fallback
+        # handles both cases so Decimal() never receives an empty string.
         imr_str = tier.get("initialMargin", "") or "0"
         imr_rate = Decimal(imr_str)
         result.append((max_val, mmr_rate, deduction, imr_rate))

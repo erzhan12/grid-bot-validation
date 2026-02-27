@@ -25,7 +25,17 @@ DEFAULT_CACHE_PATH = Path("conf/risk_limits_cache.json")
 class RiskLimitProvider:
     """Fetches and caches risk limit tier tables.
 
-    Tries cache first, then Bybit API, falls back to hardcoded tiers.
+    Three-tier fallback strategy:
+      1. **Cache** — local JSON file (default TTL: 24 hours).
+      2. **Bybit API** — ``/v5/market/risk-limit`` via injected ``BybitRestClient``.
+      3. **Hardcoded** — static tier tables in ``gridcore.pnl`` (last resort).
+
+    Cache behaviour:
+      - Entries older than *cache_ttl* (default 24 h) are considered stale and
+        trigger an API refresh, but stale data is still used as a fallback when
+        the API is unreachable.
+      - Use ``force_fetch=True`` to bypass the cache entirely — recommended
+        after a detected tier change or on startup for critical systems.
 
     Example:
         from bybit_adapter.rest_client import BybitRestClient
@@ -33,6 +43,7 @@ class RiskLimitProvider:
         client = BybitRestClient(api_key="...", api_secret="...", testnet=False)
         provider = RiskLimitProvider(rest_client=client)
         tiers = provider.get("BTCUSDT")
+        tiers = provider.get("BTCUSDT", force_fetch=True)  # bypass cache
     """
 
     def __init__(
@@ -118,11 +129,19 @@ class RiskLimitProvider:
             try:
                 with open(self.cache_path) as f:
                     cache = json.load(f)
-            except (json.JSONDecodeError, ValueError):
-                pass
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(f"Corrupted cache file {self.cache_path}, overwriting: {e}")
+                cache = {}
 
-        # Skip write if tiers haven't changed
-        if symbol in cache and cache[symbol].get("tiers") == _tiers_to_dict(tiers):
+        # Skip write if tiers haven't changed (validate structure first)
+        existing = cache.get(symbol)
+        if (
+            existing
+            and isinstance(existing, dict)
+            and "tiers" in existing
+            and "cached_at" in existing
+            and existing["tiers"] == _tiers_to_dict(tiers)
+        ):
             return
 
         # Update cache with timestamp

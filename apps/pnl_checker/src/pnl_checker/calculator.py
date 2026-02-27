@@ -25,8 +25,11 @@ from pnl_checker.fetcher import FetchResult, PositionData
 logger = logging.getLogger(__name__)
 
 # Minimum thresholds based on Bybit's decimal precision (8 decimals).
-# Values below this produce division overflow or meaningless percentages;
-# the calculator logs a warning and returns Decimal("0") instead.
+# PnL% calculation divides unrealised_pnl by position_im; values below 1E-8
+# cause Decimal overflow due to the extreme precision required (28+ digits).
+# Similarly, calc_initial_margin divides position_value by leverage; near-zero
+# leverage produces astronomically large IM values that overflow.
+# The calculator logs a warning and returns Decimal("0") instead.
 MIN_POSITION_IM = Decimal("1E-8")  # ~$0.00000001 USDT
 MIN_LEVERAGE = Decimal("1E-8")  # Effectively zero leverage
 
@@ -239,7 +242,10 @@ def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> Calculation
             if pos.position_im >= MIN_POSITION_IM:
                 pct_bybit = unrealised_mark / pos.position_im * Decimal("100")
             else:
-                logger.warning(f"{pos.symbol} {pos.direction}: position_im={pos.position_im} too small for PnL % calc")
+                logger.warning(
+                    f"{pos.symbol} {pos.direction}: position_im={pos.position_im} too small for PnL %% calc",
+                    extra={"data_quality_issue": True},
+                )
 
             # Position value and initial margin
             position_value = calc_position_value(pos.size, pos.avg_price)
@@ -251,7 +257,10 @@ def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> Calculation
                     tiers=symbol_data.risk_limit_tiers,
                 )
             else:
-                logger.warning(f"{pos.symbol} {pos.direction}: leverage={pos.leverage} too small for margin calc")
+                logger.warning(
+                    f"{pos.symbol} {pos.direction}: leverage={pos.leverage} too small for margin calc",
+                    extra={"data_quality_issue": True},
+                )
 
             # Maintenance margin (tier-based, uses dynamic tiers when available)
             maintenance_margin, mmr_rate = calc_maintenance_margin(
