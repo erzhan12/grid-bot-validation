@@ -458,6 +458,22 @@ class TestParseRiskLimitTiers:
         assert result[1][2] == Decimal("1000")
         assert result[1][3] == Decimal("0.02")
 
+    def test_missing_both_deduction_and_imr(self):
+        """Missing mmDeduction/initialMargin in all tiers defaults both to 0."""
+        api_tiers = [
+            {
+                "riskLimitValue": "200000",
+                "maintenanceMargin": "0.005",
+            },
+            {
+                "riskLimitValue": "1000000",
+                "maintenanceMargin": "0.01",
+            },
+        ]
+        result = parse_risk_limit_tiers(api_tiers)
+        assert result[0] == (Decimal("200000"), Decimal("0.005"), Decimal("0"), Decimal("0"))
+        assert result[1] == (Decimal("Infinity"), Decimal("0.01"), Decimal("0"), Decimal("0"))
+
     def test_initial_margin_extracted(self):
         """initialMargin is extracted as 4th element."""
         api_tiers = [
@@ -505,6 +521,20 @@ class TestParseRiskLimitTiers:
             parse_risk_limit_tiers([
                 {"riskLimitValue": "200000", "maintenanceMargin": "1.5",
                  "mmDeduction": "0", "initialMargin": "0.02"},
+            ])
+
+    def test_missing_risk_limit_value_raises(self):
+        """Missing required riskLimitValue raises ValueError."""
+        with pytest.raises(ValueError, match="Missing required field: riskLimitValue"):
+            parse_risk_limit_tiers([
+                {"maintenanceMargin": "0.01", "mmDeduction": "0", "initialMargin": "0.02"},
+            ])
+
+    def test_missing_maintenance_margin_raises(self):
+        """Missing required maintenanceMargin raises ValueError."""
+        with pytest.raises(ValueError, match="Missing required field: maintenanceMargin"):
+            parse_risk_limit_tiers([
+                {"riskLimitValue": "200000", "mmDeduction": "0", "initialMargin": "0.02"},
             ])
 
     def test_invalid_mmr_rate_negative(self):

@@ -298,6 +298,33 @@ class TestRiskLimitProvider:
         assert len(result) == 2
         assert result[0][0] == Decimal("500000")
 
+    def test_stale_cache_triggers_api_refresh(self, provider, cache_path):
+        """Stale cache triggers API refresh and updates cache when force_fetch=False."""
+        stale_time = datetime.now(timezone.utc) - provider.cache_ttl - timedelta(hours=2)
+        stale_tiers: MMTiers = [
+            (Decimal("200000"), Decimal("0.01"), Decimal("0"), Decimal("0.02")),
+            (Decimal("Infinity"), Decimal("0.025"), Decimal("3000"), Decimal("0.05")),
+        ]
+        fresh_tiers: MMTiers = [
+            (Decimal("500000"), Decimal("0.005"), Decimal("0"), Decimal("0.01")),
+            (Decimal("Infinity"), Decimal("0.01"), Decimal("2500"), Decimal("0.02")),
+        ]
+        cache_path.write_text(json.dumps({
+            "BTCUSDT": self._make_cache_entry(stale_tiers, cached_at=stale_time),
+        }))
+
+        with patch.object(provider, "fetch_from_bybit", return_value=fresh_tiers) as mock_fetch:
+            result = provider.get("BTCUSDT", force_fetch=False)
+
+        mock_fetch.assert_called_once_with("BTCUSDT")
+        assert result == fresh_tiers
+
+        cache = json.loads(cache_path.read_text())
+        cached_tiers = _tiers_from_dict(cache["BTCUSDT"]["tiers"])
+        refreshed_at = datetime.fromisoformat(cache["BTCUSDT"]["cached_at"])
+        assert cached_tiers == fresh_tiers
+        assert refreshed_at > stale_time
+
     def test_get_uses_stale_cache_when_api_fails(self, provider, cache_path):
         """get() falls back to stale cache when API is unavailable."""
         stale_time = datetime.now(timezone.utc) - provider.cache_ttl - timedelta(hours=1)
@@ -347,6 +374,43 @@ class TestRiskLimitProvider:
         # Restore permissions for cleanup, then verify no file was created
         read_only_dir.chmod(0o755)
         assert not cache_file.exists()
+
+    def test_load_from_cache_rejects_symlink_path(self, tmp_path, caplog):
+        """Cache reads are rejected when cache_path is a symlink."""
+        target = tmp_path / "real_cache.json"
+        target.write_text(json.dumps({
+            "BTCUSDT": self._make_cache_entry(SAMPLE_TIERS),
+        }))
+        symlink = tmp_path / "cache_link.json"
+        try:
+            symlink.symlink_to(target)
+        except OSError as e:
+            pytest.skip(f"Symlinks not supported in test environment: {e}")
+
+        provider = RiskLimitProvider(cache_path=symlink)
+        with caplog.at_level(logging.WARNING):
+            result = provider.load_from_cache("BTCUSDT")
+
+        assert result is None
+        assert any("must not be a symlink" in r.message for r in caplog.records)
+
+    def test_save_to_cache_rejects_symlink_path(self, tmp_path, caplog):
+        """Cache writes are rejected when cache_path is a symlink."""
+        target = tmp_path / "real_cache.json"
+        target.write_text("{}")
+        original = target.read_text()
+        symlink = tmp_path / "cache_link.json"
+        try:
+            symlink.symlink_to(target)
+        except OSError as e:
+            pytest.skip(f"Symlinks not supported in test environment: {e}")
+
+        provider = RiskLimitProvider(cache_path=symlink)
+        with caplog.at_level(logging.WARNING):
+            provider.save_to_cache("BTCUSDT", SAMPLE_TIERS)
+
+        assert target.read_text() == original
+        assert any("must not be a symlink" in r.message for r in caplog.records)
 
 
 class TestEdgeCases:

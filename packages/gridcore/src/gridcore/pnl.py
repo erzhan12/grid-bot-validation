@@ -23,7 +23,13 @@ MMTiers = list[tuple[Decimal, Decimal, Decimal, Decimal]]
 # Each tier: (max_position_value, mmr_rate, deduction, imr_rate)
 # MM = position_value * mmr_rate - deduction
 # IM = position_value * imr_rate
-# Last verified against Bybit API: 2025-02-27
+# Last verified against Bybit API: 2026-02-27
+#
+# These hardcoded tiers are a safe fallback when API data is unavailable.
+# Bybit applies progressively higher IM/MM rates to larger position notional
+# values, so each table is ordered by increasing notional cap. The first tier
+# whose ``max_position_value`` is >= the current position value is selected.
+# The final tier always uses ``Infinity`` to guarantee a match for any size.
 # ---------------------------------------------------------------------------
 
 MM_TIERS_BTCUSDT: MMTiers = [
@@ -135,7 +141,8 @@ def calc_initial_margin(
     When *tiers* are provided (or looked up by symbol), the IM is calculated
     as ``position_value * imr_rate`` using the tier matching the position value.
     Falls back to ``position_value / leverage`` when no tier matches or no
-    tiers are available.
+    tiers are available. Tier tables are expected to end with ``Infinity`` so
+    every positive position value finds a matching tier.
 
     Args:
         position_value: Position notional value
@@ -199,6 +206,9 @@ def calc_maintenance_margin(
 
     Returns:
         (mm_amount, mmr_rate) where mm_amount is in quote currency
+
+    Tier tables are expected to end with ``Infinity`` so every positive
+    position value finds a matching tier.
     """
     if position_value <= _ZERO:
         return _ZERO, _ZERO
@@ -276,15 +286,23 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
     if not api_tiers:
         raise ValueError("api_tiers must not be empty")
 
+    def _risk_limit_sort_key(tier: dict) -> Decimal:
+        max_val_str = tier.get("riskLimitValue")
+        if max_val_str is None:
+            raise ValueError("Missing required field: riskLimitValue")
+        try:
+            return Decimal(max_val_str)
+        except (ValueError, ArithmeticError) as e:
+            raise ValueError(f"Invalid riskLimitValue format: {max_val_str}") from e
+
     # Sort by riskLimitValue ascending
-    try:
-        sorted_tiers = sorted(api_tiers, key=lambda t: Decimal(t["riskLimitValue"]))
-    except (ValueError, ArithmeticError) as e:
-        raise ValueError(f"Invalid riskLimitValue format in tier data") from e
+    sorted_tiers = sorted(api_tiers, key=_risk_limit_sort_key)
 
     result: MMTiers = []
     for tier in sorted_tiers:
-        max_val_str = tier["riskLimitValue"]
+        max_val_str = tier.get("riskLimitValue")
+        if max_val_str is None:
+            raise ValueError("Missing required field: riskLimitValue")
         try:
             max_val = Decimal(max_val_str)
         except (ValueError, ArithmeticError) as e:
@@ -292,10 +310,14 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
         if max_val_str != "Infinity":
             if max_val.is_nan() or max_val <= 0:
                 raise ValueError(f"Invalid riskLimitValue: {max_val}")
+
+        mmr_str = tier.get("maintenanceMargin")
+        if mmr_str is None:
+            raise ValueError("Missing required field: maintenanceMargin")
         try:
-            mmr_rate = Decimal(tier["maintenanceMargin"])
+            mmr_rate = Decimal(mmr_str)
         except (ValueError, ArithmeticError) as e:
-            raise ValueError(f"Invalid maintenanceMargin format: {tier.get('maintenanceMargin')}") from e
+            raise ValueError(f"Invalid maintenanceMargin format: {mmr_str}") from e
         # Bybit can return empty string "" or omit these fields for tier 0.
         # The ``or "0"`` fallback handles both so Decimal() never receives "".
         deduction_str = tier.get("mmDeduction", "") or "0"

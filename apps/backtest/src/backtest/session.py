@@ -129,6 +129,8 @@ class BacktestSession:
         self._peak_mm = Decimal("0")
         self._peak_imr_pct = 0.0
         self._peak_mmr_pct = 0.0
+        self._last_margin_inputs: Optional[tuple[Decimal, Decimal, Decimal]] = None
+        self._last_margin_pct: tuple[float, float] = (0.0, 0.0)
 
         # Final metrics (populated by finalize())
         self.metrics: Optional[BacktestMetrics] = None
@@ -203,14 +205,30 @@ class BacktestSession:
         if total_mm > self._peak_mm:
             self._peak_mm = total_mm
         if equity > 0:
-            imr_pct = float(total_im / equity * 100)
-            mmr_pct = float(total_mm / equity * 100)
+            imr_pct, mmr_pct = self._get_margin_pct(total_im, total_mm, equity)
             if imr_pct > self._peak_imr_pct:
                 self._peak_imr_pct = imr_pct
             if mmr_pct > self._peak_mmr_pct:
                 self._peak_mmr_pct = mmr_pct
 
         return equity
+
+    def _get_margin_pct(
+        self,
+        total_im: Decimal,
+        total_mm: Decimal,
+        equity: Decimal,
+    ) -> tuple[float, float]:
+        """Compute IMR/MMR percentages with a tiny cache for repeated ticks."""
+        inputs = (total_im, total_mm, equity)
+        if self._last_margin_inputs != inputs:
+            scale = Decimal("100") / equity
+            self._last_margin_pct = (
+                float(total_im * scale),
+                float(total_mm * scale),
+            )
+            self._last_margin_inputs = inputs
+        return self._last_margin_pct
 
     def finalize(
         self,

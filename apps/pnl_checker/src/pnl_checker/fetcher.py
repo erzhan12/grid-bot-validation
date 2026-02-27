@@ -289,7 +289,10 @@ class BybitFetcher:
             logger.info(f"Fetched {len(tiers)} risk limit tiers for {symbol}")
             return tiers
         except Exception as e:
-            logger.warning(f"Failed to fetch risk limits for {symbol}: {e}")
+            logger.warning(
+                f"Failed to fetch risk limits for {symbol} ({type(e).__name__}): {e}",
+                exc_info=True,
+            )
             return None
 
     def _fetch_wallet(self) -> WalletData:

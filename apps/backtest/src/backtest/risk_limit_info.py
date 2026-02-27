@@ -6,6 +6,7 @@ Falls back to cache or hardcoded tiers if network unavailable.
 
 import json
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -63,8 +64,8 @@ class RiskLimitProvider:
         rest_client: Optional["BybitRestClient"] = None,
         max_cache_size_bytes: int = MAX_CACHE_SIZE_BYTES,
     ):
-        # Resolve cache_path to prevent directory traversal attacks via ".."
-        self.cache_path = cache_path.resolve()
+        # Normalize to absolute path without resolving symlinks.
+        self.cache_path = Path(os.path.abspath(str(cache_path.expanduser())))
         self.cache_ttl = cache_ttl
         self._rest_client = rest_client
         self.max_cache_size_bytes = max_cache_size_bytes
@@ -95,7 +96,7 @@ class RiskLimitProvider:
             logger.info(f"Fetched {len(tiers)} risk limit tiers for {symbol}")
             return tiers
 
-        except (ConnectionError, TimeoutError, ValueError, KeyError) as e:
+        except (ConnectionError, TimeoutError, ValueError, KeyError, ArithmeticError) as e:
             logger.warning(f"Error fetching risk limit tiers: {e}")
             return None
 
@@ -108,23 +109,38 @@ class RiskLimitProvider:
         Returns:
             MMTiers if found in cache, None otherwise
         """
-        if not self.cache_path.exists():
-            return None
+        tiers, _cached_at_str = self._load_cache_entry(symbol)
+        return tiers
 
+    def _load_cache_entry(self, symbol: str) -> tuple[Optional[MMTiers], Optional[str]]:
+        """Load tiers and ``cached_at`` for a symbol with a single JSON parse."""
         try:
+            if self.cache_path.is_symlink():
+                raise ValueError("Cache path must not be a symlink")
+            if not self.cache_path.exists():
+                return None, None
+            if self.cache_path.lstat().st_size > self.max_cache_size_bytes:
+                raise ValueError(
+                    f"Cache file exceeds {self.max_cache_size_bytes} byte limit"
+                )
             with open(self.cache_path) as f:
                 cache = json.load(f)
 
-            if symbol in cache:
-                tiers = _tiers_from_dict(cache[symbol].get("tiers", []))
-                return tiers if tiers else None
+            entry = cache.get(symbol)
+            if not isinstance(entry, dict):
+                return None, None
+
+            tiers = _tiers_from_dict(entry.get("tiers", []))
+            cached_at = entry.get("cached_at")
+            cached_at_str = cached_at if isinstance(cached_at, str) else None
+            return (tiers if tiers else None), cached_at_str
 
         except json.JSONDecodeError as e:
             logger.warning(f"Corrupted cache file {self.cache_path}: {e}")
-        except ValueError as e:
+        except (TypeError, ValueError) as e:
             logger.warning(f"Invalid tier data format in cache for {symbol}: {e}")
 
-        return None
+        return None, None
 
     def save_to_cache(self, symbol: str, tiers: MMTiers) -> None:
         """Save risk limit tiers to local cache.
@@ -143,9 +159,11 @@ class RiskLimitProvider:
 
     def _load_existing_cache(self) -> dict:
         """Load and return existing cache contents, or empty dict on failure."""
+        if self.cache_path.is_symlink():
+            raise ValueError("Cache path must not be a symlink")
         if not self.cache_path.exists():
             return {}
-        if self.cache_path.stat().st_size > self.max_cache_size_bytes:
+        if self.cache_path.lstat().st_size > self.max_cache_size_bytes:
             raise ValueError(
                 f"Cache file exceeds {self.max_cache_size_bytes} byte limit"
             )
@@ -186,12 +204,14 @@ class RiskLimitProvider:
 
         logger.info(f"Cached risk limit tiers for {symbol}")
 
-    def _is_cache_fresh(self, symbol: str) -> bool:
+    def _is_cache_fresh(self, symbol: str, cached_at_str: Optional[str] = None) -> bool:
         """Check if cached entry for symbol is younger than cache_ttl.
 
         Uses file mtime as a quick pre-check: if the entire file is older
         than cache_ttl, the per-symbol entry cannot be fresh either.
         """
+        if self.cache_path.is_symlink():
+            return False
         if not self.cache_path.exists():
             return False
 
@@ -203,9 +223,12 @@ class RiskLimitProvider:
             if datetime.now(timezone.utc) - file_mtime > self.cache_ttl:
                 return False
 
-            cache = self._load_existing_cache()
-            entry = cache.get(symbol, {})
-            cached_at_str = entry.get("cached_at")
+            if cached_at_str is None:
+                cache = self._load_existing_cache()
+                entry = cache.get(symbol, {})
+                if not isinstance(entry, dict):
+                    return False
+                cached_at_str = entry.get("cached_at")
             if not cached_at_str:
                 return False
 
@@ -213,7 +236,7 @@ class RiskLimitProvider:
             age = datetime.now(timezone.utc) - cached_at
             return age < self.cache_ttl
 
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, TypeError, ValueError):
             return False
 
     def get(self, symbol: str, force_fetch: bool = False) -> MMTiers:
@@ -238,10 +261,13 @@ class RiskLimitProvider:
             >>> tiers = provider.get("BTCUSDT")
             >>> provider.get("BTCUSDT", force_fetch=True)  # bypass cache
         """
+        cached: Optional[MMTiers] = None
+        cached_at_str: Optional[str] = None
+
         # Try cache first (unless force_fetch or stale)
         if not force_fetch:
-            cached = self.load_from_cache(symbol)
-            if cached and self._is_cache_fresh(symbol):
+            cached, cached_at_str = self._load_cache_entry(symbol)
+            if cached and self._is_cache_fresh(symbol, cached_at_str=cached_at_str):
                 logger.debug(f"Using cached risk limit tiers for {symbol}")
                 return cached
             if cached:
@@ -254,7 +280,8 @@ class RiskLimitProvider:
             return fetched
 
         # API failed, try cache as fallback
-        cached = self.load_from_cache(symbol)
+        if cached is None:
+            cached = self.load_from_cache(symbol)
         if cached:
             logger.warning(f"API unavailable, using cached risk limits for {symbol}")
             return cached

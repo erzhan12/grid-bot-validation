@@ -178,8 +178,9 @@ class BacktestPositionTracker:
     def calculate_unrealized_pnl(self, current_price: Decimal) -> Decimal:
         """Calculate unrealized PnL at current price.
 
-        Also recalculates margin metrics (IM/MM) since position value
-        depends on entry price which may have changed from fills.
+        Also recalculates and caches margin metrics (IM/MM) in ``self.state``
+        since position value depends on entry price which may have changed
+        from fills. Margin fields remain valid until the next call.
 
         Args:
             current_price: Current market price
