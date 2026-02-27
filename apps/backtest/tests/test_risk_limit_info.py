@@ -312,6 +312,21 @@ class TestRiskLimitProvider:
 
     # --- save_to_cache edge cases ---
 
+    def test_save_rejects_oversized_cache(self, provider, cache_path, caplog):
+        """Rejects cache files exceeding 10MB limit."""
+        # Create a 10MB+ cache file
+        large_cache = {f"SYM{i}": {
+            "tiers": _tiers_to_dict(SAMPLE_TIERS),
+            "cached_at": datetime.now(timezone.utc).isoformat(),
+        } for i in range(50000)}
+        cache_path.write_text(json.dumps(large_cache))
+
+        with caplog.at_level(logging.WARNING):
+            # Should not raise — ValueError is caught by save_to_cache wrapper
+            provider.save_to_cache("BTCUSDT", SAMPLE_TIERS)
+
+        assert any("exceeds 10MB" in r.message for r in caplog.records)
+
     def test_save_to_cache_write_permission_error(self, tmp_path, caplog):
         """save_to_cache logs warning and doesn't crash on read-only directory."""
         read_only_dir = tmp_path / "readonly"

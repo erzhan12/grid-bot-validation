@@ -73,6 +73,10 @@ If Bybit rate limits are hit during tier fetching, the provider logs a warning a
 - Increase `cache_ttl` (default is 24 hours)
 - Use `force_fetch=False` (default) to prefer cached data
 
+**Invalid tier data from API**
+
+If Bybit returns malformed tier data, the provider will log a warning with the specific validation error and fall back to cached or hardcoded tiers. Check the logs for ValueError messages indicating which field failed validation (e.g., "Invalid riskLimitValue format", "MMR rate outside valid range").
+
 **Using hardcoded fallback tiers**
 
 When both the API and cache are unavailable, the provider uses hardcoded tier tables from `gridcore.pnl.MM_TIERS`. These are static snapshots and may become outdated if Bybit changes their risk limits. If you see the log message "using hardcoded fallback", ensure API access is restored to get accurate margin calculations.

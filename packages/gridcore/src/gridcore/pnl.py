@@ -23,7 +23,7 @@ MMTiers = list[tuple[Decimal, Decimal, Decimal, Decimal]]
 # Each tier: (max_position_value, mmr_rate, deduction, imr_rate)
 # MM = position_value * mmr_rate - deduction
 # IM = position_value * imr_rate
-# Last verified against Bybit API: 2026-02-28
+# Last verified against Bybit API: 2025-02-27
 # ---------------------------------------------------------------------------
 
 MM_TIERS_BTCUSDT: MMTiers = [
@@ -266,6 +266,10 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
 
     Raises:
         ValueError: If api_tiers is empty.
+
+    Note:
+        Validates that MMR and IMR rates are in [0, 1] range and that
+        riskLimitValue is a valid positive number or "Infinity".
     """
     if not api_tiers:
         raise ValueError("api_tiers must not be empty")
@@ -276,7 +280,10 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
     result: MMTiers = []
     for tier in sorted_tiers:
         max_val_str = tier["riskLimitValue"]
-        max_val = Decimal(max_val_str)
+        try:
+            max_val = Decimal(max_val_str)
+        except (ValueError, ArithmeticError) as e:
+            raise ValueError(f"Invalid riskLimitValue format: {max_val_str}") from e
         if max_val_str != "Infinity":
             if max_val.is_nan() or max_val <= 0:
                 raise ValueError(f"Invalid riskLimitValue: {max_val}")
@@ -287,6 +294,10 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
         deduction = Decimal(deduction_str)
         imr_str = tier.get("initialMargin", "") or "0"
         imr_rate = Decimal(imr_str)
+        if not (Decimal("0") <= mmr_rate <= Decimal("1")):
+            raise ValueError(f"MMR rate {mmr_rate} outside valid range [0, 1]")
+        if not (Decimal("0") <= imr_rate <= Decimal("1")):
+            raise ValueError(f"IMR rate {imr_rate} outside valid range [0, 1]")
         result.append((max_val, mmr_rate, deduction, imr_rate))
 
     # Replace last tier's cap with Infinity
