@@ -11,42 +11,43 @@ _ZERO = Decimal("0")
 _ONE = Decimal("1")
 _HUNDRED = Decimal("100")
 
-# Type alias for maintenance-margin tier tables
-# Each tier: (max_position_value, mmr_rate, deduction)
-MMTiers = list[tuple[Decimal, Decimal, Decimal]]
+# Type alias for risk-limit tier tables
+# Each tier: (max_position_value, mmr_rate, deduction, imr_rate)
+MMTiers = list[tuple[Decimal, Decimal, Decimal, Decimal]]
 
 # ---------------------------------------------------------------------------
-# Maintenance-margin tier tables (from Bybit risk-limit documentation)
-# Each tier: (max_position_value, mmr_rate, deduction)
+# Risk-limit tier tables (from Bybit risk-limit documentation)
+# Each tier: (max_position_value, mmr_rate, deduction, imr_rate)
 # MM = position_value * mmr_rate - deduction
+# IM = position_value * imr_rate
 # ---------------------------------------------------------------------------
 
 MM_TIERS_BTCUSDT: MMTiers = [
-    (Decimal("2000000"),  Decimal("0.005"),  Decimal("0")),
-    (Decimal("10000000"), Decimal("0.01"),   Decimal("10000")),
-    (Decimal("20000000"), Decimal("0.025"),  Decimal("160000")),
-    (Decimal("40000000"), Decimal("0.05"),   Decimal("660000")),
-    (Decimal("80000000"), Decimal("0.1"),    Decimal("2660000")),
-    (Decimal("160000000"), Decimal("0.125"), Decimal("4660000")),
-    (Decimal("Infinity"), Decimal("0.15"),   Decimal("8660000")),
+    (Decimal("2000000"),  Decimal("0.005"),  Decimal("0"),       Decimal("0.01")),
+    (Decimal("10000000"), Decimal("0.01"),   Decimal("10000"),   Decimal("0.02")),
+    (Decimal("20000000"), Decimal("0.025"),  Decimal("160000"),  Decimal("0.05")),
+    (Decimal("40000000"), Decimal("0.05"),   Decimal("660000"),  Decimal("0.1")),
+    (Decimal("80000000"), Decimal("0.1"),    Decimal("2660000"), Decimal("0.2")),
+    (Decimal("160000000"), Decimal("0.125"), Decimal("4660000"), Decimal("0.25")),
+    (Decimal("Infinity"), Decimal("0.15"),   Decimal("8660000"), Decimal("0.3")),
 ]
 
 MM_TIERS_ETHUSDT: MMTiers = [
-    (Decimal("1000000"),  Decimal("0.005"),  Decimal("0")),
-    (Decimal("5000000"),  Decimal("0.01"),   Decimal("5000")),
-    (Decimal("10000000"), Decimal("0.025"),  Decimal("80000")),
-    (Decimal("20000000"), Decimal("0.05"),   Decimal("330000")),
-    (Decimal("40000000"), Decimal("0.1"),    Decimal("1330000")),
-    (Decimal("80000000"), Decimal("0.125"),  Decimal("2330000")),
-    (Decimal("Infinity"), Decimal("0.15"),   Decimal("4330000")),
+    (Decimal("1000000"),  Decimal("0.005"),  Decimal("0"),       Decimal("0.01")),
+    (Decimal("5000000"),  Decimal("0.01"),   Decimal("5000"),    Decimal("0.02")),
+    (Decimal("10000000"), Decimal("0.025"),  Decimal("80000"),   Decimal("0.05")),
+    (Decimal("20000000"), Decimal("0.05"),   Decimal("330000"),  Decimal("0.1")),
+    (Decimal("40000000"), Decimal("0.1"),    Decimal("1330000"), Decimal("0.2")),
+    (Decimal("80000000"), Decimal("0.125"),  Decimal("2330000"), Decimal("0.25")),
+    (Decimal("Infinity"), Decimal("0.15"),   Decimal("4330000"), Decimal("0.3")),
 ]
 
 MM_TIERS_DEFAULT: MMTiers = [
-    (Decimal("1000000"),  Decimal("0.01"),   Decimal("0")),
-    (Decimal("5000000"),  Decimal("0.025"),  Decimal("15000")),
-    (Decimal("10000000"), Decimal("0.05"),   Decimal("140000")),
-    (Decimal("20000000"), Decimal("0.1"),    Decimal("640000")),
-    (Decimal("Infinity"), Decimal("0.15"),   Decimal("1640000")),
+    (Decimal("1000000"),  Decimal("0.01"),   Decimal("0"),       Decimal("0.02")),
+    (Decimal("5000000"),  Decimal("0.025"),  Decimal("15000"),   Decimal("0.05")),
+    (Decimal("10000000"), Decimal("0.05"),   Decimal("140000"),  Decimal("0.1")),
+    (Decimal("20000000"), Decimal("0.1"),    Decimal("640000"),  Decimal("0.2")),
+    (Decimal("Infinity"), Decimal("0.15"),   Decimal("1640000"), Decimal("0.3")),
 ]
 
 MM_TIERS: dict[str, MMTiers] = {
@@ -115,23 +116,43 @@ def calc_position_value(size: Decimal, entry_price: Decimal) -> Decimal:
     return size * entry_price
 
 
-def calc_initial_margin(position_value: Decimal, leverage: Decimal) -> Decimal:
-    """Calculate initial margin.
+def calc_initial_margin(
+    position_value: Decimal,
+    leverage: Decimal,
+    symbol: str = "",
+    tiers: Optional[MMTiers] = None,
+) -> tuple[Decimal, Decimal]:
+    """Calculate initial margin using tier-based IMR rate.
 
-    Formula: position_value / leverage
-
-    Returns Decimal("0") if leverage is zero.
+    When *tiers* are provided (or looked up by symbol), the IM is calculated
+    as ``position_value * imr_rate`` using the tier matching the position value.
+    Falls back to ``position_value / leverage`` when no tier matches or no
+    tiers are available.
 
     Args:
         position_value: Position notional value
-        leverage: Position leverage
+        leverage: Position leverage (used as fallback)
+        symbol: Trading pair (used to select tier table when tiers is None)
+        tiers: Optional explicit tier table with 4-tuple entries.
 
     Returns:
-        Initial margin in quote currency
+        (im_amount, imr_rate) — initial margin in quote currency and the
+        IMR rate used.
     """
+    if position_value <= _ZERO:
+        return _ZERO, _ZERO
+
+    tier_table = tiers if tiers is not None else MM_TIERS.get(symbol) if symbol else None
+    if tier_table is not None:
+        for max_val, _mmr, _ded, imr_rate in tier_table:
+            if position_value <= max_val:
+                return position_value * imr_rate, imr_rate
+
+    # Fallback: position_value / leverage
     if leverage == 0:
-        return _ZERO
-    return position_value / leverage
+        return _ZERO, _ZERO
+    imr_rate = _ONE / leverage
+    return position_value / leverage, imr_rate
 
 
 def calc_liq_ratio(liq_price: Decimal, current_price: Decimal) -> float:
@@ -175,12 +196,12 @@ def calc_maintenance_margin(
         return _ZERO, _ZERO
 
     tier_table = tiers if tiers is not None else MM_TIERS.get(symbol, MM_TIERS_DEFAULT)
-    for max_val, mmr_rate, deduction in tier_table:
+    for max_val, mmr_rate, deduction, _imr in tier_table:
         if position_value <= max_val:
             mm = position_value * mmr_rate - deduction
             return max(mm, _ZERO), mmr_rate
     # Should not reach here (last tier has Infinity), but just in case
-    _, mmr_rate, deduction = tier_table[-1]
+    _, mmr_rate, deduction, _imr = tier_table[-1]
     mm = position_value * mmr_rate - deduction
     return max(mm, _ZERO), mmr_rate
 
@@ -238,10 +259,13 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
         # mmDeduction can be empty string "" or missing for tier 0 (no deduction)
         deduction_str = tier.get("mmDeduction", "") or "0"
         deduction = Decimal(deduction_str)
-        result.append((max_val, mmr_rate, deduction))
+        # initialMargin may be missing in old test data
+        imr_str = tier.get("initialMargin", "") or "0"
+        imr_rate = Decimal(imr_str)
+        result.append((max_val, mmr_rate, deduction, imr_rate))
 
     # Replace last tier's cap with Infinity
-    last_val, last_mmr, last_ded = result[-1]
-    result[-1] = (Decimal("Infinity"), last_mmr, last_ded)
+    last_val, last_mmr, last_ded, last_imr = result[-1]
+    result[-1] = (Decimal("Infinity"), last_mmr, last_ded, last_imr)
 
     return result

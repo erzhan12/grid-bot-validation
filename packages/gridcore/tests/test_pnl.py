@@ -114,20 +114,61 @@ class TestCalcPositionValue:
 class TestCalcInitialMargin:
     """Test initial margin calculation."""
 
-    def test_basic(self):
-        """Margin = position_value / leverage."""
-        result = calc_initial_margin(Decimal("5000"), Decimal("10"))
-        assert result == Decimal("500")
+    def test_fallback_no_tiers(self):
+        """Without tiers or symbol, falls back to position_value / leverage."""
+        im, imr = calc_initial_margin(Decimal("5000"), Decimal("10"))
+        assert im == Decimal("500")
+        assert imr == Decimal("0.1")  # 1/10
 
-    def test_zero_leverage(self):
-        """Zero leverage returns zero."""
-        result = calc_initial_margin(Decimal("5000"), Decimal("0"))
-        assert result == Decimal("0")
+    def test_zero_leverage_fallback(self):
+        """Zero leverage returns zero when no tiers available."""
+        im, imr = calc_initial_margin(Decimal("5000"), Decimal("0"))
+        assert im == Decimal("0")
+        assert imr == Decimal("0")
 
-    def test_high_leverage(self):
-        """100x leverage."""
-        result = calc_initial_margin(Decimal("50000"), Decimal("100"))
-        assert result == Decimal("500")
+    def test_high_leverage_fallback(self):
+        """100x leverage fallback."""
+        im, imr = calc_initial_margin(Decimal("50000"), Decimal("100"))
+        assert im == Decimal("500")
+        assert imr == Decimal("0.01")  # 1/100
+
+    def test_tier_based_btcusdt(self):
+        """BTCUSDT tier 1: $5000 position → 1% IMR, $50 IM."""
+        im, imr = calc_initial_margin(
+            Decimal("5000"), Decimal("10"), symbol="BTCUSDT",
+        )
+        assert imr == Decimal("0.01")
+        assert im == Decimal("50")  # 5000 * 0.01
+
+    def test_tier_based_custom_tiers(self):
+        """Explicit tiers override symbol lookup."""
+        custom_tiers = [
+            (Decimal("100000"), Decimal("0.005"), Decimal("0"), Decimal("0.02")),
+            (Decimal("Infinity"), Decimal("0.01"), Decimal("500"), Decimal("0.05")),
+        ]
+        im, imr = calc_initial_margin(
+            Decimal("50000"), Decimal("10"), tiers=custom_tiers,
+        )
+        assert imr == Decimal("0.02")
+        assert im == Decimal("1000")  # 50000 * 0.02
+
+    def test_tier_based_higher_tier(self):
+        """Position in higher tier uses higher IMR."""
+        custom_tiers = [
+            (Decimal("100000"), Decimal("0.005"), Decimal("0"), Decimal("0.02")),
+            (Decimal("Infinity"), Decimal("0.01"), Decimal("500"), Decimal("0.05")),
+        ]
+        im, imr = calc_initial_margin(
+            Decimal("200000"), Decimal("10"), tiers=custom_tiers,
+        )
+        assert imr == Decimal("0.05")
+        assert im == Decimal("10000")  # 200000 * 0.05
+
+    def test_zero_position_value(self):
+        """Zero position value returns zero."""
+        im, imr = calc_initial_margin(Decimal("0"), Decimal("10"), symbol="BTCUSDT")
+        assert im == Decimal("0")
+        assert imr == Decimal("0")
 
 
 class TestCalcLiqRatio:
@@ -260,9 +301,9 @@ class TestCalcMaintenanceMarginCustomTiers:
     """Test calc_maintenance_margin with explicit tiers parameter."""
 
     CUSTOM_TIERS = [
-        (Decimal("200000"), Decimal("0.01"), Decimal("0")),
-        (Decimal("1000000"), Decimal("0.025"), Decimal("3000")),
-        (Decimal("Infinity"), Decimal("0.05"), Decimal("28000")),
+        (Decimal("200000"), Decimal("0.01"), Decimal("0"), Decimal("0.02")),
+        (Decimal("1000000"), Decimal("0.025"), Decimal("3000"), Decimal("0.05")),
+        (Decimal("Infinity"), Decimal("0.05"), Decimal("28000"), Decimal("0.1")),
     ]
 
     def test_custom_tiers_override_symbol(self):
@@ -305,11 +346,12 @@ class TestParseRiskLimitTiers:
                 "riskLimitValue": "200000",
                 "maintenanceMargin": "0.01",
                 "mmDeduction": "0",
+                "initialMargin": "0.02",
             }
         ]
         result = parse_risk_limit_tiers(api_tiers)
         assert len(result) == 1
-        assert result[0] == (Decimal("Infinity"), Decimal("0.01"), Decimal("0"))
+        assert result[0] == (Decimal("Infinity"), Decimal("0.01"), Decimal("0"), Decimal("0.02"))
 
     def test_multi_tier_sorting(self):
         """Multiple tiers sorted by riskLimitValue, last gets Infinity."""
@@ -318,17 +360,19 @@ class TestParseRiskLimitTiers:
                 "riskLimitValue": "1000000",
                 "maintenanceMargin": "0.025",
                 "mmDeduction": "3000",
+                "initialMargin": "0.05",
             },
             {
                 "riskLimitValue": "200000",
                 "maintenanceMargin": "0.01",
                 "mmDeduction": "0",
+                "initialMargin": "0.02",
             },
         ]
         result = parse_risk_limit_tiers(api_tiers)
         assert len(result) == 2
-        assert result[0] == (Decimal("200000"), Decimal("0.01"), Decimal("0"))
-        assert result[1] == (Decimal("Infinity"), Decimal("0.025"), Decimal("3000"))
+        assert result[0] == (Decimal("200000"), Decimal("0.01"), Decimal("0"), Decimal("0.02"))
+        assert result[1] == (Decimal("Infinity"), Decimal("0.025"), Decimal("3000"), Decimal("0.05"))
 
     def test_empty_input_raises(self):
         """Empty input raises ValueError."""
@@ -342,6 +386,7 @@ class TestParseRiskLimitTiers:
                 "riskLimitValue": "200000",
                 "maintenanceMargin": "0.01",
                 "mmDeduction": "",
+                "initialMargin": "0.02",
             }
         ]
         result = parse_risk_limit_tiers(api_tiers)
@@ -358,6 +403,31 @@ class TestParseRiskLimitTiers:
         result = parse_risk_limit_tiers(api_tiers)
         assert result[0][2] == Decimal("0")
 
+    def test_missing_initial_margin_defaults_to_zero(self):
+        """Missing initialMargin key defaults to 0 (backward compat)."""
+        api_tiers = [
+            {
+                "riskLimitValue": "200000",
+                "maintenanceMargin": "0.01",
+                "mmDeduction": "0",
+            }
+        ]
+        result = parse_risk_limit_tiers(api_tiers)
+        assert result[0][3] == Decimal("0")
+
+    def test_initial_margin_extracted(self):
+        """initialMargin is extracted as 4th element."""
+        api_tiers = [
+            {
+                "riskLimitValue": "200000",
+                "maintenanceMargin": "0.01",
+                "mmDeduction": "0",
+                "initialMargin": "0.02",
+            }
+        ]
+        result = parse_risk_limit_tiers(api_tiers)
+        assert result[0][3] == Decimal("0.02")
+
     def test_integration_with_calc_maintenance_margin(self):
         """Parsed tiers work correctly with calc_maintenance_margin."""
         api_tiers = [
@@ -365,11 +435,13 @@ class TestParseRiskLimitTiers:
                 "riskLimitValue": "200000",
                 "maintenanceMargin": "0.01",
                 "mmDeduction": "0",
+                "initialMargin": "0.02",
             },
             {
                 "riskLimitValue": "1000000",
                 "maintenanceMargin": "0.025",
                 "mmDeduction": "3000",
+                "initialMargin": "0.05",
             },
         ]
         tiers = parse_risk_limit_tiers(api_tiers)
@@ -383,3 +455,31 @@ class TestParseRiskLimitTiers:
         mm, mmr = calc_maintenance_margin(Decimal("500000"), tiers=tiers)
         assert mmr == Decimal("0.025")
         assert mm == Decimal("9500")  # 500_000 * 0.025 - 3_000
+
+    def test_integration_with_calc_initial_margin(self):
+        """Parsed tiers work correctly with calc_initial_margin."""
+        api_tiers = [
+            {
+                "riskLimitValue": "200000",
+                "maintenanceMargin": "0.01",
+                "mmDeduction": "0",
+                "initialMargin": "0.02",
+            },
+            {
+                "riskLimitValue": "1000000",
+                "maintenanceMargin": "0.025",
+                "mmDeduction": "3000",
+                "initialMargin": "0.05",
+            },
+        ]
+        tiers = parse_risk_limit_tiers(api_tiers)
+
+        # Position in tier 1
+        im, imr = calc_initial_margin(Decimal("100000"), Decimal("10"), tiers=tiers)
+        assert imr == Decimal("0.02")
+        assert im == Decimal("2000")  # 100_000 * 0.02
+
+        # Position in tier 2 (above 200k)
+        im, imr = calc_initial_margin(Decimal("500000"), Decimal("10"), tiers=tiers)
+        assert imr == Decimal("0.05")
+        assert im == Decimal("25000")  # 500_000 * 0.05

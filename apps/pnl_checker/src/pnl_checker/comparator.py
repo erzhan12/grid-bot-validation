@@ -201,6 +201,13 @@ def _compare_position(
         f"{calc.liq_ratio:.4f}",
     ))
 
+    # IMR rate (tier-based)
+    comp.fields.append(_info_field(
+        "IMR Rate (tier)",
+        "—",
+        f"{calc.imr_rate * 100:.2f}%",
+    ))
+
     # Maintenance margin (Bybit vs our tier-based calc)
     comp.fields.append(_info_field(
         "Maintenance Margin",
@@ -265,34 +272,32 @@ def _build_account_comparison(
         _info_field("USDT Cum Realized PnL", wallet.usdt_cum_realised_pnl),
     ]
 
-    # IMR% / MMR% comparison (checked — valid for Regular Margin mode)
+    # IMR% / MMR% comparison (informational — Bybit UTA hedge mode uses
+    # cross-position netting that produces different per-position IM/MM
+    # values than the standard tier-based formula, so account-level totals
+    # will not match our independent per-position sum)
     if account_calc is not None:
-        pct_tolerance = tolerance * PERCENTAGE_TOLERANCE_MULTIPLIER
         bybit_imr_pct = wallet.account_im_rate * Decimal("100")
         bybit_mmr_pct = wallet.account_mm_rate * Decimal("100")
-        comp.fields.append(_compare_field(
+        comp.fields.append(_info_field(
             "Account IMR%",
             bybit_imr_pct,
             account_calc.imr_pct,
-            pct_tolerance,
         ))
-        comp.fields.append(_compare_field(
+        comp.fields.append(_info_field(
             "Account MMR%",
             bybit_mmr_pct,
             account_calc.mmr_pct,
-            pct_tolerance,
         ))
-        comp.fields.append(_compare_field(
+        comp.fields.append(_info_field(
             "Total IM (sum positions)",
             wallet.total_initial_margin,
             account_calc.total_im,
-            tolerance,
         ))
-        comp.fields.append(_compare_field(
+        comp.fields.append(_info_field(
             "Total MM (sum positions)",
             wallet.total_maintenance_margin,
             account_calc.total_mm,
-            tolerance,
         ))
 
     return comp

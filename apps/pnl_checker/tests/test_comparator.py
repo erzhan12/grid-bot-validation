@@ -122,6 +122,7 @@ class TestCompare:
                     unrealised_pnl_pct_bybit=Decimal("19.6"),
                     position_value=Decimal("510"),
                     initial_margin=Decimal("51"),
+                    imr_rate=Decimal("0.01"),
                     maintenance_margin=Decimal("2.55"),
                     mmr_rate=Decimal("0.005"),
                     liq_ratio=0.8824,
@@ -220,6 +221,7 @@ class TestCompare:
                 unrealised_pnl_pct_last=Decimal("19.6"),
                 unrealised_pnl_pct_bybit=Decimal("19.6"),
                 position_value=Decimal("510"), initial_margin=Decimal("51"),
+                imr_rate=Decimal("0.01"),
                 maintenance_margin=Decimal("2.55"), mmr_rate=Decimal("0.005"),
                 liq_ratio=0.8824, funding_snapshot=Decimal("0.0051"),
             ),
@@ -230,6 +232,7 @@ class TestCompare:
                 unrealised_pnl_pct_last=Decimal("19.6"),
                 unrealised_pnl_pct_bybit=Decimal("19.6"),
                 position_value=Decimal("510"), initial_margin=Decimal("51"),
+                imr_rate=Decimal("0.01"),
                 maintenance_margin=Decimal("2.55"), mmr_rate=Decimal("0.005"),
                 liq_ratio=1.1373, funding_snapshot=Decimal("0.0051"),
             ),
@@ -294,7 +297,7 @@ class TestCompare:
         assert "Total MM (sum positions)" in field_names
 
     def test_account_imr_mmr_values(self):
-        """Account IMR%/MMR% should show Bybit vs our calc values with pass/fail."""
+        """Account IMR%/MMR% should show Bybit vs our calc values (informational)."""
         fetch, calc = self._make_test_data()
         result = compare(fetch, calc, tolerance=0.01)
 
@@ -304,9 +307,9 @@ class TestCompare:
         assert imr_field.bybit_value == Decimal("0.51")
         # Our calc: 51 / 10000 * 100 = 0.51%
         assert imr_field.our_value == Decimal("0.51")
-        # These are now checked fields (pass/fail)
-        assert imr_field.passed is not None
-        assert mmr_field.passed is not None
+        # These are informational (UTA hedge mode netting)
+        assert imr_field.passed is None
+        assert mmr_field.passed is None
 
     def test_maintenance_margin_in_position(self):
         """Position comparison should include MM and MMR tier rate."""

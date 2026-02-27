@@ -49,7 +49,8 @@ class PositionCalcResult:
 
     # Position value and margin
     position_value: Decimal  # size * avg_entry_price (matches Bybit positionValue)
-    initial_margin: Decimal  # position_value / leverage
+    initial_margin: Decimal  # tier-based IM (position_value * imr_rate)
+    imr_rate: Decimal  # tier IMR rate used
     maintenance_margin: Decimal  # tier-based MM amount
     mmr_rate: Decimal  # tier MMR rate used
 
@@ -243,8 +244,12 @@ def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> Calculation
             # Position value and initial margin
             position_value = calc_position_value(pos.size, pos.avg_price)
             initial_margin = Decimal("0")
+            imr_rate = Decimal("0")
             if pos.leverage >= MIN_LEVERAGE:
-                initial_margin = calc_initial_margin(position_value, pos.leverage)
+                initial_margin, imr_rate = calc_initial_margin(
+                    position_value, pos.leverage, pos.symbol,
+                    tiers=symbol_data.risk_limit_tiers,
+                )
             else:
                 logger.warning(f"{pos.symbol} {pos.direction}: leverage={pos.leverage} too small for margin calc")
 
@@ -274,6 +279,7 @@ def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> Calculation
                 unrealised_pnl_pct_bybit=pct_bybit,
                 position_value=position_value,
                 initial_margin=initial_margin,
+                imr_rate=imr_rate,
                 maintenance_margin=maintenance_margin,
                 mmr_rate=mmr_rate,
                 liq_ratio=liq_ratio,

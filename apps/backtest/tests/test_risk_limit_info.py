@@ -19,9 +19,9 @@ from gridcore.pnl import MMTiers
 
 # Sample tiers for testing
 SAMPLE_TIERS: MMTiers = [
-    (Decimal("200000"), Decimal("0.01"), Decimal("0")),
-    (Decimal("1000000"), Decimal("0.025"), Decimal("3000")),
-    (Decimal("Infinity"), Decimal("0.05"), Decimal("28000")),
+    (Decimal("200000"), Decimal("0.01"), Decimal("0"), Decimal("0.02")),
+    (Decimal("1000000"), Decimal("0.025"), Decimal("3000"), Decimal("0.05")),
+    (Decimal("Infinity"), Decimal("0.05"), Decimal("28000"), Decimal("0.1")),
 ]
 
 
@@ -37,6 +37,24 @@ class TestTiersSerialization:
         """Infinity cap survives JSON serialization."""
         result = _tiers_from_dict(_tiers_to_dict(SAMPLE_TIERS))
         assert result[-1][0] == Decimal("Infinity")
+
+    def test_imr_rate_survives_round_trip(self):
+        """imr_rate survives serialization round-trip."""
+        result = _tiers_from_dict(_tiers_to_dict(SAMPLE_TIERS))
+        assert result[0][3] == Decimal("0.02")
+        assert result[1][3] == Decimal("0.05")
+        assert result[2][3] == Decimal("0.1")
+
+    def test_backward_compat_old_cache_format(self):
+        """Old cache format (3 keys, no imr_rate) loads with imr_rate=0."""
+        old_format = [
+            {"max_value": "200000", "mmr_rate": "0.01", "deduction": "0"},
+            {"max_value": "Infinity", "mmr_rate": "0.025", "deduction": "3000"},
+        ]
+        result = _tiers_from_dict(old_format)
+        assert len(result) == 2
+        assert result[0] == (Decimal("200000"), Decimal("0.01"), Decimal("0"), Decimal("0"))
+        assert result[1] == (Decimal("Infinity"), Decimal("0.025"), Decimal("3000"), Decimal("0"))
 
 
 class TestRiskLimitProvider:
@@ -142,11 +160,13 @@ class TestRiskLimitProvider:
                 "riskLimitValue": "200000",
                 "maintenanceMargin": "0.01",
                 "mmDeduction": "0",
+                "initialMargin": "0.02",
             },
             {
                 "riskLimitValue": "1000000",
                 "maintenanceMargin": "0.025",
                 "mmDeduction": "3000",
+                "initialMargin": "0.05",
             },
         ]
 
@@ -156,8 +176,8 @@ class TestRiskLimitProvider:
         mock_client.get_risk_limit.assert_called_once_with(symbol="BTCUSDT")
         assert result is not None
         assert len(result) == 2
-        assert result[0] == (Decimal("200000"), Decimal("0.01"), Decimal("0"))
-        assert result[1] == (Decimal("Infinity"), Decimal("0.025"), Decimal("3000"))
+        assert result[0] == (Decimal("200000"), Decimal("0.01"), Decimal("0"), Decimal("0.02"))
+        assert result[1] == (Decimal("Infinity"), Decimal("0.025"), Decimal("3000"), Decimal("0.05"))
 
     def test_fetch_from_bybit_empty_list(self, cache_path):
         """Returns None when API returns empty tier list."""
@@ -252,8 +272,8 @@ class TestRiskLimitProvider:
         }))
 
         fresh_tiers: MMTiers = [
-            (Decimal("500000"), Decimal("0.005"), Decimal("0")),
-            (Decimal("Infinity"), Decimal("0.01"), Decimal("2500")),
+            (Decimal("500000"), Decimal("0.005"), Decimal("0"), Decimal("0.01")),
+            (Decimal("Infinity"), Decimal("0.01"), Decimal("2500"), Decimal("0.02")),
         ]
 
         with patch.object(provider, "fetch_from_bybit", return_value=fresh_tiers) as mock_fetch:
