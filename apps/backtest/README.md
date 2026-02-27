@@ -49,7 +49,7 @@ To bypass the cache and fetch fresh tiers from the API:
 tiers = provider.get("BTCUSDT", force_fetch=True)
 ```
 
-**Warning:** The default `cache_ttl` of 24 hours means tier changes on Bybit may not be reflected until the cache expires. For critical systems (live trading, production backtests), use `force_fetch=True` on startup to ensure you always start with the latest tiers from the API.
+**Warning:** The default `cache_ttl` of 24 hours means tier changes on Bybit may not be reflected until the cache expires. For critical systems (live trading, production backtests), use `force_fetch=True` on startup to ensure you always start with the latest tiers from the API. Use `force_fetch=True` on startup for critical systems, or immediately after Bybit announces risk limit tier changes to ensure calculations use the latest values.
 
 ### Without API Access
 

@@ -45,7 +45,7 @@ class RiskLimitProvider:
       - API errors trigger fallback to cache or hardcoded tiers.
       - All errors are logged but never raised — ``get()`` always returns
         a valid ``MMTiers`` list.
-      - Cache files exceeding 10 MB are rejected to prevent DoS.
+      - Cache files exceeding ``max_cache_size_bytes`` (default 10 MB) are rejected to prevent DoS.
 
     Example:
         from bybit_adapter.rest_client import BybitRestClient
@@ -61,11 +61,13 @@ class RiskLimitProvider:
         cache_path: Path = DEFAULT_CACHE_PATH,
         cache_ttl: timedelta = timedelta(hours=24),
         rest_client: Optional["BybitRestClient"] = None,
+        max_cache_size_bytes: int = MAX_CACHE_SIZE_BYTES,
     ):
         # Resolve cache_path to prevent directory traversal attacks via ".."
         self.cache_path = cache_path.resolve()
         self.cache_ttl = cache_ttl
         self._rest_client = rest_client
+        self.max_cache_size_bytes = max_cache_size_bytes
 
     def fetch_from_bybit(self, symbol: str) -> Optional[MMTiers]:
         """Fetch risk limit tiers from Bybit API via BybitRestClient.
@@ -143,8 +145,10 @@ class RiskLimitProvider:
         """Load and return existing cache contents, or empty dict on failure."""
         if not self.cache_path.exists():
             return {}
-        if self.cache_path.stat().st_size > MAX_CACHE_SIZE_BYTES:
-            raise ValueError("Cache file exceeds 10MB limit")
+        if self.cache_path.stat().st_size > self.max_cache_size_bytes:
+            raise ValueError(
+                f"Cache file exceeds {self.max_cache_size_bytes} byte limit"
+            )
         try:
             with open(self.cache_path) as f:
                 return json.load(f)

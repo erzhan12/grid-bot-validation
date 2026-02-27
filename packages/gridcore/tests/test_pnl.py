@@ -499,6 +499,54 @@ class TestParseRiskLimitTiers:
         assert mmr == Decimal("0.025")
         assert mm == Decimal("9500")  # 500_000 * 0.025 - 3_000
 
+    def test_invalid_mmr_rate_above_one(self):
+        """MMR rate above 1 raises ValueError."""
+        with pytest.raises(ValueError, match="MMR rate .* outside valid range"):
+            parse_risk_limit_tiers([
+                {"riskLimitValue": "200000", "maintenanceMargin": "1.5",
+                 "mmDeduction": "0", "initialMargin": "0.02"},
+            ])
+
+    def test_invalid_mmr_rate_negative(self):
+        """Negative MMR rate raises ValueError."""
+        with pytest.raises(ValueError, match="MMR rate .* outside valid range"):
+            parse_risk_limit_tiers([
+                {"riskLimitValue": "200000", "maintenanceMargin": "-0.01",
+                 "mmDeduction": "0", "initialMargin": "0.02"},
+            ])
+
+    def test_invalid_imr_rate_above_one(self):
+        """IMR rate above 1 raises ValueError."""
+        with pytest.raises(ValueError, match="IMR rate .* outside valid range"):
+            parse_risk_limit_tiers([
+                {"riskLimitValue": "200000", "maintenanceMargin": "0.01",
+                 "mmDeduction": "0", "initialMargin": "2.0"},
+            ])
+
+    def test_invalid_risk_limit_value_negative(self):
+        """Negative riskLimitValue raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid riskLimitValue"):
+            parse_risk_limit_tiers([
+                {"riskLimitValue": "-100", "maintenanceMargin": "0.01",
+                 "mmDeduction": "0", "initialMargin": "0.02"},
+            ])
+
+    def test_invalid_risk_limit_value_nan(self):
+        """NaN riskLimitValue raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid riskLimitValue"):
+            parse_risk_limit_tiers([
+                {"riskLimitValue": "NaN", "maintenanceMargin": "0.01",
+                 "mmDeduction": "0", "initialMargin": "0.02"},
+            ])
+
+    def test_invalid_risk_limit_value_malformed_decimal(self):
+        """Malformed decimal string raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid riskLimitValue format"):
+            parse_risk_limit_tiers([
+                {"riskLimitValue": "abc", "maintenanceMargin": "0.01",
+                 "mmDeduction": "0", "initialMargin": "0.02"},
+            ])
+
     def test_integration_with_calc_initial_margin(self):
         """Parsed tiers work correctly with calc_initial_margin."""
         api_tiers = [

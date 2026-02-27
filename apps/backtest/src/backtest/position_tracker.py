@@ -73,8 +73,8 @@ class BacktestPositionTracker:
         """
         if direction not in (DirectionType.LONG, DirectionType.SHORT):
             raise ValueError(f"direction must be '{DirectionType.LONG}' or '{DirectionType.SHORT}', got '{direction}'")
-        if commission_rate < 0 or commission_rate > Decimal("0.001"):
-            raise ValueError(f"Commission rate {commission_rate} outside expected range [0, 0.001]")
+        if commission_rate < 0 or commission_rate > Decimal("0.01"):
+            raise ValueError(f"Commission rate {commission_rate} outside expected range [0, 0.01]")
 
         self.direction = direction
         self.commission_rate = commission_rate

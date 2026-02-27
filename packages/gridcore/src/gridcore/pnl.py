@@ -97,8 +97,10 @@ def calc_unrealised_pnl_pct(
     Returns Decimal("0") if entry_price or current_price is zero.
     """
     if entry_price <= 0 or current_price <= 0:
-        if entry_price < 0 or current_price < 0:
-            logger.warning(f"Invalid prices for {direction}: entry={entry_price}, current={current_price}")
+        if entry_price < 0:
+            logger.warning(f"Negative entry_price for {direction}: entry={entry_price}")
+        if current_price < 0:
+            logger.warning(f"Negative current_price for {direction}: current={current_price}")
         return _ZERO
 
     if direction == "long":
@@ -275,7 +277,10 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
         raise ValueError("api_tiers must not be empty")
 
     # Sort by riskLimitValue ascending
-    sorted_tiers = sorted(api_tiers, key=lambda t: Decimal(t["riskLimitValue"]))
+    try:
+        sorted_tiers = sorted(api_tiers, key=lambda t: Decimal(t["riskLimitValue"]))
+    except (ValueError, ArithmeticError) as e:
+        raise ValueError(f"Invalid riskLimitValue format in tier data") from e
 
     result: MMTiers = []
     for tier in sorted_tiers:

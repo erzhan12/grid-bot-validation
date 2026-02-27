@@ -326,7 +326,7 @@ class TestRiskLimitProvider:
             # Should not raise — ValueError is caught by save_to_cache wrapper
             provider.save_to_cache("BTCUSDT", SAMPLE_TIERS)
 
-        assert any("exceeds 10MB" in r.message for r in caplog.records)
+        assert any("exceeds" in r.message and "byte limit" in r.message for r in caplog.records)
 
     def test_save_to_cache_write_permission_error(self, tmp_path, caplog):
         """save_to_cache logs warning and doesn't crash on read-only directory."""
@@ -417,8 +417,24 @@ class TestEdgeCases:
         cache_path.write_text("x" * 10_000_001)
 
         provider = RiskLimitProvider(cache_path=cache_path)
-        with pytest.raises(ValueError, match="exceeds 10MB"):
+        with pytest.raises(ValueError, match="exceeds.*byte limit"):
             provider._save_to_cache_impl("BTCUSDT", SAMPLE_TIERS)
+
+    def test_custom_max_cache_size_enforced(self, tmp_path, caplog):
+        """Custom max_cache_size_bytes is enforced on save."""
+        cache_path = tmp_path / "cache.json"
+        # Create a small cache file that exceeds the custom limit
+        cache_path.write_text("x" * 500)
+
+        provider = RiskLimitProvider(
+            cache_path=cache_path, max_cache_size_bytes=100
+        )
+
+        with caplog.at_level(logging.WARNING):
+            # save_to_cache catches ValueError and logs warning
+            provider.save_to_cache("BTCUSDT", SAMPLE_TIERS)
+
+        assert any("exceeds" in r.message and "byte limit" in r.message for r in caplog.records)
 
 
 class TestConcurrentCacheAccess:
