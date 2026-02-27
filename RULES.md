@@ -1714,8 +1714,8 @@ Per-symbol maintenance-margin tiers are now fetched from Bybit's `/v5/market/ris
 ### Architecture
 
 - **`gridcore/pnl.py`** — Single source of truth. `calc_maintenance_margin()` accepts optional `tiers: MMTiers` param. When `None`, falls back to hardcoded lookup. Hardcoded tables (`MM_TIERS_BTCUSDT`, `MM_TIERS_ETHUSDT`, `MM_TIERS_DEFAULT`) remain as fallback.
-- **`MMTiers`** type alias: `list[tuple[Decimal, Decimal, Decimal]]` — `(max_position_value, mmr_rate, deduction)`
-- **`parse_risk_limit_tiers()`** — Converts Bybit API response to `MMTiers`. Sorts by `riskLimitValue`, handles empty/missing `mmDeduction`, replaces last tier cap with `Infinity`.
+- **`MMTiers`** type alias: `list[tuple[Decimal, Decimal, Decimal, Decimal]]` — `(max_position_value, mmr_rate, deduction, imr_rate)`
+- **`parse_risk_limit_tiers()`** — Converts Bybit API response to `MMTiers`. Sorts by `riskLimitValue`, handles empty/missing `mmDeduction`/`initialMargin`, replaces last tier cap with `Infinity`. Validates MMR/IMR rates are in `[0, 1]` and `riskLimitValue` is a valid positive number or "Infinity".
 
 ### Consumers
 
@@ -1786,14 +1786,16 @@ Risk limit tiers determine maintenance margin (MM) and initial margin (IM) rates
 ### Caching Strategy (3-Tier Fallback)
 1. **Cache** — Local JSON file, default TTL 24 hours. Stale cache is still used when API fails.
 2. **Bybit API** — `/v5/market/risk-limit` via `BybitRestClient`.
-3. **Hardcoded** — Static tiers in `gridcore.pnl` (last resort, verified 2026-02-28).
+3. **Hardcoded** — Static tiers in `gridcore.pnl` (last resort, verified 2025-02-27).
 
 ### Error Handling
 - Corrupted cache → logged, skipped (non-fatal)
 - API errors → fallback to cache, then hardcoded
-- Cache >10MB → rejected (DoS prevention)
+- Cache >10MB → rejected (DoS prevention), `save_to_cache()` catches `ValueError` and logs warning
 - Empty tier list from API → returns None, triggers fallback
 - `get()` never raises — always returns valid `MMTiers`
+- Invalid `riskLimitValue` format → `parse_risk_limit_tiers` raises `ValueError` with descriptive message
+- MMR/IMR rates outside `[0, 1]` → `parse_risk_limit_tiers` raises `ValueError`
 
 ### Key Pitfalls
 1. **Empty tier list**: `parse_risk_limit_tiers([])` raises `ValueError`. Always check for empty before calling.
@@ -1801,7 +1803,9 @@ Risk limit tiers determine maintenance margin (MM) and initial margin (IM) rates
 3. **Stale hardcoded values**: The hardcoded tiers in `pnl.py` should be periodically verified against the Bybit API. Check the "Last verified" timestamp comment.
 4. **None risk_limit_tiers**: When fetcher returns `None`, calculator must fallback to `MM_TIERS.get(symbol, MM_TIERS_DEFAULT)`.
 5. **Negative prices**: `calc_unrealised_pnl_pct` validates prices > 0; negative prices log a warning and return 0.
-6. **Input validation**: `parse_risk_limit_tiers` rejects negative, zero, and NaN `riskLimitValue`.
+6. **Input validation**: `parse_risk_limit_tiers` rejects negative, zero, and NaN `riskLimitValue`, invalid Decimal formats, and MMR/IMR rates outside `[0, 1]`.
+7. **Cache path determinism**: `DEFAULT_CACHE_PATH` uses `Path(__file__)` (not `Path.cwd()`) so the path is relative to package location, not the working directory. Changed in 2026-02-28.
+8. **Cache skip-write optimization**: Uses direct dict equality (`==`) instead of SHA-256 hashing for comparing tier data. Simpler and faster for small tier dicts.
 
 ## Next Steps (Future Phases)
 
