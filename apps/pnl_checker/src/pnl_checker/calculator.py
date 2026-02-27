@@ -68,6 +68,9 @@ class PositionCalcResult:
     sell_multiplier: float = 1.0
     risk_rule_triggered: str = "none"
 
+    # Data quality: False when position_im was too small for PnL% calc
+    data_quality_ok: bool = True
+
 
 @dataclass
 class AccountCalcResult:
@@ -239,9 +242,11 @@ def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> Calculation
 
             # Unrealized PnL % (Bybit standard)
             pct_bybit = Decimal("0")
+            dq_ok = True
             if pos.position_im >= MIN_POSITION_IM:
                 pct_bybit = unrealised_mark / pos.position_im * Decimal("100")
             else:
+                dq_ok = False
                 logger.warning(
                     f"{pos.symbol} {pos.direction}: position_im={pos.position_im} too small for PnL %% calc",
                     extra={"data_quality_issue": True},
@@ -296,6 +301,7 @@ def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> Calculation
                 buy_multiplier=buy_mult,
                 sell_multiplier=sell_mult,
                 risk_rule_triggered=risk_rule,
+                data_quality_ok=dq_ok,
             ))
 
     # Account-level margin rate calculations

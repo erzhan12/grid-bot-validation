@@ -97,6 +97,7 @@ class FetchResult:
 
     symbols: list[SymbolFetchResult] = field(default_factory=list)
     wallet: Optional[WalletData] = None
+    data_quality_errors: list[str] = field(default_factory=list)
 
 
 class BybitFetcher:
@@ -129,7 +130,7 @@ class BybitFetcher:
 
         # Fetch per-symbol data
         for symbol in symbols:
-            symbol_result = self._fetch_symbol(symbol)
+            symbol_result = self._fetch_symbol(symbol, result.data_quality_errors)
             if symbol_result.positions:  # Only include symbols with open positions
                 result.symbols.append(symbol_result)
             else:
@@ -145,9 +146,11 @@ class BybitFetcher:
 
         return result
 
-    def _fetch_symbol(self, symbol: str) -> SymbolFetchResult:
+    def _fetch_symbol(
+        self, symbol: str, data_quality_errors: list[str] | None = None,
+    ) -> SymbolFetchResult:
         """Fetch all data for a single symbol."""
-        positions = self._fetch_positions(symbol)
+        positions = self._fetch_positions(symbol, data_quality_errors)
         ticker = self._fetch_ticker(symbol)
         funding = self._fetch_funding(symbol)
 
@@ -163,7 +166,9 @@ class BybitFetcher:
             risk_limit_tiers=risk_limit_tiers,
         )
 
-    def _fetch_positions(self, symbol: str) -> list[PositionData]:
+    def _fetch_positions(
+        self, symbol: str, data_quality_errors: list[str] | None = None,
+    ) -> list[PositionData]:
         """Fetch open positions for a symbol (hedge mode: up to 2)."""
         raw_positions = self._client.get_positions(symbol=symbol)
         positions = []
@@ -175,7 +180,10 @@ class BybitFetcher:
             # breaking the entire report.
             if size <= 0:
                 if size < 0:
-                    logger.warning(f"Negative position size {size} for {symbol}")
+                    msg = f"Negative position size {size} for {symbol}"
+                    logger.warning(msg)
+                    if data_quality_errors is not None:
+                        data_quality_errors.append(msg)
                 continue
 
             positions.append(PositionData(

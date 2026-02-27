@@ -271,12 +271,10 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
     for tier in sorted_tiers:
         max_val = Decimal(tier["riskLimitValue"])
         mmr_rate = Decimal(tier["maintenanceMargin"])
-        # mmDeduction can be empty string "" or missing for tier 0 (no deduction)
+        # Bybit can return empty string "" or omit these fields for tier 0.
+        # The ``or "0"`` fallback handles both so Decimal() never receives "".
         deduction_str = tier.get("mmDeduction", "") or "0"
         deduction = Decimal(deduction_str)
-        # initialMargin may be missing in old test data or returned as ""
-        # by the Bybit API for the lowest tier.  The ``or "0"`` fallback
-        # handles both cases so Decimal() never receives an empty string.
         imr_str = tier.get("initialMargin", "") or "0"
         imr_rate = Decimal(imr_str)
         result.append((max_val, mmr_rate, deduction, imr_rate))

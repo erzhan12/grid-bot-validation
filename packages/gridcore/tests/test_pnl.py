@@ -415,6 +415,43 @@ class TestParseRiskLimitTiers:
         result = parse_risk_limit_tiers(api_tiers)
         assert result[0][3] == Decimal("0")
 
+    def test_empty_string_initial_margin_defaults_to_zero(self):
+        """Empty string initialMargin defaults to 0 (Bybit tier 0 edge case)."""
+        api_tiers = [
+            {
+                "riskLimitValue": "200000",
+                "maintenanceMargin": "0.01",
+                "mmDeduction": "0",
+                "initialMargin": "",
+            }
+        ]
+        result = parse_risk_limit_tiers(api_tiers)
+        assert result[0][3] == Decimal("0")
+
+    def test_tier_0_both_fields_empty_string(self):
+        """Tier 0 with both mmDeduction and initialMargin as empty strings."""
+        api_tiers = [
+            {
+                "riskLimitValue": "200000",
+                "maintenanceMargin": "0.005",
+                "mmDeduction": "",
+                "initialMargin": "",
+            },
+            {
+                "riskLimitValue": "1000000",
+                "maintenanceMargin": "0.01",
+                "mmDeduction": "1000",
+                "initialMargin": "0.02",
+            },
+        ]
+        result = parse_risk_limit_tiers(api_tiers)
+        # Tier 0: empty strings fall back to "0"
+        assert result[0][2] == Decimal("0")  # mmDeduction
+        assert result[0][3] == Decimal("0")  # initialMargin
+        # Tier 1: normal values preserved
+        assert result[1][2] == Decimal("1000")
+        assert result[1][3] == Decimal("0.02")
+
     def test_initial_margin_extracted(self):
         """initialMargin is extracted as 4th element."""
         api_tiers = [

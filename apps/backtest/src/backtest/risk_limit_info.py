@@ -4,6 +4,7 @@ Fetches per-symbol maintenance-margin tiers from Bybit API, caches locally.
 Falls back to cache or hardcoded tiers if network unavailable.
 """
 
+import hashlib
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -108,8 +109,6 @@ class RiskLimitProvider:
 
         except json.JSONDecodeError as e:
             logger.warning(f"Corrupted cache file {self.cache_path}: {e}")
-        except KeyError as e:
-            logger.warning(f"Missing required field in cache for {symbol}: {e}")
         except ValueError as e:
             logger.warning(f"Invalid tier data format in cache for {symbol}: {e}")
 
@@ -118,10 +117,19 @@ class RiskLimitProvider:
     def save_to_cache(self, symbol: str, tiers: MMTiers) -> None:
         """Save risk limit tiers to local cache.
 
+        Caching is optional — PermissionError / OSError are caught and logged
+        so that a read-only filesystem never crashes the caller.
+
         Args:
             symbol: Trading pair
             tiers: Parsed tier table to cache
         """
+        try:
+            self._save_to_cache_impl(symbol, tiers)
+        except (PermissionError, OSError) as e:
+            logger.warning(f"Failed to write cache file {self.cache_path}: {e}")
+
+    def _save_to_cache_impl(self, symbol: str, tiers: MMTiers) -> None:
         cache = {}
 
         # Load existing cache
@@ -133,20 +141,21 @@ class RiskLimitProvider:
                 logger.warning(f"Corrupted cache file {self.cache_path}, overwriting: {e}")
                 cache = {}
 
-        # Skip write if tiers haven't changed (validate structure first)
+        # Skip write if tiers haven't changed (hash comparison for efficiency)
+        new_tiers_dict = _tiers_to_dict(tiers)
         existing = cache.get(symbol)
         if (
             existing
             and isinstance(existing, dict)
-            and "tiers" in existing
+            and isinstance(existing.get("tiers"), list)
             and "cached_at" in existing
-            and existing["tiers"] == _tiers_to_dict(tiers)
+            and _tiers_hash(existing["tiers"]) == _tiers_hash(new_tiers_dict)
         ):
             return
 
         # Update cache with timestamp
         cache[symbol] = {
-            "tiers": _tiers_to_dict(tiers),
+            "tiers": new_tiers_dict,
             "cached_at": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -226,6 +235,12 @@ class RiskLimitProvider:
         # No cache, use hardcoded fallback
         logger.warning(f"No risk limit data for {symbol}, using hardcoded fallback")
         return MM_TIERS.get(symbol, MM_TIERS_DEFAULT)
+
+
+def _tiers_hash(tier_dicts: list[dict[str, str]]) -> str:
+    """Compute a fast hash of serialized tier data for skip-write comparison."""
+    raw = json.dumps(tier_dicts, sort_keys=True).encode()
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _tiers_to_dict(tiers: MMTiers) -> list[dict[str, str]]:

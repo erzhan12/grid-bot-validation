@@ -362,7 +362,13 @@ class BybitRestClient:
         response = self._session.get_risk_limit(category=category, symbol=symbol)
         self._check_response(response, "get_risk_limit")
 
-        tiers = response.get("result", {}).get("list", [])
+        # Bybit V5 returns {"result": {"list": [{"list": [tier_data, ...]}]}}
+        # The outer list contains one element per symbol; we unwrap the inner list.
+        outer_list = response.get("result", {}).get("list", [])
+        if outer_list and isinstance(outer_list[0], dict) and "list" in outer_list[0]:
+            tiers = outer_list[0].get("list", [])
+        else:
+            tiers = outer_list
         logger.debug(f"Fetched {len(tiers)} risk limit tiers for {symbol}")
         return tiers
 

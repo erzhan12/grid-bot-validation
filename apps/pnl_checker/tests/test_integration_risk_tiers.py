@@ -130,6 +130,47 @@ class TestEndToEndWithDynamicTiers:
         assert pos.maintenance_margin == Decimal("30")
         assert pos.mmr_rate == Decimal("0.005")
 
+    def test_risk_limit_failure_falls_back_to_hardcoded(self):
+        """When get_risk_limit fails, calculator uses hardcoded fallback tiers."""
+        client = _make_mock_client()
+        # Make get_risk_limit raise an exception
+        client.get_risk_limit.side_effect = ConnectionError("API unreachable")
+
+        fetcher = BybitFetcher(client)
+        fetch_result = fetcher.fetch_all(["BTCUSDT"])
+
+        # risk_limit_tiers should be None (fetch failed gracefully)
+        assert fetch_result.symbols[0].risk_limit_tiers is None
+
+        # Calculator should still produce valid results using hardcoded tiers
+        risk_config = RiskConfig(
+            min_liq_ratio=0.8,
+            max_liq_ratio=1.2,
+            max_margin=8.0,
+            min_total_margin=0.15,
+        )
+        calc_result = calculate(fetch_result, risk_config)
+
+        assert len(calc_result.positions) == 1
+        pos = calc_result.positions[0]
+
+        # position_value = 0.1 * 60000 = 6000
+        assert pos.position_value == Decimal("6000")
+
+        # Hardcoded BTCUSDT tier 1: mmr=0.005, imr=0.01 (max 2,000,000)
+        # MM = 6000 * 0.005 - 0 = 30
+        assert pos.maintenance_margin == Decimal("30")
+        assert pos.mmr_rate == Decimal("0.005")
+
+        # IM = 6000 * 0.01 = 60
+        assert pos.initial_margin == Decimal("60")
+        assert pos.imr_rate == Decimal("0.01")
+
+        # Account-level should still be populated
+        assert calc_result.account is not None
+        assert calc_result.account.total_im == Decimal("60")
+        assert calc_result.account.total_mm == Decimal("30")
+
     def test_account_level_margins_use_dynamic_tiers(self):
         """Account-level IM/MM aggregation uses tier-based per-position values."""
         client = _make_mock_client()
