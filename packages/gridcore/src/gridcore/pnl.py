@@ -98,7 +98,7 @@ def calc_unrealised_pnl_pct(
     """
     if entry_price <= 0 or current_price <= 0:
         if entry_price < 0 or current_price < 0:
-            logger.warning(f"Invalid prices: entry={entry_price}, current={current_price}")
+            logger.warning(f"Invalid prices for {direction}: entry={entry_price}, current={current_price}")
         return _ZERO
 
     if direction == "long":
@@ -155,7 +155,7 @@ def calc_initial_margin(
                 return position_value * imr_rate, imr_rate
 
     # Fallback: position_value / leverage
-    if leverage == 0:
+    if leverage <= 0:
         return _ZERO, _ZERO
     imr_rate = _ONE / leverage
     return position_value / leverage, imr_rate
@@ -287,13 +287,22 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
         if max_val_str != "Infinity":
             if max_val.is_nan() or max_val <= 0:
                 raise ValueError(f"Invalid riskLimitValue: {max_val}")
-        mmr_rate = Decimal(tier["maintenanceMargin"])
+        try:
+            mmr_rate = Decimal(tier["maintenanceMargin"])
+        except (ValueError, ArithmeticError) as e:
+            raise ValueError(f"Invalid maintenanceMargin format: {tier.get('maintenanceMargin')}") from e
         # Bybit can return empty string "" or omit these fields for tier 0.
         # The ``or "0"`` fallback handles both so Decimal() never receives "".
         deduction_str = tier.get("mmDeduction", "") or "0"
-        deduction = Decimal(deduction_str)
+        try:
+            deduction = Decimal(deduction_str)
+        except (ValueError, ArithmeticError) as e:
+            raise ValueError(f"Invalid mmDeduction format: {deduction_str}") from e
         imr_str = tier.get("initialMargin", "") or "0"
-        imr_rate = Decimal(imr_str)
+        try:
+            imr_rate = Decimal(imr_str)
+        except (ValueError, ArithmeticError) as e:
+            raise ValueError(f"Invalid initialMargin format: {imr_str}") from e
         if not (Decimal("0") <= mmr_rate <= Decimal("1")):
             raise ValueError(f"MMR rate {mmr_rate} outside valid range [0, 1]")
         if not (Decimal("0") <= imr_rate <= Decimal("1")):

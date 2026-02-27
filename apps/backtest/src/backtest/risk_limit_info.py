@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 # Default cache location (absolute to prevent path traversal)
 DEFAULT_CACHE_PATH = Path(__file__).parent.parent.parent.parent / "conf" / "risk_limits_cache.json"
 
+# Maximum allowed cache file size (bytes) to prevent DoS via bloated files
+MAX_CACHE_SIZE_BYTES = 10_000_000
+
 
 class RiskLimitProvider:
     """Fetches and caches risk limit tier tables.
@@ -59,7 +62,8 @@ class RiskLimitProvider:
         cache_ttl: timedelta = timedelta(hours=24),
         rest_client: Optional["BybitRestClient"] = None,
     ):
-        self.cache_path = cache_path
+        # Resolve cache_path to prevent directory traversal attacks via ".."
+        self.cache_path = cache_path.resolve()
         self.cache_ttl = cache_ttl
         self._rest_client = rest_client
 
@@ -135,19 +139,21 @@ class RiskLimitProvider:
         except (PermissionError, OSError, ValueError) as e:
             logger.warning(f"Failed to write cache file {self.cache_path}: {e}")
 
-    def _save_to_cache_impl(self, symbol: str, tiers: MMTiers) -> None:
-        cache = {}
+    def _load_existing_cache(self) -> dict:
+        """Load and return existing cache contents, or empty dict on failure."""
+        if not self.cache_path.exists():
+            return {}
+        if self.cache_path.stat().st_size > MAX_CACHE_SIZE_BYTES:
+            raise ValueError("Cache file exceeds 10MB limit")
+        try:
+            with open(self.cache_path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"Corrupted cache file {self.cache_path}, overwriting: {e}")
+            return {}
 
-        # Load existing cache
-        if self.cache_path.exists():
-            if self.cache_path.stat().st_size > 10_000_000:
-                raise ValueError("Cache file exceeds 10MB limit")
-            try:
-                with open(self.cache_path) as f:
-                    cache = json.load(f)
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.warning(f"Corrupted cache file {self.cache_path}, overwriting: {e}")
-                cache = {}
+    def _save_to_cache_impl(self, symbol: str, tiers: MMTiers) -> None:
+        cache = self._load_existing_cache()
 
         # Skip write if tiers haven't changed (direct equality check)
         existing = cache.get(symbol)
@@ -177,14 +183,23 @@ class RiskLimitProvider:
         logger.info(f"Cached risk limit tiers for {symbol}")
 
     def _is_cache_fresh(self, symbol: str) -> bool:
-        """Check if cached entry for symbol is younger than cache_ttl."""
+        """Check if cached entry for symbol is younger than cache_ttl.
+
+        Uses file mtime as a quick pre-check: if the entire file is older
+        than cache_ttl, the per-symbol entry cannot be fresh either.
+        """
         if not self.cache_path.exists():
             return False
 
         try:
-            with open(self.cache_path) as f:
-                cache = json.load(f)
+            # Quick pre-check: if file mtime is older than TTL, skip parsing
+            file_mtime = datetime.fromtimestamp(
+                self.cache_path.stat().st_mtime, tz=timezone.utc
+            )
+            if datetime.now(timezone.utc) - file_mtime > self.cache_ttl:
+                return False
 
+            cache = self._load_existing_cache()
             entry = cache.get(symbol, {})
             cached_at_str = entry.get("cached_at")
             if not cached_at_str:

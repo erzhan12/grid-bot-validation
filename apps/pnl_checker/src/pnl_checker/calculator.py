@@ -143,9 +143,11 @@ def _calc_risk_multipliers(
 
     results = {}
 
-    # Reset both before calculating (matches bbu2 pattern)
-    long_mgr.reset_amount_multiplier()
-    short_mgr.reset_amount_multiplier()
+    # Reset only managers with open positions (matches bbu2 pattern)
+    if long_pos:
+        long_mgr.reset_amount_multiplier()
+    if short_pos:
+        short_mgr.reset_amount_multiplier()
 
     # Calculate long multipliers
     if long_pos and long_pos.size > 0:

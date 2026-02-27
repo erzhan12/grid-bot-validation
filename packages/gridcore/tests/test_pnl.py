@@ -164,6 +164,12 @@ class TestCalcInitialMargin:
         assert imr == Decimal("0.05")
         assert im == Decimal("10000")  # 200000 * 0.05
 
+    def test_negative_leverage_fallback(self):
+        """Negative leverage returns zero when no tiers match (fallback path)."""
+        im, imr = calc_initial_margin(Decimal("5000"), Decimal("-5"))
+        assert im == Decimal("0")
+        assert imr == Decimal("0")
+
     def test_zero_position_value(self):
         """Zero position value returns zero."""
         im, imr = calc_initial_margin(Decimal("0"), Decimal("10"), symbol="BTCUSDT")

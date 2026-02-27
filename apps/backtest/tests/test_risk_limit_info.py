@@ -2,6 +2,7 @@
 
 import json
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -81,9 +82,9 @@ class TestRiskLimitProvider:
         }
 
     def test_default_cache_path(self):
-        """Provider uses DEFAULT_CACHE_PATH when none given."""
+        """Provider uses resolved DEFAULT_CACHE_PATH when none given."""
         provider = RiskLimitProvider()
-        assert provider.cache_path == DEFAULT_CACHE_PATH
+        assert provider.cache_path == DEFAULT_CACHE_PATH.resolve()
 
     # --- load_from_cache ---
 
@@ -418,3 +419,61 @@ class TestEdgeCases:
         provider = RiskLimitProvider(cache_path=cache_path)
         with pytest.raises(ValueError, match="exceeds 10MB"):
             provider._save_to_cache_impl("BTCUSDT", SAMPLE_TIERS)
+
+
+class TestConcurrentCacheAccess:
+    """Tests for concurrent cache file access."""
+
+    def test_concurrent_writes_no_corruption(self, tmp_path):
+        """Two threads writing to the same cache file don't corrupt data."""
+        cache_path = tmp_path / "cache.json"
+        provider = RiskLimitProvider(cache_path=cache_path)
+        errors: list[Exception] = []
+
+        tiers_a: MMTiers = [
+            (Decimal("100000"), Decimal("0.01"), Decimal("0"), Decimal("0.02")),
+            (Decimal("Infinity"), Decimal("0.025"), Decimal("1500"), Decimal("0.05")),
+        ]
+        tiers_b: MMTiers = [
+            (Decimal("500000"), Decimal("0.005"), Decimal("0"), Decimal("0.01")),
+            (Decimal("Infinity"), Decimal("0.01"), Decimal("2500"), Decimal("0.02")),
+        ]
+
+        def write_symbol(symbol, tiers):
+            try:
+                for _ in range(20):
+                    provider.save_to_cache(symbol, tiers)
+            except Exception as e:
+                errors.append(e)
+
+        t1 = threading.Thread(target=write_symbol, args=("AAAUSDT", tiers_a))
+        t2 = threading.Thread(target=write_symbol, args=("BBBUSDT", tiers_b))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        # No unhandled exceptions in threads
+        assert errors == [], f"Thread errors: {errors}"
+
+        # Cache file should be valid JSON
+        cache = json.loads(cache_path.read_text())
+        assert isinstance(cache, dict)
+
+
+class TestPathTraversalValidation:
+    """Tests for cache_path resolution to prevent directory traversal."""
+
+    def test_path_with_traversal_is_resolved(self, tmp_path):
+        """Path with '..' components is resolved to absolute canonical path."""
+        traversal_path = tmp_path / "a" / ".." / "cache.json"
+        provider = RiskLimitProvider(cache_path=traversal_path)
+        # Should be resolved: tmp_path/cache.json (no ".." in result)
+        assert ".." not in str(provider.cache_path)
+        assert provider.cache_path == (tmp_path / "cache.json").resolve()
+
+    def test_cache_path_is_always_absolute(self, tmp_path, monkeypatch):
+        """Relative cache paths are resolved to absolute."""
+        monkeypatch.chdir(tmp_path)
+        provider = RiskLimitProvider(cache_path=Path("relative/cache.json"))
+        assert provider.cache_path.is_absolute()
