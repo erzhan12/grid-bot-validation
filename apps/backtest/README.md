@@ -51,6 +51,8 @@ tiers = provider.get("BTCUSDT", force_fetch=True)
 
 **Warning:** The default `cache_ttl` of 24 hours means tier changes on Bybit may not be reflected until the cache expires. For critical systems (live trading, production backtests), use `force_fetch=True` on startup to ensure you always start with the latest tiers from the API. Use `force_fetch=True` on startup for critical systems, or immediately after Bybit announces risk limit tier changes to ensure calculations use the latest values.
 
+**Concurrent access:** If running multiple backtest processes simultaneously, each should use a separate cache file path. Cache writes use file locking to prevent concurrent write corruption, but separate cache files are still recommended to reduce lock contention and keep per-process cache state isolated.
+
 ### Without API Access
 
 When no `rest_client` is provided (e.g., offline backtesting), the provider uses cached data or falls back to hardcoded tier tables. No API calls are attempted.

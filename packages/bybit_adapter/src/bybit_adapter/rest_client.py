@@ -374,6 +374,11 @@ class BybitRestClient:
         if outer_list and isinstance(outer_list[0], dict) and "list" in outer_list[0]:
             tiers = outer_list[0].get("list", [])
         else:
+            if outer_list:
+                logger.warning(
+                    "Unexpected risk limit API structure for %s, using outer list directly",
+                    symbol,
+                )
             tiers = outer_list
         logger.debug(f"Fetched {len(tiers)} risk limit tiers for {symbol}")
         return tiers

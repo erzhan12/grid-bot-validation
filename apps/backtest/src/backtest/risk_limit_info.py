@@ -64,11 +64,18 @@ class RiskLimitProvider:
         rest_client: Optional["BybitRestClient"] = None,
         max_cache_size_bytes: int = MAX_CACHE_SIZE_BYTES,
     ):
-        # Normalize to absolute path without resolving symlinks.
-        self.cache_path = Path(os.path.abspath(str(cache_path.expanduser())))
+        expanded_cache_path = cache_path.expanduser()
+        # Freeze configured path to an absolute location so symlink checks
+        # remain stable even if process CWD changes after initialization.
+        self._configured_cache_path = expanded_cache_path.absolute()
+        # Normalize path and resolve symlinks for a canonical cache location.
+        self.cache_path = expanded_cache_path.resolve()
         self.cache_ttl = cache_ttl
         self._rest_client = rest_client
         self.max_cache_size_bytes = max_cache_size_bytes
+
+    def _cache_path_is_symlink(self) -> bool:
+        return self._configured_cache_path.is_symlink() or self.cache_path.is_symlink()
 
     def fetch_from_bybit(self, symbol: str) -> Optional[MMTiers]:
         """Fetch risk limit tiers from Bybit API via BybitRestClient.
@@ -114,9 +121,11 @@ class RiskLimitProvider:
 
     def _load_cache_entry(self, symbol: str) -> tuple[Optional[MMTiers], Optional[str]]:
         """Load tiers and ``cached_at`` for a symbol with a single JSON parse."""
+        if self._cache_path_is_symlink():
+            logger.warning(f"Cache path must not be a symlink: {self._configured_cache_path}")
+            return None, None
+
         try:
-            if self.cache_path.is_symlink():
-                raise ValueError("Cache path must not be a symlink")
             if not self.cache_path.exists():
                 return None, None
             if self.cache_path.lstat().st_size > self.max_cache_size_bytes:
@@ -137,7 +146,9 @@ class RiskLimitProvider:
 
         except json.JSONDecodeError as e:
             logger.warning(f"Corrupted cache file {self.cache_path}: {e}")
-        except (TypeError, ValueError) as e:
+        except TypeError as e:
+            logger.warning(f"Invalid tier data format in cache for {symbol}: {e}")
+        except ValueError as e:
             logger.warning(f"Invalid tier data format in cache for {symbol}: {e}")
 
         return None, None
@@ -159,7 +170,7 @@ class RiskLimitProvider:
 
     def _load_existing_cache(self) -> dict:
         """Load and return existing cache contents, or empty dict on failure."""
-        if self.cache_path.is_symlink():
+        if self._cache_path_is_symlink():
             raise ValueError("Cache path must not be a symlink")
         if not self.cache_path.exists():
             return {}
@@ -175,32 +186,42 @@ class RiskLimitProvider:
             return {}
 
     def _save_to_cache_impl(self, symbol: str, tiers: MMTiers) -> None:
-        cache = self._load_existing_cache()
+        if self._cache_path_is_symlink():
+            raise ValueError("Cache path must not be a symlink")
 
-        # Skip write if tiers haven't changed (direct equality check)
-        existing = cache.get(symbol)
-        new_tiers_dict = _tiers_to_dict(tiers)
-        if (
-            existing
-            and isinstance(existing, dict)
-            and isinstance(existing.get("tiers"), list)
-            and "cached_at" in existing
-            and existing["tiers"] == new_tiers_dict
-        ):
-            return
-
-        # Update cache with timestamp
-        cache[symbol] = {
-            "tiers": new_tiers_dict,
-            "cached_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-        # Ensure directory exists
+        # Ensure directory exists before creating lock/cache files.
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Write cache
-        with open(self.cache_path, "w") as f:
-            json.dump(cache, f, indent=2)
+        lock_path = self.cache_path.with_suffix(f"{self.cache_path.suffix}.lock")
+        with open(lock_path, "a+b") as lock_file:
+            _acquire_file_lock(lock_file)
+            try:
+                # Read-modify-write must be atomic across processes.
+                cache = self._load_existing_cache()
+
+                # Skip write if tiers haven't changed (direct equality check)
+                existing = cache.get(symbol)
+                new_tiers_dict = _tiers_to_dict(tiers)
+                if (
+                    existing
+                    and isinstance(existing, dict)
+                    and isinstance(existing.get("tiers"), list)
+                    and "cached_at" in existing
+                    and existing["tiers"] == new_tiers_dict
+                ):
+                    return
+
+                # Update cache with timestamp
+                cache[symbol] = {
+                    "tiers": new_tiers_dict,
+                    "cached_at": datetime.now(timezone.utc).isoformat(),
+                }
+
+                # Write cache
+                with open(self.cache_path, "w") as f:
+                    json.dump(cache, f, indent=2)
+            finally:
+                _release_file_lock(lock_file)
 
         logger.info(f"Cached risk limit tiers for {symbol}")
 
@@ -210,7 +231,7 @@ class RiskLimitProvider:
         Uses file mtime as a quick pre-check: if the entire file is older
         than cache_ttl, the per-symbol entry cannot be fresh either.
         """
-        if self.cache_path.is_symlink():
+        if self._cache_path_is_symlink():
             return False
         if not self.cache_path.exists():
             return False
@@ -302,6 +323,36 @@ def _tiers_to_dict(tiers: MMTiers) -> list[dict[str, str]]:
         }
         for max_val, mmr_rate, deduction, imr_rate in tiers
     ]
+
+
+def _acquire_file_lock(lock_file) -> None:
+    """Acquire an exclusive lock for cache read-modify-write operations."""
+    if os.name == "nt":
+        import msvcrt
+
+        lock_file.seek(0, os.SEEK_END)
+        if lock_file.tell() == 0:
+            lock_file.write(b"\0")
+            lock_file.flush()
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+
+def _release_file_lock(lock_file) -> None:
+    """Release the cache file lock."""
+    if os.name == "nt":
+        import msvcrt
+
+        lock_file.seek(0)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _tiers_from_dict(tier_dicts: list[dict[str, str]]) -> MMTiers:

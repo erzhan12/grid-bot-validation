@@ -24,6 +24,8 @@ MMTiers = list[tuple[Decimal, Decimal, Decimal, Decimal]]
 # MM = position_value * mmr_rate - deduction
 # IM = position_value * imr_rate
 # Last verified against Bybit API: 2026-02-27
+# Important: These hardcoded values should be periodically updated by running
+# the RiskLimitProvider with force_fetch=True and comparing against the latest API data.
 #
 # These hardcoded tiers are a safe fallback when API data is unavailable.
 # Bybit applies progressively higher IM/MM rates to larger position notional
