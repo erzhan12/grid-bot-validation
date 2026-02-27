@@ -1804,8 +1804,12 @@ Risk limit tiers determine maintenance margin (MM) and initial margin (IM) rates
 4. **None risk_limit_tiers**: When fetcher returns `None`, calculator must fallback to `MM_TIERS.get(symbol, MM_TIERS_DEFAULT)`.
 5. **Negative prices**: `calc_unrealised_pnl_pct` validates prices > 0; negative prices log a warning and return 0.
 6. **Input validation**: `parse_risk_limit_tiers` rejects negative, zero, and NaN `riskLimitValue`, invalid Decimal formats, and MMR/IMR rates outside `[0, 1]`.
-7. **Cache path determinism**: `DEFAULT_CACHE_PATH` uses `Path(__file__)` (not `Path.cwd()`) so the path is relative to package location, not the working directory. Changed in 2026-02-28.
+7. **Cache path security**: `cache_path` is resolved via `.resolve()` in `__init__` to prevent directory traversal via `..` components. `DEFAULT_CACHE_PATH` uses `Path(__file__)` (not `Path.cwd()`) so the path is relative to package location.
 8. **Cache skip-write optimization**: Uses direct dict equality (`==`) instead of SHA-256 hashing for comparing tier data. Simpler and faster for small tier dicts.
+9. **Decimal conversion safety**: All Decimal conversions in `parse_risk_limit_tiers` are wrapped in try-except to catch `InvalidOperation` from malformed API responses. Error messages include field name and value for debugging.
+10. **Negative leverage guard**: `calc_initial_margin` uses `leverage <= 0` (not `== 0`) in fallback path. The calculator also guards at the call site via `MIN_LEVERAGE` threshold.
+11. **_is_cache_fresh optimization**: Uses file mtime as a quick pre-check before parsing JSON. If the file hasn't been modified within the TTL window, skips parsing entirely.
+12. **Conditional position manager resets**: In `_calc_risk_multipliers`, only reset managers with open positions to avoid unnecessary work.
 
 ## Next Steps (Future Phases)
 
