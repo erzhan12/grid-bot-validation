@@ -7,6 +7,8 @@ from pnl_checker.calculator import (
     _calc_risk_multipliers,
     _detect_risk_rule,
     calculate,
+    MIN_LEVERAGE,
+    MIN_POSITION_IM,
 )
 from pnl_checker.fetcher import (
     FetchResult,
@@ -226,3 +228,101 @@ class TestMarginRatioEdgeCases:
                 wallet_balance=Decimal("-100"),
             )
         assert "Zero or negative wallet balance" in caplog.text
+
+
+class TestMinThresholdBoundaries:
+    """Tests for MIN_LEVERAGE and MIN_POSITION_IM exact boundary values."""
+
+    def _make_fetch_result(
+        self, leverage: str = "10", position_im: str = "51",
+    ) -> FetchResult:
+        """Create FetchResult with configurable leverage and position_im."""
+        pos = PositionData(
+            symbol="BTCUSDT",
+            side="Buy",
+            size=Decimal("0.01"),
+            avg_price=Decimal("50000"),
+            mark_price=Decimal("51000"),
+            liq_price=Decimal("45000"),
+            leverage=Decimal(leverage),
+            position_value=Decimal("510"),
+            position_im=Decimal(position_im),
+            position_mm=Decimal("5.1"),
+            unrealised_pnl=Decimal("10"),
+            cur_realised_pnl=Decimal("0"),
+            cum_realised_pnl=Decimal("0"),
+            position_idx=1,
+        )
+        return FetchResult(
+            symbols=[SymbolFetchResult(
+                symbol="BTCUSDT",
+                positions=[pos],
+                ticker=TickerData(
+                    symbol="BTCUSDT",
+                    last_price=Decimal("51000"),
+                    mark_price=Decimal("51000"),
+                    funding_rate=Decimal("0.0001"),
+                ),
+                funding=FundingData(
+                    symbol="BTCUSDT",
+                    cumulative_funding=Decimal("0"),
+                    transaction_count=0,
+                ),
+            )],
+            wallet=WalletData(
+                total_equity=Decimal("10000"),
+                total_wallet_balance=Decimal("9980"),
+                total_margin_balance=Decimal("10000"),
+                total_available_balance=Decimal("9900"),
+                total_perp_upl=Decimal("20"),
+                total_initial_margin=Decimal("102"),
+                total_maintenance_margin=Decimal("10.2"),
+                account_im_rate=Decimal("0.0102"),
+                account_mm_rate=Decimal("0.00102"),
+                margin_mode="REGULAR_MARGIN",
+                usdt_wallet_balance=Decimal("9980"),
+                usdt_unrealised_pnl=Decimal("20"),
+                usdt_cum_realised_pnl=Decimal("0"),
+            ),
+        )
+
+    def _risk_config(self) -> RiskConfig:
+        return RiskConfig(
+            min_liq_ratio=0.8, max_liq_ratio=1.2,
+            max_margin=8.0, min_total_margin=0.15,
+        )
+
+    def test_leverage_at_min_threshold(self):
+        """Leverage exactly at MIN_LEVERAGE should still compute IM."""
+        fetch = self._make_fetch_result(leverage=str(MIN_LEVERAGE))
+        result = calculate(fetch, self._risk_config())
+        pos = result.positions[0]
+        # At exact threshold, IM should be calculated (not zero)
+        assert pos.initial_margin > 0
+
+    def test_leverage_below_min_threshold(self, caplog):
+        """Leverage below MIN_LEVERAGE returns zero IM with warning."""
+        below = MIN_LEVERAGE / Decimal("10")
+        fetch = self._make_fetch_result(leverage=str(below))
+        with caplog.at_level(logging.WARNING, logger="pnl_checker.calculator"):
+            result = calculate(fetch, self._risk_config())
+        pos = result.positions[0]
+        assert pos.initial_margin == Decimal("0")
+        assert "too small for margin calc" in caplog.text
+
+    def test_position_im_at_min_threshold(self):
+        """position_im at MIN_POSITION_IM should still compute PnL%."""
+        fetch = self._make_fetch_result(position_im=str(MIN_POSITION_IM))
+        result = calculate(fetch, self._risk_config())
+        pos = result.positions[0]
+        assert pos.data_quality_ok is True
+
+    def test_position_im_below_min_threshold(self, caplog):
+        """position_im below MIN_POSITION_IM returns zero PnL% with warning."""
+        below = MIN_POSITION_IM / Decimal("10")
+        fetch = self._make_fetch_result(position_im=str(below))
+        with caplog.at_level(logging.WARNING, logger="pnl_checker.calculator"):
+            result = calculate(fetch, self._risk_config())
+        pos = result.positions[0]
+        assert pos.unrealised_pnl_pct_bybit == Decimal("0")
+        assert pos.data_quality_ok is False

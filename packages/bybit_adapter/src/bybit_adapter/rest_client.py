@@ -348,7 +348,11 @@ class BybitRestClient:
             category: Product type (default "linear")
 
         Returns:
-            List of tier dicts with riskLimitValue, maintenanceMargin, mmDeduction, etc.
+            List of tier dicts. Each dict contains:
+              - ``riskLimitValue`` (str): Max position value for this tier (e.g. "200000")
+              - ``maintenanceMargin`` (str): MMR rate as decimal string (e.g. "0.005")
+              - ``mmDeduction`` (str): Deduction amount (e.g. "0", may be "" for tier 0)
+              - ``initialMargin`` (str): IMR rate as decimal string (e.g. "0.01")
 
         Raises:
             Exception: If API call fails

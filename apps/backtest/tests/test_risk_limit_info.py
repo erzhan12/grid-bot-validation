@@ -331,3 +331,75 @@ class TestRiskLimitProvider:
         # Restore permissions for cleanup, then verify no file was created
         read_only_dir.chmod(0o755)
         assert not cache_file.exists()
+
+
+class TestEdgeCases:
+    """Edge case tests for risk limit parsing and caching."""
+
+    def test_negative_risk_limit_value_rejected(self):
+        """Negative riskLimitValue raises ValueError."""
+        from gridcore.pnl import parse_risk_limit_tiers
+
+        with pytest.raises(ValueError, match="Invalid riskLimitValue"):
+            parse_risk_limit_tiers([
+                {"riskLimitValue": "-100", "maintenanceMargin": "0.01",
+                 "mmDeduction": "0", "initialMargin": "0.02"},
+            ])
+
+    def test_zero_risk_limit_value_rejected(self):
+        """Zero riskLimitValue raises ValueError."""
+        from gridcore.pnl import parse_risk_limit_tiers
+
+        with pytest.raises(ValueError, match="Invalid riskLimitValue"):
+            parse_risk_limit_tiers([
+                {"riskLimitValue": "0", "maintenanceMargin": "0.01",
+                 "mmDeduction": "0", "initialMargin": "0.02"},
+            ])
+
+    def test_nan_risk_limit_value_rejected(self):
+        """NaN riskLimitValue raises ValueError."""
+        from gridcore.pnl import parse_risk_limit_tiers
+
+        with pytest.raises(ValueError, match="Invalid riskLimitValue"):
+            parse_risk_limit_tiers([
+                {"riskLimitValue": "NaN", "maintenanceMargin": "0.01",
+                 "mmDeduction": "0", "initialMargin": "0.02"},
+            ])
+
+    def test_malformed_cached_at_returns_stale(self, tmp_path):
+        """Malformed cached_at timestamp treats cache as stale."""
+        cache_path = tmp_path / "cache.json"
+        cache_path.write_text(json.dumps({
+            "BTCUSDT": {
+                "tiers": _tiers_to_dict(SAMPLE_TIERS),
+                "cached_at": "not-a-timestamp",
+            },
+        }))
+
+        provider = RiskLimitProvider(cache_path=cache_path)
+        # _is_cache_fresh should return False for malformed timestamp
+        assert provider._is_cache_fresh("BTCUSDT") is False
+
+    def test_empty_tiers_list_returns_none(self, tmp_path):
+        """Empty tiers list in cache returns None from load_from_cache."""
+        cache_path = tmp_path / "cache.json"
+        cache_path.write_text(json.dumps({
+            "BTCUSDT": {
+                "tiers": [],
+                "cached_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }))
+
+        provider = RiskLimitProvider(cache_path=cache_path)
+        result = provider.load_from_cache("BTCUSDT")
+        assert result is None
+
+    def test_cache_file_exceeds_size_limit(self, tmp_path):
+        """Cache file exceeding 10MB raises ValueError during save."""
+        cache_path = tmp_path / "cache.json"
+        # Create a file just over 10MB
+        cache_path.write_text("x" * 10_000_001)
+
+        provider = RiskLimitProvider(cache_path=cache_path)
+        with pytest.raises(ValueError, match="exceeds 10MB"):
+            provider._save_to_cache_impl("BTCUSDT", SAMPLE_TIERS)

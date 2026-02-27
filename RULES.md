@@ -1771,6 +1771,38 @@ Read-only tool that fetches live Bybit data and compares our PnL/margin calculat
 4. **Workspace dependency**: `pnl-checker` must be in root `pyproject.toml` dev deps AND `tool.uv.sources` for test discovery to work.
 5. **Initial Margin comparison (known mismatch)**: Our `calc_initial_margin` uses `positionValue / leverage` (entry-based). Bybit UTA cross-margin uses mark_price and hedge optimization. The IM comparison will show FAIL in hedge mode — this is expected. The comparison exists for visibility, not accuracy validation.
 
+## Dynamic Risk Limit Tiers
+
+### Overview
+Risk limit tiers determine maintenance margin (MM) and initial margin (IM) rates based on position size. These tiers are fetched dynamically from Bybit API and cached locally.
+
+### Files Involved
+- `packages/gridcore/src/gridcore/pnl.py` — `MMTiers` type, hardcoded fallback tiers (`MM_TIERS_BTCUSDT`, etc.), `parse_risk_limit_tiers()`, `calc_maintenance_margin()`, `calc_initial_margin()`
+- `apps/backtest/src/backtest/risk_limit_info.py` — `RiskLimitProvider` class (fetch, cache, fallback)
+- `packages/bybit_adapter/src/bybit_adapter/rest_client.py` — `get_risk_limit()` API call
+- `apps/pnl_checker/src/pnl_checker/calculator.py` — Uses tiers for IM/MM calculation
+- `apps/pnl_checker/src/pnl_checker/fetcher.py` — Fetches risk limits per symbol
+
+### Caching Strategy (3-Tier Fallback)
+1. **Cache** — Local JSON file, default TTL 24 hours. Stale cache is still used when API fails.
+2. **Bybit API** — `/v5/market/risk-limit` via `BybitRestClient`.
+3. **Hardcoded** — Static tiers in `gridcore.pnl` (last resort, verified 2026-02-28).
+
+### Error Handling
+- Corrupted cache → logged, skipped (non-fatal)
+- API errors → fallback to cache, then hardcoded
+- Cache >10MB → rejected (DoS prevention)
+- Empty tier list from API → returns None, triggers fallback
+- `get()` never raises — always returns valid `MMTiers`
+
+### Key Pitfalls
+1. **Empty tier list**: `parse_risk_limit_tiers([])` raises `ValueError`. Always check for empty before calling.
+2. **Corrupted cache**: Handled gracefully — `load_from_cache()` catches `json.JSONDecodeError` and `ValueError`.
+3. **Stale hardcoded values**: The hardcoded tiers in `pnl.py` should be periodically verified against the Bybit API. Check the "Last verified" timestamp comment.
+4. **None risk_limit_tiers**: When fetcher returns `None`, calculator must fallback to `MM_TIERS.get(symbol, MM_TIERS_DEFAULT)`.
+5. **Negative prices**: `calc_unrealised_pnl_pct` validates prices > 0; negative prices log a warning and return 0.
+6. **Input validation**: `parse_risk_limit_tiers` rejects negative, zero, and NaN `riskLimitValue`.
+
 ## Next Steps (Future Phases)
 
 - Phase I: Deployment & Monitoring

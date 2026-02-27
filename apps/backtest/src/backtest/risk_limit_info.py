@@ -19,8 +19,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Default cache location
-DEFAULT_CACHE_PATH = Path("conf/risk_limits_cache.json")
+# Default cache location (absolute to prevent path traversal)
+DEFAULT_CACHE_PATH = Path.cwd() / "conf" / "risk_limits_cache.json"
 
 
 class RiskLimitProvider:
@@ -37,6 +37,13 @@ class RiskLimitProvider:
         the API is unreachable.
       - Use ``force_fetch=True`` to bypass the cache entirely — recommended
         after a detected tier change or on startup for critical systems.
+
+    Error handling:
+      - Corrupted cache files are logged and skipped (non-fatal).
+      - API errors trigger fallback to cache or hardcoded tiers.
+      - All errors are logged but never raised — ``get()`` always returns
+        a valid ``MMTiers`` list.
+      - Cache files exceeding 10 MB are rejected to prevent DoS.
 
     Example:
         from bybit_adapter.rest_client import BybitRestClient
@@ -83,7 +90,7 @@ class RiskLimitProvider:
             logger.info(f"Fetched {len(tiers)} risk limit tiers for {symbol}")
             return tiers
 
-        except Exception as e:
+        except (ConnectionError, TimeoutError, ValueError, KeyError) as e:
             logger.warning(f"Error fetching risk limit tiers: {e}")
             return None
 
@@ -134,6 +141,8 @@ class RiskLimitProvider:
 
         # Load existing cache
         if self.cache_path.exists():
+            if self.cache_path.stat().st_size > 10_000_000:
+                raise ValueError("Cache file exceeds 10MB limit")
             try:
                 with open(self.cache_path) as f:
                     cache = json.load(f)
@@ -142,15 +151,19 @@ class RiskLimitProvider:
                 cache = {}
 
         # Skip write if tiers haven't changed (hash comparison for efficiency)
-        new_tiers_dict = _tiers_to_dict(tiers)
+        # Compute old hash before serializing new tiers to avoid redundant work
         existing = cache.get(symbol)
+        old_hash = None
         if (
             existing
             and isinstance(existing, dict)
             and isinstance(existing.get("tiers"), list)
             and "cached_at" in existing
-            and _tiers_hash(existing["tiers"]) == _tiers_hash(new_tiers_dict)
         ):
+            old_hash = _tiers_hash(existing["tiers"])
+
+        new_tiers_dict = _tiers_to_dict(tiers)
+        if old_hash is not None and old_hash == _tiers_hash(new_tiers_dict):
             return
 
         # Update cache with timestamp

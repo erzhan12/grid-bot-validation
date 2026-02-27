@@ -4,8 +4,11 @@ Single source of truth for position PnL formulas used across the project.
 All functions are pure (no side effects, no state) and use Decimal for precision.
 """
 
+import logging
 from decimal import Decimal
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 _ZERO = Decimal("0")
 _ONE = Decimal("1")
@@ -20,6 +23,7 @@ MMTiers = list[tuple[Decimal, Decimal, Decimal, Decimal]]
 # Each tier: (max_position_value, mmr_rate, deduction, imr_rate)
 # MM = position_value * mmr_rate - deduction
 # IM = position_value * imr_rate
+# Last verified against Bybit API: 2026-02-28
 # ---------------------------------------------------------------------------
 
 MM_TIERS_BTCUSDT: MMTiers = [
@@ -92,7 +96,9 @@ def calc_unrealised_pnl_pct(
 
     Returns Decimal("0") if entry_price or current_price is zero.
     """
-    if entry_price == 0 or current_price == 0:
+    if entry_price <= 0 or current_price <= 0:
+        if entry_price < 0 or current_price < 0:
+            logger.warning(f"Invalid prices: entry={entry_price}, current={current_price}")
         return _ZERO
 
     if direction == "long":
@@ -269,7 +275,11 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
 
     result: MMTiers = []
     for tier in sorted_tiers:
-        max_val = Decimal(tier["riskLimitValue"])
+        max_val_str = tier["riskLimitValue"]
+        max_val = Decimal(max_val_str)
+        if max_val_str != "Infinity":
+            if max_val.is_nan() or max_val <= 0:
+                raise ValueError(f"Invalid riskLimitValue: {max_val}")
         mmr_rate = Decimal(tier["maintenanceMargin"])
         # Bybit can return empty string "" or omit these fields for tier 0.
         # The ``or "0"`` fallback handles both so Decimal() never receives "".

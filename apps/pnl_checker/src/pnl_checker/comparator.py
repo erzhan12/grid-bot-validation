@@ -87,9 +87,15 @@ def _compare_field(
     our_val: Decimal,
     tolerance: float,
 ) -> FieldComparison:
-    """Compare a numeric field with tolerance check."""
+    """Compare a numeric field with tolerance check.
+
+    Uses the larger of the fixed tolerance and a relative tolerance
+    (0.01% of the Bybit value) so that comparisons scale correctly
+    for both small and large values.
+    """
     delta = abs(our_val - bybit_val)
-    passed = float(delta) <= tolerance
+    relative_tolerance = max(tolerance, abs(float(bybit_val)) * 0.0001)
+    passed = float(delta) <= relative_tolerance
     return FieldComparison(
         field_name=name,
         bybit_value=bybit_val,
