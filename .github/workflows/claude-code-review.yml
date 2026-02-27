@@ -94,24 +94,42 @@ jobs:
 
             In this repository, please make the following changes:
 
-            1. **[SECURITY]** File `path/to/file.ts`, line 42: <specific instruction>
-            2. **[BUG]** File `path/to/file.ts`, line 87: <specific instruction>
-            3. **[PERFORMANCE]** File `path/to/other.py`, line 15: <specific instruction>
-            4. **[QUALITY]** File `path/to/file.ts`, line 33: <specific instruction>
-            5. **[TESTING]** File `path/to/test.ts`: <specific instruction>
-            6. **[DOCS]** File `README.md`: <specific instruction>
+            1. **[P0] [SECURITY]** File `path/to/file.ts`, line 42: <specific instruction>
+            2. **[P0] [BUG]** File `path/to/file.ts`, line 87: <specific instruction>
+            3. **[P1] [PERFORMANCE]** File `path/to/other.py`, line 15: <specific instruction>
+            4. **[P2] [QUALITY]** File `path/to/file.ts`, line 33: <specific instruction>
+            5. **[P2] [TESTING]** File `path/to/test.ts`: <specific instruction>
+            6. **[P3] [DOCS]** File `README.md`: <specific instruction>
 
             After making all changes, run the existing tests to make sure nothing is broken.
+
+            ## Merge Verdict
+
+            **APPROVED** / **CHANGES REQUESTED**
+
+            <1-2 sentence justification for the verdict>
             ```
+
+            ## Priority Scale
+            - P0 = Must fix before merge (security vulnerabilities, data loss bugs, broken functionality)
+            - P1 = Should fix before merge (performance issues, significant code smells)
+            - P2 = Fix recommended (quality improvements, missing tests, minor issues)
+            - P3 = Nice to have (docs, style, minor suggestions)
+
+            ## Merge Verdict Rules
+            - **APPROVED**: No P0 issues found. P1/P2/P3 issues may exist but are not blockers.
+            - **CHANGES REQUESTED**: Any P0 issue exists, or multiple P1 issues that together pose a significant risk.
 
             ## Rules
             - Everything in ONE `gh pr comment` call, no inline comments
             - Use exact file paths relative to repo root with line numbers from the diff
             - Each fix must be a specific actionable instruction, not vague advice
             - Use category tags: [SECURITY], [BUG], [PERFORMANCE], [QUALITY], [TESTING], [DOCS]
-            - Order by priority: security > bugs > performance > quality > testing > docs
+            - Prefix each fix with priority: [P0], [P1], [P2], or [P3]
+            - Order by priority: P0 > P1 > P2 > P3
             - Skip praise or observations that require no code changes
             - If no fixes needed, say "No actionable fixes required"
+            - Always end with a Merge Verdict section
 
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
