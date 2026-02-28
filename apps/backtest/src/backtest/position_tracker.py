@@ -71,8 +71,14 @@ class BacktestPositionTracker:
             tiers: MM tier table (from RiskLimitProvider or hardcoded fallback)
             symbol: Trading symbol (used for MM fallback when tiers is None)
         """
-        if direction not in (DirectionType.LONG, DirectionType.SHORT):
-            raise ValueError(f"direction must be '{DirectionType.LONG}' or '{DirectionType.SHORT}', got '{direction}'")
+        if not isinstance(direction, DirectionType):
+            try:
+                direction = DirectionType(direction)
+            except ValueError:
+                raise ValueError(
+                    f"direction must be '{DirectionType.LONG}' or "
+                    f"'{DirectionType.SHORT}', got {direction!r}"
+                )
         if commission_rate < 0 or commission_rate > Decimal("0.01"):
             raise ValueError(f"Commission rate {commission_rate} outside expected range [0, 0.01]")
 

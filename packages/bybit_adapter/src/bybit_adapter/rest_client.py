@@ -16,6 +16,7 @@ Reference:
 - Risk Limit: https://bybit-exchange.github.io/docs/v5/market/risk-limit
 """
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -27,6 +28,9 @@ from bybit_adapter.rate_limiter import RateLimiter, RateLimitConfig, RequestType
 
 
 logger = logging.getLogger(__name__)
+
+# Valid Bybit symbol: uppercase letters and digits, 2-20 chars (e.g. "BTCUSDT")
+_SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}$")
 
 
 @dataclass
@@ -360,6 +364,9 @@ class BybitRestClient:
         Reference:
             https://bybit-exchange.github.io/docs/v5/market/risk-limit
         """
+        if not _SYMBOL_RE.match(symbol):
+            raise ValueError(f"Invalid symbol format: {symbol!r}")
+
         logger.debug(f"Fetching risk limit tiers for {symbol}")
         self._wait_for_rate_limit("query")
 

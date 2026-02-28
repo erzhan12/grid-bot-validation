@@ -376,9 +376,23 @@ class RiskLimitProvider:
         )
 
     def _write_cache_file(self, cache: dict) -> None:
-        """Atomically write the full cache dict to disk."""
-        with open(self.cache_path, "w") as f:
-            json.dump(cache, f, indent=2)
+        """Atomically write the full cache dict to disk.
+
+        Writes to a temporary file first, then renames to the target path.
+        This prevents cache corruption if the process crashes mid-write.
+        """
+        temp_path = self.cache_path.with_suffix(".tmp")
+        try:
+            with open(temp_path, "w") as f:
+                json.dump(cache, f, indent=2)
+            temp_path.replace(self.cache_path)
+        except BaseException:
+            # Clean up temp file on any failure (including KeyboardInterrupt)
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     def _save_to_cache_impl(self, symbol: str, tiers: MMTiers) -> None:
         """Perform the actual read-modify-write cache update.
@@ -456,7 +470,7 @@ class RiskLimitProvider:
             # Quick pre-check: if file mtime is older than TTL, skip parsing.
             # Return early before the expensive _load_existing_cache() call.
             file_mtime = datetime.fromtimestamp(
-                self.cache_path.stat().st_mtime, tz=timezone.utc
+                self.cache_path.lstat().st_mtime, tz=timezone.utc
             )
             if datetime.now(timezone.utc) - file_mtime > self.cache_ttl:
                 return False

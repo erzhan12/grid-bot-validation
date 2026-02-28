@@ -6,6 +6,7 @@ All functions are pure (no side effects, no state) and use Decimal for precision
 
 import bisect
 import logging
+from collections import OrderedDict
 from decimal import Decimal
 from typing import Optional
 
@@ -139,10 +140,11 @@ def calc_position_value(size: Decimal, entry_price: Decimal) -> Decimal:
 # Cache of pre-computed max_value lists, keyed by tier content.
 # Uses content-based keys so identical tier lists share the cache entry
 # regardless of object identity.  Bounded to _MAX_TIER_CACHE_ENTRIES
-# entries with LRU eviction as a defense-in-depth measure, even though
-# the number of distinct tier configurations is small in practice.
+# entries with LRU eviction (OrderedDict + move_to_end) as a
+# defense-in-depth measure, even though the number of distinct tier
+# configurations is small in practice.
 _MAX_TIER_CACHE_ENTRIES = 64
-_tier_max_values_cache: dict[tuple[Decimal, ...], list[Decimal]] = {}
+_tier_max_values_cache: OrderedDict[tuple[Decimal, ...], list[Decimal]] = OrderedDict()
 
 
 def _find_matching_tier(
@@ -161,10 +163,13 @@ def _find_matching_tier(
     max_values = _tier_max_values_cache.get(cache_key)
     if max_values is None:
         if len(_tier_max_values_cache) >= _MAX_TIER_CACHE_ENTRIES:
-            # Evict oldest entry (FIFO approximation of LRU)
-            _tier_max_values_cache.pop(next(iter(_tier_max_values_cache)))
+            # Evict least-recently-used entry
+            _tier_max_values_cache.popitem(last=False)
         max_values = list(cache_key)
         _tier_max_values_cache[cache_key] = max_values
+    else:
+        # Mark as recently used
+        _tier_max_values_cache.move_to_end(cache_key)
     idx = bisect.bisect_left(max_values, position_value)
     if idx < len(tiers):
         return tiers[idx]
