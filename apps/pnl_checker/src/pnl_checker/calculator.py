@@ -261,9 +261,14 @@ def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> Calculation
             initial_margin = Decimal("0")
             imr_rate = Decimal("0")
             if pos.leverage >= MIN_LEVERAGE:
+                tiers = (
+                    symbol_data.risk_limit_tiers
+                    if symbol_data.risk_limit_tiers is not None
+                    else MM_TIERS.get(pos.symbol, MM_TIERS_DEFAULT)
+                )
                 initial_margin, imr_rate = calc_initial_margin(
                     position_value, pos.leverage, pos.symbol,
-                    tiers=symbol_data.risk_limit_tiers or MM_TIERS.get(pos.symbol, MM_TIERS_DEFAULT),
+                    tiers=tiers,
                 )
             else:
                 logger.warning(

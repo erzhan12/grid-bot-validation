@@ -34,6 +34,7 @@ MMTiers = list[tuple[Decimal, Decimal, Decimal, Decimal]]
 # values, so each table is ordered by increasing notional cap. The first tier
 # whose ``max_position_value`` is >= the current position value is selected.
 # The final tier always uses ``Infinity`` to guarantee a match for any size.
+# API Reference: https://bybit-exchange.github.io/docs/v5/market/risk-limit
 # ---------------------------------------------------------------------------
 
 MM_TIERS_BTCUSDT: MMTiers = [
@@ -313,7 +314,7 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
         curr_val = Decimal(sorted_tiers[i].get("riskLimitValue", "0"))
         if curr_val != Decimal("Infinity") and curr_val <= prev_val:
             raise ValueError(
-                f"Tier boundaries not strictly ascending: {prev_val} >= {curr_val}"
+                f"Duplicate tier boundary detected: {prev_val} appears multiple times"
             )
 
     result: MMTiers = []
@@ -360,8 +361,9 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
             logger.warning("Zero IMR rate for tier riskLimitValue=%s (allows infinite leverage)", max_val)
         result.append((max_val, mmr_rate, deduction, imr_rate))
 
-    # Replace last tier's cap with Infinity
+    # Replace last tier's cap with Infinity (if not already)
     last_val, last_mmr, last_ded, last_imr = result[-1]
-    result[-1] = (Decimal("Infinity"), last_mmr, last_ded, last_imr)
+    if last_val != Decimal("Infinity"):
+        result[-1] = (Decimal("Infinity"), last_mmr, last_ded, last_imr)
 
     return result

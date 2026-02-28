@@ -266,7 +266,7 @@ class BacktestPositionTracker:
         Returns:
             Funding payment amount (negative = paid, positive = received)
         """
-        if abs(rate) > Decimal("0.01"):
+        if abs(rate) > Decimal("0.001"):
             logger.warning("Unusually high funding rate: %s", rate)
 
         if self.state.size == 0:

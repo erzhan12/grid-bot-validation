@@ -537,6 +537,24 @@ class TestEdgeCases:
                  "mmDeduction": "0", "initialMargin": "0.02"},
             ])
 
+    def test_api_returns_infinity_last_tier(self):
+        """parse_risk_limit_tiers handles last tier already having riskLimitValue='Infinity'."""
+        from gridcore.pnl import parse_risk_limit_tiers
+
+        api_tiers = [
+            {"riskLimitValue": "200000", "maintenanceMargin": "0.01",
+             "mmDeduction": "0", "initialMargin": "0.02"},
+            {"riskLimitValue": "Infinity", "maintenanceMargin": "0.025",
+             "mmDeduction": "3000", "initialMargin": "0.05"},
+        ]
+        result = parse_risk_limit_tiers(api_tiers)
+
+        assert len(result) == 2
+        assert result[0] == (Decimal("200000"), Decimal("0.01"), Decimal("0"), Decimal("0.02"))
+        # Last tier should keep Infinity without any issue
+        assert result[1] == (Decimal("Infinity"), Decimal("0.025"), Decimal("3000"), Decimal("0.05"))
+        assert result[-1][0] == Decimal("Infinity")
+
     def test_malformed_cached_at_returns_stale(self, tmp_path):
         """Malformed cached_at timestamp treats cache as stale."""
         cache_path = tmp_path / "cache.json"
@@ -771,14 +789,14 @@ class TestConcurrentCacheAccess:
 class TestMaxCacheSizeValidation:
     """Tests for max_cache_size_bytes constructor validation."""
 
-    def test_zero_max_cache_size_raises(self, tmp_path):
-        """max_cache_size_bytes=0 raises ValueError."""
-        with pytest.raises(ValueError, match="max_cache_size_bytes must be positive"):
-            RiskLimitProvider(cache_path=tmp_path / "c.json", max_cache_size_bytes=0)
+    def test_zero_max_cache_size_means_no_limit(self, tmp_path):
+        """max_cache_size_bytes=0 is accepted as 'no size limit'."""
+        provider = RiskLimitProvider(cache_path=tmp_path / "c.json", max_cache_size_bytes=0)
+        assert provider.max_cache_size_bytes == 0
 
     def test_negative_max_cache_size_raises(self, tmp_path):
         """Negative max_cache_size_bytes raises ValueError."""
-        with pytest.raises(ValueError, match="max_cache_size_bytes must be positive"):
+        with pytest.raises(ValueError, match="max_cache_size_bytes must be non-negative"):
             RiskLimitProvider(cache_path=tmp_path / "c.json", max_cache_size_bytes=-100)
 
     def test_positive_max_cache_size_accepted(self, tmp_path):

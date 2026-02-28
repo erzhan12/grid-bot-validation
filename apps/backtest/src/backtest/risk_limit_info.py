@@ -77,8 +77,8 @@ class RiskLimitProvider:
         self.cache_path = expanded_cache_path.resolve()
         self.cache_ttl = cache_ttl
         self._rest_client = rest_client
-        if max_cache_size_bytes <= 0:
-            raise ValueError("max_cache_size_bytes must be positive")
+        if max_cache_size_bytes < 0:
+            raise ValueError("max_cache_size_bytes must be non-negative (0 means no size limit)")
         self.max_cache_size_bytes = max_cache_size_bytes
         self._in_process_lock_key, self._in_process_lock = _acquire_in_process_lock(
             self.cache_path
@@ -162,7 +162,7 @@ class RiskLimitProvider:
         try:
             if not self.cache_path.exists():
                 return None, None
-            if self.cache_path.lstat().st_size > self.max_cache_size_bytes:
+            if self.max_cache_size_bytes and self.cache_path.lstat().st_size > self.max_cache_size_bytes:
                 raise ValueError(
                     f"Cache file exceeds {self.max_cache_size_bytes} byte limit"
                 )
@@ -219,7 +219,7 @@ class RiskLimitProvider:
             raise ValueError("Cache path must not be a symlink")
         if not self.cache_path.exists():
             return {}
-        if self.cache_path.lstat().st_size > self.max_cache_size_bytes:
+        if self.max_cache_size_bytes and self.cache_path.lstat().st_size > self.max_cache_size_bytes:
             raise ValueError(
                 f"Cache file exceeds {self.max_cache_size_bytes} byte limit"
             )
@@ -290,25 +290,30 @@ class RiskLimitProvider:
 
         Uses file mtime as a quick pre-check: if the entire file is older
         than cache_ttl, the per-symbol entry cannot be fresh either.
+
+        When ``cached_at_str`` is already known (passed by caller), the
+        expensive ``_load_existing_cache()`` JSON parse is skipped entirely.
         """
         if self._cache_path_is_symlink():
             return False
         if not self.cache_path.exists():
             return False
         try:
-            if self.cache_path.lstat().st_size > self.max_cache_size_bytes:
+            if self.max_cache_size_bytes and self.cache_path.lstat().st_size > self.max_cache_size_bytes:
                 return False
         except OSError:
             return False
 
         try:
-            # Quick pre-check: if file mtime is older than TTL, skip parsing
+            # Quick pre-check: if file mtime is older than TTL, skip parsing.
+            # Return early before the expensive _load_existing_cache() call.
             file_mtime = datetime.fromtimestamp(
                 self.cache_path.stat().st_mtime, tz=timezone.utc
             )
             if datetime.now(timezone.utc) - file_mtime > self.cache_ttl:
                 return False
 
+            # Only parse the cache file if cached_at_str wasn't provided
             if cached_at_str is None:
                 cache = self._load_existing_cache()
                 entry = cache.get(symbol, {})

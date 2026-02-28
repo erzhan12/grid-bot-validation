@@ -101,3 +101,24 @@ If Bybit returns an empty risk limit list (rare edge case), the provider returns
 **Using hardcoded fallback tiers**
 
 When both the API and cache are unavailable, the provider uses hardcoded tier tables from `gridcore.pnl.MM_TIERS`. These are static snapshots and may become outdated if Bybit changes their risk limits. If you see the log message "using hardcoded fallback", ensure API access is restored to get accurate margin calculations.
+
+## Dynamic Risk Limit Tiers
+
+The backtest engine supports dynamic risk limit tiers fetched from the Bybit `/v5/market/risk-limit` API. This ensures margin calculations use current tier boundaries rather than potentially outdated hardcoded values.
+
+### How It Works
+
+1. **Fetch**: `RiskLimitProvider` calls the Bybit API via `BybitRestClient.get_risk_limit(symbol)` to retrieve per-symbol maintenance-margin and initial-margin tier tables.
+2. **Parse**: Raw API response is parsed by `gridcore.pnl.parse_risk_limit_tiers()`, which validates rates, sorts tiers by ascending `riskLimitValue`, and ensures the last tier's cap is `Infinity`.
+3. **Cache**: Parsed tiers are saved to a local JSON file (`conf/risk_limits_cache.json` by default) with a timestamp for TTL-based freshness checks.
+4. **Fallback**: If the API is unreachable, stale cached tiers are used. If no cache exists, hardcoded tier tables from `gridcore.pnl.MM_TIERS` serve as the final fallback.
+
+### Key Files
+
+- `apps/backtest/src/backtest/risk_limit_info.py` — `RiskLimitProvider` with cache management
+- `packages/gridcore/src/gridcore/pnl.py` — `parse_risk_limit_tiers()`, hardcoded `MM_TIERS`, margin calculation functions
+- `packages/bybit_adapter/src/bybit_adapter/rest_client.py` — `BybitRestClient.get_risk_limit()` API call
+
+### API Reference
+
+- Bybit Risk Limit endpoint: https://bybit-exchange.github.io/docs/v5/market/risk-limit

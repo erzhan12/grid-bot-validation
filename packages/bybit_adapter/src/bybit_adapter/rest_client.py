@@ -366,35 +366,52 @@ class BybitRestClient:
         response = self._session.get_risk_limit(category=category, symbol=symbol)
         self._check_response(response, "get_risk_limit")
 
-        # Bybit V5 risk-limit endpoint returns nested structure:
-        # {"result": {"list": [{"list": [tier_data, ...]}, ...]}}
-        # where outer list contains one entry per symbol, each with an inner "list" of tiers.
-        # We unwrap the first symbol's inner tier list since we query one symbol at a time.
+        tiers = self._unwrap_risk_limit_response(response, symbol)
+        logger.debug(f"Fetched {len(tiers)} risk limit tiers for {symbol}")
+        return tiers
+
+    def _unwrap_risk_limit_response(self, response: dict, symbol: str) -> list[dict]:
+        """Unwrap the nested Bybit V5 risk-limit response structure.
+
+        Bybit V5 ``/v5/market/risk-limit`` returns:
+        ``{"result": {"list": [{"list": [tier_data, ...]}, ...]}}``
+        where outer list contains one entry per symbol, each with an inner
+        ``"list"`` of tiers.  We extract the first symbol's inner tier list
+        since the caller queries one symbol at a time.
+
+        Returns an empty list (with a log message) for any unexpected shape.
+        """
         outer_list = response.get("result", {}).get("list", [])
+
         if not isinstance(outer_list, list):
             logger.warning(
                 "Unexpected risk limit API structure for %s, expected list but got %s",
                 symbol,
                 type(outer_list).__name__,
             )
-            tiers = []
-        elif outer_list and isinstance(outer_list[0], dict) and "list" in outer_list[0]:
-            tiers = outer_list[0].get("list", [])
-            if not isinstance(tiers, list):
-                logger.warning(
-                    "Unexpected risk limit API structure for %s, inner list is %s",
-                    symbol,
-                    type(tiers).__name__,
-                )
-                tiers = []
-        else:
+            return []
+
+        if not outer_list:
+            return []
+
+        first_item = outer_list[0]
+        if not isinstance(first_item, dict) or "list" not in first_item:
             logger.error(
                 "Unexpected risk limit API structure for %s: outer list items missing 'list' key. "
                 "Expected nested structure but got flat list. Returning empty tier list.",
                 symbol,
             )
-            tiers = []
-        logger.debug(f"Fetched {len(tiers)} risk limit tiers for {symbol}")
+            return []
+
+        tiers = first_item.get("list", [])
+        if not isinstance(tiers, list):
+            logger.warning(
+                "Unexpected risk limit API structure for %s, inner list is %s",
+                symbol,
+                type(tiers).__name__,
+            )
+            return []
+
         return tiers
 
     # -------------------------------------------------------------------------
