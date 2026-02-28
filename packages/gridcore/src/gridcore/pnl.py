@@ -26,6 +26,8 @@ MMTiers = list[tuple[Decimal, Decimal, Decimal, Decimal]]
 # Last verified against Bybit API: 2026-02-27
 # Important: These hardcoded values should be periodically updated by running
 # the RiskLimitProvider with force_fetch=True and comparing against the latest API data.
+# To verify/update: use RiskLimitProvider(rest_client=client).get(symbol, force_fetch=True)
+# and compare the returned tiers against the tables below.
 #
 # These hardcoded tiers are a safe fallback when API data is unavailable.
 # Bybit applies progressively higher IM/MM rates to larger position notional
@@ -156,7 +158,10 @@ def calc_initial_margin(
         (im_amount, imr_rate) — initial margin in quote currency and the
         IMR rate used.
     """
-    if position_value <= _ZERO:
+    if position_value < _ZERO:
+        logger.warning("Negative position_value in calc_initial_margin: %s", position_value)
+        return _ZERO, _ZERO
+    if position_value == _ZERO:
         return _ZERO, _ZERO
 
     tier_table = tiers if tiers is not None else MM_TIERS.get(symbol) if symbol else None
@@ -302,6 +307,15 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
     # Sort by riskLimitValue ascending
     sorted_tiers = sorted(api_tiers, key=_risk_limit_sort_key)
 
+    # Validate strictly ascending tier boundaries (detect duplicates/out-of-order)
+    for i in range(1, len(sorted_tiers)):
+        prev_val = Decimal(sorted_tiers[i - 1].get("riskLimitValue", "0"))
+        curr_val = Decimal(sorted_tiers[i].get("riskLimitValue", "0"))
+        if curr_val != Decimal("Infinity") and curr_val <= prev_val:
+            raise ValueError(
+                f"Tier boundaries not strictly ascending: {prev_val} >= {curr_val}"
+            )
+
     result: MMTiers = []
     for tier in sorted_tiers:
         max_val_str = tier.get("riskLimitValue")
@@ -329,6 +343,8 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
             deduction = Decimal(deduction_str)
         except (ValueError, ArithmeticError) as e:
             raise ValueError(f"Invalid mmDeduction format: {deduction_str}") from e
+        if deduction < 0:
+            raise ValueError(f"Negative mmDeduction not allowed: {deduction}")
         imr_str = tier.get("initialMargin", "") or "0"
         try:
             imr_rate = Decimal(imr_str)
@@ -336,8 +352,12 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
             raise ValueError(f"Invalid initialMargin format: {imr_str}") from e
         if not (Decimal("0") <= mmr_rate <= Decimal("1")):
             raise ValueError(f"MMR rate {mmr_rate} outside valid range [0, 1]")
+        if mmr_rate == Decimal("0"):
+            logger.warning("Zero MMR rate for tier riskLimitValue=%s (allows infinite leverage)", max_val)
         if not (Decimal("0") <= imr_rate <= Decimal("1")):
             raise ValueError(f"IMR rate {imr_rate} outside valid range [0, 1]")
+        if imr_rate == Decimal("0"):
+            logger.warning("Zero IMR rate for tier riskLimitValue=%s (allows infinite leverage)", max_val)
         result.append((max_val, mmr_rate, deduction, imr_rate))
 
     # Replace last tier's cap with Infinity

@@ -803,3 +803,78 @@ class TestPathTraversalValidation:
         monkeypatch.chdir(tmp_path)
         provider = RiskLimitProvider(cache_path=Path("relative/cache.json"))
         assert provider.cache_path.is_absolute()
+
+
+class TestFullFallbackChainIntegration:
+    """Integration test verifying the complete fallback chain in one scenario."""
+
+    def test_full_flow_api_cache_stale_fallback(self, tmp_path):
+        """Verify: API→cache→cache hit→force_fetch bypass→stale cache fallback.
+
+        Steps:
+        1. API returns tiers → tiers are cached
+        2. Subsequent call uses cache (no API call)
+        3. force_fetch=True bypasses cache and calls API
+        4. When API fails, stale cache is used as fallback
+        """
+        cache_path = tmp_path / "cache.json"
+
+        api_tiers_raw = [
+            {
+                "riskLimitValue": "200000",
+                "maintenanceMargin": "0.01",
+                "mmDeduction": "0",
+                "initialMargin": "0.02",
+            },
+            {
+                "riskLimitValue": "1000000",
+                "maintenanceMargin": "0.025",
+                "mmDeduction": "3000",
+                "initialMargin": "0.05",
+            },
+        ]
+        expected_parsed: MMTiers = [
+            (Decimal("200000"), Decimal("0.01"), Decimal("0"), Decimal("0.02")),
+            (Decimal("Infinity"), Decimal("0.025"), Decimal("3000"), Decimal("0.05")),
+        ]
+
+        mock_client = MagicMock()
+        mock_client.get_risk_limit.return_value = api_tiers_raw
+
+        provider = RiskLimitProvider(
+            cache_path=cache_path,
+            rest_client=mock_client,
+            cache_ttl=timedelta(hours=24),
+        )
+
+        # Step 1: First call — cache is empty, should hit API and cache result
+        result = provider.get("BTCUSDT")
+        assert result == expected_parsed
+        mock_client.get_risk_limit.assert_called_once_with(symbol="BTCUSDT")
+        assert cache_path.exists()
+        cached_data = json.loads(cache_path.read_text())
+        assert "BTCUSDT" in cached_data
+
+        # Step 2: Second call — cache is fresh, should NOT call API again
+        mock_client.reset_mock()
+        result2 = provider.get("BTCUSDT")
+        assert result2 == expected_parsed
+        mock_client.get_risk_limit.assert_not_called()
+
+        # Step 3: force_fetch=True — should bypass cache and call API
+        mock_client.reset_mock()
+        result3 = provider.get("BTCUSDT", force_fetch=True)
+        assert result3 == expected_parsed
+        mock_client.get_risk_limit.assert_called_once_with(symbol="BTCUSDT")
+
+        # Step 4: Make cache stale, then make API fail → should use stale cache
+        stale_time = datetime.now(timezone.utc) - timedelta(hours=25)
+        cached_data["BTCUSDT"]["cached_at"] = stale_time.isoformat()
+        cache_path.write_text(json.dumps(cached_data))
+
+        mock_client.reset_mock()
+        mock_client.get_risk_limit.side_effect = ConnectionError("API down")
+        result4 = provider.get("BTCUSDT")
+        # Should fall back to stale cache rather than hardcoded
+        assert result4 == expected_parsed
+        mock_client.get_risk_limit.assert_called_once_with(symbol="BTCUSDT")

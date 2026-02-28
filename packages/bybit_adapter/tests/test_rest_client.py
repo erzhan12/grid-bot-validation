@@ -657,7 +657,8 @@ class TestGetRiskLimit:
             {"id": 2, "symbol": "BTCUSDT", "riskLimitValue": "4000000",
              "maintenanceMargin": "0.01", "mmDeduction": "10000"},
         ]
-        mock_session.get_risk_limit.return_value = _ok_response({"list": tiers})
+        # Bybit API returns nested structure: outer list with inner "list" key per symbol
+        mock_session.get_risk_limit.return_value = _ok_response({"list": [{"list": tiers}]})
 
         result = client.get_risk_limit(symbol="BTCUSDT")
 
@@ -694,17 +695,18 @@ class TestGetRiskLimit:
             category="inverse", symbol="BTCUSDT"
         )
 
-    def test_unexpected_structure_logs_warning_and_falls_back(self, client, mock_session, caplog):
+    def test_unexpected_structure_returns_empty_and_logs_error(self, client, mock_session, caplog):
+        """Flat list without nested 'list' key returns empty and logs error."""
         tiers = [
             {"id": 1, "symbol": "BTCUSDT", "riskLimitValue": "2000000"},
             {"id": 2, "symbol": "BTCUSDT", "riskLimitValue": "4000000"},
         ]
         mock_session.get_risk_limit.return_value = _ok_response({"list": tiers})
 
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.ERROR):
             result = client.get_risk_limit(symbol="BTCUSDT")
 
-        assert result == tiers
+        assert result == []
         assert any(
             "Unexpected risk limit API structure" in record.message for record in caplog.records
         )

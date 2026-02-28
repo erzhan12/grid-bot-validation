@@ -95,6 +95,7 @@ class RiskLimitProvider:
             if self._closed:
                 return
             self._closed = True
+            self._rest_client = None
             self._lock_finalizer()
 
     def _ensure_open(self) -> None:
@@ -294,6 +295,11 @@ class RiskLimitProvider:
             return False
         if not self.cache_path.exists():
             return False
+        try:
+            if self.cache_path.lstat().st_size > self.max_cache_size_bytes:
+                return False
+        except OSError:
+            return False
 
         try:
             # Quick pre-check: if file mtime is older than TTL, skip parsing
@@ -411,9 +417,21 @@ def _release_in_process_lock(key: str) -> None:
 
 
 def _open_lock_file(lock_path: Path):
-    """Open lock file safely; reject symlink lock paths."""
-    if lock_path.is_symlink():
-        raise ValueError("Cache lock path must not be a symlink")
+    """Open lock file safely; reject symlink lock paths.
+
+    Uses os.lstat() for the pre-open check (does not follow symlinks) and
+    validates path identity after open to close the TOCTOU window between
+    the symlink check and os.open().
+    """
+    # Pre-check: use os.lstat() which never follows symlinks (safer than is_symlink())
+    try:
+        pre_stat = os.lstat(lock_path)
+        import stat as stat_mod
+
+        if stat_mod.S_ISLNK(pre_stat.st_mode):
+            raise ValueError("Cache lock path must not be a symlink")
+    except FileNotFoundError:
+        pass  # File doesn't exist yet; os.open with O_CREAT will create it
 
     flags = os.O_RDWR | os.O_CREAT
     nofollow = getattr(os, "O_NOFOLLOW", 0)
@@ -423,22 +441,28 @@ def _open_lock_file(lock_path: Path):
     try:
         fd = os.open(lock_path, flags, 0o600)
     except OSError as e:
-        if lock_path.is_symlink():
-            raise ValueError("Cache lock path must not be a symlink") from e
+        # On platforms with O_NOFOLLOW, opening a symlink raises OSError
+        try:
+            if os.lstat(lock_path).st_mode & 0o170000 == 0o120000:  # S_IFLNK
+                raise ValueError("Cache lock path must not be a symlink") from e
+        except FileNotFoundError:
+            pass
         raise
 
-    # On platforms without O_NOFOLLOW, verify path identity after open.
-    if not nofollow:
-        try:
-            if lock_path.is_symlink():
-                raise ValueError("Cache lock path must not be a symlink")
-            path_stat = os.stat(lock_path, follow_symlinks=False)
-            fd_stat = os.fstat(fd)
-            if (path_stat.st_dev, path_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):
-                raise ValueError("Cache lock path changed during open")
-        except (OSError, ValueError):
-            os.close(fd)
-            raise
+    # Post-open validation: verify the fd points to the expected path.
+    # This closes the TOCTOU window between the pre-check and os.open().
+    try:
+        path_stat = os.lstat(lock_path)
+        import stat as stat_mod
+
+        if stat_mod.S_ISLNK(path_stat.st_mode):
+            raise ValueError("Cache lock path must not be a symlink")
+        fd_stat = os.fstat(fd)
+        if (path_stat.st_dev, path_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):
+            raise ValueError("Cache lock path changed during open")
+    except (OSError, ValueError):
+        os.close(fd)
+        raise
 
     return os.fdopen(fd, "a+b")
 

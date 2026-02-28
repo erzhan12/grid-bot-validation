@@ -388,12 +388,12 @@ class BybitRestClient:
                 )
                 tiers = []
         else:
-            if outer_list:
-                logger.warning(
-                    "Unexpected risk limit API structure for %s, using outer list directly",
-                    symbol,
-                )
-            tiers = outer_list
+            logger.error(
+                "Unexpected risk limit API structure for %s: outer list items missing 'list' key. "
+                "Expected nested structure but got flat list. Returning empty tier list.",
+                symbol,
+            )
+            tiers = []
         logger.debug(f"Fetched {len(tiers)} risk limit tiers for {symbol}")
         return tiers
 
