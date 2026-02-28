@@ -136,6 +136,11 @@ def calc_position_value(size: Decimal, entry_price: Decimal) -> Decimal:
     return size * entry_price
 
 
+# Cache of pre-computed max_value lists, keyed by tier list identity.
+# Avoids rebuilding the list on every _find_matching_tier() call.
+_tier_max_values_cache: dict[int, list[Decimal]] = {}
+
+
 def _find_matching_tier(
     position_value: Decimal, tiers: MMTiers
 ) -> Optional[tuple[Decimal, Decimal, Decimal, Decimal]]:
@@ -148,8 +153,11 @@ def _find_matching_tier(
         The matching tier tuple (max_value, mmr_rate, deduction, imr_rate),
         or None if no tier matches (should not happen when last tier is Infinity).
     """
-    # Extract max_values for bisect; tiers are sorted by max_value ascending.
-    max_values = [t[0] for t in tiers]
+    tier_id = id(tiers)
+    max_values = _tier_max_values_cache.get(tier_id)
+    if max_values is None:
+        max_values = [t[0] for t in tiers]
+        _tier_max_values_cache[tier_id] = max_values
     idx = bisect.bisect_left(max_values, position_value)
     if idx < len(tiers):
         return tiers[idx]
@@ -327,14 +335,11 @@ def _check_duplicate_boundaries(sorted_tiers: list[dict]) -> None:
             )
 
 
-def _validate_tier_dict(tier: dict) -> tuple[Decimal, Decimal, Decimal, Decimal]:
-    """Validate and extract fields from a single API tier dict.
-
-    Returns:
-        (max_val, mmr_rate, deduction, imr_rate) tuple.
+def _validate_max_val(tier: dict) -> Decimal:
+    """Validate and extract riskLimitValue from a tier dict.
 
     Raises:
-        ValueError: If any required field is missing or has an invalid value.
+        ValueError: If missing, malformed, negative, or NaN.
     """
     max_val_str = tier.get("riskLimitValue")
     if max_val_str is None:
@@ -346,7 +351,15 @@ def _validate_tier_dict(tier: dict) -> tuple[Decimal, Decimal, Decimal, Decimal]
     if max_val_str != "Infinity":
         if max_val.is_nan() or max_val <= 0:
             raise ValueError(f"Invalid riskLimitValue: {max_val}")
+    return max_val
 
+
+def _validate_mmr_rate(tier: dict) -> Decimal:
+    """Validate and extract maintenanceMargin (MMR rate) from a tier dict.
+
+    Raises:
+        ValueError: If missing, malformed, or outside [0, 1].
+    """
     mmr_str = tier.get("maintenanceMargin")
     if mmr_str is None:
         raise ValueError("Missing required field: maintenanceMargin")
@@ -354,9 +367,20 @@ def _validate_tier_dict(tier: dict) -> tuple[Decimal, Decimal, Decimal, Decimal]
         mmr_rate = Decimal(mmr_str)
     except (ValueError, ArithmeticError) as e:
         raise ValueError(f"Invalid maintenanceMargin format: {mmr_str}") from e
+    if not (Decimal("0") <= mmr_rate <= Decimal("1")):
+        raise ValueError(f"MMR rate {mmr_rate} outside valid range [0, 1]")
+    return mmr_rate
 
-    # Bybit can return empty string "" or omit these fields for tier 0.
-    # The ``or "0"`` fallback handles both so Decimal() never receives "".
+
+def _validate_deduction(tier: dict) -> Decimal:
+    """Validate and extract mmDeduction from a tier dict.
+
+    Bybit can return empty string "" or omit this field for tier 0.
+    The ``or "0"`` fallback handles both so Decimal() never receives "".
+
+    Raises:
+        ValueError: If malformed or negative.
+    """
     deduction_str = tier.get("mmDeduction", "") or "0"
     try:
         deduction = Decimal(deduction_str)
@@ -364,20 +388,45 @@ def _validate_tier_dict(tier: dict) -> tuple[Decimal, Decimal, Decimal, Decimal]
         raise ValueError(f"Invalid mmDeduction format: {deduction_str}") from e
     if deduction < 0:
         raise ValueError(f"Negative mmDeduction not allowed: {deduction}")
+    return deduction
 
+
+def _validate_imr_rate(tier: dict) -> Decimal:
+    """Validate and extract initialMargin (IMR rate) from a tier dict.
+
+    Bybit can return empty string "" or omit this field for tier 0.
+    The ``or "0"`` fallback handles both so Decimal() never receives "".
+
+    Raises:
+        ValueError: If malformed or outside [0, 1].
+    """
     imr_str = tier.get("initialMargin", "") or "0"
     try:
         imr_rate = Decimal(imr_str)
     except (ValueError, ArithmeticError) as e:
         raise ValueError(f"Invalid initialMargin format: {imr_str}") from e
-
-    if not (Decimal("0") <= mmr_rate <= Decimal("1")):
-        raise ValueError(f"MMR rate {mmr_rate} outside valid range [0, 1]")
-    if mmr_rate == Decimal("0"):
-        logger.debug("Zero MMR rate for tier riskLimitValue=%s", max_val)
     if not (Decimal("0") <= imr_rate <= Decimal("1")):
         raise ValueError(f"IMR rate {imr_rate} outside valid range [0, 1]")
-    if imr_rate == Decimal("0"):
+    return imr_rate
+
+
+def _validate_tier_dict(tier: dict) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+    """Validate and extract fields from a single API tier dict.
+
+    Returns:
+        (max_val, mmr_rate, deduction, imr_rate) tuple.
+
+    Raises:
+        ValueError: If any required field is missing or has an invalid value.
+    """
+    max_val = _validate_max_val(tier)
+    mmr_rate = _validate_mmr_rate(tier)
+    deduction = _validate_deduction(tier)
+    imr_rate = _validate_imr_rate(tier)
+
+    if mmr_rate == _ZERO:
+        logger.debug("Zero MMR rate for tier riskLimitValue=%s", max_val)
+    if imr_rate == _ZERO:
         logger.debug("Zero IMR rate for tier riskLimitValue=%s", max_val)
 
     return max_val, mmr_rate, deduction, imr_rate

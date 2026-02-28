@@ -127,7 +127,7 @@ def _calc_risk_multipliers(
         entry_price=long_pos.avg_price if long_pos else None,
         margin=_margin_ratio(long_pos),
         liquidation_price=long_pos.liq_price if long_pos else Decimal("0"),
-        leverage=int(long_pos.leverage) if long_pos else 1,
+        leverage=int(round(long_pos.leverage)) if long_pos else 1,
         position_value=long_pos.position_value if long_pos else Decimal("0"),
     )
 
@@ -137,7 +137,7 @@ def _calc_risk_multipliers(
         entry_price=short_pos.avg_price if short_pos else None,
         margin=_margin_ratio(short_pos),
         liquidation_price=short_pos.liq_price if short_pos else Decimal("0"),
-        leverage=int(short_pos.leverage) if short_pos else 1,
+        leverage=int(round(short_pos.leverage)) if short_pos else 1,
         position_value=short_pos.position_value if short_pos else Decimal("0"),
     )
 
@@ -214,6 +214,12 @@ def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> Calculation
 
     Returns:
         CalculationResult with our computed values for each position
+
+    Raises:
+        ArithmeticError: If Decimal operations overflow (e.g. division by
+            near-zero values that bypass MIN_POSITION_IM / MIN_LEVERAGE guards).
+        AttributeError: If fetch_result.wallet is None when wallet data is
+            required (e.g. accessing usdt_wallet_balance for margin ratio).
     """
     result = CalculationResult()
 

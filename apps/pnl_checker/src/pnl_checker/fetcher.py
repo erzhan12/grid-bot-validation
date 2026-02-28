@@ -186,11 +186,19 @@ class BybitFetcher:
                         data_quality_errors.append(msg)
                 continue
 
+            avg_price = Decimal(pos.get("avgPrice", "0"))
+            if avg_price <= 0:
+                msg = f"Invalid avgPrice {avg_price} for {symbol} with size {size}"
+                logger.warning(msg)
+                if data_quality_errors is not None:
+                    data_quality_errors.append(msg)
+                continue
+
             positions.append(PositionData(
                 symbol=pos.get("symbol", symbol),
                 side=pos.get("side", ""),
                 size=size,
-                avg_price=Decimal(pos.get("avgPrice", "0")),
+                avg_price=avg_price,
                 mark_price=Decimal(pos.get("markPrice", "0")),
                 liq_price=Decimal(pos.get("liqPrice", "0") or "0"),
                 leverage=Decimal(pos.get("leverage", "1")),

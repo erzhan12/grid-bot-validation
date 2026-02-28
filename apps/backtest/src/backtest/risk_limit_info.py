@@ -45,12 +45,19 @@ class RiskLimitProvider:
       2. **Bybit API** — ``/v5/market/risk-limit`` via injected ``BybitRestClient``.
       3. **Hardcoded** — static tier tables in ``gridcore.pnl`` (last resort).
 
-    Cache behaviour:
-      - Entries older than *cache_ttl* (default 24 h) are considered stale and
-        trigger an API refresh, but stale data is still used as a fallback when
-        the API is unreachable.
-      - Use ``force_fetch=True`` to bypass the cache entirely — recommended
-        after a detected tier change or on startup for critical systems.
+    Cache freshness uses a two-level check:
+      1. **File mtime** (quick pre-check): if the entire cache file is older
+         than *cache_ttl*, skip JSON parsing — no entry can be fresh.
+      2. **Per-entry ``cached_at`` timestamp** (authoritative): each symbol's
+         entry stores an ISO-8601 ``cached_at`` value written at save time.
+         This is the actual freshness check. File mtime is only an optimization
+         to avoid parsing when the whole file is clearly stale.
+
+      Entries older than *cache_ttl* (default 24 h) are considered stale and
+      trigger an API refresh, but stale data is still used as a fallback when
+      the API is unreachable.
+      Use ``force_fetch=True`` to bypass the cache entirely — recommended
+      after a detected tier change or on startup for critical systems.
 
     Error handling strategy:
       Methods follow one of three patterns depending on the failure type:
@@ -136,6 +143,11 @@ class RiskLimitProvider:
             raise RuntimeError("RiskLimitProvider is closed")
 
     def _cache_path_is_symlink(self) -> bool:
+        # Check both the original configured path (absolute, not resolved) and
+        # the resolved path to detect symlinks in any parent directory component.
+        # Example: configured=/project/conf/cache.json where conf/ is a symlink
+        # → _configured_cache_path.is_symlink() catches the parent symlink,
+        #   while cache_path (resolved) would show the real target.
         return self._configured_cache_path.is_symlink() or self.cache_path.is_symlink()
 
     def fetch_from_bybit(self, symbol: str) -> Optional[MMTiers]:

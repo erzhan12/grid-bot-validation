@@ -13,6 +13,7 @@ from gridcore.pnl import (
     calc_imr_pct,
     calc_mmr_pct,
     parse_risk_limit_tiers,
+    _find_matching_tier,
 )
 
 
@@ -652,3 +653,59 @@ class TestParseRiskLimitTiers:
         im, imr = calc_initial_margin(Decimal("500000"), Decimal("10"), tiers=tiers)
         assert imr == Decimal("0.05")
         assert im == Decimal("25000")  # 500_000 * 0.05
+
+
+class TestFindMatchingTier:
+    """Direct tests for _find_matching_tier() at exact boundaries and between."""
+
+    TIERS = [
+        (Decimal("200000"), Decimal("0.01"), Decimal("0"), Decimal("0.02")),
+        (Decimal("1000000"), Decimal("0.025"), Decimal("3000"), Decimal("0.05")),
+        (Decimal("Infinity"), Decimal("0.05"), Decimal("28000"), Decimal("0.1")),
+    ]
+
+    def test_value_below_first_tier(self):
+        """Value well below first boundary selects tier 1."""
+        tier = _find_matching_tier(Decimal("100000"), self.TIERS)
+        assert tier == self.TIERS[0]
+
+    def test_value_exactly_at_first_boundary(self):
+        """Value exactly at 200000 selects tier 1 (max_value >= position_value)."""
+        tier = _find_matching_tier(Decimal("200000"), self.TIERS)
+        assert tier == self.TIERS[0]
+
+    def test_value_just_above_first_boundary(self):
+        """Value just above 200000 selects tier 2."""
+        tier = _find_matching_tier(Decimal("200001"), self.TIERS)
+        assert tier == self.TIERS[1]
+
+    def test_value_between_boundaries(self):
+        """Value between tier 1 and tier 2 selects tier 2."""
+        tier = _find_matching_tier(Decimal("500000"), self.TIERS)
+        assert tier == self.TIERS[1]
+
+    def test_value_exactly_at_second_boundary(self):
+        """Value exactly at 1000000 selects tier 2."""
+        tier = _find_matching_tier(Decimal("1000000"), self.TIERS)
+        assert tier == self.TIERS[1]
+
+    def test_value_just_above_second_boundary(self):
+        """Value just above 1000000 selects tier 3 (Infinity)."""
+        tier = _find_matching_tier(Decimal("1000001"), self.TIERS)
+        assert tier == self.TIERS[2]
+
+    def test_very_large_value(self):
+        """Very large value selects Infinity tier."""
+        tier = _find_matching_tier(Decimal("999999999"), self.TIERS)
+        assert tier == self.TIERS[2]
+
+    def test_zero_value(self):
+        """Zero position value selects first tier."""
+        tier = _find_matching_tier(Decimal("0"), self.TIERS)
+        assert tier == self.TIERS[0]
+
+    def test_single_tier(self):
+        """Single Infinity tier always matches."""
+        single = [(Decimal("Infinity"), Decimal("0.01"), Decimal("0"), Decimal("0.02"))]
+        tier = _find_matching_tier(Decimal("999999"), single)
+        assert tier == single[0]

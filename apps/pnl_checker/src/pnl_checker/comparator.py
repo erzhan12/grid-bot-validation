@@ -9,7 +9,10 @@ from pnl_checker.calculator import AccountCalcResult, CalculationResult, Positio
 
 logger = logging.getLogger(__name__)
 
-# PnL % values are 100x larger than USDT values, so tolerance scales accordingly
+# PnL % (ROE) values are expressed as percentages (e.g. 10.0 for 10%), while
+# the base tolerance is in absolute USDT (e.g. 0.01 USDT). A 0.01 USDT
+# tolerance would be far too tight for percentage comparisons, so we scale
+# by 100x: 0.01 USDT tolerance → 1.0% threshold for PnL % fields.
 PERCENTAGE_TOLERANCE_MULTIPLIER = 100
 
 

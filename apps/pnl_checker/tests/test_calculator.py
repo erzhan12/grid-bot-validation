@@ -230,6 +230,82 @@ class TestMarginRatioEdgeCases:
         assert "Zero or negative wallet balance" in caplog.text
 
 
+class TestZeroMarkPrice:
+    """Test calculator handles zero or negative markPrice gracefully."""
+
+    def _make_fetch_result(self, mark_price: str) -> FetchResult:
+        pos = PositionData(
+            symbol="BTCUSDT",
+            side="Buy",
+            size=Decimal("0.01"),
+            avg_price=Decimal("50000"),
+            mark_price=Decimal(mark_price),
+            liq_price=Decimal("45000"),
+            leverage=Decimal("10"),
+            position_value=Decimal("510"),
+            position_im=Decimal("51"),
+            position_mm=Decimal("5.1"),
+            unrealised_pnl=Decimal("0"),
+            cur_realised_pnl=Decimal("0"),
+            cum_realised_pnl=Decimal("0"),
+            position_idx=1,
+        )
+        return FetchResult(
+            symbols=[SymbolFetchResult(
+                symbol="BTCUSDT",
+                positions=[pos],
+                ticker=TickerData(
+                    symbol="BTCUSDT",
+                    last_price=Decimal("51000"),
+                    mark_price=Decimal(mark_price),
+                    funding_rate=Decimal("0.0001"),
+                ),
+                funding=FundingData(
+                    symbol="BTCUSDT",
+                    cumulative_funding=Decimal("0"),
+                    transaction_count=0,
+                ),
+            )],
+            wallet=WalletData(
+                total_equity=Decimal("10000"),
+                total_wallet_balance=Decimal("9980"),
+                total_margin_balance=Decimal("10000"),
+                total_available_balance=Decimal("9900"),
+                total_perp_upl=Decimal("0"),
+                total_initial_margin=Decimal("51"),
+                total_maintenance_margin=Decimal("5.1"),
+                account_im_rate=Decimal("0.0051"),
+                account_mm_rate=Decimal("0.00051"),
+                margin_mode="REGULAR_MARGIN",
+                usdt_wallet_balance=Decimal("9980"),
+                usdt_unrealised_pnl=Decimal("0"),
+                usdt_cum_realised_pnl=Decimal("0"),
+            ),
+        )
+
+    def _risk_config(self) -> RiskConfig:
+        return RiskConfig(
+            min_liq_ratio=0.8, max_liq_ratio=1.2,
+            max_margin=8.0, min_total_margin=0.15,
+        )
+
+    def test_zero_mark_price(self):
+        """Zero markPrice should not crash; PnL calculations handle it."""
+        fetch = self._make_fetch_result("0")
+        result = calculate(fetch, self._risk_config())
+        pos = result.positions[0]
+        # With mark_price=0, unrealised PnL uses mark=0
+        # (50000 - 0) is valid math, just unusual data
+        assert pos.unrealised_pnl_mark is not None
+
+    def test_negative_mark_price(self):
+        """Negative markPrice should not crash calculator."""
+        fetch = self._make_fetch_result("-100")
+        result = calculate(fetch, self._risk_config())
+        pos = result.positions[0]
+        assert pos.unrealised_pnl_mark is not None
+
+
 class TestMinThresholdBoundaries:
     """Tests for MIN_LEVERAGE and MIN_POSITION_IM exact boundary values."""
 
