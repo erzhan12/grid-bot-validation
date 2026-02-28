@@ -41,6 +41,8 @@ client = BybitRestClient(api_key="...", api_secret="...", testnet=False)
 provider = RiskLimitProvider(rest_client=client)
 ```
 
+**Note:** The backtest engine creates `RiskLimitProvider` without a REST client (see `apps/backtest/src/backtest/engine.py`), meaning backtests use cached or hardcoded tiers only, never fetch from API. This is intentional for reproducibility but should be documented. To update the cache with current API data, use `RiskLimitProvider` with a `BybitRestClient` outside the backtest workflow.
+
 ### Force Cache Refresh
 
 To bypass the cache and fetch fresh tiers from the API:

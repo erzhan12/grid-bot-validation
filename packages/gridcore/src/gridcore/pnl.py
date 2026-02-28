@@ -165,7 +165,7 @@ def calc_initial_margin(
     if position_value == _ZERO:
         return _ZERO, _ZERO
 
-    tier_table = tiers if tiers is not None else MM_TIERS.get(symbol) if symbol else None
+    tier_table = tiers if tiers is not None else MM_TIERS.get(symbol, MM_TIERS_DEFAULT) if symbol else MM_TIERS_DEFAULT
     if tier_table is not None:
         for max_val, _mmr, _ded, imr_rate in tier_table:
             if position_value <= max_val:
@@ -312,7 +312,7 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
     for i in range(1, len(sorted_tiers)):
         prev_val = Decimal(sorted_tiers[i - 1].get("riskLimitValue", "0"))
         curr_val = Decimal(sorted_tiers[i].get("riskLimitValue", "0"))
-        if curr_val != Decimal("Infinity") and curr_val <= prev_val:
+        if curr_val != Decimal("Infinity") and (curr_val < prev_val or (curr_val - prev_val).copy_abs() < Decimal("0.01")):
             raise ValueError(
                 f"Duplicate tier boundary detected: {prev_val} appears multiple times"
             )
@@ -354,11 +354,11 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
         if not (Decimal("0") <= mmr_rate <= Decimal("1")):
             raise ValueError(f"MMR rate {mmr_rate} outside valid range [0, 1]")
         if mmr_rate == Decimal("0"):
-            logger.warning("Zero MMR rate for tier riskLimitValue=%s (allows infinite leverage)", max_val)
+            logger.debug("Zero MMR rate for tier riskLimitValue=%s", max_val)
         if not (Decimal("0") <= imr_rate <= Decimal("1")):
             raise ValueError(f"IMR rate {imr_rate} outside valid range [0, 1]")
         if imr_rate == Decimal("0"):
-            logger.warning("Zero IMR rate for tier riskLimitValue=%s (allows infinite leverage)", max_val)
+            logger.debug("Zero IMR rate for tier riskLimitValue=%s", max_val)
         result.append((max_val, mmr_rate, deduction, imr_rate))
 
     # Replace last tier's cap with Infinity (if not already)

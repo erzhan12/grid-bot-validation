@@ -684,6 +684,47 @@ class TestConcurrentCacheAccess:
         assert "AAAUSDT" in cache
         assert "BBBUSDT" in cache
 
+    def test_concurrent_cache_writes(self, tmp_path):
+        """Multiple provider instances writing concurrently produce a valid, non-corrupt cache."""
+        cache_path = tmp_path / "cache.json"
+        num_providers = 4
+        writes_per_provider = 15
+        providers = [RiskLimitProvider(cache_path=cache_path) for _ in range(num_providers)]
+        errors: list[Exception] = []
+
+        all_tiers: list[MMTiers] = [
+            [
+                (Decimal(str(100000 * (i + 1))), Decimal("0.01"), Decimal("0"), Decimal("0.02")),
+                (Decimal("Infinity"), Decimal("0.025"), Decimal("1500"), Decimal("0.05")),
+            ]
+            for i in range(num_providers)
+        ]
+
+        def write_for_provider(idx: int):
+            try:
+                symbol = f"SYM{idx}USDT"
+                for _ in range(writes_per_provider):
+                    providers[idx].save_to_cache(symbol, all_tiers[idx])
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=write_for_provider, args=(i,)) for i in range(num_providers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"Thread errors: {errors}"
+
+        # Cache must be valid JSON with all symbols present
+        cache = json.loads(cache_path.read_text())
+        assert isinstance(cache, dict)
+        for i in range(num_providers):
+            symbol = f"SYM{i}USDT"
+            assert symbol in cache, f"{symbol} missing from cache"
+            assert isinstance(cache[symbol]["tiers"], list)
+            assert len(cache[symbol]["tiers"]) == 2
+
     def test_lock_registry_released_when_instances_deleted(self, tmp_path):
         """In-process lock entry is cleaned up when providers are deleted."""
         import backtest.risk_limit_info as risk_limit_info_module

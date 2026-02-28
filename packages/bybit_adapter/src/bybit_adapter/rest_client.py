@@ -396,7 +396,7 @@ class BybitRestClient:
 
         first_item = outer_list[0]
         if not isinstance(first_item, dict) or "list" not in first_item:
-            logger.error(
+            logger.warning(
                 "Unexpected risk limit API structure for %s: outer list items missing 'list' key. "
                 "Expected nested structure but got flat list. Returning empty tier list.",
                 symbol,

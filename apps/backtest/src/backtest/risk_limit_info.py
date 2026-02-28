@@ -78,7 +78,10 @@ class RiskLimitProvider:
         self.cache_ttl = cache_ttl
         self._rest_client = rest_client
         if max_cache_size_bytes < 0:
-            raise ValueError("max_cache_size_bytes must be non-negative (0 means no size limit)")
+            raise ValueError(
+                "max_cache_size_bytes must be non-negative. "
+                "Set to 0 to disable size limit checks (allows unlimited cache file size)."
+            )
         self.max_cache_size_bytes = max_cache_size_bytes
         self._in_process_lock_key, self._in_process_lock = _acquire_in_process_lock(
             self.cache_path

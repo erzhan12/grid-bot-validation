@@ -695,15 +695,15 @@ class TestGetRiskLimit:
             category="inverse", symbol="BTCUSDT"
         )
 
-    def test_unexpected_structure_returns_empty_and_logs_error(self, client, mock_session, caplog):
-        """Flat list without nested 'list' key returns empty and logs error."""
+    def test_unexpected_structure_returns_empty_and_logs_warning(self, client, mock_session, caplog):
+        """Flat list without nested 'list' key returns empty and logs warning."""
         tiers = [
             {"id": 1, "symbol": "BTCUSDT", "riskLimitValue": "2000000"},
             {"id": 2, "symbol": "BTCUSDT", "riskLimitValue": "4000000"},
         ]
         mock_session.get_risk_limit.return_value = _ok_response({"list": tiers})
 
-        with caplog.at_level(logging.ERROR):
+        with caplog.at_level(logging.WARNING):
             result = client.get_risk_limit(symbol="BTCUSDT")
 
         assert result == []

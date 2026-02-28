@@ -114,23 +114,23 @@ class TestCalcPositionValue:
 class TestCalcInitialMargin:
     """Test initial margin calculation."""
 
-    def test_fallback_no_tiers(self):
-        """Without tiers or symbol, falls back to position_value / leverage."""
+    def test_default_tiers_no_symbol(self):
+        """Without tiers or symbol, uses MM_TIERS_DEFAULT (tier 1: 2% IMR)."""
         im, imr = calc_initial_margin(Decimal("5000"), Decimal("10"))
-        assert im == Decimal("500")
-        assert imr == Decimal("0.1")  # 1/10
+        assert im == Decimal("100.00")  # 5000 * 0.02
+        assert imr == Decimal("0.02")
 
-    def test_zero_leverage_fallback(self):
-        """Zero leverage returns zero when no tiers available."""
+    def test_default_tiers_zero_leverage(self):
+        """Zero leverage is irrelevant when default tiers are used."""
         im, imr = calc_initial_margin(Decimal("5000"), Decimal("0"))
-        assert im == Decimal("0")
-        assert imr == Decimal("0")
+        assert im == Decimal("100.00")  # 5000 * 0.02
+        assert imr == Decimal("0.02")
 
-    def test_high_leverage_fallback(self):
-        """100x leverage fallback."""
+    def test_default_tiers_high_leverage(self):
+        """Leverage is irrelevant when default tiers are used."""
         im, imr = calc_initial_margin(Decimal("50000"), Decimal("100"))
-        assert im == Decimal("500")
-        assert imr == Decimal("0.01")  # 1/100
+        assert im == Decimal("1000.00")  # 50000 * 0.02
+        assert imr == Decimal("0.02")
 
     def test_tier_based_btcusdt(self):
         """BTCUSDT tier 1: $5000 position → 1% IMR, $50 IM."""
@@ -164,11 +164,11 @@ class TestCalcInitialMargin:
         assert imr == Decimal("0.05")
         assert im == Decimal("10000")  # 200000 * 0.05
 
-    def test_negative_leverage_fallback(self):
-        """Negative leverage returns zero when no tiers match (fallback path)."""
+    def test_negative_leverage_uses_default_tiers(self):
+        """Negative leverage is irrelevant when default tiers are used."""
         im, imr = calc_initial_margin(Decimal("5000"), Decimal("-5"))
-        assert im == Decimal("0")
-        assert imr == Decimal("0")
+        assert im == Decimal("100.00")  # 5000 * 0.02
+        assert imr == Decimal("0.02")
 
     def test_zero_position_value(self):
         """Zero position value returns zero."""
