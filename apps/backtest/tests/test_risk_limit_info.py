@@ -14,6 +14,7 @@ import pytest
 from backtest.risk_limit_info import (
     RiskLimitProvider,
     DEFAULT_CACHE_PATH,
+    DEFAULT_ALLOWED_CACHE_ROOT,
     _tiers_to_dict,
     _tiers_from_dict,
 )
@@ -71,7 +72,7 @@ class TestRiskLimitProvider:
     @pytest.fixture
     def provider(self, cache_path):
         """Provider with temp cache path."""
-        return RiskLimitProvider(cache_path=cache_path)
+        return RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
 
     def _make_cache_entry(self, tiers, cached_at=None):
         """Build cache dict entry with cached_at timestamp."""
@@ -186,7 +187,7 @@ class TestRiskLimitProvider:
     def test_save_to_cache_creates_parent_dirs(self, tmp_path):
         """Creates parent directories if they don't exist."""
         deep_path = tmp_path / "a" / "b" / "cache.json"
-        provider = RiskLimitProvider(cache_path=deep_path)
+        provider = RiskLimitProvider(cache_path=deep_path, allowed_cache_root=None)
 
         provider.save_to_cache("BTCUSDT", SAMPLE_TIERS)
 
@@ -242,7 +243,7 @@ class TestRiskLimitProvider:
             },
         ]
 
-        provider = RiskLimitProvider(cache_path=cache_path, rest_client=mock_client)
+        provider = RiskLimitProvider(cache_path=cache_path, rest_client=mock_client, allowed_cache_root=None)
         result = provider.fetch_from_bybit("BTCUSDT")
 
         mock_client.get_risk_limit.assert_called_once_with(symbol="BTCUSDT")
@@ -256,7 +257,7 @@ class TestRiskLimitProvider:
         mock_client = MagicMock()
         mock_client.get_risk_limit.return_value = []
 
-        provider = RiskLimitProvider(cache_path=cache_path, rest_client=mock_client)
+        provider = RiskLimitProvider(cache_path=cache_path, rest_client=mock_client, allowed_cache_root=None)
         result = provider.fetch_from_bybit("BTCUSDT")
 
         assert result is None
@@ -266,7 +267,7 @@ class TestRiskLimitProvider:
         mock_client = MagicMock()
         mock_client.get_risk_limit.side_effect = ConnectionError("timeout")
 
-        provider = RiskLimitProvider(cache_path=cache_path, rest_client=mock_client)
+        provider = RiskLimitProvider(cache_path=cache_path, rest_client=mock_client, allowed_cache_root=None)
         result = provider.fetch_from_bybit("BTCUSDT")
 
         assert result is None
@@ -420,7 +421,7 @@ class TestRiskLimitProvider:
         cache_file = read_only_dir / "cache.json"
         read_only_dir.chmod(0o444)
 
-        provider = RiskLimitProvider(cache_path=cache_file)
+        provider = RiskLimitProvider(cache_path=cache_file, allowed_cache_root=None)
 
         with caplog.at_level(logging.WARNING):
             # Should not raise — permission error is caught and logged
@@ -445,7 +446,7 @@ class TestRiskLimitProvider:
         except OSError as e:
             pytest.skip(f"Symlinks not supported in test environment: {e}")
 
-        provider = RiskLimitProvider(cache_path=symlink)
+        provider = RiskLimitProvider(cache_path=symlink, allowed_cache_root=None)
         with caplog.at_level(logging.WARNING):
             result = provider.load_from_cache("BTCUSDT")
 
@@ -463,7 +464,7 @@ class TestRiskLimitProvider:
         except OSError as e:
             pytest.skip(f"Symlinks not supported in test environment: {e}")
 
-        provider = RiskLimitProvider(cache_path=symlink)
+        provider = RiskLimitProvider(cache_path=symlink, allowed_cache_root=None)
         with caplog.at_level(logging.WARNING):
             provider.save_to_cache("BTCUSDT", SAMPLE_TIERS)
 
@@ -481,7 +482,7 @@ class TestRiskLimitProvider:
         except OSError as e:
             pytest.skip(f"Symlinks not supported in test environment: {e}")
 
-        provider = RiskLimitProvider(cache_path=cache_path)
+        provider = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
         with caplog.at_level(logging.WARNING):
             provider.save_to_cache("BTCUSDT", SAMPLE_TIERS)
 
@@ -491,7 +492,7 @@ class TestRiskLimitProvider:
     def test_close_makes_provider_unusable(self, tmp_path):
         """A closed provider raises RuntimeError on further use."""
         cache_path = tmp_path / "cache.json"
-        provider = RiskLimitProvider(cache_path=cache_path)
+        provider = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
         provider.save_to_cache("BTCUSDT", SAMPLE_TIERS)
 
         provider.close()
@@ -565,7 +566,7 @@ class TestEdgeCases:
             },
         }))
 
-        provider = RiskLimitProvider(cache_path=cache_path)
+        provider = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
         # _is_cache_fresh should return False for malformed timestamp
         assert provider._is_cache_fresh("BTCUSDT") is False
 
@@ -579,7 +580,7 @@ class TestEdgeCases:
             },
         }))
 
-        provider = RiskLimitProvider(cache_path=cache_path)
+        provider = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
         result = provider.load_from_cache("BTCUSDT")
         assert result is None
 
@@ -589,7 +590,7 @@ class TestEdgeCases:
         # Create a file just over 10MB
         cache_path.write_text("x" * 10_000_001)
 
-        provider = RiskLimitProvider(cache_path=cache_path)
+        provider = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
         with pytest.raises(ValueError, match="exceeds.*byte limit"):
             provider._save_to_cache_impl("BTCUSDT", SAMPLE_TIERS)
 
@@ -600,7 +601,7 @@ class TestEdgeCases:
         cache_path.write_text("x" * 500)
 
         provider = RiskLimitProvider(
-            cache_path=cache_path, max_cache_size_bytes=100
+            cache_path=cache_path, max_cache_size_bytes=100, allowed_cache_root=None
         )
 
         with caplog.at_level(logging.WARNING):
@@ -616,7 +617,7 @@ class TestConcurrentCacheAccess:
     def test_concurrent_writes_no_corruption(self, tmp_path):
         """Two threads writing to the same cache file don't corrupt data."""
         cache_path = tmp_path / "cache.json"
-        provider = RiskLimitProvider(cache_path=cache_path)
+        provider = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
         errors: list[Exception] = []
 
         tiers_a: MMTiers = [
@@ -652,8 +653,8 @@ class TestConcurrentCacheAccess:
     def test_concurrent_writes_across_instances_no_corruption(self, tmp_path):
         """Two provider instances sharing one cache path coordinate writes safely."""
         cache_path = tmp_path / "cache.json"
-        provider_a = RiskLimitProvider(cache_path=cache_path)
-        provider_b = RiskLimitProvider(cache_path=cache_path)
+        provider_a = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
+        provider_b = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
         errors: list[Exception] = []
 
         tiers_a: MMTiers = [
@@ -689,7 +690,7 @@ class TestConcurrentCacheAccess:
         cache_path = tmp_path / "cache.json"
         num_providers = 4
         writes_per_provider = 15
-        providers = [RiskLimitProvider(cache_path=cache_path) for _ in range(num_providers)]
+        providers = [RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None) for _ in range(num_providers)]
         errors: list[Exception] = []
 
         all_tiers: list[MMTiers] = [
@@ -731,8 +732,8 @@ class TestConcurrentCacheAccess:
 
         cache_path = tmp_path / "cache.json"
         key = str(cache_path.resolve())
-        provider_a = RiskLimitProvider(cache_path=cache_path)
-        provider_b = RiskLimitProvider(cache_path=cache_path)
+        provider_a = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
+        provider_b = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
 
         assert key in risk_limit_info_module._IN_PROCESS_LOCKS
         assert risk_limit_info_module._IN_PROCESS_LOCKS[key][1] >= 2
@@ -749,8 +750,8 @@ class TestConcurrentCacheAccess:
 
         cache_path = tmp_path / "cache.json"
         key = str(cache_path.resolve())
-        provider_a = RiskLimitProvider(cache_path=cache_path)
-        provider_b = RiskLimitProvider(cache_path=cache_path)
+        provider_a = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
+        provider_b = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
         assert key in risk_limit_info_module._IN_PROCESS_LOCKS
         assert risk_limit_info_module._IN_PROCESS_LOCKS[key][1] >= 2
 
@@ -760,7 +761,7 @@ class TestConcurrentCacheAccess:
         with pytest.raises(RuntimeError, match="closed"):
             provider_a.save_to_cache("AAAUSDT", SAMPLE_TIERS)
 
-        provider_c = RiskLimitProvider(cache_path=cache_path)
+        provider_c = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
         assert risk_limit_info_module._IN_PROCESS_LOCKS[key][1] == 2
 
         provider_b.save_to_cache("BBBUSDT", SAMPLE_TIERS)
@@ -781,7 +782,7 @@ class TestConcurrentCacheAccess:
                 "cached_at": datetime.now(timezone.utc).isoformat(),
             },
         }))
-        provider = RiskLimitProvider(cache_path=cache_path)
+        provider = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
         errors: list[Exception] = []
 
         write_tiers: MMTiers = [
@@ -832,17 +833,17 @@ class TestMaxCacheSizeValidation:
 
     def test_zero_max_cache_size_means_no_limit(self, tmp_path):
         """max_cache_size_bytes=0 is accepted as 'no size limit'."""
-        provider = RiskLimitProvider(cache_path=tmp_path / "c.json", max_cache_size_bytes=0)
+        provider = RiskLimitProvider(cache_path=tmp_path / "c.json", max_cache_size_bytes=0, allowed_cache_root=None)
         assert provider.max_cache_size_bytes == 0
 
     def test_negative_max_cache_size_raises(self, tmp_path):
         """Negative max_cache_size_bytes raises ValueError."""
         with pytest.raises(ValueError, match="max_cache_size_bytes must be non-negative"):
-            RiskLimitProvider(cache_path=tmp_path / "c.json", max_cache_size_bytes=-100)
+            RiskLimitProvider(cache_path=tmp_path / "c.json", max_cache_size_bytes=-100, allowed_cache_root=None)
 
     def test_positive_max_cache_size_accepted(self, tmp_path):
         """Positive max_cache_size_bytes is accepted."""
-        provider = RiskLimitProvider(cache_path=tmp_path / "c.json", max_cache_size_bytes=1)
+        provider = RiskLimitProvider(cache_path=tmp_path / "c.json", max_cache_size_bytes=1, allowed_cache_root=None)
         assert provider.max_cache_size_bytes == 1
 
 
@@ -852,7 +853,7 @@ class TestPathTraversalValidation:
     def test_path_with_traversal_is_resolved(self, tmp_path):
         """Path with '..' components is resolved to absolute canonical path."""
         traversal_path = tmp_path / "a" / ".." / "cache.json"
-        provider = RiskLimitProvider(cache_path=traversal_path)
+        provider = RiskLimitProvider(cache_path=traversal_path, allowed_cache_root=None)
         # Should be resolved: tmp_path/cache.json (no ".." in result)
         assert ".." not in str(provider.cache_path)
         assert provider.cache_path == (tmp_path / "cache.json").resolve()
@@ -860,8 +861,28 @@ class TestPathTraversalValidation:
     def test_cache_path_is_always_absolute(self, tmp_path, monkeypatch):
         """Relative cache paths are resolved to absolute."""
         monkeypatch.chdir(tmp_path)
-        provider = RiskLimitProvider(cache_path=Path("relative/cache.json"))
+        provider = RiskLimitProvider(cache_path=Path("relative/cache.json"), allowed_cache_root=None)
         assert provider.cache_path.is_absolute()
+
+    def test_path_outside_allowed_root_rejected(self, tmp_path):
+        """Cache path outside allowed_cache_root raises ValueError."""
+        allowed_root = tmp_path / "allowed"
+        allowed_root.mkdir()
+        outside_path = tmp_path / "outside" / "cache.json"
+        with pytest.raises(ValueError, match="outside allowed directory"):
+            RiskLimitProvider(cache_path=outside_path, allowed_cache_root=allowed_root)
+
+    def test_path_inside_allowed_root_accepted(self, tmp_path):
+        """Cache path inside allowed_cache_root is accepted."""
+        allowed_root = tmp_path / "allowed"
+        allowed_root.mkdir()
+        inside_path = allowed_root / "cache.json"
+        provider = RiskLimitProvider(cache_path=inside_path, allowed_cache_root=allowed_root)
+        assert provider.cache_path == inside_path.resolve()
+
+    def test_default_allowed_root_is_conf_dir(self):
+        """Default allowed_cache_root matches the conf/ directory."""
+        assert DEFAULT_ALLOWED_CACHE_ROOT == DEFAULT_CACHE_PATH.parent
 
 
 class TestFullFallbackChainIntegration:
@@ -904,6 +925,7 @@ class TestFullFallbackChainIntegration:
             cache_path=cache_path,
             rest_client=mock_client,
             cache_ttl=timedelta(hours=24),
+            allowed_cache_root=None,
         )
 
         # Step 1: First call — cache is empty, should hit API and cache result

@@ -4,6 +4,7 @@ Single source of truth for position PnL formulas used across the project.
 All functions are pure (no side effects, no state) and use Decimal for precision.
 """
 
+import bisect
 import logging
 from decimal import Decimal
 from typing import Optional
@@ -135,6 +136,26 @@ def calc_position_value(size: Decimal, entry_price: Decimal) -> Decimal:
     return size * entry_price
 
 
+def _find_matching_tier(
+    position_value: Decimal, tiers: MMTiers
+) -> Optional[tuple[Decimal, Decimal, Decimal, Decimal]]:
+    """Find the tier whose max_value >= position_value using binary search.
+
+    Tiers must be sorted by ascending max_value (the standard format).
+    Uses O(log n) bisect lookup instead of O(n) linear scan.
+
+    Returns:
+        The matching tier tuple (max_value, mmr_rate, deduction, imr_rate),
+        or None if no tier matches (should not happen when last tier is Infinity).
+    """
+    # Extract max_values for bisect; tiers are sorted by max_value ascending.
+    max_values = [t[0] for t in tiers]
+    idx = bisect.bisect_left(max_values, position_value)
+    if idx < len(tiers):
+        return tiers[idx]
+    return None
+
+
 def calc_initial_margin(
     position_value: Decimal,
     leverage: Decimal,
@@ -167,9 +188,10 @@ def calc_initial_margin(
 
     tier_table = tiers if tiers is not None else MM_TIERS.get(symbol, MM_TIERS_DEFAULT) if symbol else MM_TIERS_DEFAULT
     if tier_table is not None:
-        for max_val, _mmr, _ded, imr_rate in tier_table:
-            if position_value <= max_val:
-                return position_value * imr_rate, imr_rate
+        tier = _find_matching_tier(position_value, tier_table)
+        if tier is not None:
+            _max_val, _mmr, _ded, imr_rate = tier
+            return position_value * imr_rate, imr_rate
 
     # Fallback: position_value / leverage
     if leverage <= 0:
@@ -222,12 +244,12 @@ def calc_maintenance_margin(
         return _ZERO, _ZERO
 
     tier_table = tiers if tiers is not None else MM_TIERS.get(symbol, MM_TIERS_DEFAULT)
-    for max_val, mmr_rate, deduction, _imr in tier_table:
-        if position_value <= max_val:
-            mm = position_value * mmr_rate - deduction
-            return max(mm, _ZERO), mmr_rate
-    # Should not reach here (last tier has Infinity), but just in case
-    _, mmr_rate, deduction, _imr = tier_table[-1]
+    tier = _find_matching_tier(position_value, tier_table)
+    if tier is not None:
+        _max_val, mmr_rate, deduction, _imr = tier
+    else:
+        # Should not reach here (last tier has Infinity), but just in case
+        _max_val, mmr_rate, deduction, _imr = tier_table[-1]
     mm = position_value * mmr_rate - deduction
     return max(mm, _ZERO), mmr_rate
 

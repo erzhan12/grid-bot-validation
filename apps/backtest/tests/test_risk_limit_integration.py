@@ -47,7 +47,7 @@ class TestFallbackChain:
     def test_api_success_returns_api_tiers(self, cache_path):
         """When API succeeds, returns API tiers and caches them."""
         client = self._mock_client(tiers=API_TIERS)
-        provider = RiskLimitProvider(cache_path=cache_path, rest_client=client)
+        provider = RiskLimitProvider(cache_path=cache_path, rest_client=client, allowed_cache_root=None)
 
         result = provider.get("BTCUSDT")
 
@@ -67,7 +67,7 @@ class TestFallbackChain:
         }))
 
         client = self._mock_client(error=ConnectionError("timeout"))
-        provider = RiskLimitProvider(cache_path=cache_path, rest_client=client)
+        provider = RiskLimitProvider(cache_path=cache_path, rest_client=client, allowed_cache_root=None)
 
         result = provider.get("BTCUSDT", force_fetch=True)
 
@@ -77,7 +77,7 @@ class TestFallbackChain:
     def test_api_and_cache_failure_falls_back_to_hardcoded(self, cache_path):
         """When both API and cache fail, returns hardcoded tiers."""
         client = self._mock_client(error=ConnectionError("timeout"))
-        provider = RiskLimitProvider(cache_path=cache_path, rest_client=client)
+        provider = RiskLimitProvider(cache_path=cache_path, rest_client=client, allowed_cache_root=None)
 
         result = provider.get("BTCUSDT")
 
@@ -88,7 +88,7 @@ class TestFallbackChain:
     def test_unknown_symbol_falls_back_to_default_hardcoded(self, cache_path):
         """Unknown symbol with no API/cache gets default hardcoded tiers."""
         client = self._mock_client(error=ConnectionError("timeout"))
-        provider = RiskLimitProvider(cache_path=cache_path, rest_client=client)
+        provider = RiskLimitProvider(cache_path=cache_path, rest_client=client, allowed_cache_root=None)
 
         result = provider.get("XYZUSDT")
 
@@ -104,7 +104,7 @@ class TestFallbackChain:
             },
         }))
 
-        provider = RiskLimitProvider(cache_path=cache_path, rest_client=None)
+        provider = RiskLimitProvider(cache_path=cache_path, rest_client=None, allowed_cache_root=None)
         result = provider.get("BTCUSDT")
 
         assert len(result) == 2
@@ -127,7 +127,7 @@ class TestCacheTTL:
         }))
 
         client = MagicMock()
-        provider = RiskLimitProvider(cache_path=cache_path, rest_client=client)
+        provider = RiskLimitProvider(cache_path=cache_path, rest_client=client, allowed_cache_root=None)
         result = provider.get("BTCUSDT")
 
         client.get_risk_limit.assert_not_called()
@@ -164,7 +164,7 @@ class TestCacheTTL:
             },
         ]
 
-        provider = RiskLimitProvider(cache_path=cache_path, rest_client=client)
+        provider = RiskLimitProvider(cache_path=cache_path, rest_client=client, allowed_cache_root=None)
         result = provider.get("BTCUSDT")
 
         client.get_risk_limit.assert_called_once_with(symbol="BTCUSDT")
@@ -183,7 +183,7 @@ class TestCacheTTL:
         client = MagicMock()
         client.get_risk_limit.side_effect = ConnectionError("unreachable")
 
-        provider = RiskLimitProvider(cache_path=cache_path, rest_client=client)
+        provider = RiskLimitProvider(cache_path=cache_path, rest_client=client, allowed_cache_root=None)
         result = provider.get("BTCUSDT")
 
         # Stale cache preferred over hardcoded
@@ -207,6 +207,7 @@ class TestCacheTTL:
         provider = RiskLimitProvider(
             cache_path=cache_path, rest_client=client,
             cache_ttl=timedelta(hours=1),
+            allowed_cache_root=None,
         )
         # API returns empty → falls back to stale cache
         client.get_risk_limit.return_value = []

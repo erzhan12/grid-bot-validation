@@ -12,7 +12,7 @@ import weakref
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import IO, TYPE_CHECKING, Optional
 
 from gridcore.pnl import MMTiers, MM_TIERS, MM_TIERS_DEFAULT, parse_risk_limit_tiers
 
@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 
 # Default cache location (absolute to prevent path traversal)
 DEFAULT_CACHE_PATH = Path(__file__).parent.parent.parent.parent / "conf" / "risk_limits_cache.json"
+
+# Default allowed root directory for cache files (prevents path traversal)
+DEFAULT_ALLOWED_CACHE_ROOT = Path(__file__).parent.parent.parent.parent / "conf"
 
 # Maximum allowed cache file size (bytes) to prevent DoS via bloated files
 MAX_CACHE_SIZE_BYTES = 10_000_000
@@ -68,6 +71,7 @@ class RiskLimitProvider:
         cache_ttl: timedelta = timedelta(hours=24),
         rest_client: Optional["BybitRestClient"] = None,
         max_cache_size_bytes: int = MAX_CACHE_SIZE_BYTES,
+        allowed_cache_root: Optional[Path] = DEFAULT_ALLOWED_CACHE_ROOT,
     ):
         expanded_cache_path = cache_path.expanduser()
         # Freeze configured path to an absolute location so symlink checks
@@ -75,6 +79,14 @@ class RiskLimitProvider:
         self._configured_cache_path = expanded_cache_path.absolute()
         # Normalize path and resolve symlinks for a canonical cache location.
         self.cache_path = expanded_cache_path.resolve()
+        # Validate cache path is within expected directory tree to prevent
+        # path traversal attacks (e.g. cache_path="../../etc/passwd").
+        if allowed_cache_root is not None:
+            expected_root = allowed_cache_root.resolve()
+            if not self.cache_path.is_relative_to(expected_root):
+                raise ValueError(
+                    f"Cache path {self.cache_path} is outside allowed directory {expected_root}"
+                )
         self.cache_ttl = cache_ttl
         self._rest_client = rest_client
         if max_cache_size_bytes < 0:
@@ -87,6 +99,7 @@ class RiskLimitProvider:
             self.cache_path
         )
         self._closed = False
+        self._no_client_warned = False
         # Deterministic cleanup without relying on __del__ timing.
         self._lock_finalizer = weakref.finalize(
             self, _release_in_process_lock, self._in_process_lock_key
@@ -122,7 +135,12 @@ class RiskLimitProvider:
         """
         self._ensure_open()
         if self._rest_client is None:
-            logger.debug("No rest_client configured, skipping API fetch")
+            if not self._no_client_warned:
+                logger.warning(
+                    "No rest_client configured — calculations may use stale or "
+                    "hardcoded tier data. Provide a BybitRestClient for live data."
+                )
+                self._no_client_warned = True
             return None
 
         logger.debug(
@@ -169,14 +187,19 @@ class RiskLimitProvider:
                 raise ValueError(
                     f"Cache file exceeds {self.max_cache_size_bytes} byte limit"
                 )
-            # TOCTOU protection: verify inode/device after open to detect
-            # symlink swaps between the symlink check above and file open.
-            path_stat = os.stat(self.cache_path, follow_symlinks=False)
-            with open(self.cache_path) as f:
-                fd_stat = os.fstat(f.fileno())
-                if (path_stat.st_dev, path_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):
-                    logger.warning("Cache file changed during open (possible symlink swap)")
-                    return None, None
+            # TOCTOU protection: use O_NOFOLLOW to atomically reject symlinks
+            # at open time, eliminating the race window between check and open.
+            flags = os.O_RDONLY
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            if nofollow:
+                flags |= nofollow
+            try:
+                fd = os.open(self.cache_path, flags)
+            except OSError:
+                # O_NOFOLLOW causes OSError if path is a symlink
+                logger.warning("Cache file is a symlink or inaccessible (possible symlink swap)")
+                return None, None
+            with os.fdopen(fd, "r") as f:
                 cache = json.load(f)
             if not isinstance(cache, dict):
                 raise ValueError("Cache root must be a JSON object")
@@ -268,23 +291,29 @@ class RiskLimitProvider:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
 
             lock_path = self.cache_path.with_suffix(f"{self.cache_path.suffix}.lock")
-            with _open_lock_file(lock_path) as lock_file:
+            lock_file = None
+            try:
+                lock_file = _open_lock_file(lock_path)
                 _acquire_file_lock(lock_file)
-                try:
-                    # Read-modify-write must be atomic across processes.
-                    cache = self._load_existing_cache()
 
-                    new_tiers_dict = _tiers_to_dict(tiers)
-                    if self._should_skip_cache_write(cache.get(symbol), new_tiers_dict):
-                        return
+                # Read-modify-write must be atomic across processes.
+                cache = self._load_existing_cache()
 
-                    cache[symbol] = {
-                        "tiers": new_tiers_dict,
-                        "cached_at": datetime.now(timezone.utc).isoformat(),
-                    }
-                    self._write_cache_file(cache)
-                finally:
-                    _release_file_lock(lock_file)
+                new_tiers_dict = _tiers_to_dict(tiers)
+                if self._should_skip_cache_write(cache.get(symbol), new_tiers_dict):
+                    return
+
+                cache[symbol] = {
+                    "tiers": new_tiers_dict,
+                    "cached_at": datetime.now(timezone.utc).isoformat(),
+                }
+                self._write_cache_file(cache)
+            finally:
+                if lock_file is not None:
+                    try:
+                        _release_file_lock(lock_file)
+                    finally:
+                        lock_file.close()
 
         logger.info(f"Cached risk limit tiers for {symbol}")
 
@@ -316,7 +345,12 @@ class RiskLimitProvider:
             if datetime.now(timezone.utc) - file_mtime > self.cache_ttl:
                 return False
 
-            # Only parse the cache file if cached_at_str wasn't provided
+            # Only parse the cache file if cached_at_str wasn't provided.
+            # Full JSON parse is acceptable here because: (1) the primary
+            # caller (get()) always passes cached_at_str from a prior
+            # _load_cache_entry() call, so this branch rarely executes;
+            # (2) a separate timestamp index file would add complexity
+            # and another file to keep in sync with the cache.
             if cached_at_str is None:
                 cache = self._load_existing_cache()
                 entry = cache.get(symbol, {})
@@ -376,13 +410,23 @@ class RiskLimitProvider:
 
         # API failed, try cache as fallback
         if cached is None:
-            cached = self.load_from_cache(symbol)
+            cached, cached_at_str = self._load_cache_entry(symbol)
         if cached:
-            logger.warning(f"API unavailable, using cached risk limits for {symbol}")
+            staleness = ""
+            if cached_at_str:
+                staleness = f" (cached_at={cached_at_str})"
+            logger.warning(
+                f"API unavailable for {symbol}, using potentially stale cached "
+                f"risk limits{staleness}. Margin calculations may be inaccurate."
+            )
             return cached
 
         # No cache, use hardcoded fallback
-        logger.warning(f"No risk limit data for {symbol}, using hardcoded fallback")
+        logger.warning(
+            f"No risk limit data for {symbol}, using hardcoded fallback. "
+            f"Margin calculations may be inaccurate — connect a BybitRestClient "
+            f"to fetch current tiers."
+        )
         return MM_TIERS.get(symbol, MM_TIERS_DEFAULT)
 
 
@@ -424,7 +468,7 @@ def _release_in_process_lock(key: str) -> None:
             _IN_PROCESS_LOCKS[key] = (lock, ref_count - 1)
 
 
-def _open_lock_file(lock_path: Path):
+def _open_lock_file(lock_path: Path) -> "IO[bytes]":
     """Open lock file safely; reject symlink lock paths.
 
     Uses os.lstat() for the pre-open check (does not follow symlinks) and
