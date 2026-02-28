@@ -27,7 +27,10 @@ DEFAULT_CACHE_PATH = Path(__file__).parent.parent.parent.parent / "conf" / "risk
 # Default allowed root directory for cache files (prevents path traversal)
 DEFAULT_ALLOWED_CACHE_ROOT = Path(__file__).parent.parent.parent.parent / "conf"
 
-# Maximum allowed cache file size (bytes) to prevent DoS via bloated files
+# Maximum allowed cache file size (bytes) to prevent DoS via bloated files.
+# 10 MB is generous for typical use (~50 symbols × ~10 tiers × ~200 bytes each
+# ≈ 100 KB), but allows headroom for hundreds of symbols without triggering
+# false positives.  Configurable per-instance via the constructor parameter.
 MAX_CACHE_SIZE_BYTES = 10_000_000
 
 _IN_PROCESS_LOCKS: dict[str, tuple[threading.Lock, int]] = {}
@@ -49,12 +52,26 @@ class RiskLimitProvider:
       - Use ``force_fetch=True`` to bypass the cache entirely — recommended
         after a detected tier change or on startup for critical systems.
 
-    Error handling:
-      - Corrupted cache files are logged and skipped (non-fatal).
-      - API errors trigger fallback to cache or hardcoded tiers.
-      - ``get()`` returns a valid ``MMTiers`` list unless the provider has
-        been closed via ``close()`` (then methods raise ``RuntimeError``).
-      - Cache files exceeding ``max_cache_size_bytes`` (default 10 MB) are rejected to prevent DoS.
+    Error handling strategy:
+      Methods follow one of three patterns depending on the failure type:
+
+      - **Return ``None``** for expected, recoverable failures where a
+        fallback exists: ``load_from_cache()``, ``fetch_from_bybit()``.
+        Callers should check the return value and fall through to the
+        next tier in the fallback chain.
+      - **Raise an exception** for programming errors or invalid state
+        that cannot be recovered from: ``_ensure_open()`` raises
+        ``RuntimeError`` when the provider has been ``close()``d;
+        the constructor raises ``ValueError`` for invalid parameters
+        (negative ``max_cache_size_bytes``, path outside allowed root).
+      - **Catch, log, and continue** for optional side-effects that
+        must not crash the caller: ``save_to_cache()`` catches
+        ``PermissionError`` / ``OSError`` / ``ValueError`` from disk
+        writes and logs a warning — a read-only filesystem never
+        blocks tier lookups.
+
+      ``get()`` always returns a valid ``MMTiers`` list (API, cache,
+      or hardcoded fallback) unless the provider has been closed.
 
     Example:
         from bybit_adapter.rest_client import BybitRestClient
@@ -519,7 +536,7 @@ def _open_lock_file(lock_path: Path) -> "IO[bytes]":
     return os.fdopen(fd, "a+b")
 
 
-def _acquire_file_lock(lock_file) -> None:
+def _acquire_file_lock(lock_file: IO[bytes]) -> None:
     """Acquire an exclusive lock for cache read-modify-write operations."""
     if os.name == "nt":
         import msvcrt
@@ -536,7 +553,7 @@ def _acquire_file_lock(lock_file) -> None:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
 
 
-def _release_file_lock(lock_file) -> None:
+def _release_file_lock(lock_file: IO[bytes]) -> None:
     """Release the cache file lock."""
     if os.name == "nt":
         import msvcrt

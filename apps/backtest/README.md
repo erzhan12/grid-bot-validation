@@ -41,7 +41,7 @@ client = BybitRestClient(api_key="...", api_secret="...", testnet=False)
 provider = RiskLimitProvider(rest_client=client)
 ```
 
-**Note:** The backtest engine creates `RiskLimitProvider` without a REST client (see `apps/backtest/src/backtest/engine.py`), meaning backtests use cached or hardcoded tiers only, never fetch from API. This is intentional for reproducibility but should be documented. To update the cache with current API data, use `RiskLimitProvider` with a `BybitRestClient` outside the backtest workflow.
+See [Design Decisions](#design-decisions) below for why the backtest engine does not make API calls.
 
 ### Force Cache Refresh
 
@@ -103,6 +103,28 @@ If Bybit returns an empty risk limit list (rare edge case), the provider returns
 **Using hardcoded fallback tiers**
 
 When both the API and cache are unavailable, the provider uses hardcoded tier tables from `gridcore.pnl.MM_TIERS`. These are static snapshots and may become outdated if Bybit changes their risk limits. If you see the log message "using hardcoded fallback", ensure API access is restored to get accurate margin calculations.
+
+### Design Decisions
+
+**No API calls during backtests (reproducibility)**
+
+The backtest engine intentionally creates `RiskLimitProvider` without a `BybitRestClient` (see `apps/backtest/src/backtest/engine.py`). This means backtests use cached or hardcoded tier tables only and never fetch from the Bybit API at runtime. This is a deliberate design choice for **reproducibility**: backtest results should be deterministic and not depend on the current state of external APIs. Running the same backtest twice should produce identical margin calculations.
+
+To update the cache with current API data **before** running backtests:
+
+```python
+from backtest.risk_limit_info import RiskLimitProvider
+from bybit_adapter.rest_client import BybitRestClient
+
+client = BybitRestClient(api_key="...", api_secret="...", testnet=False)
+provider = RiskLimitProvider(rest_client=client)
+
+# Force-refresh cache for symbols you plan to backtest
+for symbol in ["BTCUSDT", "ETHUSDT"]:
+    provider.get(symbol, force_fetch=True)
+```
+
+After this, backtests will pick up the refreshed cache automatically.
 
 ## Dynamic Risk Limit Tiers
 

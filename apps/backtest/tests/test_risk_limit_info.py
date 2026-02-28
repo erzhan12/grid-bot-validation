@@ -18,7 +18,7 @@ from backtest.risk_limit_info import (
     _tiers_to_dict,
     _tiers_from_dict,
 )
-from gridcore.pnl import MMTiers
+from gridcore.pnl import MMTiers, MM_TIERS, parse_risk_limit_tiers
 
 
 # Sample tiers for testing
@@ -959,3 +959,200 @@ class TestFullFallbackChainIntegration:
         # Should fall back to stale cache rather than hardcoded
         assert result4 == expected_parsed
         mock_client.get_risk_limit.assert_called_once_with(symbol="BTCUSDT")
+
+
+class TestMalformedApiResponses:
+    """Tests for malformed API response handling in parse_risk_limit_tiers."""
+
+    def test_non_list_input_raises(self):
+        """parse_risk_limit_tiers rejects non-list input."""
+        with pytest.raises(TypeError):
+            parse_risk_limit_tiers({"not": "a list"})
+
+    def test_missing_maintenance_margin_raises(self):
+        """Missing maintenanceMargin field raises ValueError."""
+        with pytest.raises(ValueError, match="maintenanceMargin"):
+            parse_risk_limit_tiers([{"riskLimitValue": "1000000"}])
+
+    def test_missing_risk_limit_value_raises(self):
+        """Missing riskLimitValue field raises ValueError."""
+        with pytest.raises(ValueError, match="riskLimitValue"):
+            parse_risk_limit_tiers([{"maintenanceMargin": "0.01"}])
+
+    def test_invalid_mmr_format_raises(self):
+        """Non-numeric maintenanceMargin raises ValueError."""
+        with pytest.raises(ValueError):
+            parse_risk_limit_tiers([{
+                "riskLimitValue": "1000000",
+                "maintenanceMargin": "not_a_number",
+                "initialMargin": "0.01",
+            }])
+
+    def test_mmr_out_of_range_raises(self):
+        """MMR rate outside [0, 1] raises ValueError."""
+        with pytest.raises(ValueError, match="outside valid range"):
+            parse_risk_limit_tiers([{
+                "riskLimitValue": "1000000",
+                "maintenanceMargin": "1.5",
+                "initialMargin": "2.0",
+            }])
+
+    def test_negative_deduction_raises(self):
+        """Negative mmDeduction raises ValueError."""
+        with pytest.raises(ValueError, match="negative"):
+            parse_risk_limit_tiers([{
+                "riskLimitValue": "1000000",
+                "maintenanceMargin": "0.01",
+                "mmDeduction": "-100",
+                "initialMargin": "0.02",
+            }])
+
+    def test_imr_out_of_range_raises(self):
+        """IMR rate outside [0, 1] raises ValueError."""
+        with pytest.raises(ValueError, match="outside valid range"):
+            parse_risk_limit_tiers([{
+                "riskLimitValue": "1000000",
+                "maintenanceMargin": "0.01",
+                "initialMargin": "1.5",
+            }])
+
+    def test_empty_deduction_defaults_to_zero(self):
+        """Empty mmDeduction string defaults to 0."""
+        result = parse_risk_limit_tiers([{
+            "riskLimitValue": "1000000",
+            "maintenanceMargin": "0.005",
+            "mmDeduction": "",
+            "initialMargin": "0.01",
+        }])
+        assert result[0][2] == Decimal("0")
+
+    def test_missing_deduction_defaults_to_zero(self):
+        """Missing mmDeduction key defaults to 0."""
+        result = parse_risk_limit_tiers([{
+            "riskLimitValue": "1000000",
+            "maintenanceMargin": "0.005",
+            "initialMargin": "0.01",
+        }])
+        assert result[0][2] == Decimal("0")
+
+    def test_missing_initial_margin_defaults_to_double_mmr(self):
+        """Missing initialMargin defaults to 2x maintenanceMargin."""
+        result = parse_risk_limit_tiers([{
+            "riskLimitValue": "1000000",
+            "maintenanceMargin": "0.005",
+        }])
+        assert result[0][3] == Decimal("0.01")
+
+    def test_duplicate_boundaries_raises(self):
+        """Duplicate riskLimitValue boundaries raise ValueError."""
+        with pytest.raises(ValueError, match="[Dd]uplicate"):
+            parse_risk_limit_tiers([
+                {
+                    "riskLimitValue": "1000000",
+                    "maintenanceMargin": "0.005",
+                    "initialMargin": "0.01",
+                },
+                {
+                    "riskLimitValue": "1000000",
+                    "maintenanceMargin": "0.01",
+                    "initialMargin": "0.02",
+                },
+            ])
+
+    def test_single_tier_gets_infinity_cap(self):
+        """A single valid tier gets Infinity as its cap."""
+        result = parse_risk_limit_tiers([{
+            "riskLimitValue": "999999999",
+            "maintenanceMargin": "0.005",
+            "initialMargin": "0.01",
+        }])
+        assert len(result) == 1
+        assert result[0][0] == Decimal("Infinity")
+
+
+class TestCacheCorruptionRecovery:
+    """Tests for cache corruption recovery scenarios."""
+
+    @pytest.fixture
+    def cache_path(self, tmp_path):
+        return tmp_path / "cache.json"
+
+    def test_corrupt_cache_recovers_on_next_save(self, cache_path):
+        """Corrupt cache file is overwritten on next successful save."""
+        cache_path.write_text("{{{{not json at all")
+
+        mock_client = MagicMock()
+        mock_client.get_risk_limit.return_value = [
+            {
+                "riskLimitValue": "500000",
+                "maintenanceMargin": "0.005",
+                "mmDeduction": "0",
+                "initialMargin": "0.01",
+            },
+            {
+                "riskLimitValue": "999999999",
+                "maintenanceMargin": "0.01",
+                "mmDeduction": "2500",
+                "initialMargin": "0.02",
+            },
+        ]
+
+        provider = RiskLimitProvider(
+            cache_path=cache_path, rest_client=mock_client, allowed_cache_root=None,
+        )
+        result = provider.get("BTCUSDT")
+
+        assert len(result) == 2
+        # Cache should now be valid JSON
+        cached = json.loads(cache_path.read_text())
+        assert "BTCUSDT" in cached
+
+    def test_truncated_json_falls_back_gracefully(self, cache_path):
+        """Truncated JSON cache falls back to API or hardcoded."""
+        cache_path.write_text('{"BTCUSDT": {"tiers": [')
+
+        provider = RiskLimitProvider(
+            cache_path=cache_path, rest_client=None, allowed_cache_root=None,
+        )
+        result = provider.get("BTCUSDT")
+
+        # Should fall back to hardcoded
+        assert result == MM_TIERS["BTCUSDT"]
+
+    def test_non_dict_root_recovery(self, cache_path):
+        """Cache file with non-dict root (e.g. a list) is treated as corrupt."""
+        cache_path.write_text('[1, 2, 3]')
+
+        provider = RiskLimitProvider(
+            cache_path=cache_path, rest_client=None, allowed_cache_root=None,
+        )
+        result = provider.get("BTCUSDT")
+
+        # Should fall back to hardcoded
+        assert result == MM_TIERS["BTCUSDT"]
+
+    def test_wrong_type_entry_ignored(self, cache_path):
+        """Cache entry that's not a dict is ignored."""
+        cache_path.write_text(json.dumps({"BTCUSDT": "not a dict"}))
+
+        provider = RiskLimitProvider(
+            cache_path=cache_path, rest_client=None, allowed_cache_root=None,
+        )
+        result = provider.get("BTCUSDT")
+
+        # Should fall back to hardcoded
+        assert result == MM_TIERS["BTCUSDT"]
+
+    def test_missing_tiers_key_falls_back(self, cache_path):
+        """Cache entry without 'tiers' key falls back."""
+        cache_path.write_text(json.dumps({
+            "BTCUSDT": {"cached_at": "2024-01-01T00:00:00+00:00"},
+        }))
+
+        provider = RiskLimitProvider(
+            cache_path=cache_path, rest_client=None, allowed_cache_root=None,
+        )
+        result = provider.get("BTCUSDT")
+
+        # Should fall back to hardcoded
+        assert result == MM_TIERS["BTCUSDT"]
