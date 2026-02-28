@@ -61,6 +61,12 @@ class TestTiersSerialization:
         assert result[0] == (Decimal("200000"), Decimal("0.01"), Decimal("0"), Decimal("0"))
         assert result[1] == (Decimal("Infinity"), Decimal("0.025"), Decimal("3000"), Decimal("0"))
 
+    def test_tiers_from_dict_missing_required_key_raises(self):
+        """tiers_from_dict raises ValueError when required keys are missing."""
+        from backtest.tier_serialization import tiers_from_dict
+        with pytest.raises(ValueError, match="Missing required tier keys"):
+            tiers_from_dict([{"max_value": "1000"}])  # missing mmr_rate, deduction
+
 
 class TestRiskLimitProvider:
     """Tests for RiskLimitProvider."""
@@ -847,6 +853,20 @@ class TestMaxCacheSizeValidation:
         """Positive max_cache_size_bytes is accepted."""
         provider = RiskLimitProvider(cache_path=tmp_path / "c.json", max_cache_size_bytes=1, allowed_cache_root=None)
         assert provider.max_cache_size_bytes == 1
+
+    def test_zero_cache_size_limit_disables_size_check(self, tmp_path):
+        """max_cache_size_bytes=0 disables size limit validation."""
+        cache_path = tmp_path / "cache.json"
+        provider = RiskLimitProvider(cache_path=cache_path, max_cache_size_bytes=0, allowed_cache_root=None)
+        # Create large cache file exceeding normal default limits
+        large_data = {"BTCUSDT": {
+            "tiers": _tiers_to_dict(SAMPLE_TIERS) * 1000,
+            "cached_at": datetime.now(timezone.utc).isoformat(),
+        }}
+        cache_path.write_text(json.dumps(large_data))
+        # Should load successfully without CacheSizeExceededError
+        tiers = provider.load_from_cache("BTCUSDT")
+        assert tiers is not None
 
 
 class TestPathTraversalValidation:

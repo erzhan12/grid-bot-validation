@@ -25,13 +25,20 @@ def tiers_from_dict(tier_dicts: list[dict[str, str]]) -> MMTiers:
     """Deserialize MMTiers from cached list of dicts.
 
     Handles old cache files that lack ``imr_rate`` by defaulting to "0".
+
+    Raises:
+        ValueError: If any tier dict is missing required keys.
     """
-    return [
-        (
+    _REQUIRED_KEYS = {"max_value", "mmr_rate", "deduction"}
+    result = []
+    for d in tier_dicts:
+        if not _REQUIRED_KEYS.issubset(d.keys()):
+            missing = _REQUIRED_KEYS - set(d.keys())
+            raise ValueError(f"Missing required tier keys: {missing}")
+        result.append((
             Decimal(d["max_value"]),
             Decimal(d["mmr_rate"]),
             Decimal(d["deduction"]),
             Decimal(d.get("imr_rate", "0")),
-        )
-        for d in tier_dicts
-    ]
+        ))
+    return result

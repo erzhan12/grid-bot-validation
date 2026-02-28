@@ -1818,6 +1818,21 @@ Risk limit tiers determine maintenance margin (MM) and initial margin (IM) rates
 14. **_open_lock_file TOCTOU**: Uses `os.lstat()` (not `is_symlink()`) for pre-check and always validates path identity post-open via inode/device comparison, regardless of O_NOFOLLOW support.
 15. **Negative position_value**: `calc_initial_margin` logs a warning and returns zero for negative `position_value` (likely a data error).
 
+## Risk Limit Cache Format Evolution
+
+**Cache format versions** (apps/backtest/conf/risk_limits_cache.json):
+- v1 (pre-2026-02-28): `{max_value, mmr_rate, deduction}` (3 fields)
+- v2 (2026-02-28): Added `imr_rate` field (4 fields total)
+
+**Backward compatibility**: `tier_serialization.tiers_from_dict()` defaults `imr_rate="0"` for old cache entries.
+
+**Migration**: Old cache files are automatically upgraded on next write. No manual intervention needed.
+
+**Symlink Attack Prevention**: The TOCTOU defense pattern in `cache_lock.py` and `cache_validation.py`:
+1. Open with `O_NOFOLLOW` to atomically reject symlinks
+2. Post-open `fstat` vs `lstat` inode/device comparison detects symlink swaps
+This pattern should be used for all security-sensitive file operations.
+
 ## Next Steps (Future Phases)
 
 - Phase I: Deployment & Monitoring

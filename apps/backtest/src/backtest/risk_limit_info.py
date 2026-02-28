@@ -56,9 +56,12 @@ DEFAULT_ALLOWED_CACHE_ROOT = Path(__file__).parent.parent.parent.parent / "conf"
 # 10 MB is generous for typical use (~50 symbols × ~10 tiers × ~200 bytes each
 # ≈ 100 KB), but allows headroom for hundreds of symbols without triggering
 # false positives.  Configurable per-instance via constructor or env var.
+# 10 MB default allows ~50 symbols × ~10 tiers × ~200 bytes ≈ 100 KB with 100× headroom
 _DEFAULT_MAX_CACHE_SIZE_BYTES = 10_000_000
-_MIN_CACHE_SIZE_BYTES = 1_024          # 1 KB floor
-_MAX_CACHE_SIZE_BYTES_LIMIT = 100_000_000  # 100 MB ceiling
+# Minimum 1 KB prevents absurdly small limits that would break normal operation
+_MIN_CACHE_SIZE_BYTES = 1_024
+# Maximum 100 MB ceiling prevents DoS via unbounded env var configuration
+_MAX_CACHE_SIZE_BYTES_LIMIT = 100_000_000
 
 
 def _read_max_cache_size_from_env() -> int:
@@ -312,14 +315,11 @@ class RiskLimitProvider:
             if fd is None:
                 return None, None
 
-            try:
-                cache = read_cache_from_fd(fd)
-            except (json.JSONDecodeError, ValueError):
-                raise
+            cache = read_cache_from_fd(fd)
             # fd is now closed by read_cache_from_fd
 
             entry = cache.get(symbol)
-            if not isinstance(entry, dict):
+            if not isinstance(entry, dict) or not isinstance(entry.get("tiers"), list):
                 return None, None
 
             tiers = tiers_from_dict(entry.get("tiers", []))
@@ -422,8 +422,10 @@ class RiskLimitProvider:
             with os.fdopen(fd, "w") as f:
                 json.dump(cache, f, indent=2)
             temp_path.replace(self.cache_path)
-        except BaseException:
-            # Clean up temp file on any failure (including KeyboardInterrupt)
+        except Exception:
+            # Clean up temp file on failure (system-level exceptions like
+            # KeyboardInterrupt/SystemExit are intentionally not caught to
+            # avoid interfering with process shutdown)
             try:
                 temp_path.unlink(missing_ok=True)
             except OSError:
