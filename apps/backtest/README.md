@@ -105,7 +105,7 @@ Reads do not acquire file locks, so concurrent readers do not block each other o
 | 6-10 | Separate cache files recommended | Lock contention becomes measurable |
 | 10+ | Separate cache files **required** | Shared cache becomes a bottleneck |
 
-Each read-modify-write cycle involves: open lock file, `flock(LOCK_EX)`, read JSON, update entry, write JSON, release lock. With a typical cache file (~50-100 KB for 50 symbols), this takes 1-5 ms per write on SSD storage.
+Each read-modify-write cycle involves: open lock file, `flock(LOCK_EX)`, read JSON, update entry, write JSON, release lock. With a typical cache file (~50-100 KB for 50 symbols), this takes 1-5 ms per write on SSD storage. Benchmarked on SSD storage with ~50 KB cache files. Performance may vary on slower storage (e.g. NFS, HDD) or with larger cache files.
 
 ### Troubleshooting
 

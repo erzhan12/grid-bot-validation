@@ -5,8 +5,8 @@ All functions are pure (no side effects, no state) and use Decimal for precision
 """
 
 import bisect
+import functools
 import logging
-from collections import OrderedDict
 from decimal import Decimal
 from typing import Optional
 
@@ -30,8 +30,8 @@ MMTiers = list[tuple[Decimal, Decimal, Decimal, Decimal]]
 # the RiskLimitProvider with force_fetch=True and comparing against the latest API data.
 # To verify/update: use RiskLimitProvider(rest_client=client).get(symbol, force_fetch=True)
 # and compare the returned tiers against the tables below.
-# TODO: Add a CI job or monthly monitoring alert that fetches current tier data
-# from the Bybit API and compares against these hardcoded tables, flagging drift.
+# Automated drift detection: .github/workflows/risk-tier-monitor.yml runs weekly
+# and compares these tables against live API data via scripts/check_tier_drift.py.
 #
 # These hardcoded tiers are a safe fallback when API data is unavailable.
 # Bybit applies progressively higher IM/MM rates to larger position notional
@@ -99,7 +99,11 @@ def calc_unrealised_pnl(
 
 
 def calc_unrealised_pnl_pct(
-    direction: str, entry_price: Decimal, current_price: Decimal, leverage: Decimal
+    direction: str,
+    entry_price: Decimal,
+    current_price: Decimal,
+    leverage: Decimal,
+    symbol: str = "",
 ) -> Decimal:
     """Calculate unrealized PnL percentage (ROE) using standard Bybit formula.
 
@@ -112,10 +116,11 @@ def calc_unrealised_pnl_pct(
     Returns Decimal("0") if entry_price or current_price is zero.
     """
     if entry_price <= 0 or current_price <= 0:
+        label = symbol or "unknown"
         if entry_price < 0:
-            logger.warning(f"Negative entry_price for {direction}: entry={entry_price}")
+            logger.warning(f"Negative entry_price for {label} {direction}: entry={entry_price}")
         if current_price < 0:
-            logger.warning(f"Negative current_price for {direction}: current={current_price}")
+            logger.warning(f"Negative current_price for {label} {direction}: current={current_price}")
         return _ZERO
 
     if direction == "long":
@@ -139,30 +144,33 @@ def calc_position_value(size: Decimal, entry_price: Decimal) -> Decimal:
     return size * entry_price
 
 
-# Cache of pre-computed max_value lists for bisect, keyed by tier
-# boundary values: tuple(t[0] for t in tiers).  This is content-based
-# (uses Decimal values, not object identity) so identical tier lists
-# share the cache entry.  Only max_value boundaries are keyed because
-# the cached list is only used for bisect lookup, not rate lookups.
-# Bounded to _MAX_TIER_CACHE_ENTRIES entries with LRU eviction
-# (OrderedDict + move_to_end) as a defense-in-depth measure.
-# 64 entries supports ~60 actively traded symbol pairs with headroom for
-# transient entries before LRU eviction kicks in.  The value is sized to
-# exceed the number of concurrent symbols in typical production deployments
-# (see README "Performance Considerations" section for benchmarks).
+# Maximum number of distinct tier boundary signatures cached for bisect
+# lookup.  64 entries supports ~60 actively traded symbol pairs with
+# headroom for transient entries before LRU eviction kicks in.  The value
+# is sized to exceed the number of concurrent symbols in typical production
+# deployments (see README "Performance Considerations" section for benchmarks).
 _MAX_TIER_CACHE_ENTRIES = 64
-_tier_max_values_cache: OrderedDict[tuple[Decimal, ...], list[Decimal]] = OrderedDict()
+
+
+@functools.lru_cache(maxsize=_MAX_TIER_CACHE_ENTRIES)
+def _get_tier_max_values(boundaries: tuple[Decimal, ...]) -> list[Decimal]:
+    """Return a list of tier max_values suitable for ``bisect.bisect_left``.
+
+    The result is cached (LRU, maxsize=64) so that repeated calls for the
+    same tier table avoid re-creating the list.  The hardcoded tier tables
+    are warmed automatically at module load time by ``_preseed_tier_cache``.
+    """
+    return list(boundaries)
 
 
 def _preseed_tier_cache() -> None:
     """Pre-compute cache entries for hardcoded tier tables at module load time.
 
-    Avoids repeated ``tuple(t[0] for t in tiers)`` key creation on every
-    call to ``_find_matching_tier`` for the common-case hardcoded tables.
+    Avoids repeated tuple key creation on every call to
+    ``_find_matching_tier`` for the common-case hardcoded tables.
     """
     for _tiers in (MM_TIERS_BTCUSDT, MM_TIERS_ETHUSDT, MM_TIERS_DEFAULT):
-        key = tuple(t[0] for t in _tiers)
-        _tier_max_values_cache[key] = list(key)
+        _get_tier_max_values(tuple(t[0] for t in _tiers))
 
 
 _preseed_tier_cache()
@@ -181,16 +189,7 @@ def _find_matching_tier(
         or None if no tier matches (should not happen when last tier is Infinity).
     """
     cache_key = tuple(t[0] for t in tiers)
-    max_values = _tier_max_values_cache.get(cache_key)
-    if max_values is None:
-        if len(_tier_max_values_cache) >= _MAX_TIER_CACHE_ENTRIES:
-            # Evict least-recently-used entry
-            _tier_max_values_cache.popitem(last=False)
-        max_values = list(cache_key)
-        _tier_max_values_cache[cache_key] = max_values
-    else:
-        # Mark as recently used
-        _tier_max_values_cache.move_to_end(cache_key)
+    max_values = _get_tier_max_values(cache_key)
     idx = bisect.bisect_left(max_values, position_value)
     if idx < len(tiers):
         return tiers[idx]
@@ -367,12 +366,12 @@ class _TierValidator:
             except (ValueError, ArithmeticError) as e:
                 raise ValueError(f"Invalid riskLimitValue format: {max_val_str}") from e
 
-        # Fast-path: check if already sorted (avoids O(n log n) sort)
+        # Fast-path: short-circuit on first out-of-order element
         values = [_parse_limit(t) for t in api_tiers]
-        if all(values[i] <= values[i + 1] for i in range(len(values) - 1)):
-            return api_tiers
-
-        return sorted(api_tiers, key=_parse_limit)
+        for i in range(len(values) - 1):
+            if values[i] > values[i + 1]:
+                return sorted(api_tiers, key=_parse_limit)
+        return api_tiers
 
     @staticmethod
     def check_duplicate_boundaries(sorted_tiers: list[dict]) -> None:

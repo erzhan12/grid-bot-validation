@@ -695,43 +695,28 @@ class TestGetRiskLimit:
             category="inverse", symbol="BTCUSDT"
         )
 
-    def test_unexpected_structure_returns_empty_and_logs_warning(self, client, mock_session, caplog):
-        """Flat list without nested 'list' key returns empty and logs warning."""
+    def test_unexpected_structure_raises_value_error(self, client, mock_session):
+        """Flat list without nested 'list' key raises ValueError."""
         tiers = [
             {"id": 1, "symbol": "BTCUSDT", "riskLimitValue": "2000000"},
             {"id": 2, "symbol": "BTCUSDT", "riskLimitValue": "4000000"},
         ]
         mock_session.get_risk_limit.return_value = _ok_response({"list": tiers})
 
-        with caplog.at_level(logging.WARNING):
-            result = client.get_risk_limit(symbol="BTCUSDT")
+        with pytest.raises(ValueError, match="Unexpected risk limit API structure"):
+            client.get_risk_limit(symbol="BTCUSDT")
 
-        assert result == []
-        assert any(
-            "Unexpected risk limit API structure" in record.message for record in caplog.records
-        )
-
-    def test_non_list_structure_logs_warning_and_returns_empty(self, client, mock_session, caplog):
+    def test_non_list_structure_raises_value_error(self, client, mock_session):
         mock_session.get_risk_limit.return_value = _ok_response({"list": {"unexpected": "shape"}})
 
-        with caplog.at_level(logging.WARNING):
-            result = client.get_risk_limit(symbol="BTCUSDT")
+        with pytest.raises(ValueError, match="expected list but got dict"):
+            client.get_risk_limit(symbol="BTCUSDT")
 
-        assert result == []
-        assert any(
-            "expected list but got dict" in record.message for record in caplog.records
-        )
-
-    def test_non_list_inner_list_logs_warning_and_returns_empty(self, client, mock_session, caplog):
+    def test_non_list_inner_list_raises_value_error(self, client, mock_session):
         mock_session.get_risk_limit.return_value = _ok_response({"list": [{"list": "bad-inner"}]})
 
-        with caplog.at_level(logging.WARNING):
-            result = client.get_risk_limit(symbol="BTCUSDT")
-
-        assert result == []
-        assert any(
-            "inner list is str" in record.message for record in caplog.records
-        )
+        with pytest.raises(ValueError, match="inner list is str"):
+            client.get_risk_limit(symbol="BTCUSDT")
 
 
 class TestGetTransactionLogAll:

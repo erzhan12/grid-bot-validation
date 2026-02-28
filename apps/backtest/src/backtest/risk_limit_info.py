@@ -70,13 +70,19 @@ def _read_max_cache_size_from_env() -> int:
         value = int(env_val)
     except ValueError:
         logger.warning(
-            "Invalid GRIDBOT_RISK_CACHE_MAX_SIZE=%r, using default %d",
+            "Invalid GRIDBOT_RISK_CACHE_MAX_SIZE=%r (not an integer), using default %d",
             env_val, _DEFAULT_MAX_CACHE_SIZE_BYTES,
+        )
+        return _DEFAULT_MAX_CACHE_SIZE_BYTES
+    if value <= 0:
+        logger.warning(
+            "GRIDBOT_RISK_CACHE_MAX_SIZE=%d must be a positive integer, using default %d",
+            value, _DEFAULT_MAX_CACHE_SIZE_BYTES,
         )
         return _DEFAULT_MAX_CACHE_SIZE_BYTES
     if value < _MIN_CACHE_SIZE_BYTES or value > _MAX_CACHE_SIZE_BYTES_LIMIT:
         logger.warning(
-            "GRIDBOT_RISK_CACHE_MAX_SIZE=%d outside [%d, %d], using default %d",
+            "GRIDBOT_RISK_CACHE_MAX_SIZE=%d is outside safe range [%d, %d], using default %d",
             value, _MIN_CACHE_SIZE_BYTES, _MAX_CACHE_SIZE_BYTES_LIMIT,
             _DEFAULT_MAX_CACHE_SIZE_BYTES,
         )
@@ -85,6 +91,7 @@ def _read_max_cache_size_from_env() -> int:
 
 
 MAX_CACHE_SIZE_BYTES = _read_max_cache_size_from_env()
+logger.debug("Configured MAX_CACHE_SIZE_BYTES=%d", MAX_CACHE_SIZE_BYTES)
 
 
 class RiskLimitProvider:
@@ -129,6 +136,12 @@ class RiskLimitProvider:
 
       ``get()`` always returns a valid ``MMTiers`` list (API, cache,
       or hardcoded fallback) unless the provider has been closed.
+
+    Thread safety:
+      Concurrent ``get()`` calls within a single process are safe — an
+      internal ``threading.Lock`` serializes cache writes.  For
+      multi-process safety, see the *cache_path* documentation and the
+      README "Concurrent Access" section.
 
     Args:
         cache_path: Path to the JSON cache file. Resolved to an absolute
@@ -529,13 +542,13 @@ class RiskLimitProvider:
         if not self.cache_path.exists():
             return False
         try:
+            # Single try block: lstat, size check, and mtime are all
+            # subject to the same race (file deleted/replaced between
+            # calls).  Catching OSError here handles all those cases.
             cache_stat = self.cache_path.lstat()
             if self.max_cache_size_bytes and cache_stat.st_size > self.max_cache_size_bytes:
                 return False
-        except OSError:
-            return False
 
-        try:
             # Quick pre-check: if file mtime is older than TTL, skip parsing.
             # Return early before the expensive _load_existing_cache() call.
             file_mtime = datetime.fromtimestamp(
@@ -559,7 +572,7 @@ class RiskLimitProvider:
             age = datetime.now(timezone.utc) - cached_at
             return age < self.cache_ttl
 
-        except (json.JSONDecodeError, TypeError, ValueError):
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
             return False
 
     def get(self, symbol: str, force_fetch: bool = False) -> MMTiers:

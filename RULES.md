@@ -1782,9 +1782,10 @@ Risk limit tiers determine maintenance margin (MM) and initial margin (IM) rates
 - `apps/backtest/src/backtest/cache_lock.py` — In-process and cross-process locking helpers
 - `apps/backtest/src/backtest/tier_serialization.py` — MMTiers ↔ JSON dict serialization
 - `apps/backtest/src/backtest/cache_validation.py` — Symlink, size, and inode file validation
-- `packages/bybit_adapter/src/bybit_adapter/rest_client.py` — `get_risk_limit()` API call
+- `packages/bybit_adapter/src/bybit_adapter/rest_client.py` — `get_risk_limit()` API call (`_unwrap_risk_limit_response` raises `ValueError` on unexpected structure)
 - `apps/pnl_checker/src/pnl_checker/calculator.py` — Uses tiers for IM/MM calculation
 - `apps/pnl_checker/src/pnl_checker/fetcher.py` — Fetches risk limits per symbol
+- `scripts/check_tier_drift.py` — Compares hardcoded tiers against live API (weekly CI via `.github/workflows/risk-tier-monitor.yml`)
 
 ### Caching Strategy (3-Tier Fallback)
 1. **Cache** — Local JSON file, default TTL 24 hours. Stale cache is still used when API fails.

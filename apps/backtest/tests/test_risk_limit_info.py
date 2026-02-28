@@ -1488,3 +1488,66 @@ class TestCrossProcessFileLocking:
         # At least some reads should have succeeded
         successful_reads = [r for r in read_results if r is not None]
         assert len(successful_reads) > 0, "No successful reads during concurrent writes"
+
+
+class TestTierBoundaryExactMatch:
+    """Verify bisect_left behavior when position_value equals a tier max_value."""
+
+    def test_exact_boundary_matches_that_tier(self):
+        """A position_value exactly equal to a tier's max_value should
+        match *that* tier (not the next one), because bisect_left finds
+        the leftmost insertion point where max_value >= position_value."""
+        from gridcore.pnl import _find_matching_tier
+
+        tiers: MMTiers = [
+            (Decimal("2000000"), Decimal("0.005"), Decimal("0"), Decimal("0.01")),
+            (Decimal("10000000"), Decimal("0.01"), Decimal("10000"), Decimal("0.02")),
+            (Decimal("Infinity"), Decimal("0.025"), Decimal("160000"), Decimal("0.05")),
+        ]
+        # Exactly at the first tier boundary
+        tier = _find_matching_tier(Decimal("2000000"), tiers)
+        assert tier is not None
+        assert tier[0] == Decimal("2000000")
+        assert tier[1] == Decimal("0.005")
+
+    def test_one_above_boundary_matches_next_tier(self):
+        """Position value just above a tier boundary matches the next tier."""
+        from gridcore.pnl import _find_matching_tier
+
+        tiers: MMTiers = [
+            (Decimal("2000000"), Decimal("0.005"), Decimal("0"), Decimal("0.01")),
+            (Decimal("10000000"), Decimal("0.01"), Decimal("10000"), Decimal("0.02")),
+            (Decimal("Infinity"), Decimal("0.025"), Decimal("160000"), Decimal("0.05")),
+        ]
+        tier = _find_matching_tier(Decimal("2000001"), tiers)
+        assert tier is not None
+        assert tier[0] == Decimal("10000000")
+        assert tier[1] == Decimal("0.01")
+
+    def test_one_below_boundary_matches_current_tier(self):
+        """Position value just below a tier boundary matches the current tier."""
+        from gridcore.pnl import _find_matching_tier
+
+        tiers: MMTiers = [
+            (Decimal("2000000"), Decimal("0.005"), Decimal("0"), Decimal("0.01")),
+            (Decimal("10000000"), Decimal("0.01"), Decimal("10000"), Decimal("0.02")),
+            (Decimal("Infinity"), Decimal("0.025"), Decimal("160000"), Decimal("0.05")),
+        ]
+        tier = _find_matching_tier(Decimal("1999999"), tiers)
+        assert tier is not None
+        assert tier[0] == Decimal("2000000")
+        assert tier[1] == Decimal("0.005")
+
+    def test_exact_second_boundary(self):
+        """Exact match on the second tier boundary."""
+        from gridcore.pnl import _find_matching_tier
+
+        tiers: MMTiers = [
+            (Decimal("2000000"), Decimal("0.005"), Decimal("0"), Decimal("0.01")),
+            (Decimal("10000000"), Decimal("0.01"), Decimal("10000"), Decimal("0.02")),
+            (Decimal("Infinity"), Decimal("0.025"), Decimal("160000"), Decimal("0.05")),
+        ]
+        tier = _find_matching_tier(Decimal("10000000"), tiers)
+        assert tier is not None
+        assert tier[0] == Decimal("10000000")
+        assert tier[1] == Decimal("0.01")

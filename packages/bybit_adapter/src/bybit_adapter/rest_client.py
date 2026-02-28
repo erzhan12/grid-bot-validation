@@ -386,38 +386,35 @@ class BybitRestClient:
         ``"list"`` of tiers.  We extract the first symbol's inner tier list
         since the caller queries one symbol at a time.
 
-        Returns an empty list (with a log message) for any unexpected shape.
+        Returns an empty list when the symbol has no tiers (legitimate).
+        Raises ``ValueError`` when the API response structure is unexpected
+        (indicates an API format change), so the error propagates to
+        ``fetch_from_bybit`` and gets logged at the appropriate level.
         """
         outer_list = response.get("result", {}).get("list", [])
 
         if not isinstance(outer_list, list):
-            logger.warning(
-                "Unexpected risk limit API structure for %s, expected list but got %s",
-                symbol,
-                type(outer_list).__name__,
+            raise ValueError(
+                f"Unexpected risk limit API structure for {symbol}: "
+                f"expected list but got {type(outer_list).__name__}"
             )
-            return []
 
         if not outer_list:
             return []
 
         first_item = outer_list[0]
         if not isinstance(first_item, dict) or "list" not in first_item:
-            logger.warning(
-                "Unexpected risk limit API structure for %s: outer list items missing 'list' key. "
-                "Expected nested structure but got flat list. Returning empty tier list.",
-                symbol,
+            raise ValueError(
+                f"Unexpected risk limit API structure for {symbol}: "
+                f"outer list items missing 'list' key (expected nested structure)"
             )
-            return []
 
         tiers = first_item.get("list", [])
         if not isinstance(tiers, list):
-            logger.warning(
-                "Unexpected risk limit API structure for %s, inner list is %s",
-                symbol,
-                type(tiers).__name__,
+            raise ValueError(
+                f"Unexpected risk limit API structure for {symbol}: "
+                f"inner list is {type(tiers).__name__}"
             )
-            return []
 
         return tiers
 

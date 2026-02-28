@@ -257,7 +257,8 @@ class BacktestPositionTracker:
             return Decimal("0")
 
         pnl_percent = calc_unrealised_pnl_pct(
-            self.direction, self.state.avg_entry_price, current_price, leverage
+            self.direction, self.state.avg_entry_price, current_price, leverage,
+            symbol=self.symbol,
         )
         self.state.unrealized_pnl_percent = pnl_percent
         return pnl_percent

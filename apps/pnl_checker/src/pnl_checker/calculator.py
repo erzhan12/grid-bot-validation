@@ -260,8 +260,8 @@ def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> Calculation
             unrealised_last = calc_unrealised_pnl(pos.direction, pos.avg_price, last, pos.size)
 
             # Unrealized PnL % (standard formula)
-            pct_mark = calc_unrealised_pnl_pct(pos.direction, pos.avg_price, mark, pos.leverage)
-            pct_last = calc_unrealised_pnl_pct(pos.direction, pos.avg_price, last, pos.leverage)
+            pct_mark = calc_unrealised_pnl_pct(pos.direction, pos.avg_price, mark, pos.leverage, symbol=pos.symbol)
+            pct_last = calc_unrealised_pnl_pct(pos.direction, pos.avg_price, last, pos.leverage, symbol=pos.symbol)
 
             # Unrealized PnL % (Bybit standard)
             pct_bybit = Decimal("0")

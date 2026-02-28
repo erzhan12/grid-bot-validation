@@ -60,20 +60,13 @@ def release_in_process_lock(key: str) -> None:
 def open_lock_file(lock_path: Path) -> "IO[bytes]":
     """Open lock file safely; reject symlink lock paths.
 
-    Uses os.lstat() for the pre-open check (does not follow symlinks) and
-    validates path identity after open to close the TOCTOU window between
-    the symlink check and os.open().
+    Relies on ``O_NOFOLLOW`` to atomically reject symlinks at open time.
+    A post-open inode/device check closes the remaining TOCTOU window:
+    even though ``O_NOFOLLOW`` prevents *following* a symlink, an attacker
+    could swap the real file for a symlink between the ``open()`` return
+    and the first ``fstat()``.  The post-open ``lstat`` + ``fstat``
+    comparison detects this swap.
     """
-    # Pre-check: use os.lstat() which never follows symlinks (safer than is_symlink())
-    try:
-        pre_stat = os.lstat(lock_path)
-        import stat as stat_mod
-
-        if stat_mod.S_ISLNK(pre_stat.st_mode):
-            raise ValueError("Cache lock path must not be a symlink")
-    except FileNotFoundError:
-        pass  # File doesn't exist yet; os.open with O_CREAT will create it
-
     flags = os.O_RDWR | os.O_CREAT
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     if not nofollow:
@@ -95,7 +88,10 @@ def open_lock_file(lock_path: Path) -> "IO[bytes]":
         raise
 
     # Post-open validation: verify the fd points to the expected path.
-    # This closes the TOCTOU window between the pre-check and os.open().
+    # This is necessary despite O_NOFOLLOW because a symlink swap could
+    # occur between os.open() returning and this check.  Comparing the
+    # inode/device of the opened fd against lstat() of the path detects
+    # such swaps.
     try:
         path_stat = os.lstat(lock_path)
         import stat as stat_mod

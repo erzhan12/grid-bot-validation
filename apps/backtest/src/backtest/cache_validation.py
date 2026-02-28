@@ -75,7 +75,7 @@ def validate_and_open_cache_file(
         fd_stat = os.fstat(fd)
         if max_cache_size_bytes and fd_stat.st_size > max_cache_size_bytes:
             raise CacheSizeExceededError(
-                f"Cache file exceeds {max_cache_size_bytes} byte limit"
+                f"Cache file size {fd_stat.st_size} exceeds {max_cache_size_bytes} byte limit"
             )
         path_stat = os.lstat(cache_path)
         if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
