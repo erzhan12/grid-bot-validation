@@ -21,6 +21,13 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+class CacheSizeExceededError(ValueError):
+    """Raised when the cache file exceeds the configured size limit."""
+
+    pass
+
+
 # Default cache location (absolute to prevent path traversal)
 DEFAULT_CACHE_PATH = Path(__file__).parent.parent.parent.parent / "conf" / "risk_limits_cache.json"
 
@@ -83,6 +90,24 @@ class RiskLimitProvider:
 
       ``get()`` always returns a valid ``MMTiers`` list (API, cache,
       or hardcoded fallback) unless the provider has been closed.
+
+    Args:
+        cache_path: Path to the JSON cache file. Resolved to an absolute
+            canonical path at construction time. Must be within
+            *allowed_cache_root* (when set).
+        cache_ttl: Maximum age for a cached entry to be considered fresh.
+            Affects both the mtime pre-check and the per-entry ``cached_at``
+            comparison. All processes sharing a cache file should use the
+            same TTL to avoid inconsistent freshness decisions.
+        rest_client: Optional ``BybitRestClient`` for API fetching. When
+            ``None``, the provider operates in offline mode (cache and
+            hardcoded fallback only). This is the recommended setup for
+            backtests to ensure reproducibility.
+        max_cache_size_bytes: Upper bound on cache file size (bytes).
+            Files exceeding this limit are rejected with
+            ``CacheSizeExceededError``. Set to ``0`` to disable the check.
+        allowed_cache_root: Directory that *cache_path* must reside under.
+            Prevents path-traversal attacks. Set to ``None`` to disable.
 
     Example:
         from bybit_adapter.rest_client import BybitRestClient
@@ -243,7 +268,7 @@ class RiskLimitProvider:
                 # Size check on the opened fd (not the path) prevents race
                 # where file is swapped for a larger one after pre-check.
                 if self.max_cache_size_bytes and fd_stat.st_size > self.max_cache_size_bytes:
-                    raise ValueError(
+                    raise CacheSizeExceededError(
                         f"Cache file exceeds {self.max_cache_size_bytes} byte limit"
                     )
                 # Verify fd points to expected path (inode/device match).
@@ -254,7 +279,7 @@ class RiskLimitProvider:
             except OSError:
                 os.close(fd)
                 return None, None
-            except ValueError:
+            except CacheSizeExceededError:
                 os.close(fd)
                 raise
             with os.fdopen(fd, "r") as f:
@@ -273,11 +298,10 @@ class RiskLimitProvider:
 
         except json.JSONDecodeError as e:
             logger.warning(f"Corrupted cache file {self.cache_path}: {e}")
+        except CacheSizeExceededError as e:
+            logger.warning(str(e))
         except (TypeError, ValueError, KeyError, ArithmeticError) as e:
-            if str(e).startswith("Cache file exceeds"):
-                logger.warning(str(e))
-            else:
-                logger.warning(f"Invalid cache data for {symbol}: {e}")
+            logger.warning(f"Invalid cache data for {symbol}: {e}")
 
         return None, None
 
@@ -316,7 +340,7 @@ class RiskLimitProvider:
         try:
             fd_stat = os.fstat(fd)
             if self.max_cache_size_bytes and fd_stat.st_size > self.max_cache_size_bytes:
-                raise ValueError(
+                raise CacheSizeExceededError(
                     f"Cache file exceeds {self.max_cache_size_bytes} byte limit"
                 )
             path_stat = os.lstat(self.cache_path)
@@ -357,6 +381,19 @@ class RiskLimitProvider:
             json.dump(cache, f, indent=2)
 
     def _save_to_cache_impl(self, symbol: str, tiers: MMTiers) -> None:
+        """Perform the actual read-modify-write cache update.
+
+        Performance: This method reads the entire cache file, updates one
+        symbol entry, and writes the whole file back. The read-modify-write
+        cycle is serialized by both an in-process threading lock and a
+        cross-process file lock, so concurrent writers block rather than
+        corrupt. For low concurrency (1-5 processes) this is acceptable.
+        At higher concurrency, use separate cache files per process.
+
+        An early-exit optimization skips the write entirely when the
+        existing cached tiers already match the new ones (same tier list,
+        only ``cached_at`` would change).
+        """
         # Serialize same-process writers; file lock handles cross-process writers.
         with self._in_process_lock:
             self._ensure_open()
@@ -483,8 +520,10 @@ class RiskLimitProvider:
             self.save_to_cache(symbol, fetched)
             return fetched
 
-        # API failed, try cache as fallback
-        if cached is None:
+        # API failed, try cache as fallback.
+        # Only load from cache if we skipped it earlier (force_fetch=True).
+        # When force_fetch=False, cached is already set from the first load.
+        if cached is None and force_fetch:
             cached, cached_at_str = self._load_cache_entry(symbol)
         if cached:
             staleness = ""

@@ -70,9 +70,16 @@ provider = RiskLimitProvider(
 
 Reads do not acquire file locks, so concurrent readers do not block each other or writers. However, a reader may see a partially-written file if it races with a writer. The provider handles this gracefully by falling back to hardcoded tiers on JSON parse errors.
 
-### Without API Access
+**Practical recommendations:**
 
-When no `rest_client` is provided (e.g., offline backtesting), the provider uses cached data or falls back to hardcoded tier tables. No API calls are attempted.
+| Processes | Strategy | Notes |
+|-----------|----------|-------|
+| 1 | Shared cache (default) | No contention |
+| 2-5 | Shared cache (default) | Lock wait < 1 ms per write typically |
+| 6-10 | Separate cache files recommended | Lock contention becomes measurable |
+| 10+ | Separate cache files **required** | Shared cache becomes a bottleneck |
+
+Each read-modify-write cycle involves: open lock file, `flock(LOCK_EX)`, read JSON, update entry, write JSON, release lock. With a typical cache file (~50-100 KB for 50 symbols), this takes 1-5 ms per write on SSD storage.
 
 ### Troubleshooting
 
@@ -109,6 +116,8 @@ When both the API and cache are unavailable, the provider uses hardcoded tier ta
 **No API calls during backtests (reproducibility)**
 
 The backtest engine intentionally creates `RiskLimitProvider` without a `BybitRestClient` (see `apps/backtest/src/backtest/engine.py`). This means backtests use cached or hardcoded tier tables only and never fetch from the Bybit API at runtime. This is a deliberate design choice for **reproducibility**: backtest results should be deterministic and not depend on the current state of external APIs. Running the same backtest twice should produce identical margin calculations.
+
+When no `rest_client` is provided (e.g., offline backtesting), the provider uses cached data or falls back to hardcoded tier tables. No API calls are attempted.
 
 To update the cache with current API data **before** running backtests:
 

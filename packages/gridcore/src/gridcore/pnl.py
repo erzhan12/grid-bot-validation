@@ -138,9 +138,10 @@ def calc_position_value(size: Decimal, entry_price: Decimal) -> Decimal:
 
 # Cache of pre-computed max_value lists, keyed by tier content.
 # Uses content-based keys so identical tier lists share the cache entry
-# regardless of object identity.  The number of distinct tier
-# configurations is small (a handful of symbols), so unbounded growth
-# is not a practical concern.
+# regardless of object identity.  Bounded to _MAX_TIER_CACHE_ENTRIES
+# entries with LRU eviction as a defense-in-depth measure, even though
+# the number of distinct tier configurations is small in practice.
+_MAX_TIER_CACHE_ENTRIES = 64
 _tier_max_values_cache: dict[tuple[Decimal, ...], list[Decimal]] = {}
 
 
@@ -159,6 +160,9 @@ def _find_matching_tier(
     cache_key = tuple(t[0] for t in tiers)
     max_values = _tier_max_values_cache.get(cache_key)
     if max_values is None:
+        if len(_tier_max_values_cache) >= _MAX_TIER_CACHE_ENTRIES:
+            # Evict oldest entry (FIFO approximation of LRU)
+            _tier_max_values_cache.pop(next(iter(_tier_max_values_cache)))
         max_values = list(cache_key)
         _tier_max_values_cache[cache_key] = max_values
     idx = bisect.bisect_left(max_values, position_value)
@@ -197,7 +201,12 @@ def calc_initial_margin(
     if position_value == _ZERO:
         return _ZERO, _ZERO
 
-    tier_table = tiers if tiers is not None else MM_TIERS.get(symbol, MM_TIERS_DEFAULT) if symbol else MM_TIERS_DEFAULT
+    if tiers is not None:
+        tier_table = tiers
+    elif symbol:
+        tier_table = MM_TIERS.get(symbol, MM_TIERS_DEFAULT)
+    else:
+        tier_table = MM_TIERS_DEFAULT
     if tier_table is not None:
         tier = _find_matching_tier(position_value, tier_table)
         if tier is not None:

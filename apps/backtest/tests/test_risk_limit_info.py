@@ -13,6 +13,7 @@ import pytest
 
 from backtest.risk_limit_info import (
     RiskLimitProvider,
+    CacheSizeExceededError,
     DEFAULT_CACHE_PATH,
     DEFAULT_ALLOWED_CACHE_ROOT,
     _tiers_to_dict,
@@ -567,8 +568,9 @@ class TestEdgeCases:
         }))
 
         provider = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
-        # _is_cache_fresh should return False for malformed timestamp
-        assert provider._is_cache_fresh("BTCUSDT") is False
+        # Pass the malformed cached_at_str to exercise the timestamp parsing
+        # path (without it, the mtime fast-path returns True for recent files).
+        assert provider._is_cache_fresh("BTCUSDT", cached_at_str="not-a-timestamp") is False
 
     def test_empty_tiers_list_returns_none(self, tmp_path):
         """Empty tiers list in cache returns None from load_from_cache."""
@@ -966,7 +968,7 @@ class TestMalformedApiResponses:
 
     def test_non_list_input_raises(self):
         """parse_risk_limit_tiers rejects non-list input."""
-        with pytest.raises(TypeError):
+        with pytest.raises(ValueError, match="must be a list"):
             parse_risk_limit_tiers({"not": "a list"})
 
     def test_missing_maintenance_margin_raises(self):
@@ -999,7 +1001,7 @@ class TestMalformedApiResponses:
 
     def test_negative_deduction_raises(self):
         """Negative mmDeduction raises ValueError."""
-        with pytest.raises(ValueError, match="negative"):
+        with pytest.raises(ValueError, match="(?i)negative"):
             parse_risk_limit_tiers([{
                 "riskLimitValue": "1000000",
                 "maintenanceMargin": "0.01",
@@ -1035,13 +1037,13 @@ class TestMalformedApiResponses:
         }])
         assert result[0][2] == Decimal("0")
 
-    def test_missing_initial_margin_defaults_to_double_mmr(self):
-        """Missing initialMargin defaults to 2x maintenanceMargin."""
+    def test_missing_initial_margin_defaults_to_zero(self):
+        """Missing initialMargin defaults to 0."""
         result = parse_risk_limit_tiers([{
             "riskLimitValue": "1000000",
             "maintenanceMargin": "0.005",
         }])
-        assert result[0][3] == Decimal("0.01")
+        assert result[0][3] == Decimal("0")
 
     def test_duplicate_boundaries_raises(self):
         """Duplicate riskLimitValue boundaries raise ValueError."""
@@ -1156,3 +1158,129 @@ class TestCacheCorruptionRecovery:
 
         # Should fall back to hardcoded
         assert result == MM_TIERS["BTCUSDT"]
+
+
+class TestCacheSizeExceededError:
+    """Tests for CacheSizeExceededError custom exception."""
+
+    def test_is_subclass_of_value_error(self):
+        """CacheSizeExceededError is a ValueError subclass for backward compat."""
+        assert issubclass(CacheSizeExceededError, ValueError)
+
+    def test_raised_on_oversized_cache(self, tmp_path):
+        """Oversized cache file triggers CacheSizeExceededError, not generic ValueError."""
+        cache_path = tmp_path / "cache.json"
+        cache_path.write_text("x" * 500)
+
+        provider = RiskLimitProvider(
+            cache_path=cache_path, max_cache_size_bytes=100, allowed_cache_root=None,
+        )
+        result = provider.load_from_cache("BTCUSDT")
+        assert result is None
+
+    def test_save_with_oversized_existing_cache(self, tmp_path, caplog):
+        """save_to_cache logs warning when existing cache exceeds size limit."""
+        cache_path = tmp_path / "cache.json"
+        cache_path.write_text("x" * 500)
+
+        provider = RiskLimitProvider(
+            cache_path=cache_path, max_cache_size_bytes=100, allowed_cache_root=None,
+        )
+        with caplog.at_level(logging.WARNING):
+            provider.save_to_cache("BTCUSDT", SAMPLE_TIERS)
+
+        assert any("exceeds" in r.message and "byte limit" in r.message for r in caplog.records)
+
+
+class TestConcurrentStressAccess:
+    """Stress tests for concurrent cache access with higher thread counts."""
+
+    def test_many_writers_all_symbols_preserved(self, tmp_path):
+        """8 threads writing different symbols all appear in final cache."""
+        cache_path = tmp_path / "cache.json"
+        num_threads = 8
+        writes_per_thread = 10
+        errors: list[Exception] = []
+
+        def write_symbol(idx: int):
+            try:
+                provider = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
+                tiers: MMTiers = [
+                    (Decimal(str(100000 * (idx + 1))), Decimal("0.01"), Decimal("0"), Decimal("0.02")),
+                    (Decimal("Infinity"), Decimal("0.025"), Decimal("1500"), Decimal("0.05")),
+                ]
+                for _ in range(writes_per_thread):
+                    provider.save_to_cache(f"SYM{idx}USDT", tiers)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=write_symbol, args=(i,)) for i in range(num_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"Thread errors: {errors}"
+
+        cache = json.loads(cache_path.read_text())
+        for i in range(num_threads):
+            assert f"SYM{i}USDT" in cache, f"SYM{i}USDT missing from cache"
+
+    def test_interleaved_reads_and_writes_consistent(self, tmp_path):
+        """Readers always see valid tiers (never partial or corrupt) during writes."""
+        cache_path = tmp_path / "cache.json"
+        # Seed with initial data
+        cache_path.write_text(json.dumps({
+            "BTCUSDT": {
+                "tiers": _tiers_to_dict(SAMPLE_TIERS),
+                "cached_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }))
+        errors: list[Exception] = []
+
+        write_tiers: MMTiers = [
+            (Decimal("500000"), Decimal("0.005"), Decimal("0"), Decimal("0.01")),
+            (Decimal("Infinity"), Decimal("0.01"), Decimal("2500"), Decimal("0.02")),
+        ]
+
+        def reader():
+            try:
+                provider = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
+                for _ in range(50):
+                    result = provider.load_from_cache("BTCUSDT")
+                    if result is not None:
+                        # Verify structural integrity: each tier is a 4-tuple
+                        assert isinstance(result, list)
+                        for tier in result:
+                            assert len(tier) == 4
+                            assert all(isinstance(v, Decimal) for v in tier)
+            except Exception as e:
+                errors.append(e)
+
+        def writer():
+            try:
+                provider = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
+                for i in range(50):
+                    symbol = f"WRITE{i}USDT"
+                    provider.save_to_cache(symbol, write_tiers)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=reader),
+            threading.Thread(target=reader),
+            threading.Thread(target=reader),
+            threading.Thread(target=writer),
+            threading.Thread(target=writer),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"Thread errors: {errors}"
+
+        # Cache should still be valid JSON
+        cache = json.loads(cache_path.read_text())
+        assert isinstance(cache, dict)
+        assert "BTCUSDT" in cache

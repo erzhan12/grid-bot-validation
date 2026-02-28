@@ -515,23 +515,38 @@ class BybitRestClient:
         if order_link_id is not None:
             params["orderLinkId"] = order_link_id
 
+        # Bybit retCodes for orders that are already terminal or not found.
+        # Primary detection uses retCode; message text matching is a fallback
+        # in case Bybit introduces new codes we haven't catalogued yet.
+        _EXPECTED_CANCEL_CODES = {110001, 110003, 170213}
+
         try:
             response = self._session.cancel_order(**params)
-            self._check_response(response, "cancel_order")
+        except Exception as e:
+            logger.error(f"Cancel order request failed: {e}")
+            return False
+
+        ret_code = response.get("retCode", -1)
+        ret_msg = response.get("retMsg", "Unknown error")
+
+        if ret_code == 0:
             logger.info("Order cancelled successfully")
             return True
-        except Exception as e:
-            err_msg = str(e).lower()
-            # Expected: order already filled, cancelled, or not found.
-            # NOTE: Error detection relies on message text, which is fragile.
-            # If Bybit changes error wording, this may misclassify errors.
-            # Consider checking retCode instead when Bybit publishes stable
-            # error codes for these conditions.
-            if any(phrase in err_msg for phrase in ("not found", "not exist", "already filled", "already cancelled")):
-                logger.warning(f"Cancel order failed (expected): {e}")
-            else:
-                logger.error(f"Cancel order failed (unexpected): {e}")
+
+        if ret_code in _EXPECTED_CANCEL_CODES:
+            logger.warning(f"Cancel order failed (expected): [{ret_code}] {ret_msg}")
             return False
+
+        # Fallback: check message text for unknown codes
+        if any(
+            phrase in ret_msg.lower()
+            for phrase in ("not found", "not exist", "already filled", "already cancelled")
+        ):
+            logger.warning(f"Cancel order failed (expected): [{ret_code}] {ret_msg}")
+            return False
+
+        logger.error(f"Cancel order failed (unexpected): [{ret_code}] {ret_msg}")
+        return False
 
     def cancel_all_orders(self, symbol: str) -> int:
         """Cancel all open orders for a symbol.
