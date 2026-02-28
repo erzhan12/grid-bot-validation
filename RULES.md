@@ -1707,7 +1707,7 @@ This is the bbu2 pattern (bbu2-master/position.py:105). It represents what fract
 
 **Backtest gap**: The backtest engine does not integrate gridcore's `Position` risk manager. It uses `BacktestPositionTracker` (PnL only) and `GridEngine` (grid logic only). Risk-based order size multipliers are not applied in backtests.
 
-## Dynamic Risk Limit Tiers (2026-02-26)
+## Dynamic Risk Limit Tiers (Feature/dynamic risk limit tiers)
 
 Per-symbol maintenance-margin tiers are now fetched from Bybit's `/v5/market/risk-limit` API instead of relying solely on hardcoded tables. This fixed LTCUSDT MM mismatch (our DEFAULT used 1% MMR at $1M, Bybit actual is 1% at $200k).
 

@@ -92,6 +92,15 @@ class CalculationResult:
     account: AccountCalcResult | None = None
 
 
+def _safe_leverage_int(leverage: Decimal) -> int:
+    """Convert Decimal leverage to int, defaulting to 1 on conversion errors."""
+    try:
+        return int(round(leverage))
+    except (ValueError, OverflowError):
+        logger.warning("Invalid leverage value %s, defaulting to 1", leverage)
+        return 1
+
+
 def _calc_risk_multipliers(
     long_pos: PositionData | None,
     short_pos: PositionData | None,
@@ -127,7 +136,7 @@ def _calc_risk_multipliers(
         entry_price=long_pos.avg_price if long_pos else None,
         margin=_margin_ratio(long_pos),
         liquidation_price=long_pos.liq_price if long_pos else Decimal("0"),
-        leverage=int(round(long_pos.leverage)) if long_pos else 1,
+        leverage=_safe_leverage_int(long_pos.leverage) if long_pos else 1,
         position_value=long_pos.position_value if long_pos else Decimal("0"),
     )
 
@@ -137,13 +146,16 @@ def _calc_risk_multipliers(
         entry_price=short_pos.avg_price if short_pos else None,
         margin=_margin_ratio(short_pos),
         liquidation_price=short_pos.liq_price if short_pos else Decimal("0"),
-        leverage=int(round(short_pos.leverage)) if short_pos else 1,
+        leverage=_safe_leverage_int(short_pos.leverage) if short_pos else 1,
         position_value=short_pos.position_value if short_pos else Decimal("0"),
     )
 
     results = {}
 
-    # Reset only managers with open positions (matches bbu2 pattern)
+    # Reset only managers with open positions (matches bbu2 pattern).
+    # Verified: bbu2 resets multipliers before calculate_amount_multiplier()
+    # only when a position exists; skipping reset for absent positions
+    # preserves the default multiplier state (1.0).
     if long_pos:
         long_mgr.reset_amount_multiplier()
     if short_pos:

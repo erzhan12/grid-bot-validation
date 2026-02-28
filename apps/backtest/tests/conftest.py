@@ -20,8 +20,9 @@ from backtest.executor import BacktestExecutor
 def db_settings(monkeypatch):
     """In-memory SQLite settings for testing.
 
-    Clear unrelated Bybit env vars so DatabaseSettings validation stays
-    deterministic across developer environments.
+    Clear Bybit API credentials from environment to prevent test pollution.
+    DatabaseSettings validation should be deterministic and not depend on
+    local developer credentials.
     """
     for key in ("BYBIT_API_KEY", "BYBIT_API_SECRET", "bybit_api_key", "bybit_api_secret"):
         monkeypatch.delenv(key, raising=False)

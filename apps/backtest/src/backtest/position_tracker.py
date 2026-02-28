@@ -266,7 +266,9 @@ class BacktestPositionTracker:
         Returns:
             Funding payment amount (negative = paid, positive = received)
         """
-        if abs(rate) > Decimal("0.001"):
+        # Bybit funding rates regularly exceed 0.1% during volatile periods.
+        # Use 1% threshold to avoid excessive warnings.
+        if abs(rate) > Decimal("0.01"):
             logger.warning("Unusually high funding rate: %s", rate)
 
         if self.state.size == 0:

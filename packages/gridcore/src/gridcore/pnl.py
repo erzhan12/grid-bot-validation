@@ -136,9 +136,12 @@ def calc_position_value(size: Decimal, entry_price: Decimal) -> Decimal:
     return size * entry_price
 
 
-# Cache of pre-computed max_value lists, keyed by tier list identity.
-# Avoids rebuilding the list on every _find_matching_tier() call.
-_tier_max_values_cache: dict[int, list[Decimal]] = {}
+# Cache of pre-computed max_value lists, keyed by tier content.
+# Uses content-based keys so identical tier lists share the cache entry
+# regardless of object identity.  The number of distinct tier
+# configurations is small (a handful of symbols), so unbounded growth
+# is not a practical concern.
+_tier_max_values_cache: dict[tuple[Decimal, ...], list[Decimal]] = {}
 
 
 def _find_matching_tier(
@@ -153,11 +156,11 @@ def _find_matching_tier(
         The matching tier tuple (max_value, mmr_rate, deduction, imr_rate),
         or None if no tier matches (should not happen when last tier is Infinity).
     """
-    tier_id = id(tiers)
-    max_values = _tier_max_values_cache.get(tier_id)
+    cache_key = tuple(t[0] for t in tiers)
+    max_values = _tier_max_values_cache.get(cache_key)
     if max_values is None:
-        max_values = [t[0] for t in tiers]
-        _tier_max_values_cache[tier_id] = max_values
+        max_values = list(cache_key)
+        _tier_max_values_cache[cache_key] = max_values
     idx = bisect.bisect_left(max_values, position_value)
     if idx < len(tiers):
         return tiers[idx]
@@ -202,6 +205,10 @@ def calc_initial_margin(
             return position_value * imr_rate, imr_rate
 
     # Fallback: position_value / leverage
+    logger.warning(
+        "No matching tier for position_value=%s, using leverage fallback",
+        position_value,
+    )
     if leverage <= 0:
         return _ZERO, _ZERO
     imr_rate = _ONE / leverage
@@ -326,10 +333,7 @@ def _check_duplicate_boundaries(sorted_tiers: list[dict]) -> None:
     for i in range(1, len(sorted_tiers)):
         prev_val = Decimal(sorted_tiers[i - 1].get("riskLimitValue", "0"))
         curr_val = Decimal(sorted_tiers[i].get("riskLimitValue", "0"))
-        if curr_val != Decimal("Infinity") and (
-            curr_val < prev_val
-            or (curr_val - prev_val).copy_abs() < Decimal("0.01")
-        ):
+        if curr_val != Decimal("Infinity") and curr_val <= prev_val:
             raise ValueError(
                 f"Duplicate tier boundary detected: {prev_val} appears multiple times"
             )
@@ -425,9 +429,9 @@ def _validate_tier_dict(tier: dict) -> tuple[Decimal, Decimal, Decimal, Decimal]
     imr_rate = _validate_imr_rate(tier)
 
     if mmr_rate == _ZERO:
-        logger.debug("Zero MMR rate for tier riskLimitValue=%s", max_val)
+        logger.info("Zero MMR rate for tier riskLimitValue=%s", max_val)
     if imr_rate == _ZERO:
-        logger.debug("Zero IMR rate for tier riskLimitValue=%s", max_val)
+        logger.info("Zero IMR rate for tier riskLimitValue=%s", max_val)
 
     return max_val, mmr_rate, deduction, imr_rate
 

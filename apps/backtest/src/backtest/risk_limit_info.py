@@ -33,6 +33,10 @@ DEFAULT_ALLOWED_CACHE_ROOT = Path(__file__).parent.parent.parent.parent / "conf"
 # false positives.  Configurable per-instance via the constructor parameter.
 MAX_CACHE_SIZE_BYTES = 10_000_000
 
+# Lock region size for Windows msvcrt.locking (bytes).
+# Must match in both _acquire_file_lock and _release_file_lock.
+_LOCK_REGION_BYTES = 1024
+
 _IN_PROCESS_LOCKS: dict[str, tuple[threading.Lock, int]] = {}
 _IN_PROCESS_LOCKS_GUARD = threading.Lock()
 
@@ -111,6 +115,15 @@ class RiskLimitProvider:
                 raise ValueError(
                     f"Cache path {self.cache_path} is outside allowed directory {expected_root}"
                 )
+            # Ensure cache path (if it exists) is a regular file,
+            # not a device, socket, pipe, or other special file type.
+            if self.cache_path.exists():
+                import stat as stat_mod
+
+                if not stat_mod.S_ISREG(self.cache_path.lstat().st_mode):
+                    raise ValueError(
+                        f"Cache path {self.cache_path} is not a regular file"
+                    )
         self.cache_ttl = cache_ttl
         self._rest_client = rest_client
         if max_cache_size_bytes < 0:
@@ -212,10 +225,6 @@ class RiskLimitProvider:
         try:
             if not self.cache_path.exists():
                 return None, None
-            if self.max_cache_size_bytes and self.cache_path.lstat().st_size > self.max_cache_size_bytes:
-                raise ValueError(
-                    f"Cache file exceeds {self.max_cache_size_bytes} byte limit"
-                )
             # TOCTOU protection: use O_NOFOLLOW to atomically reject symlinks
             # at open time, eliminating the race window between check and open.
             flags = os.O_RDONLY
@@ -228,6 +237,26 @@ class RiskLimitProvider:
                 # O_NOFOLLOW causes OSError if path is a symlink
                 logger.warning("Cache file is a symlink or inaccessible (possible symlink swap)")
                 return None, None
+            # Post-open validation on the opened fd to close TOCTOU windows.
+            try:
+                fd_stat = os.fstat(fd)
+                # Size check on the opened fd (not the path) prevents race
+                # where file is swapped for a larger one after pre-check.
+                if self.max_cache_size_bytes and fd_stat.st_size > self.max_cache_size_bytes:
+                    raise ValueError(
+                        f"Cache file exceeds {self.max_cache_size_bytes} byte limit"
+                    )
+                # Verify fd points to expected path (inode/device match).
+                path_stat = os.lstat(self.cache_path)
+                if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+                    logger.warning("Cache file identity changed during open (possible symlink swap)")
+                    return None, None
+            except OSError:
+                os.close(fd)
+                return None, None
+            except ValueError:
+                os.close(fd)
+                raise
             with os.fdopen(fd, "r") as f:
                 cache = json.load(f)
             if not isinstance(cache, dict):
@@ -274,12 +303,30 @@ class RiskLimitProvider:
             raise ValueError("Cache path must not be a symlink")
         if not self.cache_path.exists():
             return {}
-        if self.max_cache_size_bytes and self.cache_path.lstat().st_size > self.max_cache_size_bytes:
-            raise ValueError(
-                f"Cache file exceeds {self.max_cache_size_bytes} byte limit"
-            )
+        # Use os.open with O_NOFOLLOW consistently (same pattern as
+        # _load_cache_entry) to prevent symlink following.
+        flags = os.O_RDONLY
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        if nofollow:
+            flags |= nofollow
         try:
-            with open(self.cache_path) as f:
+            fd = os.open(self.cache_path, flags)
+        except OSError:
+            raise ValueError("Cache path must not be a symlink")
+        try:
+            fd_stat = os.fstat(fd)
+            if self.max_cache_size_bytes and fd_stat.st_size > self.max_cache_size_bytes:
+                raise ValueError(
+                    f"Cache file exceeds {self.max_cache_size_bytes} byte limit"
+                )
+            path_stat = os.lstat(self.cache_path)
+            if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
+                raise ValueError("Cache file identity changed during open")
+        except (OSError, ValueError):
+            os.close(fd)
+            raise
+        try:
+            with os.fdopen(fd, "r") as f:
                 cache = json.load(f)
             if not isinstance(cache, dict):
                 logger.warning(
@@ -320,6 +367,9 @@ class RiskLimitProvider:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
 
             lock_path = self.cache_path.with_suffix(f"{self.cache_path.suffix}.lock")
+            # Verify lock file stays in same directory as validated cache path.
+            if lock_path.parent != self.cache_path.parent:
+                raise ValueError("Lock file path outside cache directory")
             lock_file = None
             try:
                 lock_file = _open_lock_file(lock_path)
@@ -374,18 +424,14 @@ class RiskLimitProvider:
             if datetime.now(timezone.utc) - file_mtime > self.cache_ttl:
                 return False
 
-            # Only parse the cache file if cached_at_str wasn't provided.
-            # Full JSON parse is acceptable here because: (1) the primary
-            # caller (get()) always passes cached_at_str from a prior
-            # _load_cache_entry() call, so this branch rarely executes;
-            # (2) a separate timestamp index file would add complexity
-            # and another file to keep in sync with the cache.
+            # When cached_at_str is not provided, the mtime pre-check above
+            # already confirmed the file was modified within TTL.  Use mtime
+            # as a sufficient freshness signal and avoid the expensive
+            # _load_existing_cache() JSON parse.  The primary caller (get())
+            # always passes cached_at_str from a prior _load_cache_entry()
+            # call, so this fast-path rarely executes.
             if cached_at_str is None:
-                cache = self._load_existing_cache()
-                entry = cache.get(symbol, {})
-                if not isinstance(entry, dict):
-                    return False
-                cached_at_str = entry.get("cached_at")
+                return True
             if not cached_at_str:
                 return False
 
@@ -554,11 +600,12 @@ def _acquire_file_lock(lock_file: IO[bytes]) -> None:
         import msvcrt
 
         lock_file.seek(0, os.SEEK_END)
-        if lock_file.tell() == 0:
-            lock_file.write(b"\0")
+        file_size = lock_file.tell()
+        if file_size < _LOCK_REGION_BYTES:
+            lock_file.write(b"\0" * (_LOCK_REGION_BYTES - file_size))
             lock_file.flush()
         lock_file.seek(0)
-        msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, _LOCK_REGION_BYTES)
     else:
         import fcntl
 
@@ -571,7 +618,7 @@ def _release_file_lock(lock_file: IO[bytes]) -> None:
         import msvcrt
 
         lock_file.seek(0)
-        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, _LOCK_REGION_BYTES)
     else:
         import fcntl
 

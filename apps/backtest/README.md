@@ -51,7 +51,7 @@ To bypass the cache and fetch fresh tiers from the API:
 tiers = provider.get("BTCUSDT", force_fetch=True)
 ```
 
-**Warning:** The default `cache_ttl` of 24 hours means tier changes on Bybit may not be reflected until the cache expires. For critical systems (live trading, production backtests), use `force_fetch=True` on startup, or immediately after Bybit announces risk limit tier changes, to ensure calculations use the latest API tiers.
+**Warning:** The default `cache_ttl` of 24 hours means tier changes on Bybit may not be reflected until the cache expires. For critical systems (live trading, production backtests), use `force_fetch=True` on startup, or immediately after Bybit announces risk limit tier changes, to ensure calculations use the latest API tiers. Note: `force_fetch=True` makes a synchronous API call and blocks until the response is received. In production, prefer scheduled cache refreshes rather than per-request force fetches.
 
 **Concurrent access:** If running multiple backtest processes simultaneously, each should use a separate cache file path. Cache writes use file locking to prevent concurrent write corruption, but separate cache files are still recommended to reduce lock contention and keep per-process cache state isolated. When sharing cache files, all processes should use the same `cache_ttl` to avoid inconsistent freshness checks. For example, Process A with `cache_ttl=1h` and Process B with `cache_ttl=24h` reading the same cache will have different views of whether a cached entry is fresh or stale.
 

@@ -522,7 +522,11 @@ class BybitRestClient:
             return True
         except Exception as e:
             err_msg = str(e).lower()
-            # Expected: order already filled, cancelled, or not found
+            # Expected: order already filled, cancelled, or not found.
+            # NOTE: Error detection relies on message text, which is fragile.
+            # If Bybit changes error wording, this may misclassify errors.
+            # Consider checking retCode instead when Bybit publishes stable
+            # error codes for these conditions.
             if any(phrase in err_msg for phrase in ("not found", "not exist", "already filled", "already cancelled")):
                 logger.warning(f"Cancel order failed (expected): {e}")
             else:
@@ -575,7 +579,11 @@ class BybitRestClient:
             max_pages: Maximum number of pages to fetch (safety limit)
 
         Returns:
-            List of open order dicts
+            List of open order dicts.  **Note:** if more orders exist than
+            ``max_pages * limit`` (default 500), results will be silently
+            truncated and a warning is logged.  Callers relying on complete
+            data should increase ``max_pages`` or check the log for
+            truncation warnings.
 
         Raises:
             Exception: If API call fails

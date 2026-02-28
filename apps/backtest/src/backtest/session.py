@@ -219,7 +219,13 @@ class BacktestSession:
         total_mm: Decimal,
         equity: Decimal,
     ) -> tuple[float, float]:
-        """Compute IMR/MMR percentages with a tiny cache for repeated ticks."""
+        """Compute IMR/MMR percentages with a tiny cache for repeated ticks.
+
+        Micro-optimization: saves ~2 Decimal divisions when inputs repeat
+        across consecutive ticks.
+        """
+        if equity == 0:
+            return (0.0, 0.0)
         inputs = (total_im, total_mm, equity)
         if self._last_margin_inputs != inputs:
             scale = Decimal("100") / equity

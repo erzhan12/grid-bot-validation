@@ -337,7 +337,7 @@ class TestMarginCalculation:
         assert tracker.state.initial_margin == Decimal("50")
         assert tracker.state.imr_rate == Decimal("0.01")
         # MM = 5000 * 0.005 - 0 = 25 (BTCUSDT tier 1: ≤2M, 0.5%)
-        assert tracker.state.maintenance_margin == Decimal("25.000")
+        assert tracker.state.maintenance_margin.normalize() == Decimal("25")
         assert tracker.state.mmr_rate == Decimal("0.005")
 
     def test_margin_zero_when_no_position(self):
