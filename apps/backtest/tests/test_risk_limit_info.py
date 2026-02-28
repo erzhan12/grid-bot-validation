@@ -1160,6 +1160,48 @@ class TestCacheCorruptionRecovery:
         assert result == MM_TIERS["BTCUSDT"]
 
 
+class TestAtomicCacheWrite:
+    """Tests for atomic cache write (temp file + rename pattern)."""
+
+    def test_cache_write_uses_temp_file_and_rename(self, tmp_path, monkeypatch):
+        """Verify save_to_cache writes to .tmp first, then renames to final path."""
+        cache_path = tmp_path / "cache.json"
+        provider = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
+
+        temp_path_seen = []
+        original_replace = Path.replace
+
+        def spy_replace(self_path, target):
+            if str(self_path).endswith(".tmp"):
+                temp_path_seen.append(str(self_path))
+            return original_replace(self_path, target)
+
+        monkeypatch.setattr(Path, "replace", spy_replace)
+        provider.save_to_cache("BTCUSDT", SAMPLE_TIERS)
+
+        assert len(temp_path_seen) == 1
+        assert temp_path_seen[0] == str(cache_path.with_suffix(".tmp"))
+        assert cache_path.exists()
+        assert not cache_path.with_suffix(".tmp").exists()
+
+    def test_temp_file_cleaned_up_on_write_failure(self, tmp_path, monkeypatch):
+        """Temp file is removed if json.dump fails mid-write."""
+        cache_path = tmp_path / "cache.json"
+        provider = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
+
+        original_dump = json.dump
+
+        def failing_dump(*args, **kwargs):
+            raise IOError("Simulated write failure")
+
+        monkeypatch.setattr(json, "dump", failing_dump)
+
+        provider.save_to_cache("BTCUSDT", SAMPLE_TIERS)
+
+        assert not cache_path.with_suffix(".tmp").exists()
+        assert not cache_path.exists()
+
+
 class TestCacheSizeExceededError:
     """Tests for CacheSizeExceededError custom exception."""
 

@@ -2,6 +2,32 @@
 
 Grid trading strategy backtester using historical market data.
 
+## Quick Start
+
+```python
+from backtest.risk_limit_info import RiskLimitProvider
+
+# Create a provider (offline mode — uses cached/hardcoded tiers)
+provider = RiskLimitProvider()
+
+# Get risk limit tiers for a symbol
+tiers = provider.get("BTCUSDT")
+
+# Each tier: (max_position_value, mmr_rate, deduction, imr_rate)
+for max_val, mmr, ded, imr in tiers:
+    print(f"  Up to {max_val}: MMR={mmr}, deduction={ded}, IMR={imr}")
+```
+
+To use live API data, provide a `BybitRestClient`:
+
+```python
+from bybit_adapter.rest_client import BybitRestClient
+
+client = BybitRestClient(api_key="...", api_secret="...", testnet=False)
+provider = RiskLimitProvider(rest_client=client)
+tiers = provider.get("BTCUSDT", force_fetch=True)
+```
+
 ## Risk Limit Tiers
 
 The backtest engine uses per-symbol maintenance-margin tier tables from Bybit to calculate accurate margin requirements. Tiers are fetched from the `/v5/market/risk-limit` API and cached locally.

@@ -9,6 +9,7 @@ import logging
 import os
 import threading
 import weakref
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -70,6 +71,9 @@ MAX_CACHE_SIZE_BYTES = _read_max_cache_size_from_env()
 
 # Lock region size for Windows msvcrt.locking (bytes).
 # Must match in both _acquire_file_lock and _release_file_lock.
+# 1 KB is sufficient: msvcrt.locking locks a byte range (not the whole
+# file), so 1024 bytes provides a wide enough region to prevent
+# overlapping partial locks while staying well within any cache file size.
 _LOCK_REGION_BYTES = 1024
 
 _IN_PROCESS_LOCKS: dict[str, tuple[threading.Lock, int]] = {}
@@ -448,6 +452,45 @@ class RiskLimitProvider:
                 pass
             raise
 
+    @contextmanager
+    def _locked_cache(self):
+        """Validate paths, acquire locks, load cache, and yield it.
+
+        Context manager that encapsulates the shared boilerplate for
+        cache write operations:
+          1. Acquires in-process threading lock
+          2. Validates provider is open and cache path is not a symlink
+          3. Ensures parent directory exists
+          4. Acquires cross-process file lock
+          5. Loads existing cache contents
+          6. Yields the cache dict for caller to modify and write
+
+        The caller is responsible for calling ``_write_cache_file(cache)``
+        inside the ``with`` block if changes were made.
+        """
+        with self._in_process_lock:
+            self._ensure_open()
+            if self._cache_path_is_symlink():
+                raise ValueError("Cache path must not be a symlink")
+
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+            lock_path = self.cache_path.with_suffix(f"{self.cache_path.suffix}.lock")
+            if lock_path.parent != self.cache_path.parent:
+                raise ValueError("Lock file path outside cache directory")
+            lock_file = None
+            try:
+                lock_file = _open_lock_file(lock_path)
+                _acquire_file_lock(lock_file)
+
+                yield self._load_existing_cache()
+            finally:
+                if lock_file is not None:
+                    try:
+                        _release_file_lock(lock_file)
+                    finally:
+                        lock_file.close()
+
     def _save_to_cache_impl(self, symbol: str, tiers: MMTiers) -> None:
         """Perform the actual read-modify-write cache update.
 
@@ -462,42 +505,16 @@ class RiskLimitProvider:
         existing cached tiers already match the new ones (same tier list,
         only ``cached_at`` would change).
         """
-        # Serialize same-process writers; file lock handles cross-process writers.
-        with self._in_process_lock:
-            self._ensure_open()
-            if self._cache_path_is_symlink():
-                raise ValueError("Cache path must not be a symlink")
+        with self._locked_cache() as cache:
+            new_tiers_dict = _tiers_to_dict(tiers)
+            if self._should_skip_cache_write(cache.get(symbol), new_tiers_dict):
+                return
 
-            # Ensure directory exists before creating lock/cache files.
-            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
-
-            lock_path = self.cache_path.with_suffix(f"{self.cache_path.suffix}.lock")
-            # Verify lock file stays in same directory as validated cache path.
-            if lock_path.parent != self.cache_path.parent:
-                raise ValueError("Lock file path outside cache directory")
-            lock_file = None
-            try:
-                lock_file = _open_lock_file(lock_path)
-                _acquire_file_lock(lock_file)
-
-                # Read-modify-write must be atomic across processes.
-                cache = self._load_existing_cache()
-
-                new_tiers_dict = _tiers_to_dict(tiers)
-                if self._should_skip_cache_write(cache.get(symbol), new_tiers_dict):
-                    return
-
-                cache[symbol] = {
-                    "tiers": new_tiers_dict,
-                    "cached_at": datetime.now(timezone.utc).isoformat(),
-                }
-                self._write_cache_file(cache)
-            finally:
-                if lock_file is not None:
-                    try:
-                        _release_file_lock(lock_file)
-                    finally:
-                        lock_file.close()
+            cache[symbol] = {
+                "tiers": new_tiers_dict,
+                "cached_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self._write_cache_file(cache)
 
         logger.info(f"Cached risk limit tiers for {symbol}")
 
@@ -507,43 +524,22 @@ class RiskLimitProvider:
         Same locking strategy as _save_to_cache_impl but updates all
         symbols in one pass, avoiding repeated file I/O.
         """
-        with self._in_process_lock:
-            self._ensure_open()
-            if self._cache_path_is_symlink():
-                raise ValueError("Cache path must not be a symlink")
+        with self._locked_cache() as cache:
+            now = datetime.now(timezone.utc).isoformat()
+            updated = False
 
-            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            for symbol, tiers in items.items():
+                new_tiers_dict = _tiers_to_dict(tiers)
+                if self._should_skip_cache_write(cache.get(symbol), new_tiers_dict):
+                    continue
+                cache[symbol] = {
+                    "tiers": new_tiers_dict,
+                    "cached_at": now,
+                }
+                updated = True
 
-            lock_path = self.cache_path.with_suffix(f"{self.cache_path.suffix}.lock")
-            if lock_path.parent != self.cache_path.parent:
-                raise ValueError("Lock file path outside cache directory")
-            lock_file = None
-            try:
-                lock_file = _open_lock_file(lock_path)
-                _acquire_file_lock(lock_file)
-
-                cache = self._load_existing_cache()
-                now = datetime.now(timezone.utc).isoformat()
-                updated = False
-
-                for symbol, tiers in items.items():
-                    new_tiers_dict = _tiers_to_dict(tiers)
-                    if self._should_skip_cache_write(cache.get(symbol), new_tiers_dict):
-                        continue
-                    cache[symbol] = {
-                        "tiers": new_tiers_dict,
-                        "cached_at": now,
-                    }
-                    updated = True
-
-                if updated:
-                    self._write_cache_file(cache)
-            finally:
-                if lock_file is not None:
-                    try:
-                        _release_file_lock(lock_file)
-                    finally:
-                        lock_file.close()
+            if updated:
+                self._write_cache_file(cache)
 
         if updated:
             logger.info(f"Cached risk limit tiers for {len(items)} symbols")
@@ -562,7 +558,8 @@ class RiskLimitProvider:
         if not self.cache_path.exists():
             return False
         try:
-            if self.max_cache_size_bytes and self.cache_path.lstat().st_size > self.max_cache_size_bytes:
+            cache_stat = self.cache_path.lstat()
+            if self.max_cache_size_bytes and cache_stat.st_size > self.max_cache_size_bytes:
                 return False
         except OSError:
             return False
@@ -571,7 +568,7 @@ class RiskLimitProvider:
             # Quick pre-check: if file mtime is older than TTL, skip parsing.
             # Return early before the expensive _load_existing_cache() call.
             file_mtime = datetime.fromtimestamp(
-                self.cache_path.lstat().st_mtime, tz=timezone.utc
+                cache_stat.st_mtime, tz=timezone.utc
             )
             if datetime.now(timezone.utc) - file_mtime > self.cache_ttl:
                 return False
