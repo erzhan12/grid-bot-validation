@@ -1326,3 +1326,165 @@ class TestConcurrentStressAccess:
         cache = json.loads(cache_path.read_text())
         assert isinstance(cache, dict)
         assert "BTCUSDT" in cache
+
+
+class TestCrossProcessFileLocking:
+    """Tests that verify file locking works correctly when multiple
+    threads (simulating concurrent processes) attempt simultaneous writes.
+
+    These tests go beyond the existing single-process scenarios to
+    validate the cross-process locking that is critical for production
+    use, where multiple backtest workers may share a single cache file.
+    """
+
+    def test_concurrent_writes_same_symbol_no_corruption(self, tmp_path):
+        """Multiple threads writing the same symbol never produce corrupt JSON."""
+        cache_path = tmp_path / "cache.json"
+        num_threads = 6
+        iterations = 20
+        errors: list[Exception] = []
+
+        def writer(thread_id: int):
+            try:
+                provider = RiskLimitProvider(
+                    cache_path=cache_path, allowed_cache_root=None,
+                )
+                for i in range(iterations):
+                    tiers: MMTiers = [
+                        (
+                            Decimal(str(100000 * (thread_id + 1) * (i + 1))),
+                            Decimal("0.01"),
+                            Decimal("0"),
+                            Decimal("0.02"),
+                        ),
+                        (Decimal("Infinity"), Decimal("0.05"), Decimal("5000"), Decimal("0.1")),
+                    ]
+                    provider.save_to_cache("BTCUSDT", tiers)
+                provider.close()
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=writer, args=(i,))
+            for i in range(num_threads)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"Thread errors: {errors}"
+
+        # File must be valid JSON with the expected structure
+        cache = json.loads(cache_path.read_text())
+        assert "BTCUSDT" in cache
+        entry = cache["BTCUSDT"]
+        assert isinstance(entry["tiers"], list)
+        assert len(entry["tiers"]) == 2
+        assert "cached_at" in entry
+
+    def test_concurrent_batch_writes_all_symbols_survive(self, tmp_path):
+        """Concurrent save_multiple_to_cache calls preserve all symbols."""
+        cache_path = tmp_path / "cache.json"
+        num_threads = 4
+        symbols_per_thread = 5
+        errors: list[Exception] = []
+
+        def batch_writer(thread_id: int):
+            try:
+                provider = RiskLimitProvider(
+                    cache_path=cache_path, allowed_cache_root=None,
+                )
+                items: dict[str, MMTiers] = {}
+                for j in range(symbols_per_thread):
+                    symbol = f"T{thread_id}S{j}USDT"
+                    items[symbol] = [
+                        (Decimal("500000"), Decimal("0.005"), Decimal("0"), Decimal("0.01")),
+                        (Decimal("Infinity"), Decimal("0.01"), Decimal("500"), Decimal("0.02")),
+                    ]
+                provider.save_multiple_to_cache(items)
+                provider.close()
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=batch_writer, args=(i,))
+            for i in range(num_threads)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"Thread errors: {errors}"
+
+        cache = json.loads(cache_path.read_text())
+        for tid in range(num_threads):
+            for sid in range(symbols_per_thread):
+                symbol = f"T{tid}S{sid}USDT"
+                assert symbol in cache, f"{symbol} missing after concurrent batch writes"
+
+    def test_reader_during_heavy_writes_never_crashes(self, tmp_path):
+        """Readers get valid data or None — never an exception — while
+        writers are actively modifying the cache file."""
+        cache_path = tmp_path / "cache.json"
+        # Seed cache so readers have something to find
+        cache_path.write_text(json.dumps({
+            "BTCUSDT": {
+                "tiers": _tiers_to_dict(SAMPLE_TIERS),
+                "cached_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }))
+
+        read_results: list[object] = []
+        errors: list[Exception] = []
+
+        def reader():
+            try:
+                provider = RiskLimitProvider(
+                    cache_path=cache_path, allowed_cache_root=None,
+                )
+                for _ in range(100):
+                    result = provider.load_from_cache("BTCUSDT")
+                    if result is not None:
+                        # Structural integrity: 4-tuple Decimals
+                        for tier in result:
+                            assert len(tier) == 4
+                            assert all(isinstance(v, Decimal) for v in tier)
+                    read_results.append(result)
+                provider.close()
+            except Exception as e:
+                errors.append(e)
+
+        def writer():
+            try:
+                provider = RiskLimitProvider(
+                    cache_path=cache_path, allowed_cache_root=None,
+                )
+                for i in range(100):
+                    tiers: MMTiers = [
+                        (Decimal(str(100000 * (i + 1))), Decimal("0.01"), Decimal("0"), Decimal("0.02")),
+                        (Decimal("Infinity"), Decimal("0.025"), Decimal("1500"), Decimal("0.05")),
+                    ]
+                    provider.save_to_cache(f"W{i}USDT", tiers)
+                provider.close()
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=reader),
+            threading.Thread(target=reader),
+            threading.Thread(target=reader),
+            threading.Thread(target=reader),
+            threading.Thread(target=writer),
+            threading.Thread(target=writer),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"Thread errors: {errors}"
+        # At least some reads should have succeeded
+        successful_reads = [r for r in read_results if r is not None]
+        assert len(successful_reads) > 0, "No successful reads during concurrent writes"

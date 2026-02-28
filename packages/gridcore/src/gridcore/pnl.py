@@ -30,6 +30,8 @@ MMTiers = list[tuple[Decimal, Decimal, Decimal, Decimal]]
 # the RiskLimitProvider with force_fetch=True and comparing against the latest API data.
 # To verify/update: use RiskLimitProvider(rest_client=client).get(symbol, force_fetch=True)
 # and compare the returned tiers against the tables below.
+# TODO: Add a CI job or monthly monitoring alert that fetches current tier data
+# from the Bybit API and compares against these hardcoded tables, flagging drift.
 #
 # These hardcoded tiers are a safe fallback when API data is unavailable.
 # Bybit applies progressively higher IM/MM rates to larger position notional
@@ -144,10 +146,26 @@ def calc_position_value(size: Decimal, entry_price: Decimal) -> Decimal:
 # the cached list is only used for bisect lookup, not rate lookups.
 # Bounded to _MAX_TIER_CACHE_ENTRIES entries with LRU eviction
 # (OrderedDict + move_to_end) as a defense-in-depth measure.
-# 64 supports ~60 actively traded symbol pairs with headroom for
-# transient entries before LRU eviction kicks in.
+# 64 entries supports ~60 actively traded symbol pairs with headroom for
+# transient entries before LRU eviction kicks in.  The value is sized to
+# exceed the number of concurrent symbols in typical production deployments
+# (see README "Performance Considerations" section for benchmarks).
 _MAX_TIER_CACHE_ENTRIES = 64
 _tier_max_values_cache: OrderedDict[tuple[Decimal, ...], list[Decimal]] = OrderedDict()
+
+
+def _preseed_tier_cache() -> None:
+    """Pre-compute cache entries for hardcoded tier tables at module load time.
+
+    Avoids repeated ``tuple(t[0] for t in tiers)`` key creation on every
+    call to ``_find_matching_tier`` for the common-case hardcoded tables.
+    """
+    for _tiers in (MM_TIERS_BTCUSDT, MM_TIERS_ETHUSDT, MM_TIERS_DEFAULT):
+        key = tuple(t[0] for t in _tiers)
+        _tier_max_values_cache[key] = list(key)
+
+
+_preseed_tier_cache()
 
 
 def _find_matching_tier(
@@ -515,6 +533,8 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
         raise ValueError("api_tiers must be a list")
     if not api_tiers:
         raise ValueError("api_tiers must not be empty")
+    if not all(isinstance(t, dict) for t in api_tiers):
+        raise ValueError("api_tiers must contain dict objects")
 
     sorted_tiers = _TierValidator.sort(api_tiers)
     _TierValidator.check_duplicate_boundaries(sorted_tiers)

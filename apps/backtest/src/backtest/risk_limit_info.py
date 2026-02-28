@@ -2,6 +2,11 @@
 
 Fetches per-symbol maintenance-margin tiers from Bybit API, caches locally.
 Falls back to cache or hardcoded tiers if network unavailable.
+
+Implementation is split across focused modules:
+  - ``cache_lock`` — in-process and cross-process locking.
+  - ``tier_serialization`` — MMTiers ↔ JSON dict conversion.
+  - ``cache_validation`` — symlink / size / inode file checks.
 """
 
 import json
@@ -11,11 +16,25 @@ import threading
 import weakref
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
 from pathlib import Path
-from typing import IO, TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional
 
 from gridcore.pnl import MMTiers, MM_TIERS, MM_TIERS_DEFAULT, parse_risk_limit_tiers
+
+from backtest.cache_lock import (
+    acquire_in_process_lock,
+    release_in_process_lock,
+    open_lock_file,
+    acquire_file_lock,
+    release_file_lock,
+)
+from backtest.cache_validation import (
+    CacheSizeExceededError,
+    cache_path_is_symlink,
+    validate_and_open_cache_file,
+    read_cache_from_fd,
+)
+from backtest.tier_serialization import tiers_to_dict, tiers_from_dict
 
 if TYPE_CHECKING:
     from bybit_adapter.rest_client import BybitRestClient
@@ -23,10 +42,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class CacheSizeExceededError(ValueError):
-    """Raised when the cache file exceeds the configured size limit."""
-
-    pass
+# Re-export CacheSizeExceededError so existing imports keep working.
+__all__ = ["CacheSizeExceededError", "RiskLimitProvider"]
 
 
 # Default cache location (absolute to prevent path traversal)
@@ -68,16 +85,6 @@ def _read_max_cache_size_from_env() -> int:
 
 
 MAX_CACHE_SIZE_BYTES = _read_max_cache_size_from_env()
-
-# Lock region size for Windows msvcrt.locking (bytes).
-# Must match in both _acquire_file_lock and _release_file_lock.
-# 1 KB is sufficient: msvcrt.locking locks a byte range (not the whole
-# file), so 1024 bytes provides a wide enough region to prevent
-# overlapping partial locks while staying well within any cache file size.
-_LOCK_REGION_BYTES = 1024
-
-_IN_PROCESS_LOCKS: dict[str, tuple[threading.Lock, int]] = {}
-_IN_PROCESS_LOCKS_GUARD = threading.Lock()
 
 
 class RiskLimitProvider:
@@ -189,14 +196,16 @@ class RiskLimitProvider:
                 "Set to 0 to disable size limit checks (allows unlimited cache file size)."
             )
         self.max_cache_size_bytes = max_cache_size_bytes
-        self._in_process_lock_key, self._in_process_lock = _acquire_in_process_lock(
+        self._in_process_lock_key, self._in_process_lock = acquire_in_process_lock(
             self.cache_path
         )
         self._closed = False
+        # Guard concurrent access to _no_client_warned across threads.
+        self._warn_lock = threading.Lock()
         self._no_client_warned = False
         # Deterministic cleanup without relying on __del__ timing.
         self._lock_finalizer = weakref.finalize(
-            self, _release_in_process_lock, self._in_process_lock_key
+            self, release_in_process_lock, self._in_process_lock_key
         )
 
     def close(self) -> None:
@@ -213,12 +222,7 @@ class RiskLimitProvider:
             raise RuntimeError("RiskLimitProvider is closed")
 
     def _cache_path_is_symlink(self) -> bool:
-        # Check both the original configured path (absolute, not resolved) and
-        # the resolved path to detect symlinks in any parent directory component.
-        # Example: configured=/project/conf/cache.json where conf/ is a symlink
-        # → _configured_cache_path.is_symlink() catches the parent symlink,
-        #   while cache_path (resolved) would show the real target.
-        return self._configured_cache_path.is_symlink() or self.cache_path.is_symlink()
+        return cache_path_is_symlink(self._configured_cache_path, self.cache_path)
 
     def fetch_from_bybit(self, symbol: str) -> Optional[MMTiers]:
         """Fetch risk limit tiers from Bybit API via BybitRestClient.
@@ -234,31 +238,42 @@ class RiskLimitProvider:
         """
         self._ensure_open()
         if self._rest_client is None:
-            if not self._no_client_warned:
-                logger.warning(
-                    "No rest_client configured — calculations may use stale or "
-                    "hardcoded tier data. Provide a BybitRestClient for live data."
-                )
-                self._no_client_warned = True
+            with self._warn_lock:
+                if not self._no_client_warned:
+                    logger.warning(
+                        "No rest_client configured — calculations may use stale or "
+                        "hardcoded tier data. Provide a BybitRestClient for live data."
+                    )
+                    self._no_client_warned = True
             return None
 
         logger.debug(
             f"Fetching risk limit tiers for {symbol} via rest_client "
             f"(type={type(self._rest_client).__name__})"
         )
+
+        # --- Network call: catch only transport-level errors ---
         try:
             raw_tiers = self._rest_client.get_risk_limit(symbol=symbol)
-            if not raw_tiers:
-                logger.warning(f"No risk limit tiers returned for {symbol}")
-                return None
-
-            tiers = parse_risk_limit_tiers(raw_tiers)
-            logger.info(f"Fetched {len(tiers)} risk limit tiers for {symbol}")
-            return tiers
-
-        except (ConnectionError, TimeoutError, ValueError, KeyError, ArithmeticError) as e:
-            logger.warning(f"Error fetching risk limit tiers: {e}")
+        except (ConnectionError, TimeoutError) as e:
+            logger.warning(f"Network error fetching risk limit tiers for {symbol}: {e}")
             return None
+
+        if not raw_tiers:
+            logger.warning(f"No risk limit tiers returned for {symbol}")
+            return None
+
+        # --- Data validation: catch only parsing / value errors ---
+        try:
+            tiers = parse_risk_limit_tiers(raw_tiers)
+        except (ValueError, KeyError, ArithmeticError) as e:
+            logger.warning(
+                f"Data validation error parsing risk limit tiers for {symbol}: {e}"
+            )
+            return None
+
+        logger.info(f"Fetched {len(tiers)} risk limit tiers for {symbol}")
+        return tiers
 
     def load_from_cache(self, symbol: str) -> Optional[MMTiers]:
         """Load risk limit tiers from local cache.
@@ -280,67 +295,32 @@ class RiskLimitProvider:
             return None, None
 
         try:
-            if not self.cache_path.exists():
+            fd = validate_and_open_cache_file(self.cache_path, self.max_cache_size_bytes)
+            if fd is None:
                 return None, None
-            # TOCTOU protection: use O_NOFOLLOW to atomically reject symlinks
-            # at open time, eliminating the race window between check and open.
-            flags = os.O_RDONLY
-            nofollow = getattr(os, "O_NOFOLLOW", 0)
-            if not nofollow:
-                raise NotImplementedError(
-                    "os.O_NOFOLLOW is not available on this platform; "
-                    "symlink protection for cache files is disabled"
-                )
-            flags |= nofollow
+
             try:
-                fd = os.open(self.cache_path, flags)
-            except OSError:
-                # O_NOFOLLOW causes OSError if path is a symlink
-                logger.warning("Cache file is a symlink or inaccessible (possible symlink swap)")
-                return None, None
-            # Post-open validation and reading on the opened fd to close
-            # TOCTOU windows.  The fdopen is inside the try block so the fd
-            # is always closed on any failure path.
-            try:
-                fd_stat = os.fstat(fd)
-                # Size check on the opened fd (not the path) prevents race
-                # where file is swapped for a larger one after pre-check.
-                if self.max_cache_size_bytes and fd_stat.st_size > self.max_cache_size_bytes:
-                    raise CacheSizeExceededError(
-                        f"Cache file exceeds {self.max_cache_size_bytes} byte limit"
-                    )
-                # Verify fd points to expected path (inode/device match).
-                path_stat = os.lstat(self.cache_path)
-                if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
-                    logger.warning("Cache file identity changed during open (possible symlink swap)")
-                    return None, None
-                with os.fdopen(fd, "r") as f:
-                    cache = json.load(f)
-                # fd is now owned by the file object and closed by `with`
-                fd = -1
-            except CacheSizeExceededError:
+                cache = read_cache_from_fd(fd)
+            except (json.JSONDecodeError, ValueError):
                 raise
-            except OSError:
-                return None, None
-            finally:
-                if fd >= 0:
-                    os.close(fd)
-            if not isinstance(cache, dict):
-                raise ValueError("Cache root must be a JSON object")
+            # fd is now closed by read_cache_from_fd
 
             entry = cache.get(symbol)
             if not isinstance(entry, dict):
                 return None, None
 
-            tiers = _tiers_from_dict(entry.get("tiers", []))
+            tiers = tiers_from_dict(entry.get("tiers", []))
             cached_at = entry.get("cached_at")
             cached_at_str = cached_at if isinstance(cached_at, str) else None
             return (tiers if tiers else None), cached_at_str
 
-        except json.JSONDecodeError as e:
-            logger.warning(f"Corrupted cache file {self.cache_path}: {e}")
         except CacheSizeExceededError as e:
             logger.warning(str(e))
+        except OSError:
+            # O_NOFOLLOW causes OSError if path is a symlink
+            logger.warning("Cache file is a symlink or inaccessible (possible symlink swap)")
+        except json.JSONDecodeError as e:
+            logger.warning(f"Corrupted cache file {self.cache_path}: {e}")
         except (TypeError, ValueError, KeyError, ArithmeticError) as e:
             logger.warning(f"Invalid cache data for {symbol}: {e}")
 
@@ -383,40 +363,22 @@ class RiskLimitProvider:
         """Load and return existing cache contents, or empty dict on failure."""
         if self._cache_path_is_symlink():
             raise ValueError("Cache path must not be a symlink")
-        if not self.cache_path.exists():
-            return {}
-        # Use os.open with O_NOFOLLOW consistently (same pattern as
-        # _load_cache_entry) to prevent symlink following.
-        flags = os.O_RDONLY
-        nofollow = getattr(os, "O_NOFOLLOW", 0)
-        if nofollow:
-            flags |= nofollow
+
         try:
-            fd = os.open(self.cache_path, flags)
+            fd = validate_and_open_cache_file(self.cache_path, self.max_cache_size_bytes)
         except OSError:
             raise ValueError("Cache path must not be a symlink")
+
+        if fd is None:
+            return {}
+
         try:
-            fd_stat = os.fstat(fd)
-            if self.max_cache_size_bytes and fd_stat.st_size > self.max_cache_size_bytes:
-                raise CacheSizeExceededError(
-                    f"Cache file exceeds {self.max_cache_size_bytes} byte limit"
-                )
-            path_stat = os.lstat(self.cache_path)
-            if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
-                raise ValueError("Cache file identity changed during open")
-        except (OSError, ValueError):
-            os.close(fd)
-            raise
-        try:
-            with os.fdopen(fd, "r") as f:
-                cache = json.load(f)
-            if not isinstance(cache, dict):
-                logger.warning(
-                    f"Invalid cache root in {self.cache_path}: expected JSON object, got "
-                    f"{type(cache).__name__}; overwriting"
-                )
-                return {}
-            return cache
+            return read_cache_from_fd(fd)
+        except ValueError:
+            logger.warning(
+                f"Invalid cache root in {self.cache_path}: expected JSON object; overwriting"
+            )
+            return {}
         except (json.JSONDecodeError, ValueError) as e:
             logger.warning(f"Corrupted cache file {self.cache_path}, overwriting: {e}")
             return {}
@@ -438,10 +400,13 @@ class RiskLimitProvider:
 
         Writes to a temporary file first, then renames to the target path.
         This prevents cache corruption if the process crashes mid-write.
+        File permissions are set to 0o600 (owner-only read/write) to
+        prevent other users from reading potentially sensitive tier data.
         """
         temp_path = self.cache_path.with_suffix(".tmp")
         try:
-            with open(temp_path, "w") as f:
+            fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
                 json.dump(cache, f, indent=2)
             temp_path.replace(self.cache_path)
         except BaseException:
@@ -480,33 +445,39 @@ class RiskLimitProvider:
                 raise ValueError("Lock file path outside cache directory")
             lock_file = None
             try:
-                lock_file = _open_lock_file(lock_path)
-                _acquire_file_lock(lock_file)
+                lock_file = open_lock_file(lock_path)
+                acquire_file_lock(lock_file)
 
                 yield self._load_existing_cache()
             finally:
                 if lock_file is not None:
                     try:
-                        _release_file_lock(lock_file)
+                        release_file_lock(lock_file)
                     finally:
                         lock_file.close()
 
     def _save_to_cache_impl(self, symbol: str, tiers: MMTiers) -> None:
         """Perform the actual read-modify-write cache update.
 
-        Performance: This method reads the entire cache file, updates one
-        symbol entry, and writes the whole file back. The read-modify-write
-        cycle is serialized by both an in-process threading lock and a
-        cross-process file lock, so concurrent writers block rather than
-        corrupt. For low concurrency (1-5 processes) this is acceptable.
-        At higher concurrency, use separate cache files per process.
+        Performance note: This method reads the entire cache file, updates
+        one symbol entry, and writes the whole file back.  The
+        read-modify-write cycle is serialized by both an in-process
+        threading lock and a cross-process file lock, so concurrent
+        writers block rather than corrupt.  For low concurrency (1-5
+        processes) this is acceptable (~1-5 ms per write).  At higher
+        concurrency, use separate cache files per process — see the
+        README "Concurrent Access" section for benchmarks.
+
+        Hint: When updating many symbols at once, prefer
+        ``save_multiple_to_cache()`` which batches all updates into a
+        single read-modify-write pass.
 
         An early-exit optimization skips the write entirely when the
         existing cached tiers already match the new ones (same tier list,
         only ``cached_at`` would change).
         """
         with self._locked_cache() as cache:
-            new_tiers_dict = _tiers_to_dict(tiers)
+            new_tiers_dict = tiers_to_dict(tiers)
             if self._should_skip_cache_write(cache.get(symbol), new_tiers_dict):
                 return
 
@@ -529,7 +500,7 @@ class RiskLimitProvider:
             updated = False
 
             for symbol, tiers in items.items():
-                new_tiers_dict = _tiers_to_dict(tiers)
+                new_tiers_dict = tiers_to_dict(tiers)
                 if self._should_skip_cache_write(cache.get(symbol), new_tiers_dict):
                     continue
                 cache[symbol] = {
@@ -656,141 +627,15 @@ class RiskLimitProvider:
         return MM_TIERS.get(symbol, MM_TIERS_DEFAULT)
 
 
-def _tiers_to_dict(tiers: MMTiers) -> list[dict[str, str]]:
-    """Serialize MMTiers to JSON-compatible list of dicts."""
-    return [
-        {
-            "max_value": str(max_val),
-            "mmr_rate": str(mmr_rate),
-            "deduction": str(deduction),
-            "imr_rate": str(imr_rate),
-        }
-        for max_val, mmr_rate, deduction, imr_rate in tiers
-    ]
-
-
-def _acquire_in_process_lock(path: Path) -> tuple[str, threading.Lock]:
-    key = str(path)
-    with _IN_PROCESS_LOCKS_GUARD:
-        entry = _IN_PROCESS_LOCKS.get(key)
-        if entry is None:
-            lock = threading.Lock()
-            _IN_PROCESS_LOCKS[key] = (lock, 1)
-        else:
-            lock, ref_count = entry
-            _IN_PROCESS_LOCKS[key] = (lock, ref_count + 1)
-    return key, lock
-
-
-def _release_in_process_lock(key: str) -> None:
-    with _IN_PROCESS_LOCKS_GUARD:
-        entry = _IN_PROCESS_LOCKS.get(key)
-        if entry is None:
-            return
-        lock, ref_count = entry
-        if ref_count <= 1:
-            del _IN_PROCESS_LOCKS[key]
-        else:
-            _IN_PROCESS_LOCKS[key] = (lock, ref_count - 1)
-
-
-def _open_lock_file(lock_path: Path) -> "IO[bytes]":
-    """Open lock file safely; reject symlink lock paths.
-
-    Uses os.lstat() for the pre-open check (does not follow symlinks) and
-    validates path identity after open to close the TOCTOU window between
-    the symlink check and os.open().
-    """
-    # Pre-check: use os.lstat() which never follows symlinks (safer than is_symlink())
-    try:
-        pre_stat = os.lstat(lock_path)
-        import stat as stat_mod
-
-        if stat_mod.S_ISLNK(pre_stat.st_mode):
-            raise ValueError("Cache lock path must not be a symlink")
-    except FileNotFoundError:
-        pass  # File doesn't exist yet; os.open with O_CREAT will create it
-
-    flags = os.O_RDWR | os.O_CREAT
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    if not nofollow:
-        raise NotImplementedError(
-            "os.O_NOFOLLOW is not available on this platform; "
-            "symlink protection for cache lock files is disabled"
-        )
-    flags |= nofollow
-
-    try:
-        fd = os.open(lock_path, flags, 0o600)
-    except OSError as e:
-        # On platforms with O_NOFOLLOW, opening a symlink raises OSError
-        try:
-            if os.lstat(lock_path).st_mode & 0o170000 == 0o120000:  # S_IFLNK
-                raise ValueError("Cache lock path must not be a symlink") from e
-        except FileNotFoundError:
-            pass
-        raise
-
-    # Post-open validation: verify the fd points to the expected path.
-    # This closes the TOCTOU window between the pre-check and os.open().
-    try:
-        path_stat = os.lstat(lock_path)
-        import stat as stat_mod
-
-        if stat_mod.S_ISLNK(path_stat.st_mode):
-            raise ValueError("Cache lock path must not be a symlink")
-        fd_stat = os.fstat(fd)
-        if (path_stat.st_dev, path_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):
-            raise ValueError("Cache lock path changed during open")
-    except (OSError, ValueError):
-        os.close(fd)
-        raise
-
-    return os.fdopen(fd, "a+b")
-
-
-def _acquire_file_lock(lock_file: IO[bytes]) -> None:
-    """Acquire an exclusive lock for cache read-modify-write operations."""
-    if os.name == "nt":
-        import msvcrt
-
-        lock_file.seek(0, os.SEEK_END)
-        file_size = lock_file.tell()
-        if file_size < _LOCK_REGION_BYTES:
-            lock_file.write(b"\0" * (_LOCK_REGION_BYTES - file_size))
-            lock_file.flush()
-        lock_file.seek(0)
-        msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, _LOCK_REGION_BYTES)
-    else:
-        import fcntl
-
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-
-
-def _release_file_lock(lock_file: IO[bytes]) -> None:
-    """Release the cache file lock."""
-    if os.name == "nt":
-        import msvcrt
-
-        lock_file.seek(0)
-        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, _LOCK_REGION_BYTES)
-    else:
-        import fcntl
-
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-
-
-def _tiers_from_dict(tier_dicts: list[dict[str, str]]) -> MMTiers:
-    """Deserialize MMTiers from cached list of dicts.
-
-    Handles old cache files that lack ``imr_rate`` by defaulting to "0".
-    """
-    return [
-        (
-            Decimal(d["max_value"]),
-            Decimal(d["mmr_rate"]),
-            Decimal(d["deduction"]),
-            Decimal(d.get("imr_rate", "0")),
-        )
-        for d in tier_dicts
-    ]
+# ---------------------------------------------------------------------------
+# Backward-compatible aliases for private helpers used by tests.
+# These delegate to the extracted modules so existing test imports
+# (e.g. ``from backtest.risk_limit_info import _tiers_to_dict``) keep working.
+# ---------------------------------------------------------------------------
+_tiers_to_dict = tiers_to_dict
+_tiers_from_dict = tiers_from_dict
+_acquire_in_process_lock = acquire_in_process_lock
+_release_in_process_lock = release_in_process_lock
+_open_lock_file = open_lock_file
+_acquire_file_lock = acquire_file_lock
+_release_file_lock = release_file_lock

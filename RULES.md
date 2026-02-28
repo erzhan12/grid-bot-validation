@@ -1778,7 +1778,10 @@ Risk limit tiers determine maintenance margin (MM) and initial margin (IM) rates
 
 ### Files Involved
 - `packages/gridcore/src/gridcore/pnl.py` — `MMTiers` type, hardcoded fallback tiers (`MM_TIERS_BTCUSDT`, etc.), `parse_risk_limit_tiers()`, `calc_maintenance_margin()`, `calc_initial_margin()`
-- `apps/backtest/src/backtest/risk_limit_info.py` — `RiskLimitProvider` class (fetch, cache, fallback)
+- `apps/backtest/src/backtest/risk_limit_info.py` — `RiskLimitProvider` orchestrator (fetch, cache, fallback)
+- `apps/backtest/src/backtest/cache_lock.py` — In-process and cross-process locking helpers
+- `apps/backtest/src/backtest/tier_serialization.py` — MMTiers ↔ JSON dict serialization
+- `apps/backtest/src/backtest/cache_validation.py` — Symlink, size, and inode file validation
 - `packages/bybit_adapter/src/bybit_adapter/rest_client.py` — `get_risk_limit()` API call
 - `apps/pnl_checker/src/pnl_checker/calculator.py` — Uses tiers for IM/MM calculation
 - `apps/pnl_checker/src/pnl_checker/fetcher.py` — Fetches risk limits per symbol

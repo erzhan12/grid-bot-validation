@@ -172,9 +172,29 @@ The backtest engine supports dynamic risk limit tiers fetched from the Bybit `/v
 3. **Cache**: Parsed tiers are saved to a local JSON file (`conf/risk_limits_cache.json` by default) with a timestamp for TTL-based freshness checks.
 4. **Fallback**: If the API is unreachable, stale cached tiers are used. If no cache exists, hardcoded tier tables from `gridcore.pnl.MM_TIERS` serve as the final fallback.
 
+### Security
+
+Cache files may contain tier data fetched from production APIs and should be
+treated as sensitive in multi-user environments:
+
+- **File permissions** — Cache and lock files are created with mode `0o600`
+  (owner-only read/write). Do not weaken these permissions.
+- **Shared directories** — Avoid storing cache files in world-readable
+  directories (e.g. `/tmp`). Prefer a project-local `conf/` directory or a
+  user-owned path.
+- **Symlink protection** — The provider rejects symlinks for both cache and
+  lock file paths (`O_NOFOLLOW` + inode verification). This prevents symlink
+  attacks that redirect cache reads/writes to unintended locations.
+- **Path traversal** — The `allowed_cache_root` parameter (set by default to
+  `conf/`) restricts cache file placement. It should not be set to `None` in
+  production.
+
 ### Key Files
 
-- `apps/backtest/src/backtest/risk_limit_info.py` — `RiskLimitProvider` with cache management
+- `apps/backtest/src/backtest/risk_limit_info.py` — `RiskLimitProvider` orchestrator
+- `apps/backtest/src/backtest/cache_lock.py` — In-process and cross-process locking
+- `apps/backtest/src/backtest/tier_serialization.py` — MMTiers ↔ JSON dict conversion
+- `apps/backtest/src/backtest/cache_validation.py` — Symlink, size, and inode validation
 - `packages/gridcore/src/gridcore/pnl.py` — `parse_risk_limit_tiers()`, hardcoded `MM_TIERS`, margin calculation functions
 - `packages/bybit_adapter/src/bybit_adapter/rest_client.py` — `BybitRestClient.get_risk_limit()` API call
 
