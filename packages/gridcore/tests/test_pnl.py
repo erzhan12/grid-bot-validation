@@ -255,10 +255,9 @@ class TestCalcMaintenanceMargin:
         assert mmr == Decimal("0")
 
     def test_negative_position(self):
-        """Negative position value returns zero."""
-        mm, mmr = calc_maintenance_margin(Decimal("-100"), "BTCUSDT")
-        assert mm == Decimal("0")
-        assert mmr == Decimal("0")
+        """Negative position value raises ValueError."""
+        with pytest.raises(ValueError, match="Negative position_value"):
+            calc_maintenance_margin(Decimal("-100"), "BTCUSDT")
 
 
 class TestCalcImrPct:

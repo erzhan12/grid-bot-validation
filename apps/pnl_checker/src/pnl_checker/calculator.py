@@ -90,6 +90,7 @@ class CalculationResult:
 
     positions: list[PositionCalcResult] = field(default_factory=list)
     account: AccountCalcResult | None = None
+    data_quality_errors: list[str] = field(default_factory=list)
 
 
 def _safe_leverage_int(leverage: Decimal) -> int:
@@ -269,10 +270,9 @@ def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> Calculation
                 pct_bybit = unrealised_mark / pos.position_im * Decimal("100")
             else:
                 dq_ok = False
-                logger.warning(
-                    f"{pos.symbol} {pos.direction}: position_im={pos.position_im} too small for PnL %% calc",
-                    extra={"data_quality_issue": True},
-                )
+                msg = f"{pos.symbol} {pos.direction}: position_im={pos.position_im} too small for PnL %% calc"
+                logger.warning(msg, extra={"data_quality_issue": True})
+                result.data_quality_errors.append(msg)
 
             # Position value and initial margin
             position_value = calc_position_value(pos.size, pos.avg_price)
@@ -289,15 +289,22 @@ def calculate(fetch_result: FetchResult, risk_config: RiskConfig) -> Calculation
                     tiers=tiers,
                 )
             else:
-                logger.warning(
-                    f"{pos.symbol} {pos.direction}: leverage={pos.leverage} too small for margin calc",
-                    extra={"data_quality_issue": True},
-                )
+                msg = f"{pos.symbol} {pos.direction}: leverage={pos.leverage} too small for margin calc"
+                logger.warning(msg, extra={"data_quality_issue": True})
+                result.data_quality_errors.append(msg)
 
             # Maintenance margin (tier-based, uses dynamic tiers when available)
             maintenance_margin, mmr_rate = calc_maintenance_margin(
                 position_value, pos.symbol, tiers=symbol_data.risk_limit_tiers
             )
+            if position_value > 0 and (maintenance_margin == 0 or mmr_rate == 0):
+                dq_ok = False
+                msg = (
+                    f"{pos.symbol} {pos.direction}: zero MM for non-zero position "
+                    f"(pv={position_value}, mm={maintenance_margin}, mmr={mmr_rate})"
+                )
+                logger.warning(msg, extra={"data_quality_issue": True})
+                result.data_quality_errors.append(msg)
 
             # Liquidation ratio
             liq_ratio = calc_liq_ratio(pos.liq_price, last) if last > 0 else 0.0

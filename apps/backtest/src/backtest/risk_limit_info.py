@@ -37,8 +37,36 @@ DEFAULT_ALLOWED_CACHE_ROOT = Path(__file__).parent.parent.parent.parent / "conf"
 # Maximum allowed cache file size (bytes) to prevent DoS via bloated files.
 # 10 MB is generous for typical use (~50 symbols × ~10 tiers × ~200 bytes each
 # ≈ 100 KB), but allows headroom for hundreds of symbols without triggering
-# false positives.  Configurable per-instance via the constructor parameter.
-MAX_CACHE_SIZE_BYTES = 10_000_000
+# false positives.  Configurable per-instance via constructor or env var.
+_DEFAULT_MAX_CACHE_SIZE_BYTES = 10_000_000
+_MIN_CACHE_SIZE_BYTES = 1_024          # 1 KB floor
+_MAX_CACHE_SIZE_BYTES_LIMIT = 100_000_000  # 100 MB ceiling
+
+
+def _read_max_cache_size_from_env() -> int:
+    """Read MAX_CACHE_SIZE_BYTES from GRIDBOT_RISK_CACHE_MAX_SIZE env var."""
+    env_val = os.environ.get("GRIDBOT_RISK_CACHE_MAX_SIZE")
+    if env_val is None:
+        return _DEFAULT_MAX_CACHE_SIZE_BYTES
+    try:
+        value = int(env_val)
+    except ValueError:
+        logger.warning(
+            "Invalid GRIDBOT_RISK_CACHE_MAX_SIZE=%r, using default %d",
+            env_val, _DEFAULT_MAX_CACHE_SIZE_BYTES,
+        )
+        return _DEFAULT_MAX_CACHE_SIZE_BYTES
+    if value < _MIN_CACHE_SIZE_BYTES or value > _MAX_CACHE_SIZE_BYTES_LIMIT:
+        logger.warning(
+            "GRIDBOT_RISK_CACHE_MAX_SIZE=%d outside [%d, %d], using default %d",
+            value, _MIN_CACHE_SIZE_BYTES, _MAX_CACHE_SIZE_BYTES_LIMIT,
+            _DEFAULT_MAX_CACHE_SIZE_BYTES,
+        )
+        return _DEFAULT_MAX_CACHE_SIZE_BYTES
+    return value
+
+
+MAX_CACHE_SIZE_BYTES = _read_max_cache_size_from_env()
 
 # Lock region size for Windows msvcrt.locking (bytes).
 # Must match in both _acquire_file_lock and _release_file_lock.
@@ -254,15 +282,21 @@ class RiskLimitProvider:
             # at open time, eliminating the race window between check and open.
             flags = os.O_RDONLY
             nofollow = getattr(os, "O_NOFOLLOW", 0)
-            if nofollow:
-                flags |= nofollow
+            if not nofollow:
+                raise NotImplementedError(
+                    "os.O_NOFOLLOW is not available on this platform; "
+                    "symlink protection for cache files is disabled"
+                )
+            flags |= nofollow
             try:
                 fd = os.open(self.cache_path, flags)
             except OSError:
                 # O_NOFOLLOW causes OSError if path is a symlink
                 logger.warning("Cache file is a symlink or inaccessible (possible symlink swap)")
                 return None, None
-            # Post-open validation on the opened fd to close TOCTOU windows.
+            # Post-open validation and reading on the opened fd to close
+            # TOCTOU windows.  The fdopen is inside the try block so the fd
+            # is always closed on any failure path.
             try:
                 fd_stat = os.fstat(fd)
                 # Size check on the opened fd (not the path) prevents race
@@ -276,14 +310,17 @@ class RiskLimitProvider:
                 if (fd_stat.st_dev, fd_stat.st_ino) != (path_stat.st_dev, path_stat.st_ino):
                     logger.warning("Cache file identity changed during open (possible symlink swap)")
                     return None, None
-            except OSError:
-                os.close(fd)
-                return None, None
+                with os.fdopen(fd, "r") as f:
+                    cache = json.load(f)
+                # fd is now owned by the file object and closed by `with`
+                fd = -1
             except CacheSizeExceededError:
-                os.close(fd)
                 raise
-            with os.fdopen(fd, "r") as f:
-                cache = json.load(f)
+            except OSError:
+                return None, None
+            finally:
+                if fd >= 0:
+                    os.close(fd)
             if not isinstance(cache, dict):
                 raise ValueError("Cache root must be a JSON object")
 
@@ -318,6 +355,23 @@ class RiskLimitProvider:
         self._ensure_open()
         try:
             self._save_to_cache_impl(symbol, tiers)
+        except (PermissionError, OSError, ValueError) as e:
+            logger.warning(f"Failed to write cache file {self.cache_path}: {e}")
+
+    def save_multiple_to_cache(self, items: dict[str, MMTiers]) -> None:
+        """Save multiple symbols' tiers in a single read-modify-write cycle.
+
+        More efficient than calling save_to_cache() per symbol because the
+        cache file is read once, all entries are updated, and written once.
+
+        Args:
+            items: Mapping of symbol → tier table to cache
+        """
+        if not items:
+            return
+        self._ensure_open()
+        try:
+            self._save_multiple_to_cache_impl(items)
         except (PermissionError, OSError, ValueError) as e:
             logger.warning(f"Failed to write cache file {self.cache_path}: {e}")
 
@@ -446,6 +500,53 @@ class RiskLimitProvider:
                         lock_file.close()
 
         logger.info(f"Cached risk limit tiers for {symbol}")
+
+    def _save_multiple_to_cache_impl(self, items: dict[str, MMTiers]) -> None:
+        """Perform a single read-modify-write for multiple symbols.
+
+        Same locking strategy as _save_to_cache_impl but updates all
+        symbols in one pass, avoiding repeated file I/O.
+        """
+        with self._in_process_lock:
+            self._ensure_open()
+            if self._cache_path_is_symlink():
+                raise ValueError("Cache path must not be a symlink")
+
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+            lock_path = self.cache_path.with_suffix(f"{self.cache_path.suffix}.lock")
+            if lock_path.parent != self.cache_path.parent:
+                raise ValueError("Lock file path outside cache directory")
+            lock_file = None
+            try:
+                lock_file = _open_lock_file(lock_path)
+                _acquire_file_lock(lock_file)
+
+                cache = self._load_existing_cache()
+                now = datetime.now(timezone.utc).isoformat()
+                updated = False
+
+                for symbol, tiers in items.items():
+                    new_tiers_dict = _tiers_to_dict(tiers)
+                    if self._should_skip_cache_write(cache.get(symbol), new_tiers_dict):
+                        continue
+                    cache[symbol] = {
+                        "tiers": new_tiers_dict,
+                        "cached_at": now,
+                    }
+                    updated = True
+
+                if updated:
+                    self._write_cache_file(cache)
+            finally:
+                if lock_file is not None:
+                    try:
+                        _release_file_lock(lock_file)
+                    finally:
+                        lock_file.close()
+
+        if updated:
+            logger.info(f"Cached risk limit tiers for {len(items)} symbols")
 
     def _is_cache_fresh(self, symbol: str, cached_at_str: Optional[str] = None) -> bool:
         """Check if cached entry for symbol is younger than cache_ttl.
@@ -615,8 +716,12 @@ def _open_lock_file(lock_path: Path) -> "IO[bytes]":
 
     flags = os.O_RDWR | os.O_CREAT
     nofollow = getattr(os, "O_NOFOLLOW", 0)
-    if nofollow:
-        flags |= nofollow
+    if not nofollow:
+        raise NotImplementedError(
+            "os.O_NOFOLLOW is not available on this platform; "
+            "symlink protection for cache lock files is disabled"
+        )
+    flags |= nofollow
 
     try:
         fd = os.open(lock_path, flags, 0o600)

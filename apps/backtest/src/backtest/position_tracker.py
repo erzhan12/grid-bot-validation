@@ -220,6 +220,11 @@ class BacktestPositionTracker:
         self.state.initial_margin = im
         self.state.imr_rate = imr
         mm, mmr = calc_maintenance_margin(pv, self.symbol, tiers=self.tiers)
+        if pv > 0 and (mm == 0 or mmr == 0):
+            logger.warning(
+                "Zero MM for non-zero position: pv=%s mm=%s mmr=%s symbol=%s",
+                pv, mm, mmr, self.symbol,
+            )
         self.state.maintenance_margin = mm
         self.state.mmr_rate = mmr
 
@@ -272,9 +277,9 @@ class BacktestPositionTracker:
         Returns:
             Funding payment amount (negative = paid, positive = received)
         """
-        # Bybit funding rates regularly exceed 0.1% during volatile periods.
-        # Use 1% threshold to avoid excessive warnings.
-        if abs(rate) > Decimal("0.01"):
+        # Bybit funding rates regularly exceed 1% during volatile periods.
+        # Use 5% threshold to avoid excessive warnings.
+        if abs(rate) > Decimal("0.05"):
             logger.warning("Unusually high funding rate: %s", rate)
 
         if self.state.size == 0:

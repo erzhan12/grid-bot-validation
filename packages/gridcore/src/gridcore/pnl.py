@@ -137,12 +137,13 @@ def calc_position_value(size: Decimal, entry_price: Decimal) -> Decimal:
     return size * entry_price
 
 
-# Cache of pre-computed max_value lists, keyed by tier content.
-# Uses content-based keys so identical tier lists share the cache entry
-# regardless of object identity.  Bounded to _MAX_TIER_CACHE_ENTRIES
-# entries with LRU eviction (OrderedDict + move_to_end) as a
-# defense-in-depth measure, even though the number of distinct tier
-# configurations is small in practice.
+# Cache of pre-computed max_value lists for bisect, keyed by tier
+# boundary values: tuple(t[0] for t in tiers).  This is content-based
+# (uses Decimal values, not object identity) so identical tier lists
+# share the cache entry.  Only max_value boundaries are keyed because
+# the cached list is only used for bisect lookup, not rate lookups.
+# Bounded to _MAX_TIER_CACHE_ENTRIES entries with LRU eviction
+# (OrderedDict + move_to_end) as a defense-in-depth measure.
 _MAX_TIER_CACHE_ENTRIES = 64
 _tier_max_values_cache: OrderedDict[tuple[Decimal, ...], list[Decimal]] = OrderedDict()
 
@@ -201,8 +202,7 @@ def calc_initial_margin(
         IMR rate used.
     """
     if position_value < _ZERO:
-        logger.warning("Negative position_value in calc_initial_margin: %s", position_value)
-        return _ZERO, _ZERO
+        raise ValueError(f"Negative position_value in calc_initial_margin: {position_value}")
     if position_value == _ZERO:
         return _ZERO, _ZERO
 
@@ -286,7 +286,9 @@ def calc_maintenance_margin(
         (Decimal('4000'), Decimal('0.01'))
         >>> # MM = 500000 * 0.01 - 1000 = 4000
     """
-    if position_value <= _ZERO:
+    if position_value < _ZERO:
+        raise ValueError(f"Negative position_value in calc_maintenance_margin: {position_value}")
+    if position_value == _ZERO:
         return _ZERO, _ZERO
 
     tier_table = tiers if tiers is not None else MM_TIERS.get(symbol, MM_TIERS_DEFAULT)
@@ -323,10 +325,12 @@ def calc_mmr_pct(total_maintenance_margin: Decimal, margin_balance: Decimal) -> 
 def _sort_tiers(api_tiers: list[dict]) -> list[dict]:
     """Sort API tier dicts by ascending riskLimitValue.
 
+    Skips sorting if tiers are already in order (common case for API data).
+
     Raises:
         ValueError: If any tier is missing riskLimitValue or has an invalid format.
     """
-    def sort_key(tier: dict) -> Decimal:
+    def _parse_limit(tier: dict) -> Decimal:
         max_val_str = tier.get("riskLimitValue")
         if max_val_str is None:
             raise ValueError("Missing required field: riskLimitValue")
@@ -335,7 +339,12 @@ def _sort_tiers(api_tiers: list[dict]) -> list[dict]:
         except (ValueError, ArithmeticError) as e:
             raise ValueError(f"Invalid riskLimitValue format: {max_val_str}") from e
 
-    return sorted(api_tiers, key=sort_key)
+    # Fast-path: check if already sorted (avoids O(n log n) sort)
+    values = [_parse_limit(t) for t in api_tiers]
+    if all(values[i] <= values[i + 1] for i in range(len(values) - 1)):
+        return api_tiers
+
+    return sorted(api_tiers, key=_parse_limit)
 
 
 def _check_duplicate_boundaries(sorted_tiers: list[dict]) -> None:
