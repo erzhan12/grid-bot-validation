@@ -53,6 +53,21 @@ tiers = provider.get("BTCUSDT", force_fetch=True)
 
 **Concurrent access:** If running multiple backtest processes simultaneously, each should use a separate cache file path. Cache writes use file locking to prevent concurrent write corruption, but separate cache files are still recommended to reduce lock contention and keep per-process cache state isolated.
 
+### Performance Considerations
+
+Cache writes use file-level locking (POSIX `flock` / Windows `msvcrt.locking`) to prevent corruption when multiple processes share one cache file. This locking serializes all writers, which means:
+
+- **Low concurrency (1-5 processes):** Locking overhead is negligible. Shared cache files work fine.
+- **High concurrency (>5-10 processes):** Lock contention becomes a bottleneck because every write must wait for the previous one to complete the read-modify-write cycle. At this scale, use **separate cache files per process** to eliminate contention entirely:
+
+```python
+provider = RiskLimitProvider(
+    cache_path=Path(f"/tmp/risk_cache_{os.getpid()}.json"),
+)
+```
+
+Reads do not acquire file locks, so concurrent readers do not block each other or writers. However, a reader may see a partially-written file if it races with a writer. The provider handles this gracefully by falling back to hardcoded tiers on JSON parse errors.
+
 ### Without API Access
 
 When no `rest_client` is provided (e.g., offline backtesting), the provider uses cached data or falls back to hardcoded tier tables. No API calls are attempted.

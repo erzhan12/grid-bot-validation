@@ -285,6 +285,8 @@ def parse_risk_limit_tiers(api_tiers: list[dict]) -> MMTiers:
         Validates that MMR and IMR rates are in [0, 1] range and that
         riskLimitValue is a valid positive number or "Infinity".
     """
+    if not isinstance(api_tiers, list):
+        raise ValueError("api_tiers must be a list")
     if not api_tiers:
         raise ValueError("api_tiers must not be empty")
 

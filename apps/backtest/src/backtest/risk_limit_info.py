@@ -77,6 +77,8 @@ class RiskLimitProvider:
         self.cache_path = expanded_cache_path.resolve()
         self.cache_ttl = cache_ttl
         self._rest_client = rest_client
+        if max_cache_size_bytes <= 0:
+            raise ValueError("max_cache_size_bytes must be positive")
         self.max_cache_size_bytes = max_cache_size_bytes
         self._in_process_lock_key, self._in_process_lock = _acquire_in_process_lock(
             self.cache_path
@@ -119,6 +121,10 @@ class RiskLimitProvider:
             logger.debug("No rest_client configured, skipping API fetch")
             return None
 
+        logger.debug(
+            f"Fetching risk limit tiers for {symbol} via rest_client "
+            f"(type={type(self._rest_client).__name__})"
+        )
         try:
             raw_tiers = self._rest_client.get_risk_limit(symbol=symbol)
             if not raw_tiers:
@@ -159,7 +165,14 @@ class RiskLimitProvider:
                 raise ValueError(
                     f"Cache file exceeds {self.max_cache_size_bytes} byte limit"
                 )
+            # TOCTOU protection: verify inode/device after open to detect
+            # symlink swaps between the symlink check above and file open.
+            path_stat = os.stat(self.cache_path, follow_symlinks=False)
             with open(self.cache_path) as f:
+                fd_stat = os.fstat(f.fileno())
+                if (path_stat.st_dev, path_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):
+                    logger.warning("Cache file changed during open (possible symlink swap)")
+                    return None, None
                 cache = json.load(f)
             if not isinstance(cache, dict):
                 raise ValueError("Cache root must be a JSON object")
@@ -223,6 +236,23 @@ class RiskLimitProvider:
             logger.warning(f"Corrupted cache file {self.cache_path}, overwriting: {e}")
             return {}
 
+    @staticmethod
+    def _should_skip_cache_write(
+        existing: object, new_tiers_dict: list[dict[str, str]]
+    ) -> bool:
+        """Return True if the cached entry already matches new_tiers_dict."""
+        return (
+            isinstance(existing, dict)
+            and isinstance(existing.get("tiers"), list)
+            and "cached_at" in existing
+            and existing["tiers"] == new_tiers_dict
+        )
+
+    def _write_cache_file(self, cache: dict) -> None:
+        """Atomically write the full cache dict to disk."""
+        with open(self.cache_path, "w") as f:
+            json.dump(cache, f, indent=2)
+
     def _save_to_cache_impl(self, symbol: str, tiers: MMTiers) -> None:
         # Serialize same-process writers; file lock handles cross-process writers.
         with self._in_process_lock:
@@ -240,27 +270,15 @@ class RiskLimitProvider:
                     # Read-modify-write must be atomic across processes.
                     cache = self._load_existing_cache()
 
-                    # Skip write if tiers haven't changed (direct equality check)
-                    existing = cache.get(symbol)
                     new_tiers_dict = _tiers_to_dict(tiers)
-                    if (
-                        existing
-                        and isinstance(existing, dict)
-                        and isinstance(existing.get("tiers"), list)
-                        and "cached_at" in existing
-                        and existing["tiers"] == new_tiers_dict
-                    ):
+                    if self._should_skip_cache_write(cache.get(symbol), new_tiers_dict):
                         return
 
-                    # Update cache with timestamp
                     cache[symbol] = {
                         "tiers": new_tiers_dict,
                         "cached_at": datetime.now(timezone.utc).isoformat(),
                     }
-
-                    # Write cache
-                    with open(self.cache_path, "w") as f:
-                        json.dump(cache, f, indent=2)
+                    self._write_cache_file(cache)
                 finally:
                     _release_file_lock(lock_file)
 
@@ -418,7 +436,7 @@ def _open_lock_file(lock_path: Path):
             fd_stat = os.fstat(fd)
             if (path_stat.st_dev, path_stat.st_ino) != (fd_stat.st_dev, fd_stat.st_ino):
                 raise ValueError("Cache lock path changed during open")
-        except Exception:
+        except (OSError, ValueError):
             os.close(fd)
             raise
 

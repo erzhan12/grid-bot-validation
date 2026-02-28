@@ -712,6 +712,81 @@ class TestConcurrentCacheAccess:
         assert "CCCUSDT" in cache
 
 
+    def test_concurrent_reads_with_one_write_no_corruption(self, tmp_path):
+        """Multiple readers with one writer don't corrupt data or raise errors."""
+        cache_path = tmp_path / "cache.json"
+        # Seed the cache with initial data
+        cache_path.write_text(json.dumps({
+            "BTCUSDT": {
+                "tiers": _tiers_to_dict(SAMPLE_TIERS),
+                "cached_at": datetime.now(timezone.utc).isoformat(),
+            },
+        }))
+        provider = RiskLimitProvider(cache_path=cache_path)
+        errors: list[Exception] = []
+
+        write_tiers: MMTiers = [
+            (Decimal("500000"), Decimal("0.005"), Decimal("0"), Decimal("0.01")),
+            (Decimal("Infinity"), Decimal("0.01"), Decimal("2500"), Decimal("0.02")),
+        ]
+
+        def reader(symbol: str):
+            try:
+                for _ in range(30):
+                    result = provider.load_from_cache(symbol)
+                    # Result is either valid tiers or None (never corrupt)
+                    if result is not None:
+                        assert isinstance(result, list)
+                        assert all(len(t) == 4 for t in result)
+            except Exception as e:
+                errors.append(e)
+
+        def writer():
+            try:
+                for _ in range(30):
+                    provider.save_to_cache("ETHUSDT", write_tiers)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=reader, args=("BTCUSDT",)),
+            threading.Thread(target=reader, args=("BTCUSDT",)),
+            threading.Thread(target=reader, args=("ETHUSDT",)),
+            threading.Thread(target=writer),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == [], f"Thread errors: {errors}"
+
+        # Cache file should be valid JSON with both symbols
+        cache = json.loads(cache_path.read_text())
+        assert isinstance(cache, dict)
+        assert "BTCUSDT" in cache
+        assert "ETHUSDT" in cache
+
+
+class TestMaxCacheSizeValidation:
+    """Tests for max_cache_size_bytes constructor validation."""
+
+    def test_zero_max_cache_size_raises(self, tmp_path):
+        """max_cache_size_bytes=0 raises ValueError."""
+        with pytest.raises(ValueError, match="max_cache_size_bytes must be positive"):
+            RiskLimitProvider(cache_path=tmp_path / "c.json", max_cache_size_bytes=0)
+
+    def test_negative_max_cache_size_raises(self, tmp_path):
+        """Negative max_cache_size_bytes raises ValueError."""
+        with pytest.raises(ValueError, match="max_cache_size_bytes must be positive"):
+            RiskLimitProvider(cache_path=tmp_path / "c.json", max_cache_size_bytes=-100)
+
+    def test_positive_max_cache_size_accepted(self, tmp_path):
+        """Positive max_cache_size_bytes is accepted."""
+        provider = RiskLimitProvider(cache_path=tmp_path / "c.json", max_cache_size_bytes=1)
+        assert provider.max_cache_size_bytes == 1
+
+
 class TestPathTraversalValidation:
     """Tests for cache_path resolution to prevent directory traversal."""
 

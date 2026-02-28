@@ -515,6 +515,54 @@ class TestParseRiskLimitTiers:
         assert mmr == Decimal("0.025")
         assert mm == Decimal("9500")  # 500_000 * 0.025 - 3_000
 
+    def test_empty_string_mm_deduction_backward_compat(self):
+        """Empty string mmDeduction falls back to 0 (backward compat with Bybit tier 0)."""
+        api_tiers = [
+            {
+                "riskLimitValue": "200000",
+                "maintenanceMargin": "0.005",
+                "mmDeduction": "",
+                "initialMargin": "0.01",
+            },
+            {
+                "riskLimitValue": "1000000",
+                "maintenanceMargin": "0.01",
+                "mmDeduction": "1000",
+                "initialMargin": "0.02",
+            },
+        ]
+        result = parse_risk_limit_tiers(api_tiers)
+        assert result[0][2] == Decimal("0")  # empty string → "0"
+        assert result[1][2] == Decimal("1000")  # normal value preserved
+
+    def test_empty_string_initial_margin_backward_compat(self):
+        """Empty string initialMargin falls back to 0 (backward compat with Bybit tier 0)."""
+        api_tiers = [
+            {
+                "riskLimitValue": "200000",
+                "maintenanceMargin": "0.005",
+                "mmDeduction": "0",
+                "initialMargin": "",
+            },
+            {
+                "riskLimitValue": "1000000",
+                "maintenanceMargin": "0.01",
+                "mmDeduction": "1000",
+                "initialMargin": "0.02",
+            },
+        ]
+        result = parse_risk_limit_tiers(api_tiers)
+        assert result[0][3] == Decimal("0")  # empty string → "0"
+        assert result[1][3] == Decimal("0.02")  # normal value preserved
+
+    def test_non_list_input_raises(self):
+        """Non-list input raises ValueError."""
+        with pytest.raises(ValueError, match="api_tiers must be a list"):
+            parse_risk_limit_tiers("not a list")
+
+        with pytest.raises(ValueError, match="api_tiers must be a list"):
+            parse_risk_limit_tiers({"key": "value"})
+
     def test_invalid_mmr_rate_above_one(self):
         """MMR rate above 1 raises ValueError."""
         with pytest.raises(ValueError, match="MMR rate .* outside valid range"):
