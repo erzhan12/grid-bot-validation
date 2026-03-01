@@ -221,6 +221,9 @@ class BybitRestClient:
             all_executions.extend(executions)
             page += 1
 
+            if not executions:
+                break
+
             if not cursor:
                 break
 
@@ -782,6 +785,9 @@ class BybitRestClient:
             )
             all_transactions.extend(transactions)
             page += 1
+
+            if not transactions:
+                break
 
             if not cursor:
                 break
