@@ -28,7 +28,7 @@ def _fetch_live_tiers(symbol: str) -> MMTiers:
     """Fetch current tiers from Bybit public API (no auth required)."""
     from bybit_adapter.rest_client import BybitRestClient
 
-    client = BybitRestClient(testnet=False)
+    client = BybitRestClient(api_key="", api_secret="", testnet=False)
     raw = client.get_risk_limit(symbol=symbol)
     if not raw:
         raise RuntimeError(f"Empty response from Bybit API for {symbol}")

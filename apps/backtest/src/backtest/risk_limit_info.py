@@ -65,7 +65,13 @@ _MAX_CACHE_SIZE_BYTES_LIMIT = 100_000_000
 
 
 def _read_max_cache_size_from_env() -> int:
-    """Read MAX_CACHE_SIZE_BYTES from GRIDBOT_RISK_CACHE_MAX_SIZE env var."""
+    """Read MAX_CACHE_SIZE_BYTES from GRIDBOT_RISK_CACHE_MAX_SIZE env var.
+
+    Note: This function is called once at module import time.  The resulting
+    value is stored in the module-level ``MAX_CACHE_SIZE_BYTES`` constant.
+    Changes to the environment variable after import have no effect —
+    restart the process or reload the module to pick up new values.
+    """
     env_val = os.environ.get("GRIDBOT_RISK_CACHE_MAX_SIZE")
     if env_val is None:
         return _DEFAULT_MAX_CACHE_SIZE_BYTES

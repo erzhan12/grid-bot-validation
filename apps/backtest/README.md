@@ -198,6 +198,41 @@ treated as sensitive in multi-user environments:
 - `packages/gridcore/src/gridcore/pnl.py` — `parse_risk_limit_tiers()`, hardcoded `MM_TIERS`, margin calculation functions
 - `packages/bybit_adapter/src/bybit_adapter/rest_client.py` — `BybitRestClient.get_risk_limit()` API call
 
+### Monitoring
+
+Hardcoded tier tables in `gridcore.pnl.MM_TIERS` are checked automatically against the live Bybit API to detect drift.
+
+**Automated workflow:** `.github/workflows/risk-tier-monitor.yml` runs every Monday at 08:00 UTC (configurable via cron). It can also be triggered manually via `workflow_dispatch`.
+
+**How it works:**
+1. `scripts/check_tier_drift.py` fetches live tiers for every symbol in `MM_TIERS`
+2. Each field (max_value, mmr_rate, deduction, imr_rate) is compared with a relative drift threshold (default 5%)
+3. If any drift exceeds the threshold, the script exits with code 1 and prints a drift report
+4. The workflow creates a GitHub issue with the report, labeled `risk-tiers` and `automated`
+
+**Configuring the threshold:**
+```bash
+# Default 5% relative drift threshold
+uv run python scripts/check_tier_drift.py --threshold 0.05
+
+# Stricter 1% threshold for production
+uv run python scripts/check_tier_drift.py --threshold 0.01
+```
+
+**Interpreting drift reports:**
+- `tier count mismatch` — Bybit added or removed a tier level. Review and update the hardcoded table.
+- `mmr_rate drift X%` — Maintenance margin rate changed. Update the rate in `MM_TIERS`.
+- `imr_rate drift X%` — Initial margin rate changed. Update the rate in `MM_TIERS`.
+- `failed to fetch live tiers` — API was unreachable. Check network/rate limits; the check will retry next week.
+
+**Updating hardcoded tiers when Bybit changes them:**
+1. Review the drift report in the GitHub issue
+2. Run `uv run python scripts/check_tier_drift.py` locally to confirm
+3. Update the tier tables in `packages/gridcore/src/gridcore/pnl.py`
+4. Update the "Last verified" comment timestamp
+5. Run tests: `uv run pytest packages/gridcore/tests/ -v`
+6. Commit and close the drift issue
+
 ### API Reference
 
 - Bybit Risk Limit endpoint: https://bybit-exchange.github.io/docs/v5/market/risk-limit
