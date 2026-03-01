@@ -19,7 +19,11 @@ from gridcore import (
     CancelIntent,
     DirectionType,
     SideType,
+    Position,
+    PositionState,
+    RiskConfig,
 )
+from gridcore.pnl import calc_position_value
 
 from backtest.config import BacktestStrategyConfig
 from backtest.executor import BacktestExecutor
@@ -100,6 +104,32 @@ class BacktestRunner:
             commission_rate=strategy_config.commission_rate,
         )
 
+        # Risk multiplier support
+        self._leverage = strategy_config.leverage
+        self._mmr = strategy_config.maintenance_margin_rate
+        self._enable_risk = strategy_config.enable_risk_multipliers
+
+        if self._enable_risk:
+            risk_config = RiskConfig(
+                min_liq_ratio=strategy_config.min_liq_ratio,
+                max_liq_ratio=strategy_config.max_liq_ratio,
+                max_margin=strategy_config.max_margin,
+                min_total_margin=strategy_config.min_total_margin,
+            )
+            self._long_position, self._short_position = Position.create_linked_pair(risk_config)
+
+            # Compose risk multiplier with existing qty_calculator so that
+            # base qty (from amount pattern + rounding) is computed first,
+            # then scaled by the risk multiplier.
+            self._base_qty_calculator = self._executor.qty_calculator
+            self._executor.qty_calculator = self._apply_risk_to_qty
+        else:
+            self._long_position = None
+            self._short_position = None
+
+        # Last price seen (needed for multiplier recalculation)
+        self._last_price: Optional[Decimal] = None
+
         # Track whether grid has been built
         self._grid_built = False
 
@@ -155,6 +185,7 @@ class BacktestRunner:
         Returns:
             List of intents generated from fills.
         """
+        self._last_price = event.last_price
         intents: list[PlaceLimitIntent | CancelIntent] = []
 
         # Check for fills
@@ -250,6 +281,135 @@ class BacktestRunner:
             f"{self.strat_id}: Fill {event.side} {event.qty} @ {event.price}, "
             f"realized_pnl={realized_pnl:.2f}, direction={direction}"
         )
+
+        # Recalculate risk multipliers after position change.
+        # Use ticker last_price (not fill price) — fill price is the order
+        # limit price, but liq_ratio checks need the current market price.
+        if self._enable_risk and self._last_price is not None:
+            self._update_risk_multipliers(float(self._last_price))
+
+    def _build_position_state(
+        self,
+        tracker: BacktestPositionTracker,
+        wallet_balance: Decimal,
+        direction: str,
+    ) -> PositionState:
+        """Build gridcore PositionState from backtest tracker state.
+
+        Args:
+            tracker: Position tracker with current size/entry.
+            wallet_balance: Current wallet balance for margin ratio.
+            direction: 'long' or 'short'.
+
+        Returns:
+            PositionState for risk calculation.
+        """
+        size = tracker.state.size
+        entry_price = tracker.state.avg_entry_price
+
+        if size > 0 and entry_price > 0:
+            position_value = calc_position_value(size, entry_price)
+            margin = position_value / wallet_balance if wallet_balance > 0 else Decimal("0")
+            liq_price = self._estimate_liquidation_price(entry_price, direction)
+        else:
+            position_value = Decimal("0")
+            margin = Decimal("0")
+            liq_price = Decimal("0")
+
+        return PositionState(
+            direction=direction,
+            size=size,
+            entry_price=entry_price if entry_price > 0 else None,
+            margin=margin,
+            liquidation_price=liq_price,
+            leverage=self._leverage,
+            position_value=position_value,
+        )
+
+    def _estimate_liquidation_price(self, entry_price: Decimal, direction: str) -> Decimal:
+        """Estimate liquidation price from entry price, leverage, and MMR.
+
+        Simplified formula for linear USDT perpetuals (isolated margin):
+        - Long:  liq = entry * (1 - 1/leverage + mmr)
+        - Short: liq = entry * (1 + 1/leverage - mmr)
+        """
+        inv_leverage = Decimal(1) / Decimal(self._leverage)
+        mmr = Decimal(str(self._mmr))
+
+        if direction == DirectionType.LONG:
+            return entry_price * (1 - inv_leverage + mmr)
+        else:
+            return entry_price * (1 + inv_leverage - mmr)
+
+    def _update_risk_multipliers(self, last_price: float) -> None:
+        """Recalculate risk multipliers from current position state.
+
+        Mirrors live bot pattern: reset both, calculate long first, then short.
+        """
+        wallet_balance = self._session.current_balance
+
+        long_state = self._build_position_state(
+            self._long_tracker, wallet_balance, DirectionType.LONG
+        )
+        short_state = self._build_position_state(
+            self._short_tracker, wallet_balance, DirectionType.SHORT
+        )
+
+        # Reset then calculate (bbu2 pattern — cross-position effects preserved)
+        self._long_position.reset_amount_multiplier()
+        self._short_position.reset_amount_multiplier()
+
+        if long_state.size > 0:
+            self._long_position.calculate_amount_multiplier(
+                long_state, short_state, last_price
+            )
+
+        if short_state.size > 0:
+            self._short_position.calculate_amount_multiplier(
+                short_state, long_state, last_price
+            )
+
+        long_mult = self._long_position.get_amount_multiplier()
+        short_mult = self._short_position.get_amount_multiplier()
+        logger.debug(
+            "%s: Risk update - long_mult=Buy:%.2f/Sell:%.2f, "
+            "short_mult=Buy:%.2f/Sell:%.2f",
+            self.strat_id,
+            long_mult['Buy'], long_mult['Sell'],
+            short_mult['Buy'], short_mult['Sell'],
+        )
+
+    def get_amount_multiplier(self, direction: str, side: str) -> float:
+        """Get current risk multiplier for a direction and side.
+
+        Args:
+            direction: 'long' or 'short'.
+            side: 'Buy' or 'Sell'.
+
+        Returns:
+            Multiplier value (1.0 if risk disabled).
+        """
+        if not self._enable_risk:
+            return 1.0
+        if direction == DirectionType.LONG:
+            return self._long_position.get_amount_multiplier()[side]
+        else:
+            return self._short_position.get_amount_multiplier()[side]
+
+    def _apply_risk_to_qty(self, intent: PlaceLimitIntent, wallet_balance: Decimal) -> Decimal:
+        """qty_calculator callback for BacktestExecutor.
+
+        Composes with the base qty_calculator: first computes base qty from
+        amount pattern + rounding, then scales by the risk multiplier.
+        """
+        # Compute base qty using the original calculator (amount/rounding)
+        if self._base_qty_calculator is not None:
+            base_qty = self._base_qty_calculator(intent, wallet_balance)
+        else:
+            base_qty = intent.qty
+
+        multiplier = self.get_amount_multiplier(intent.direction, intent.side)
+        return base_qty * Decimal(str(multiplier))
 
     def _infer_direction(self, side: str) -> str:
         """Infer direction from side when order lookup fails.
