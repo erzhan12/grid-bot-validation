@@ -118,7 +118,10 @@ class BacktestRunner:
             )
             self._long_position, self._short_position = Position.create_linked_pair(risk_config)
 
-            # Wire qty_calculator into executor so order qty is multiplied
+            # Compose risk multiplier with existing qty_calculator so that
+            # base qty (from amount pattern + rounding) is computed first,
+            # then scaled by the risk multiplier.
+            self._base_qty_calculator = self._executor.qty_calculator
             self._executor.qty_calculator = self._apply_risk_to_qty
         else:
             self._long_position = None
@@ -279,9 +282,11 @@ class BacktestRunner:
             f"realized_pnl={realized_pnl:.2f}, direction={direction}"
         )
 
-        # Recalculate risk multipliers after position change
-        if self._enable_risk:
-            self._update_risk_multipliers(float(event.price))
+        # Recalculate risk multipliers after position change.
+        # Use ticker last_price (not fill price) — fill price is the order
+        # limit price, but liq_ratio checks need the current market price.
+        if self._enable_risk and self._last_price is not None:
+            self._update_risk_multipliers(float(self._last_price))
 
     def _build_position_state(
         self,
@@ -394,10 +399,17 @@ class BacktestRunner:
     def _apply_risk_to_qty(self, intent: PlaceLimitIntent, wallet_balance: Decimal) -> Decimal:
         """qty_calculator callback for BacktestExecutor.
 
-        Multiplies intent.qty by the risk multiplier for the intent's direction/side.
+        Composes with the base qty_calculator: first computes base qty from
+        amount pattern + rounding, then scales by the risk multiplier.
         """
+        # Compute base qty using the original calculator (amount/rounding)
+        if self._base_qty_calculator is not None:
+            base_qty = self._base_qty_calculator(intent, wallet_balance)
+        else:
+            base_qty = intent.qty
+
         multiplier = self.get_amount_multiplier(intent.direction, intent.side)
-        return intent.qty * Decimal(str(multiplier))
+        return base_qty * Decimal(str(multiplier))
 
     def _infer_direction(self, side: str) -> str:
         """Infer direction from side when order lookup fails.
