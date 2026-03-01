@@ -35,7 +35,8 @@ class DatabaseSettings(BaseSettings):
     # Debug
     echo_sql: bool = False
 
-    model_config = SettingsConfigDict(env_prefix="GRIDBOT_", env_file=".env")
+    # Ignore unrelated GRIDBOT_* keys from shared .env files used by other apps.
+    model_config = SettingsConfigDict(env_prefix="GRIDBOT_", env_file=".env", extra="ignore")
 
     def get_database_url(self) -> str:
         """Build database URL from settings.

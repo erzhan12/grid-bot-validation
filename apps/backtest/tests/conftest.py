@@ -10,19 +10,27 @@ from grid_db import DatabaseFactory, DatabaseSettings
 
 from backtest.config import BacktestConfig, BacktestStrategyConfig, WindDownMode
 from backtest.fill_simulator import TradeThroughFillSimulator
-from backtest.order_manager import BacktestOrderManager, SimulatedOrder
+from backtest.order_manager import BacktestOrderManager
 from backtest.position_tracker import BacktestPositionTracker
 from backtest.session import BacktestSession
 from backtest.executor import BacktestExecutor
 
 
 @pytest.fixture
-def db_settings():
-    """In-memory SQLite settings for testing."""
+def db_settings(monkeypatch):
+    """In-memory SQLite settings for testing.
+
+    Clear Bybit API credentials from environment to prevent test pollution.
+    DatabaseSettings validation should be deterministic and not depend on
+    local developer credentials.
+    """
+    for key in ("BYBIT_API_KEY", "BYBIT_API_SECRET", "bybit_api_key", "bybit_api_secret"):
+        monkeypatch.delenv(key, raising=False)
     return DatabaseSettings(
         db_type="sqlite",
         db_name=":memory:",
         echo_sql=False,
+        _env_file=None,
     )
 
 

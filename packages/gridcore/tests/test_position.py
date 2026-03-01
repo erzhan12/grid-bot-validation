@@ -893,10 +893,11 @@ class TestCalculateAmountMultiplierEdgeCases:
             margin=Decimal('2.0')
         )
 
-        # last_close=0 causes ZeroDivisionError in unrealized_pnl_pct calculation
-        # (1 / entry_price - 1 / last_close) → 1/0 = ZeroDivisionError
-        with pytest.raises(ZeroDivisionError):
-            long_mgr.calculate_amount_multiplier(position, opposite, last_close=0.0)
+        # last_close=0: standard formula divides by entry_price (not last_close),
+        # so no ZeroDivisionError.  _get_liquidation_ratio returns 0.0 when
+        # last_close=0.  The method should run without error.
+        result = long_mgr.calculate_amount_multiplier(position, opposite, last_close=0.0)
+        assert isinstance(result, dict)
 
     def test_opposite_margin_zero_uses_default(self):
         """opposite_margin of 0 uses 0.0001 default to avoid division error."""

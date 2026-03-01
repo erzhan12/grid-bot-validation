@@ -1,0 +1,72 @@
+name: Risk Tier Drift Monitor
+
+on:
+  schedule:
+    # Run every Monday at 08:00 UTC
+    - cron: "0 8 * * 1"
+  workflow_dispatch: # Allow manual triggers
+
+jobs:
+  check-tier-drift:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Check tier drift
+        id: drift-check
+        run: |
+          set +e
+          OUTPUT=$(uv run python scripts/check_tier_drift.py --threshold 0.05 2>&1)
+          EXIT_CODE=$?
+          echo "$OUTPUT"
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          # Escape multiline output for GitHub Actions
+          {
+            echo "drift_report<<EOF"
+            echo "$OUTPUT"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create issue on drift
+        if: steps.drift-check.outputs.exit_code == '1'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const report = `${{ steps.drift-check.outputs.drift_report }}`;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '⚠️ Risk limit tier drift detected',
+              body: [
+                '## Tier Drift Report',
+                '',
+                'The weekly tier drift monitor detected differences between',
+                'hardcoded `MM_TIERS` in `gridcore/pnl.py` and live Bybit API data.',
+                '',
+                '```',
+                report,
+                '```',
+                '',
+                '### Action Required',
+                '',
+                '1. Review the drift report above',
+                '2. If the changes are intentional (Bybit updated tiers),',
+                '   update the hardcoded tables in `packages/gridcore/src/gridcore/pnl.py`',
+                '3. Run `uv run python scripts/check_tier_drift.py` locally to verify',
+                '',
+                '_This issue was created automatically by the risk-tier-monitor workflow._',
+              ].join('\n'),
+              labels: ['risk-tiers', 'automated'],
+              assignees: ['erzhan12'],
+            });
