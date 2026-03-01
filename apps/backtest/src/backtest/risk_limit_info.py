@@ -210,6 +210,8 @@ class RiskLimitProvider:
                     raise ValueError(
                         f"Cache path {self.cache_path} is not a regular file"
                     )
+        if cache_ttl.total_seconds() <= 0:
+            raise ValueError("cache_ttl must be positive")
         self.cache_ttl = cache_ttl
         self._rest_client = rest_client
         if max_cache_size_bytes < 0:

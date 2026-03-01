@@ -29,7 +29,9 @@ from bybit_adapter.rate_limiter import RateLimiter, RateLimitConfig, RequestType
 
 logger = logging.getLogger(__name__)
 
-# Valid Bybit symbol: uppercase letters and digits, 2-20 chars (e.g. "BTCUSDT")
+# Valid Bybit symbol: uppercase letters and digits, 2-20 chars (e.g. "BTCUSDT").
+# Limitation: Does not allow hyphens or underscores. Update this pattern if
+# Bybit introduces symbol formats beyond [A-Z0-9] (check their API docs).
 _SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}$")
 
 

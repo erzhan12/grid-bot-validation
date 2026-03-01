@@ -854,6 +854,16 @@ class TestMaxCacheSizeValidation:
         provider = RiskLimitProvider(cache_path=tmp_path / "c.json", max_cache_size_bytes=1, allowed_cache_root=None)
         assert provider.max_cache_size_bytes == 1
 
+    def test_zero_cache_ttl_raises(self, tmp_path):
+        """Zero cache_ttl raises ValueError."""
+        with pytest.raises(ValueError, match="cache_ttl must be positive"):
+            RiskLimitProvider(cache_path=tmp_path / "c.json", cache_ttl=timedelta(0), allowed_cache_root=None)
+
+    def test_negative_cache_ttl_raises(self, tmp_path):
+        """Negative cache_ttl raises ValueError."""
+        with pytest.raises(ValueError, match="cache_ttl must be positive"):
+            RiskLimitProvider(cache_path=tmp_path / "c.json", cache_ttl=timedelta(hours=-1), allowed_cache_root=None)
+
     def test_zero_cache_size_limit_disables_size_check(self, tmp_path):
         """max_cache_size_bytes=0 disables size limit validation."""
         cache_path = tmp_path / "cache.json"

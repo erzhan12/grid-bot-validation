@@ -68,5 +68,5 @@ jobs:
                 '_This issue was created automatically by the risk-tier-monitor workflow._',
               ].join('\n'),
               labels: ['risk-tiers', 'automated'],
-              assignees: ['<team-lead-github-username>'],
+              assignees: ['erzhan12'],
             });
