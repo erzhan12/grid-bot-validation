@@ -43,6 +43,13 @@ class BacktestStrategyConfig(BaseModel):
     min_liq_ratio: float = Field(default=0.8, description="Minimum liquidation ratio")
     max_liq_ratio: float = Field(default=1.2, description="Maximum liquidation ratio")
     min_total_margin: float = Field(default=0.15, description="Minimum total margin")
+    leverage: int = Field(default=10, ge=1, description="Position leverage for liq price estimation")
+    maintenance_margin_rate: float = Field(
+        default=0.005, ge=0, description="Maintenance margin rate for liq price estimation"
+    )
+    enable_risk_multipliers: bool = Field(
+        default=True, description="Enable risk-based order size multipliers (A/B toggle)"
+    )
 
     # Commission
     commission_rate: Decimal = Field(
