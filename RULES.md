@@ -275,6 +275,14 @@ uv run pytest packages/gridcore/tests/test_grid.py -v
     - **Values**: `GridSideType.BUY` ('Buy'), `GridSideType.SELL` ('Sell'), `GridSideType.WAIT` ('Wait')
     - **History**: Renamed from `GridSide` to `GridSideType` for clarity (these are type constants, not directional sides)
     - File: `packages/gridcore/src/gridcore/grid.py:20-24`
+19. **Backtest Risk Multiplier Composition (2026-03-02)**: Risk qty callback must COMPOSE with the base `qty_calculator`, not replace it
+    - **GridEngine emits `qty=0`** in `PlaceLimitIntent` — qty is always computed by the execution layer's `qty_calculator` (amount pattern + rounding)
+    - **WRONG**: `executor.qty_calculator = risk_callback` (overwrites base calculator; `intent.qty * multiplier = 0 * 1.0 = 0`)
+    - **RIGHT**: Save `self._base_qty_calculator = executor.qty_calculator`, then compose: `base_qty = base_calc(intent, balance); return base_qty * multiplier`
+    - **Risk recalculation price**: Use ticker `last_price` (market price), NOT `event.price` (fill/limit price). Fill price is the order limit price, but liq_ratio checks need the current market price.
+    - **Test pitfall**: Tests using synthetic intents with `qty=Decimal("0.001")` hide the zero-qty bug. Always test with `qty=0` to match real GridEngine behavior.
+    - **Test pitfall**: Conditional assertions (`if limit_orders["long"]:`) silently pass when no orders are placed. Use unconditional `assert len(...) > 0`.
+    - Files: `apps/backtest/src/backtest/runner.py:121-125,399-411`, `apps/backtest/tests/test_runner.py`
 
 ## Grid Anchor Persistence
 
@@ -1698,9 +1706,9 @@ This is the bbu2 pattern (bbu2-master/position.py:105). It represents what fract
 |----------|-------------------|--------|
 | gridbot (live) | `positionValue / walletBalance` | Correct (runner.py:478) |
 | pnl_checker | `positionValue / walletBalance` | Fixed 2026-02-24 (was using positionIM) |
-| backtest | Not implemented yet | Does NOT use gridcore Position risk mgmt |
+| backtest | `positionValue / walletBalance` | Implemented 2026-03-02 (runner.py:302-307) |
 
-**Backtest gap**: The backtest engine does not integrate gridcore's `Position` risk manager. It uses `BacktestPositionTracker` (PnL only) and `GridEngine` (grid logic only). Risk-based order size multipliers are not applied in backtests.
+**Backtest risk multipliers (2026-03-02)**: `BacktestRunner` now integrates gridcore's `Position` risk manager. See pitfall #19 below for critical composition pattern.
 
 ## Phase K: PnL Checker (`apps/pnl_checker/`)
 
