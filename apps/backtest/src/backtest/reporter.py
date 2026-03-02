@@ -153,6 +153,10 @@ class BacktestReporter:
             ("short_pnl", str(m.short_pnl)),
             ("long_profit_factor", f"{m.long_profit_factor:.4f}"),
             ("short_profit_factor", f"{m.short_profit_factor:.4f}"),
+            ("peak_im", str(m.peak_im)),
+            ("peak_mm", str(m.peak_mm)),
+            ("peak_imr_pct", f"{m.peak_imr_pct:.2f}"),
+            ("peak_mmr_pct", f"{m.peak_mmr_pct:.2f}"),
         ]
 
         with open(path, "w", newline="") as f:
@@ -225,4 +229,8 @@ class BacktestReporter:
             "short_pnl": float(m.short_pnl),
             "long_profit_factor": m.long_profit_factor,
             "short_profit_factor": m.short_profit_factor,
+            "peak_im": float(m.peak_im),
+            "peak_mm": float(m.peak_mm),
+            "peak_imr_pct": m.peak_imr_pct,
+            "peak_mmr_pct": m.peak_mmr_pct,
         }

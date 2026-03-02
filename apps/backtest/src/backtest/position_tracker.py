@@ -10,7 +10,14 @@ from decimal import Decimal
 from typing import Optional
 
 from gridcore import DirectionType, SideType
-from gridcore.pnl import calc_unrealised_pnl, calc_unrealised_pnl_pct
+from gridcore.pnl import (
+    MMTiers,
+    calc_initial_margin,
+    calc_maintenance_margin,
+    calc_position_value,
+    calc_unrealised_pnl,
+    calc_unrealised_pnl_pct,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -28,6 +35,13 @@ class PositionState:
     commission_paid: Decimal = field(default_factory=lambda: Decimal("0"))
     funding_paid: Decimal = field(default_factory=lambda: Decimal("0"))
 
+    # Margin fields (calculated via gridcore.pnl functions)
+    position_value: Decimal = field(default_factory=lambda: Decimal("0"))
+    initial_margin: Decimal = field(default_factory=lambda: Decimal("0"))
+    imr_rate: Decimal = field(default_factory=lambda: Decimal("0"))
+    maintenance_margin: Decimal = field(default_factory=lambda: Decimal("0"))
+    mmr_rate: Decimal = field(default_factory=lambda: Decimal("0"))
+
 
 class BacktestPositionTracker:
     """Track position and calculate PnL for backtest.
@@ -44,20 +58,35 @@ class BacktestPositionTracker:
         self,
         direction: str,
         commission_rate: Decimal = Decimal("0.0002"),
+        leverage: int = 10,
+        tiers: Optional[MMTiers] = None,
+        symbol: str = "",
     ):
         """Initialize position tracker.
 
         Args:
             direction: 'long' or 'short' (or DirectionType enum)
             commission_rate: Commission rate per trade (default 0.02%)
+            leverage: Position leverage for IM calculation
+            tiers: MM tier table (from RiskLimitProvider or hardcoded fallback)
+            symbol: Trading symbol (used for MM fallback when tiers is None)
         """
-        if direction not in (DirectionType.LONG, DirectionType.SHORT):
-            raise ValueError(f"direction must be '{DirectionType.LONG}' or '{DirectionType.SHORT}', got '{direction}'")
+        if not isinstance(direction, DirectionType):
+            try:
+                direction = DirectionType(direction)
+            except ValueError:
+                raise ValueError(
+                    f"direction must be '{DirectionType.LONG}' or "
+                    f"'{DirectionType.SHORT}', got {direction!r}"
+                )
         if commission_rate < 0 or commission_rate > Decimal("0.01"):
             raise ValueError(f"Commission rate {commission_rate} outside expected range [0, 0.01]")
 
         self.direction = direction
         self.commission_rate = commission_rate
+        self.leverage = Decimal(str(leverage))
+        self.tiers = tiers
+        self.symbol = symbol
         self.state = PositionState()
 
     def process_fill(
@@ -155,6 +184,10 @@ class BacktestPositionTracker:
     def calculate_unrealized_pnl(self, current_price: Decimal) -> Decimal:
         """Calculate unrealized PnL at current price.
 
+        Also recalculates and caches margin metrics (IM/MM) in ``self.state``
+        since position value depends on entry price which may have changed
+        from fills. Margin fields remain valid until the next call.
+
         Args:
             current_price: Current market price
 
@@ -163,13 +196,45 @@ class BacktestPositionTracker:
         """
         if self.state.size == 0:
             self.state.unrealized_pnl = Decimal("0")
+            self._reset_margin()
             return Decimal("0")
 
         unrealized = calc_unrealised_pnl(
             self.direction, self.state.avg_entry_price, current_price, self.state.size
         )
         self.state.unrealized_pnl = unrealized
+        self._update_margin()
         return unrealized
+
+    def _update_margin(self) -> None:
+        """Recalculate IM/MM from current position state.
+
+        Uses the same gridcore functions as pnl_checker:
+        - calc_position_value(size, entry_price)
+        - calc_initial_margin(position_value, leverage, symbol, tiers)
+        - calc_maintenance_margin(position_value, symbol, tiers)
+        """
+        pv = calc_position_value(self.state.size, self.state.avg_entry_price)
+        self.state.position_value = pv
+        im, imr = calc_initial_margin(pv, self.leverage, self.symbol, tiers=self.tiers)
+        self.state.initial_margin = im
+        self.state.imr_rate = imr
+        mm, mmr = calc_maintenance_margin(pv, self.symbol, tiers=self.tiers)
+        if pv > 0 and (mm == 0 or mmr == 0):
+            logger.warning(
+                "Zero MM for non-zero position: pv=%s mm=%s mmr=%s symbol=%s",
+                pv, mm, mmr, self.symbol,
+            )
+        self.state.maintenance_margin = mm
+        self.state.mmr_rate = mmr
+
+    def _reset_margin(self) -> None:
+        """Zero out margin fields when position is closed."""
+        self.state.position_value = Decimal("0")
+        self.state.initial_margin = Decimal("0")
+        self.state.imr_rate = Decimal("0")
+        self.state.maintenance_margin = Decimal("0")
+        self.state.mmr_rate = Decimal("0")
 
     def calculate_unrealized_pnl_percent(
         self, current_price: Decimal, leverage: Decimal
@@ -192,7 +257,8 @@ class BacktestPositionTracker:
             return Decimal("0")
 
         pnl_percent = calc_unrealised_pnl_pct(
-            self.direction, self.state.avg_entry_price, current_price, leverage
+            self.direction, self.state.avg_entry_price, current_price, leverage,
+            symbol=self.symbol,
         )
         self.state.unrealized_pnl_percent = pnl_percent
         return pnl_percent
@@ -212,7 +278,9 @@ class BacktestPositionTracker:
         Returns:
             Funding payment amount (negative = paid, positive = received)
         """
-        if abs(rate) > Decimal("0.01"):
+        # Bybit funding rates regularly exceed 1% during volatile periods.
+        # Use 5% threshold to avoid excessive warnings.
+        if abs(rate) > Decimal("0.05"):
             logger.warning("Unusually high funding rate: %s", rate)
 
         if self.state.size == 0:

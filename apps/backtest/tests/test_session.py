@@ -1,11 +1,10 @@
 """Tests for backtest session."""
 
-from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
 
-from backtest.session import BacktestSession, BacktestTrade, BacktestMetrics
+from backtest.session import BacktestTrade
 
 
 class TestBacktestSession:
@@ -151,3 +150,84 @@ class TestBacktestSession:
         assert "Backtest Results" in summary
         assert "Trades: 1" in summary
         assert "Win Rate" in summary
+        assert "Margin:" in summary
+        assert "Peak IM:" in summary
+        assert "Peak MM:" in summary
+
+
+class TestSessionMarginTracking:
+    """Tests for margin peak tracking in BacktestSession."""
+
+    def test_peak_im_tracking(self, session, sample_timestamp):
+        """Tracks highest observed total IM across ticks."""
+        t = sample_timestamp
+        session.update_equity(t, Decimal("0"), total_im=Decimal("100"), total_mm=Decimal("10"))
+        session.update_equity(t, Decimal("0"), total_im=Decimal("250"), total_mm=Decimal("15"))
+        session.update_equity(t, Decimal("0"), total_im=Decimal("180"), total_mm=Decimal("20"))
+        assert session._peak_im == Decimal("250")
+
+    def test_peak_mm_tracking(self, session, sample_timestamp):
+        """Tracks highest observed total MM across ticks."""
+        t = sample_timestamp
+        session.update_equity(t, Decimal("0"), total_im=Decimal("100"), total_mm=Decimal("10"))
+        session.update_equity(t, Decimal("0"), total_im=Decimal("120"), total_mm=Decimal("35"))
+        session.update_equity(t, Decimal("0"), total_im=Decimal("150"), total_mm=Decimal("25"))
+        assert session._peak_mm == Decimal("35")
+
+    def test_peak_imr_pct_calculation(self, session, sample_timestamp):
+        """Peak IMR% is calculated from total_im / equity * 100."""
+        t = sample_timestamp
+        session.update_equity(t, Decimal("0"), total_im=Decimal("100"), total_mm=Decimal("0"))
+        session.total_realized_pnl = Decimal("-500")  # equity = 9500
+        session.update_equity(t, Decimal("0"), total_im=Decimal("100"), total_mm=Decimal("0"))
+        expected_peak = float(Decimal("100") / Decimal("9500") * Decimal("100"))
+        assert session._peak_imr_pct == pytest.approx(expected_peak)
+
+    def test_peak_mmr_pct_calculation(self, session, sample_timestamp):
+        """Peak MMR% is calculated from total_mm / equity * 100."""
+        t = sample_timestamp
+        session.update_equity(t, Decimal("0"), total_im=Decimal("0"), total_mm=Decimal("20"))
+        session.total_realized_pnl = Decimal("-2000")  # equity = 8000
+        session.update_equity(t, Decimal("0"), total_im=Decimal("0"), total_mm=Decimal("20"))
+        expected_peak = float(Decimal("20") / Decimal("8000") * Decimal("100"))
+        assert session._peak_mmr_pct == pytest.approx(expected_peak)
+
+    def test_margin_peaks_tracked(self, session, sample_timestamp):
+        """Peak IM and MM tracked across equity updates."""
+        t = sample_timestamp
+
+        session.update_equity(t, Decimal("0"), total_im=Decimal("100"), total_mm=Decimal("10"))
+        session.update_equity(t, Decimal("0"), total_im=Decimal("200"), total_mm=Decimal("20"))
+        session.update_equity(t, Decimal("0"), total_im=Decimal("150"), total_mm=Decimal("15"))
+
+        assert session._peak_im == Decimal("200")
+        assert session._peak_mm == Decimal("20")
+
+    def test_margin_peaks_in_metrics(self, session, sample_timestamp):
+        """Peak margin values appear in finalized metrics."""
+        t = sample_timestamp
+        session.update_equity(t, Decimal("0"), total_im=Decimal("500"), total_mm=Decimal("50"))
+
+        metrics = session.finalize()
+
+        assert metrics.peak_im == Decimal("500")
+        assert metrics.peak_mm == Decimal("50")
+        # IMR% = 500 / 10000 * 100 = 5.0%
+        assert metrics.peak_imr_pct == pytest.approx(5.0)
+        # MMR% = 50 / 10000 * 100 = 0.5%
+        assert metrics.peak_mmr_pct == pytest.approx(0.5)
+
+    def test_margin_zero_by_default(self, session):
+        """Margin peaks are zero when no margin data provided."""
+        metrics = session.finalize()
+
+        assert metrics.peak_im == Decimal("0")
+        assert metrics.peak_mm == Decimal("0")
+        assert metrics.peak_imr_pct == 0.0
+        assert metrics.peak_mmr_pct == 0.0
+
+    def test_backward_compatible_update_equity(self, session, sample_timestamp):
+        """update_equity works without margin params (backward compatible)."""
+        equity = session.update_equity(sample_timestamp, Decimal("100"))
+
+        assert equity == Decimal("10100")  # 10000 + 100 unrealized

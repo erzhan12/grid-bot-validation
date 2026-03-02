@@ -13,8 +13,10 @@ Reference:
 - Order History: https://bybit-exchange.github.io/docs/v5/order/order-list
 - Position List: https://bybit-exchange.github.io/docs/v5/position
 - Wallet Balance: https://bybit-exchange.github.io/docs/v5/account/wallet-balance
+- Risk Limit: https://bybit-exchange.github.io/docs/v5/market/risk-limit
 """
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -26,6 +28,11 @@ from bybit_adapter.rate_limiter import RateLimiter, RateLimitConfig, RequestType
 
 
 logger = logging.getLogger(__name__)
+
+# Valid Bybit symbol: uppercase letters and digits, 2-20 chars (e.g. "BTCUSDT").
+# Limitation: Does not allow hyphens or underscores. Update this pattern if
+# Bybit introduces symbol formats beyond [A-Z0-9] (check their API docs).
+_SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}$")
 
 
 @dataclass
@@ -214,6 +221,9 @@ class BybitRestClient:
             all_executions.extend(executions)
             page += 1
 
+            if not executions:
+                break
+
             if not cursor:
                 break
 
@@ -320,6 +330,99 @@ class BybitRestClient:
         logger.debug("Fetched wallet balance")
         return result
 
+    def get_account_info(self) -> dict:
+        """Fetch account info (margin mode, etc.).
+
+        Returns:
+            Account info dict with marginMode, unifiedMarginStatus, etc.
+
+        Raises:
+            Exception: If API call fails
+        """
+        logger.debug("Fetching account info")
+        self._wait_for_rate_limit("query")
+
+        response = self._session.get_account_info()
+        self._check_response(response, "get_account_info")
+
+        result = response.get("result", {})
+        logger.debug(f"Fetched account info: marginMode={result.get('marginMode')}")
+        return result
+
+    def get_risk_limit(self, symbol: str, category: str = "linear") -> list[dict]:
+        """Fetch risk limit tiers for a symbol.
+
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+            category: Product type (default "linear")
+
+        Returns:
+            List of tier dicts. Each dict contains:
+              - ``riskLimitValue`` (str): Max position value for this tier (e.g. "200000")
+              - ``maintenanceMargin`` (str): MMR rate as decimal string (e.g. "0.005")
+              - ``mmDeduction`` (str): Deduction amount (e.g. "0", may be "" for tier 0)
+              - ``initialMargin`` (str): IMR rate as decimal string (e.g. "0.01")
+
+        Raises:
+            Exception: If API call fails
+
+        Reference:
+            https://bybit-exchange.github.io/docs/v5/market/risk-limit
+        """
+        if not _SYMBOL_RE.match(symbol):
+            raise ValueError(f"Invalid symbol format: {symbol!r}")
+
+        logger.debug(f"Fetching risk limit tiers for {symbol}")
+        self._wait_for_rate_limit("query")
+
+        response = self._session.get_risk_limit(category=category, symbol=symbol)
+        self._check_response(response, "get_risk_limit")
+
+        tiers = self._unwrap_risk_limit_response(response, symbol)
+        logger.debug(f"Fetched {len(tiers)} risk limit tiers for {symbol}")
+        return tiers
+
+    def _unwrap_risk_limit_response(self, response: dict, symbol: str) -> list[dict]:
+        """Unwrap the nested Bybit V5 risk-limit response structure.
+
+        Bybit V5 ``/v5/market/risk-limit`` returns:
+        ``{"result": {"list": [{"list": [tier_data, ...]}, ...]}}``
+        where outer list contains one entry per symbol, each with an inner
+        ``"list"`` of tiers.  We extract the first symbol's inner tier list
+        since the caller queries one symbol at a time.
+
+        Returns an empty list when the symbol has no tiers (legitimate).
+        Raises ``ValueError`` when the API response structure is unexpected
+        (indicates an API format change), so the error propagates to
+        ``fetch_from_bybit`` and gets logged at the appropriate level.
+        """
+        outer_list = response.get("result", {}).get("list", [])
+
+        if not isinstance(outer_list, list):
+            raise ValueError(
+                f"Unexpected risk limit API structure for {symbol}: "
+                f"expected list but got {type(outer_list).__name__}"
+            )
+
+        if not outer_list:
+            return []
+
+        first_item = outer_list[0]
+        if not isinstance(first_item, dict) or "list" not in first_item:
+            raise ValueError(
+                f"Unexpected risk limit API structure for {symbol}: "
+                f"outer list items missing 'list' key (expected nested structure)"
+            )
+
+        tiers = first_item.get("list", [])
+        if not isinstance(tiers, list):
+            raise ValueError(
+                f"Unexpected risk limit API structure for {symbol}: "
+                f"inner list is {type(tiers).__name__}"
+            )
+
+        return tiers
+
     # -------------------------------------------------------------------------
     # Order Management Methods
     # -------------------------------------------------------------------------
@@ -421,15 +524,38 @@ class BybitRestClient:
         if order_link_id is not None:
             params["orderLinkId"] = order_link_id
 
+        # Bybit retCodes for orders that are already terminal or not found.
+        # Primary detection uses retCode; message text matching is a fallback
+        # in case Bybit introduces new codes we haven't catalogued yet.
+        _EXPECTED_CANCEL_CODES = {110001, 110003, 170213}
+
         try:
             response = self._session.cancel_order(**params)
-            self._check_response(response, "cancel_order")
+        except Exception as e:
+            logger.error(f"Cancel order request failed: {e}")
+            return False
+
+        ret_code = response.get("retCode", -1)
+        ret_msg = response.get("retMsg", "Unknown error")
+
+        if ret_code == 0:
             logger.info("Order cancelled successfully")
             return True
-        except Exception as e:
-            # Order may already be filled or cancelled
-            logger.warning(f"Cancel order failed: {e}")
+
+        if ret_code in _EXPECTED_CANCEL_CODES:
+            logger.warning(f"Cancel order failed (expected): [{ret_code}] {ret_msg}")
             return False
+
+        # Fallback: check message text for unknown codes
+        if any(
+            phrase in ret_msg.lower()
+            for phrase in ("not found", "not exist", "already filled", "already cancelled")
+        ):
+            logger.warning(f"Cancel order failed (expected): [{ret_code}] {ret_msg}")
+            return False
+
+        logger.error(f"Cancel order failed (unexpected): [{ret_code}] {ret_msg}")
+        return False
 
     def cancel_all_orders(self, symbol: str) -> int:
         """Cancel all open orders for a symbol.
@@ -466,6 +592,7 @@ class BybitRestClient:
         symbol: Optional[str] = None,
         order_type: str = "Limit",
         limit: int = 50,
+        max_pages: int = 10,
     ) -> list[dict]:
         """Fetch all open orders with pagination.
 
@@ -473,9 +600,14 @@ class BybitRestClient:
             symbol: Filter by symbol (optional)
             order_type: Filter by order type (default "Limit")
             limit: Results per page (max 50)
+            max_pages: Maximum number of pages to fetch (safety limit)
 
         Returns:
-            List of open order dicts
+            List of open order dicts.  **Note:** if more orders exist than
+            ``max_pages * limit`` (default 500), results will be silently
+            truncated and a warning is logged.  Callers relying on complete
+            data should increase ``max_pages`` or check the log for
+            truncation warnings.
 
         Raises:
             Exception: If API call fails
@@ -488,8 +620,9 @@ class BybitRestClient:
         all_orders = []
         # Note: _wait_for_rate_limit is called inside the loop before each page request
         cursor = None
+        page = 0
 
-        while True:
+        while page < max_pages:
             self._wait_for_rate_limit("query")
             params = {
                 "category": "linear",
@@ -514,10 +647,14 @@ class BybitRestClient:
             all_orders.extend(filtered)
 
             cursor = result.get("nextPageCursor")
+            page += 1
             if not cursor:
                 break
 
-        logger.debug(f"Fetched {len(all_orders)} open {order_type} orders")
+        if page >= max_pages and cursor:
+            logger.warning(f"get_open_orders reached max_pages={max_pages} with more data available")
+
+        logger.debug(f"Fetched {len(all_orders)} open {order_type} orders across {page} pages")
         return all_orders
 
     def get_tickers(self, symbol: str) -> dict:
@@ -648,6 +785,9 @@ class BybitRestClient:
             )
             all_transactions.extend(transactions)
             page += 1
+
+            if not transactions:
+                break
 
             if not cursor:
                 break
