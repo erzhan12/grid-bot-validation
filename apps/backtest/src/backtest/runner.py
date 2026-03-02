@@ -24,7 +24,7 @@ from gridcore import (
     PositionState,
     RiskConfig,
 )
-from gridcore.pnl import calc_position_value, calc_maintenance_margin, MMTiers, MM_TIERS, MM_TIERS_DEFAULT
+from gridcore.pnl import calc_position_value, calc_margin_ratio, calc_maintenance_margin, MMTiers, MM_TIERS, MM_TIERS_DEFAULT
 
 from backtest.config import BacktestStrategyConfig
 from backtest.executor import BacktestExecutor
@@ -385,7 +385,7 @@ class BacktestRunner:
         if size > 0 and entry_price > 0:
             position_value = calc_position_value(size, entry_price)
             if wallet_balance > 0:
-                margin = position_value / wallet_balance
+                margin = calc_margin_ratio(position_value, wallet_balance)
             else:
                 logger.error(
                     "%s: wallet_balance is zero but %s position has value %s "

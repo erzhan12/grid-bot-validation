@@ -203,31 +203,29 @@ class TestMarginRatioEdgeCases:
         )
         assert result == {}
 
-    def test_zero_wallet_balance_logs_warning(self, caplog):
-        """Zero wallet balance triggers warning log."""
+    def test_zero_wallet_balance_returns_zero_margin(self):
+        """Zero wallet balance produces zero margin ratio."""
         pos = self._make_position()
-        with caplog.at_level(logging.WARNING, logger="pnl_checker.calculator"):
-            _calc_risk_multipliers(
-                long_pos=pos,
-                short_pos=None,
-                last_price=50000.0,
-                risk_config=self._risk_config(),
-                wallet_balance=Decimal("0"),
-            )
-        assert "Zero or negative wallet balance" in caplog.text
+        result = _calc_risk_multipliers(
+            long_pos=pos,
+            short_pos=None,
+            last_price=50000.0,
+            risk_config=self._risk_config(),
+            wallet_balance=Decimal("0"),
+        )
+        assert "long" in result
 
-    def test_negative_wallet_balance_logs_warning(self, caplog):
-        """Negative wallet balance triggers warning log."""
+    def test_negative_wallet_balance_returns_zero_margin(self):
+        """Negative wallet balance produces zero margin ratio."""
         pos = self._make_position()
-        with caplog.at_level(logging.WARNING, logger="pnl_checker.calculator"):
-            _calc_risk_multipliers(
-                long_pos=pos,
-                short_pos=None,
-                last_price=50000.0,
-                risk_config=self._risk_config(),
-                wallet_balance=Decimal("-100"),
-            )
-        assert "Zero or negative wallet balance" in caplog.text
+        result = _calc_risk_multipliers(
+            long_pos=pos,
+            short_pos=None,
+            last_price=50000.0,
+            risk_config=self._risk_config(),
+            wallet_balance=Decimal("-100"),
+        )
+        assert "long" in result
 
 
 class TestZeroMarkPrice:

@@ -18,6 +18,7 @@ from gridcore.pnl import (
     calc_maintenance_margin,
     calc_imr_pct,
     calc_mmr_pct,
+    calc_margin_ratio,
     MM_TIERS,
     MM_TIERS_DEFAULT,
 )
@@ -121,21 +122,18 @@ def _calc_risk_multipliers(
     """
     long_mgr, short_mgr = Position.create_linked_pair(risk_config)
 
-    def _margin_ratio(pos: PositionData | None) -> Decimal:
-        """Compute margin as positionValue / walletBalance (bbu2 pattern)."""
+    def _pos_margin(pos: PositionData | None) -> Decimal:
+        """Per-position margin ratio, with None-position guard."""
         if pos is None:
             return Decimal("0")
-        if wallet_balance <= 0:
-            logger.warning("Zero or negative wallet balance in margin calculation")
-            return Decimal("0")
-        return pos.position_value / wallet_balance
+        return calc_margin_ratio(pos.position_value, wallet_balance)
 
     # Build PositionState for each direction
     long_state = PositionState(
         direction="long",
         size=long_pos.size if long_pos else Decimal("0"),
         entry_price=long_pos.avg_price if long_pos else None,
-        margin=_margin_ratio(long_pos),
+        margin=_pos_margin(long_pos),
         liquidation_price=long_pos.liq_price if long_pos else Decimal("0"),
         leverage=_safe_leverage_int(long_pos.leverage) if long_pos else 1,
         position_value=long_pos.position_value if long_pos else Decimal("0"),
@@ -145,7 +143,7 @@ def _calc_risk_multipliers(
         direction="short",
         size=short_pos.size if short_pos else Decimal("0"),
         entry_price=short_pos.avg_price if short_pos else None,
-        margin=_margin_ratio(short_pos),
+        margin=_pos_margin(short_pos),
         liquidation_price=short_pos.liq_price if short_pos else Decimal("0"),
         leverage=_safe_leverage_int(short_pos.leverage) if short_pos else 1,
         position_value=short_pos.position_value if short_pos else Decimal("0"),
