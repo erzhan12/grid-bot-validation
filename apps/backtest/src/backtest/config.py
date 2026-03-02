@@ -36,11 +36,6 @@ class BacktestStrategyConfig(BaseModel):
         default="x0.001",
         description="Order amount: fixed USDT, 'x0.001' for wallet fraction, 'b0.001' for BTC equivalent",
     )
-    leverage: int = Field(
-        default=10, ge=1,
-        description="Position leverage for margin calculations. "
-                    "Default 10x matches typical grid trading configurations.",
-    )
     max_margin: float = Field(default=8.0, gt=0, description="Maximum margin per position")
     long_koef: float = Field(default=1.0, gt=0, description="Long/short bias multiplier")
 
@@ -54,6 +49,9 @@ class BacktestStrategyConfig(BaseModel):
     )
     enable_risk_multipliers: bool = Field(
         default=True, description="Enable risk-based order size multipliers (A/B toggle)"
+    )
+    risk_limits_cache_path: Optional[str] = Field(
+        default=None, description="Path to risk_limits_cache.json for tiered MMR (None = auto-discover conf/risk_limits_cache.json, then hardcoded defaults)"
     )
 
     # Commission

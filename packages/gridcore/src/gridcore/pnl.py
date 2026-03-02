@@ -20,6 +20,7 @@ _HUNDRED = Decimal("100")
 # Each tier: (max_position_value, mmr_rate, deduction, imr_rate)
 MMTiers = list[tuple[Decimal, Decimal, Decimal, Decimal]]
 
+
 # ---------------------------------------------------------------------------
 # Risk-limit tier tables (from Bybit risk-limit documentation)
 # Each tier: (max_position_value, mmr_rate, deduction, imr_rate)
@@ -40,6 +41,7 @@ MMTiers = list[tuple[Decimal, Decimal, Decimal, Decimal]]
 # The final tier always uses ``Infinity`` to guarantee a match for any size.
 # API Reference: https://bybit-exchange.github.io/docs/v5/market/risk-limit
 # ---------------------------------------------------------------------------
+
 
 MM_TIERS_BTCUSDT: MMTiers = [
     (Decimal("2000000"),  Decimal("0.005"),  Decimal("0"),       Decimal("0.01")),
