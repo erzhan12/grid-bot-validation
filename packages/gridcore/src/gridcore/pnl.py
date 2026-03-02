@@ -146,6 +146,23 @@ def calc_position_value(size: Decimal, entry_price: Decimal) -> Decimal:
     return size * entry_price
 
 
+def calc_margin_ratio(position_value: Decimal, wallet_balance: Decimal) -> Decimal:
+    """Per-position margin ratio = positionValue / walletBalance.
+
+    Matches the bbu2 pattern used for risk multiplier calculations.
+
+    Args:
+        position_value: Position notional value in quote currency.
+        wallet_balance: Account wallet balance in quote currency.
+
+    Returns:
+        Margin ratio as Decimal. Returns zero if wallet_balance <= 0.
+    """
+    if wallet_balance <= _ZERO:
+        return _ZERO
+    return position_value / wallet_balance
+
+
 # Maximum number of distinct tier boundary signatures cached for bisect
 # lookup.  64 entries supports ~60 actively traded symbol pairs with
 # headroom for transient entries before LRU eviction kicks in.  The value

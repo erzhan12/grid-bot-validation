@@ -1559,6 +1559,7 @@ Pure PnL calculation functions extracted into gridcore as the single source of t
 - `calc_maintenance_margin(position_value, symbol, tiers=None)` — Tier-based MM (supports dynamic tiers)
 - `calc_imr_pct(total_im, margin_balance)` — Account IMR %
 - `calc_mmr_pct(total_mm, margin_balance)` — Account MMR %
+- `calc_margin_ratio(position_value, wallet_balance)` — Per-position margin ratio (positionValue / walletBalance)
 - `parse_risk_limit_tiers(api_tiers)` — Bybit API response → `MMTiers`
 
 All take Decimal inputs; `position.py` keeps float copy for risk mgmt performance.

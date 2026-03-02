@@ -14,6 +14,7 @@ from gridcore.pnl import (
     calc_mmr_pct,
     parse_risk_limit_tiers,
     _find_matching_tier,
+    calc_margin_ratio,
 )
 
 
@@ -301,6 +302,30 @@ class TestCalcMmrPct:
         """MMR% = 100% means liquidation."""
         result = calc_mmr_pct(Decimal("10000"), Decimal("10000"))
         assert result == Decimal("100")
+
+
+class TestCalcMarginRatio:
+    """Test per-position margin ratio calculation."""
+
+    def test_basic(self):
+        """margin = position_value / wallet_balance."""
+        result = calc_margin_ratio(Decimal("5000"), Decimal("10000"))
+        assert result == Decimal("0.5")
+
+    def test_zero_wallet_balance(self):
+        """Zero wallet balance returns 0."""
+        result = calc_margin_ratio(Decimal("5000"), Decimal("0"))
+        assert result == Decimal("0")
+
+    def test_negative_wallet_balance(self):
+        """Negative wallet balance returns 0."""
+        result = calc_margin_ratio(Decimal("5000"), Decimal("-100"))
+        assert result == Decimal("0")
+
+    def test_zero_position(self):
+        """Zero position value returns 0."""
+        result = calc_margin_ratio(Decimal("0"), Decimal("10000"))
+        assert result == Decimal("0")
 
 
 class TestCalcMaintenanceMarginCustomTiers:

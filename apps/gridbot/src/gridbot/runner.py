@@ -28,6 +28,8 @@ from gridcore import (
     CancelIntent,
     GridAnchorStore,
     DirectionType,
+    calc_position_value,
+    calc_margin_ratio,
 )
 
 from gridbot.config import StrategyConfig
@@ -474,17 +476,19 @@ class StrategyRunner:
         unrealized_pnl = float(position_data.get("unrealisedPnl", 0) or 0)
 
         # Calculate margin
-        position_value = size * entry_price if entry_price > 0 else 0
-        margin = position_value / wallet_balance if wallet_balance > 0 else 0
+        size_d = Decimal(str(size))
+        entry_d = Decimal(str(entry_price))
+        position_value = calc_position_value(size_d, entry_d) if entry_price > 0 else Decimal("0")
+        margin = calc_margin_ratio(position_value, Decimal(str(wallet_balance)))
 
         return PositionState(
             direction=direction,
-            size=Decimal(str(size)),
-            entry_price=Decimal(str(entry_price)) if entry_price else None,
+            size=size_d,
+            entry_price=entry_d if entry_price else None,
             unrealized_pnl=Decimal(str(unrealized_pnl)),
-            margin=Decimal(str(margin)),
+            margin=margin,
             liquidation_price=Decimal(str(liq_price)),
-            position_value=Decimal(str(position_value)),
+            position_value=position_value,
         )
 
     async def _execute_intents(self, intents: list[PlaceLimitIntent | CancelIntent]) -> None:
