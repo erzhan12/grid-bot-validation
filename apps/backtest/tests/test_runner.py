@@ -177,7 +177,13 @@ class TestBacktestRunnerRiskMultipliers:
             fill_simulator=fill_sim,
             commission_rate=risk_config.commission_rate,
         )
-        executor = BacktestExecutor(order_manager=order_mgr)
+
+        def qty_from_usdt(intent, wallet_balance):
+            if intent.price <= 0:
+                return Decimal("0")
+            return Decimal("100") / intent.price
+
+        executor = BacktestExecutor(order_manager=order_mgr, qty_calculator=qty_from_usdt)
         return BacktestRunner(
             strategy_config=risk_config,
             executor=executor,
@@ -193,7 +199,13 @@ class TestBacktestRunnerRiskMultipliers:
             fill_simulator=fill_sim,
             commission_rate=no_risk_config.commission_rate,
         )
-        executor = BacktestExecutor(order_manager=order_mgr)
+
+        def qty_from_usdt(intent, wallet_balance):
+            if intent.price <= 0:
+                return Decimal("0")
+            return Decimal("100") / intent.price
+
+        executor = BacktestExecutor(order_manager=order_mgr, qty_calculator=qty_from_usdt)
         return BacktestRunner(
             strategy_config=no_risk_config,
             executor=executor,
@@ -216,9 +228,10 @@ class TestBacktestRunnerRiskMultipliers:
         """Risk-enabled runner wires qty_calculator to executor."""
         assert risk_runner._executor.qty_calculator is not None
 
-    def test_risk_disabled_no_qty_calculator(self, no_risk_runner):
-        """Risk-disabled runner leaves qty_calculator as None."""
-        assert no_risk_runner._executor.qty_calculator is None
+    def test_risk_disabled_no_risk_wrapper(self, no_risk_runner):
+        """Risk-disabled runner keeps base qty_calculator without risk wrapper."""
+        assert no_risk_runner._executor.qty_calculator is not None
+        assert not hasattr(no_risk_runner, "_base_qty_calculator")
 
     def test_get_amount_multiplier_default(self, risk_runner):
         """Default multipliers are 1.0 before any fills."""

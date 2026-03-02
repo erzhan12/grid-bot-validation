@@ -283,8 +283,9 @@ uv run pytest packages/gridcore/tests/test_grid.py -v
     - **Test pitfall**: Tests using synthetic intents with `qty=Decimal("0.001")` hide the zero-qty bug. Always test with `qty=0` to match real GridEngine behavior.
     - **Test pitfall**: Conditional assertions (`if limit_orders["long"]:`) silently pass when no orders are placed. Use unconditional `assert len(...) > 0`.
     - **Defensive guard**: `_update_risk_multipliers` call must check `self._long_position is not None and self._short_position is not None` — if `Position.create_linked_pair()` fails in `__init__`, these stay `None` and calling `.reset_amount_multiplier()` raises `AttributeError`.
-    - **Division-by-zero in margin calc**: When `position_value > 0` but `wallet_balance == 0`, log a warning instead of silently returning `Decimal("0")`. This indicates a state inconsistency (open position with no balance).
-    - Files: `apps/backtest/src/backtest/runner.py:121-125,288-293,315-325,399-411`, `apps/backtest/tests/test_runner.py`
+    - **Division-by-zero in margin calc**: When `position_value > 0` but `wallet_balance == 0`, raise `ValueError` — silently setting margin to 0 masks a critical state inconsistency. File: `runner.py:317-326`.
+    - **Test fixture pitfall**: ALL test fixtures creating `BacktestExecutor` MUST include a `qty_calculator` (e.g. `qty_from_usdt`). Without it, GridEngine's `qty=0` intents produce zero-qty orders that get rejected. The `risk_runner` and `no_risk_runner` fixtures must match the `runner` fixture pattern.
+    - Files: `apps/backtest/src/backtest/runner.py:121-125,288-293,317-326,399-411`, `apps/backtest/tests/test_runner.py`
 
 ## Grid Anchor Persistence
 

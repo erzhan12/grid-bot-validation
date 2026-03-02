@@ -317,12 +317,14 @@ class BacktestRunner:
             if wallet_balance > 0:
                 margin = position_value / wallet_balance
             else:
-                logger.warning(
+                logger.error(
                     "%s: wallet_balance is zero but %s position has value %s "
-                    "— state inconsistency, margin set to 0",
+                    "— critical state inconsistency",
                     self.strat_id, direction, position_value,
                 )
-                margin = Decimal("0")
+                raise ValueError(
+                    f"wallet_balance is zero with {direction} position value {position_value}"
+                )
             liq_price = self._estimate_liquidation_price(entry_price, direction)
         else:
             position_value = Decimal("0")
