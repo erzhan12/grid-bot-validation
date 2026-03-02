@@ -285,7 +285,12 @@ class BacktestRunner:
         # Recalculate risk multipliers after position change.
         # Use ticker last_price (not fill price) — fill price is the order
         # limit price, but liq_ratio checks need the current market price.
-        if self._enable_risk and self._last_price is not None:
+        if (
+            self._enable_risk
+            and self._last_price is not None
+            and self._long_position is not None
+            and self._short_position is not None
+        ):
             self._update_risk_multipliers(float(self._last_price))
 
     def _build_position_state(
@@ -309,7 +314,15 @@ class BacktestRunner:
 
         if size > 0 and entry_price > 0:
             position_value = calc_position_value(size, entry_price)
-            margin = position_value / wallet_balance if wallet_balance > 0 else Decimal("0")
+            if wallet_balance > 0:
+                margin = position_value / wallet_balance
+            else:
+                logger.warning(
+                    "%s: wallet_balance is zero but %s position has value %s "
+                    "— state inconsistency, margin set to 0",
+                    self.strat_id, direction, position_value,
+                )
+                margin = Decimal("0")
             liq_price = self._estimate_liquidation_price(entry_price, direction)
         else:
             position_value = Decimal("0")
