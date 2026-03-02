@@ -47,6 +47,7 @@ def sample_strategy_config():
         amount="x0.001",
         max_margin=8.0,
         commission_rate=Decimal("0.0002"),
+        enable_risk_multipliers=False,
     )
 
 
