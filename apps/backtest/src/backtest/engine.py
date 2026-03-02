@@ -19,6 +19,7 @@ from backtest.instrument_info import InstrumentInfoProvider, InstrumentInfo
 from backtest.order_manager import BacktestOrderManager
 from backtest.executor import BacktestExecutor
 from backtest.position_tracker import BacktestPositionTracker
+from backtest.risk_limit_info import RiskLimitProvider
 from backtest.runner import BacktestRunner
 from backtest.session import BacktestSession, BacktestMetrics, BacktestTrade
 
@@ -117,6 +118,7 @@ class BacktestEngine:
         self._instrument_provider = InstrumentInfoProvider(
             cache_ttl=timedelta(hours=config.instrument_cache_ttl_hours),
         )
+        self._risk_limit_provider = RiskLimitProvider()
 
         # Session and runners (created per run)
         self._session: Optional[BacktestSession] = None
@@ -259,14 +261,27 @@ class BacktestEngine:
             qty_calculator=qty_calculator,
         )
 
+        # Fetch risk limit tiers for margin calculations
+        tiers = self._risk_limit_provider.get(strategy_config.symbol)
+        logger.info(
+            f"Risk limit tiers for {strategy_config.symbol}: "
+            f"{len(tiers)} tiers, leverage={strategy_config.leverage}"
+        )
+
         # Create position trackers
         long_tracker = BacktestPositionTracker(
             direction=DirectionType.LONG,
             commission_rate=strategy_config.commission_rate,
+            leverage=strategy_config.leverage,
+            tiers=tiers,
+            symbol=strategy_config.symbol,
         )
         short_tracker = BacktestPositionTracker(
             direction=DirectionType.SHORT,
             commission_rate=strategy_config.commission_rate,
+            leverage=strategy_config.leverage,
+            tiers=tiers,
+            symbol=strategy_config.symbol,
         )
 
         # Create runner
@@ -360,9 +375,10 @@ class BacktestEngine:
                 runner.process_fills(tick)
 
         # 3. Update equity AFTER fills (reflects realized PnL from fills)
-        # Aggregates unrealized PnL from ALL runners for multi-strategy support
+        # Aggregates unrealized PnL and margin from ALL runners for multi-strategy support
         total_unrealized = self._calculate_unrealized_at_price(tick.symbol, tick.last_price)
-        self._session.update_equity(tick.exchange_ts, total_unrealized)
+        total_im, total_mm = self._calculate_total_margin(tick.symbol)
+        self._session.update_equity(tick.exchange_ts, total_unrealized, total_im, total_mm)
 
         # 4. Phase 2: Execute tick intents for all runners (uses updated balance)
         for runner in self._runners.values():
@@ -481,6 +497,19 @@ class BacktestEngine:
                 total += runner.long_tracker.calculate_unrealized_pnl(price)
                 total += runner.short_tracker.calculate_unrealized_pnl(price)
         return total
+
+    def _calculate_total_margin(self, symbol: str) -> tuple[Decimal, Decimal]:
+        """Calculate total IM and MM across all runners for a symbol.
+
+        Called after unrealized PnL is calculated (which also updates margin).
+        """
+        total_im = Decimal("0")
+        total_mm = Decimal("0")
+        for runner in self._runners.values():
+            if runner.symbol == symbol:
+                total_im += runner.get_total_im()
+                total_mm += runner.get_total_mm()
+        return total_im, total_mm
 
     def _calculate_total_unrealized(self) -> Decimal:
         """Calculate total unrealized PnL across all runners using last prices."""

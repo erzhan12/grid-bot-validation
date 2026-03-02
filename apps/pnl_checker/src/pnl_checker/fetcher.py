@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Optional
 
 from bybit_adapter.rest_client import BybitRestClient
+from gridcore.pnl import MMTiers, parse_risk_limit_tiers
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,10 @@ class WalletData:
     total_perp_upl: Decimal
     total_initial_margin: Decimal
     total_maintenance_margin: Decimal
+    # Account margin rates (from Bybit API)
+    account_im_rate: Decimal  # Bybit's reported account IM rate
+    account_mm_rate: Decimal  # Bybit's reported account MM rate
+    margin_mode: str  # "REGULAR_MARGIN" or "PORTFOLIO_MARGIN"
     # USDT coin-level
     usdt_wallet_balance: Decimal
     usdt_unrealised_pnl: Decimal
@@ -83,6 +88,7 @@ class SymbolFetchResult:
     positions: list[PositionData]  # Up to 2 (long + short) in hedge mode
     ticker: TickerData
     funding: FundingData
+    risk_limit_tiers: MMTiers | None = None
 
 
 @dataclass
@@ -91,6 +97,7 @@ class FetchResult:
 
     symbols: list[SymbolFetchResult] = field(default_factory=list)
     wallet: Optional[WalletData] = None
+    data_quality_errors: list[str] = field(default_factory=list)
 
 
 class BybitFetcher:
@@ -123,7 +130,7 @@ class BybitFetcher:
 
         # Fetch per-symbol data
         for symbol in symbols:
-            symbol_result = self._fetch_symbol(symbol)
+            symbol_result = self._fetch_symbol(symbol, result.data_quality_errors)
             if symbol_result.positions:  # Only include symbols with open positions
                 result.symbols.append(symbol_result)
             else:
@@ -139,40 +146,59 @@ class BybitFetcher:
 
         return result
 
-    def _fetch_symbol(self, symbol: str) -> SymbolFetchResult:
+    def _fetch_symbol(
+        self, symbol: str, data_quality_errors: list[str] | None = None,
+    ) -> SymbolFetchResult:
         """Fetch all data for a single symbol."""
-        positions = self._fetch_positions(symbol)
+        positions = self._fetch_positions(symbol, data_quality_errors)
         ticker = self._fetch_ticker(symbol)
         funding = self._fetch_funding(symbol)
+
+        # Only fetch risk limits when there are open positions
+        # (avoids wasting an API call + rate limit slot)
+        risk_limit_tiers = self._fetch_risk_limits(symbol) if positions else None
 
         return SymbolFetchResult(
             symbol=symbol,
             positions=positions,
             ticker=ticker,
             funding=funding,
+            risk_limit_tiers=risk_limit_tiers,
         )
 
-    def _fetch_positions(self, symbol: str) -> list[PositionData]:
+    def _fetch_positions(
+        self, symbol: str, data_quality_errors: list[str] | None = None,
+    ) -> list[PositionData]:
         """Fetch open positions for a symbol (hedge mode: up to 2)."""
         raw_positions = self._client.get_positions(symbol=symbol)
         positions = []
 
         for pos in raw_positions:
             size = Decimal(pos.get("size", "0"))
-            # Negative sizes should never occur (Bybit always returns >= 0).
-            # We log-and-skip rather than raising because this is a read-only
-            # validation tool — crashing would prevent the rest of the report
-            # from being generated for the remaining symbols.
+            # Defensive check: Bybit should always return size >= 0, but we
+            # handle negative values gracefully in this read-only tool to avoid
+            # breaking the entire report.
             if size <= 0:
                 if size < 0:
-                    logger.warning(f"Negative position size {size} for {symbol}")
+                    msg = f"Negative position size {size} for {symbol}"
+                    logger.warning(msg)
+                    if data_quality_errors is not None:
+                        data_quality_errors.append(msg)
+                continue
+
+            avg_price = Decimal(pos.get("avgPrice", "0"))
+            if avg_price <= 0:
+                msg = f"Invalid avgPrice {avg_price} for {symbol} with size {size}"
+                logger.warning(msg)
+                if data_quality_errors is not None:
+                    data_quality_errors.append(msg)
                 continue
 
             positions.append(PositionData(
                 symbol=pos.get("symbol", symbol),
                 side=pos.get("side", ""),
                 size=size,
-                avg_price=Decimal(pos.get("avgPrice", "0")),
+                avg_price=avg_price,
                 mark_price=Decimal(pos.get("markPrice", "0")),
                 liq_price=Decimal(pos.get("liqPrice", "0") or "0"),
                 leverage=Decimal(pos.get("leverage", "1")),
@@ -200,7 +226,15 @@ class BybitFetcher:
         )
 
     def _fetch_funding(self, symbol: str) -> FundingData:
-        """Fetch cumulative funding fees from transaction log."""
+        """Fetch cumulative funding fees from transaction log.
+
+        Iterates all SETTLEMENT transactions for the symbol via paginated
+        ``get_transaction_log_all``.  Each page returns up to 50 records,
+        so the total records fetched is at most ``funding_max_pages * 50``.
+        For accounts with a long funding history (thousands of 8-hour
+        settlements), consider increasing *funding_max_pages* passed to
+        ``BybitFetcher.__init__`` to avoid truncated results.
+        """
         try:
             transactions, truncated = self._client.get_transaction_log_all(
                 symbol=symbol,
@@ -251,6 +285,24 @@ class BybitFetcher:
             truncated=truncated,
         )
 
+    def _fetch_risk_limits(self, symbol: str) -> MMTiers | None:
+        """Fetch and parse risk limit tiers for a symbol.
+
+        Returns None on any failure (non-fatal — calculator falls back
+        to hardcoded tiers).
+        """
+        try:
+            raw_tiers = self._client.get_risk_limit(symbol=symbol)
+            tiers = parse_risk_limit_tiers(raw_tiers)
+            logger.info(f"Fetched {len(tiers)} risk limit tiers for {symbol}")
+            return tiers
+        except Exception as e:
+            logger.warning(
+                f"Failed to fetch risk limits for {symbol} ({type(e).__name__}): {e}",
+                exc_info=True,
+            )
+            return None
+
     def _fetch_wallet(self) -> WalletData:
         """Fetch account wallet balance."""
         raw = self._client.get_wallet_balance(account_type="UNIFIED")
@@ -261,6 +313,14 @@ class BybitFetcher:
             raise Exception("No wallet data returned")
 
         account = account_list[0]
+
+        # Fetch margin mode from account info endpoint
+        margin_mode = "UNKNOWN"
+        try:
+            account_info = self._client.get_account_info()
+            margin_mode = account_info.get("marginMode", "UNKNOWN")
+        except Exception as e:
+            logger.warning(f"Failed to fetch account info: {e}")
 
         # Find USDT coin data
         usdt_data = {}
@@ -277,6 +337,9 @@ class BybitFetcher:
             total_perp_upl=Decimal(account.get("totalPerpUPL", "0")),
             total_initial_margin=Decimal(account.get("totalInitialMargin", "0")),
             total_maintenance_margin=Decimal(account.get("totalMaintenanceMargin", "0")),
+            account_im_rate=Decimal(account.get("accountIMRate", "0")),
+            account_mm_rate=Decimal(account.get("accountMMRate", "0")),
+            margin_mode=margin_mode,
             usdt_wallet_balance=Decimal(usdt_data.get("walletBalance", "0")),
             usdt_unrealised_pnl=Decimal(usdt_data.get("unrealisedPnl", "0")),
             usdt_cum_realised_pnl=Decimal(usdt_data.get("cumRealisedPnl", "0")),

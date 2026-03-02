@@ -56,6 +56,12 @@ class BacktestMetrics:
     profit_factor: float = 0.0
     sharpe_ratio: float = 0.0  # Risk-adjusted return (annualized)
 
+    # Margin (from gridcore IM/MM calculations)
+    peak_im: Decimal = field(default_factory=lambda: Decimal("0"))
+    peak_mm: Decimal = field(default_factory=lambda: Decimal("0"))
+    peak_imr_pct: float = 0.0  # Peak initial margin rate %
+    peak_mmr_pct: float = 0.0  # Peak maintenance margin rate %
+
     # Balance
     initial_balance: Decimal = field(default_factory=lambda: Decimal("0"))
     final_balance: Decimal = field(default_factory=lambda: Decimal("0"))
@@ -118,6 +124,14 @@ class BacktestSession:
         # Volume tracking for turnover
         self.total_volume = Decimal("0")
 
+        # Margin peak tracking
+        self._peak_im = Decimal("0")
+        self._peak_mm = Decimal("0")
+        self._peak_imr_pct = 0.0
+        self._peak_mmr_pct = 0.0
+        self._last_margin_inputs: Optional[tuple[Decimal, Decimal, Decimal]] = None
+        self._last_margin_pct: tuple[float, float] = (0.0, 0.0)
+
         # Final metrics (populated by finalize())
         self.metrics: Optional[BacktestMetrics] = None
 
@@ -145,12 +159,16 @@ class BacktestSession:
         self,
         timestamp: datetime,
         unrealized_pnl: Decimal,
+        total_im: Decimal = Decimal("0"),
+        total_mm: Decimal = Decimal("0"),
     ) -> Decimal:
-        """Record equity point and update drawdown.
+        """Record equity point, update drawdown, and track margin peaks.
 
         Args:
             timestamp: Current timestamp
             unrealized_pnl: Current unrealized PnL
+            total_im: Sum of initial margins across all positions
+            total_mm: Sum of maintenance margins across all positions
 
         Returns:
             Current equity
@@ -181,7 +199,42 @@ class BacktestSession:
         if drawdown > self._max_drawdown:
             self._max_drawdown = drawdown
 
+        # Track margin peaks
+        if total_im > self._peak_im:
+            self._peak_im = total_im
+        if total_mm > self._peak_mm:
+            self._peak_mm = total_mm
+        if equity > 0:
+            imr_pct, mmr_pct = self._get_margin_pct(total_im, total_mm, equity)
+            if imr_pct > self._peak_imr_pct:
+                self._peak_imr_pct = imr_pct
+            if mmr_pct > self._peak_mmr_pct:
+                self._peak_mmr_pct = mmr_pct
+
         return equity
+
+    def _get_margin_pct(
+        self,
+        total_im: Decimal,
+        total_mm: Decimal,
+        equity: Decimal,
+    ) -> tuple[float, float]:
+        """Compute IMR/MMR percentages with a tiny cache for repeated ticks.
+
+        Micro-optimization: saves ~2 Decimal divisions when inputs repeat
+        across consecutive ticks.
+        """
+        if equity == 0:
+            return (0.0, 0.0)
+        inputs = (total_im, total_mm, equity)
+        if self._last_margin_inputs != inputs:
+            scale = Decimal("100") / equity
+            self._last_margin_pct = (
+                float(total_im * scale),
+                float(total_mm * scale),
+            )
+            self._last_margin_inputs = inputs
+        return self._last_margin_pct
 
     def finalize(
         self,
@@ -298,6 +351,10 @@ class BacktestSession:
             short_pnl=short_pnl,
             long_profit_factor=long_profit_factor,
             short_profit_factor=short_profit_factor,
+            peak_im=self._peak_im,
+            peak_mm=self._peak_mm,
+            peak_imr_pct=self._peak_imr_pct,
+            peak_mmr_pct=self._peak_mmr_pct,
         )
 
         return self.metrics
@@ -415,6 +472,10 @@ Risk:
   Max Drawdown: {m.max_drawdown:.2f} ({m.max_drawdown_pct:.1f}%)
   Max DD Duration: {m.max_drawdown_duration} ticks
   Sharpe Ratio: {m.sharpe_ratio:.2f}
+
+Margin:
+  Peak IM: {m.peak_im:.4f} ({m.peak_imr_pct:.2f}%)
+  Peak MM: {m.peak_mm:.4f} ({m.peak_mmr_pct:.2f}%)
 
 Activity:
   Total Volume: {m.total_volume:.2f}

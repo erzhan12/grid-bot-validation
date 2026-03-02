@@ -74,4 +74,5 @@ apps/pnl_checker/src/pnl_checker/output/
 
 # Runtime caches
 conf/instruments_cache.json
+conf/risk_limits_cache.json
 /keys.yaml

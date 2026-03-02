@@ -1,5 +1,6 @@
 """Tests for BybitRestClient."""
 
+import logging
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -641,6 +642,81 @@ class TestGetTransactionLog:
 # ---------------------------------------------------------------------------
 # get_transaction_log_all (pagination + truncated flag)
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# get_risk_limit
+# ---------------------------------------------------------------------------
+
+
+class TestGetRiskLimit:
+    def test_returns_tier_list(self, client, mock_session):
+        tiers = [
+            {"id": 1, "symbol": "BTCUSDT", "riskLimitValue": "2000000",
+             "maintenanceMargin": "0.005", "mmDeduction": "0"},
+            {"id": 2, "symbol": "BTCUSDT", "riskLimitValue": "4000000",
+             "maintenanceMargin": "0.01", "mmDeduction": "10000"},
+        ]
+        # Bybit API returns nested structure: outer list with inner "list" key per symbol
+        mock_session.get_risk_limit.return_value = _ok_response({"list": [{"list": tiers}]})
+
+        result = client.get_risk_limit(symbol="BTCUSDT")
+
+        assert result == tiers
+        mock_session.get_risk_limit.assert_called_once_with(
+            category="linear", symbol="BTCUSDT"
+        )
+
+    def test_api_error_raises(self, client, mock_session):
+        mock_session.get_risk_limit.return_value = _error_response(10001, "Invalid symbol")
+
+        with pytest.raises(Exception, match="Invalid symbol"):
+            client.get_risk_limit(symbol="INVALID")
+
+    def test_network_error_raises(self, client, mock_session):
+        mock_session.get_risk_limit.side_effect = ConnectionError("Network unreachable")
+
+        with pytest.raises(ConnectionError, match="Network unreachable"):
+            client.get_risk_limit(symbol="BTCUSDT")
+
+    def test_empty_tier_list(self, client, mock_session):
+        mock_session.get_risk_limit.return_value = _ok_response({"list": []})
+
+        result = client.get_risk_limit(symbol="BTCUSDT")
+
+        assert result == []
+
+    def test_custom_category(self, client, mock_session):
+        mock_session.get_risk_limit.return_value = _ok_response({"list": []})
+
+        client.get_risk_limit(symbol="BTCUSDT", category="inverse")
+
+        mock_session.get_risk_limit.assert_called_once_with(
+            category="inverse", symbol="BTCUSDT"
+        )
+
+    def test_unexpected_structure_raises_value_error(self, client, mock_session):
+        """Flat list without nested 'list' key raises ValueError."""
+        tiers = [
+            {"id": 1, "symbol": "BTCUSDT", "riskLimitValue": "2000000"},
+            {"id": 2, "symbol": "BTCUSDT", "riskLimitValue": "4000000"},
+        ]
+        mock_session.get_risk_limit.return_value = _ok_response({"list": tiers})
+
+        with pytest.raises(ValueError, match="Unexpected risk limit API structure"):
+            client.get_risk_limit(symbol="BTCUSDT")
+
+    def test_non_list_structure_raises_value_error(self, client, mock_session):
+        mock_session.get_risk_limit.return_value = _ok_response({"list": {"unexpected": "shape"}})
+
+        with pytest.raises(ValueError, match="expected list but got dict"):
+            client.get_risk_limit(symbol="BTCUSDT")
+
+    def test_non_list_inner_list_raises_value_error(self, client, mock_session):
+        mock_session.get_risk_limit.return_value = _ok_response({"list": [{"list": "bad-inner"}]})
+
+        with pytest.raises(ValueError, match="inner list is str"):
+            client.get_risk_limit(symbol="BTCUSDT")
 
 
 class TestGetTransactionLogAll:

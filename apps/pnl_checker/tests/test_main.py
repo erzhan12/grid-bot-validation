@@ -49,7 +49,10 @@ def _make_fetch_result():
             total_equity=Decimal("10000"), total_wallet_balance=Decimal("9980"),
             total_margin_balance=Decimal("10000"), total_available_balance=Decimal("9900"),
             total_perp_upl=Decimal("20"), total_initial_margin=Decimal("102"),
-            total_maintenance_margin=Decimal("10.2"), usdt_wallet_balance=Decimal("9980"),
+            total_maintenance_margin=Decimal("10.2"),
+            account_im_rate=Decimal("0.0102"), account_mm_rate=Decimal("0.00102"),
+            margin_mode="REGULAR_MARGIN",
+            usdt_wallet_balance=Decimal("9980"),
             usdt_unrealised_pnl=Decimal("20"), usdt_cum_realised_pnl=Decimal("0"),
         ),
     )

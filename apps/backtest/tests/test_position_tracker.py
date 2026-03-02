@@ -245,13 +245,13 @@ class TestBacktestPositionTracker:
         leverage = Decimal("10")
         pnl_percent = tracker.calculate_unrealized_pnl_percent(Decimal("51000"), leverage)
 
-        # Formula: (1/entry - 1/close) * entry * 100 * leverage
-        # (1/50000 - 1/51000) * 50000 * 100 * 10 ≈ 19.6%
+        # Formula: (close - entry) / entry * leverage * 100
+        # (51000 - 50000) / 50000 * 10 * 100 = 20.0%
         expected = (
-            (Decimal("1") / Decimal("50000") - Decimal("1") / Decimal("51000"))
-            * Decimal("50000")
-            * Decimal("100")
+            (Decimal("51000") - Decimal("50000"))
+            / Decimal("50000")
             * leverage
+            * Decimal("100")
         )
         assert pnl_percent == expected
         assert pnl_percent > Decimal("0")  # Profit
@@ -282,12 +282,13 @@ class TestBacktestPositionTracker:
         leverage = Decimal("10")
         pnl_percent = tracker.calculate_unrealized_pnl_percent(Decimal("49000"), leverage)
 
-        # Formula: (1/close - 1/entry) * entry * 100 * leverage
+        # Formula: (entry - close) / entry * leverage * 100
+        # (50000 - 49000) / 50000 * 10 * 100 = 20.0%
         expected = (
-            (Decimal("1") / Decimal("49000") - Decimal("1") / Decimal("50000"))
-            * Decimal("50000")
-            * Decimal("100")
+            (Decimal("50000") - Decimal("49000"))
+            / Decimal("50000")
             * leverage
+            * Decimal("100")
         )
         assert pnl_percent == expected
         assert pnl_percent > Decimal("0")  # Profit
@@ -317,3 +318,78 @@ class TestBacktestPositionTracker:
 
         assert pnl_percent == Decimal("0")
         assert tracker.state.unrealized_pnl_percent == Decimal("0")
+
+
+class TestMarginCalculation:
+    """Tests for IM/MM calculation in BacktestPositionTracker."""
+
+    def test_margin_calculated_on_unrealized_pnl(self):
+        """Margin fields populated when calculate_unrealized_pnl is called."""
+        tracker = BacktestPositionTracker(
+            direction="long", leverage=10, symbol="BTCUSDT",
+        )
+        tracker.process_fill(side="Buy", qty=Decimal("0.1"), price=Decimal("50000"))
+        tracker.calculate_unrealized_pnl(Decimal("51000"))
+
+        # position_value = size * entry = 0.1 * 50000 = 5000
+        assert tracker.state.position_value == Decimal("5000")
+        # IM = 5000 * 0.01 = 50 (BTCUSDT tier 1: imr_rate=0.01)
+        assert tracker.state.initial_margin == Decimal("50")
+        assert tracker.state.imr_rate == Decimal("0.01")
+        # MM = 5000 * 0.005 - 0 = 25 (BTCUSDT tier 1: ≤2M, 0.5%)
+        assert tracker.state.maintenance_margin.normalize() == Decimal("25")
+        assert tracker.state.mmr_rate == Decimal("0.005")
+
+    def test_margin_zero_when_no_position(self):
+        """Margin fields are zero when position is empty."""
+        tracker = BacktestPositionTracker(
+            direction="long", leverage=10, symbol="BTCUSDT",
+        )
+        tracker.calculate_unrealized_pnl(Decimal("50000"))
+
+        assert tracker.state.position_value == Decimal("0")
+        assert tracker.state.initial_margin == Decimal("0")
+        assert tracker.state.maintenance_margin == Decimal("0")
+
+    def test_margin_reset_after_close(self):
+        """Margin fields reset to zero after position is closed."""
+        tracker = BacktestPositionTracker(
+            direction="long", leverage=10, symbol="BTCUSDT",
+        )
+        tracker.process_fill(side="Buy", qty=Decimal("0.1"), price=Decimal("50000"))
+        tracker.calculate_unrealized_pnl(Decimal("51000"))
+        assert tracker.state.initial_margin > 0
+
+        # Close position
+        tracker.process_fill(side="Sell", qty=Decimal("0.1"), price=Decimal("51000"))
+        tracker.calculate_unrealized_pnl(Decimal("51000"))
+
+        assert tracker.state.position_value == Decimal("0")
+        assert tracker.state.initial_margin == Decimal("0")
+        assert tracker.state.maintenance_margin == Decimal("0")
+
+    def test_margin_with_custom_tiers(self):
+        """Custom tiers override symbol-based lookup."""
+        custom_tiers = [
+            (Decimal("100000"), Decimal("0.02"), Decimal("0"), Decimal("0.04")),
+            (Decimal("Infinity"), Decimal("0.05"), Decimal("3000"), Decimal("0.1")),
+        ]
+        tracker = BacktestPositionTracker(
+            direction="short", leverage=5, tiers=custom_tiers, symbol="XYZUSDT",
+        )
+        tracker.process_fill(side="Sell", qty=Decimal("1"), price=Decimal("1000"))
+        tracker.calculate_unrealized_pnl(Decimal("900"))
+
+        # position_value = 1 * 1000 = 1000
+        assert tracker.state.position_value == Decimal("1000")
+        # IM = 1000 * 0.04 = 40 (tier 1: imr_rate=0.04)
+        assert tracker.state.initial_margin == Decimal("40")
+        assert tracker.state.imr_rate == Decimal("0.04")
+        # MM = 1000 * 0.02 - 0 = 20 (tier 1: ≤100000)
+        assert tracker.state.maintenance_margin == Decimal("20")
+        assert tracker.state.mmr_rate == Decimal("0.02")
+
+    def test_margin_uses_default_leverage(self):
+        """Default leverage is 10."""
+        tracker = BacktestPositionTracker(direction="long")
+        assert tracker.leverage == Decimal("10")

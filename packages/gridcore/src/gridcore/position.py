@@ -198,9 +198,9 @@ class Position:
         # Calculate unrealized PnL percentage (float arithmetic for risk management)
         # NOTE: Canonical Decimal version is in gridcore.pnl.calc_unrealised_pnl_pct
         if self.direction == self.DIRECTION_LONG:
-            unrealized_pnl_pct = (1 / entry_price - 1 / last_close) * entry_price * 100 * leverage
+            unrealized_pnl_pct = (last_close - entry_price) / entry_price * 100 * leverage
         else:  # short
-            unrealized_pnl_pct = (1 / last_close - 1 / entry_price) * entry_price * 100 * leverage
+            unrealized_pnl_pct = (entry_price - last_close) / entry_price * 100 * leverage
 
         # Calculate liquidation ratio
         liq_ratio = self._get_liquidation_ratio(position.liquidation_price, last_close)
