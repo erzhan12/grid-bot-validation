@@ -50,6 +50,9 @@ class BacktestStrategyConfig(BaseModel):
     enable_risk_multipliers: bool = Field(
         default=True, description="Enable risk-based order size multipliers (A/B toggle)"
     )
+    risk_limits_cache_path: Optional[str] = Field(
+        default=None, description="Path to risk_limits_cache.json for tiered MMR (None = auto-discover conf/risk_limits_cache.json, then hardcoded defaults)"
+    )
 
     # Commission
     commission_rate: Decimal = Field(

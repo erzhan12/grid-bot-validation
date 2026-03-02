@@ -8,6 +8,7 @@ The runner is responsible for:
 
 import logging
 from decimal import Decimal
+from pathlib import Path
 from typing import Optional
 
 from gridcore import (
@@ -23,7 +24,7 @@ from gridcore import (
     PositionState,
     RiskConfig,
 )
-from gridcore.pnl import calc_position_value
+from gridcore.pnl import calc_position_value, calc_maintenance_margin, MMTiers, MM_TIERS, MM_TIERS_DEFAULT
 
 from backtest.config import BacktestStrategyConfig
 from backtest.executor import BacktestExecutor
@@ -108,6 +109,9 @@ class BacktestRunner:
         self._leverage = strategy_config.leverage
         self._mmr = strategy_config.maintenance_margin_rate
         self._enable_risk = strategy_config.enable_risk_multipliers
+        self._mm_tiers: Optional[MMTiers] = self._load_mm_tiers(
+            strategy_config.symbol, strategy_config.risk_limits_cache_path
+        )
 
         if self._enable_risk:
             risk_config = RiskConfig(
@@ -162,6 +166,72 @@ class BacktestRunner:
     def short_tracker(self) -> BacktestPositionTracker:
         """Short position tracker."""
         return self._short_tracker
+
+    # Default cache location: project_root/conf/risk_limits_cache.json
+    # __file__ = apps/backtest/src/backtest/runner.py → 5x parent = project root
+    _DEFAULT_CACHE_PATH = Path(__file__).parent.parent.parent.parent.parent / "conf" / "risk_limits_cache.json"
+
+    @staticmethod
+    def _load_mm_tiers(symbol: str, cache_path: Optional[str]) -> Optional[MMTiers]:
+        """Load tiered MMR from cache file, falling back to hardcoded defaults.
+
+        Resolution order:
+        1. Explicit ``cache_path`` if provided.
+        2. Auto-discover ``conf/risk_limits_cache.json`` relative to project root.
+        3. Hardcoded tier tables in ``gridcore.pnl``.
+
+        Args:
+            symbol: Trading pair (e.g. "BTCUSDT").
+            cache_path: Path to risk_limits_cache.json, or None for auto-discover.
+
+        Returns:
+            MMTiers list for the symbol, or None if nothing available.
+        """
+        import json
+
+        # Resolve cache path: explicit > auto-discover
+        paths_to_try = []
+        if cache_path is not None:
+            paths_to_try.append(Path(cache_path))
+        else:
+            paths_to_try.append(BacktestRunner._DEFAULT_CACHE_PATH)
+
+        for path in paths_to_try:
+            if not path.exists():
+                continue
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                symbol_data = data.get(symbol)
+                if symbol_data and "tiers" in symbol_data:
+                    raw_tiers = symbol_data["tiers"]
+                    converted: MMTiers = []
+                    for t in raw_tiers:
+                        max_val = Decimal(t["max_value"]) if t["max_value"] != "Infinity" else Decimal("Infinity")
+                        mmr_rate = Decimal(t["mmr_rate"])
+                        deduction = Decimal(t["deduction"])
+                        imr_rate = Decimal(t.get("imr_rate", "0"))
+                        converted.append((max_val, mmr_rate, deduction, imr_rate))
+                    logger.info(
+                        "%s: loaded %d MMR tiers from %s",
+                        symbol, len(converted), path,
+                    )
+                    return converted
+                else:
+                    logger.info(
+                        "%s: symbol not found in cache %s, trying next source",
+                        symbol, path,
+                    )
+            except (json.JSONDecodeError, KeyError, ValueError, ArithmeticError, TypeError) as exc:
+                logger.warning(
+                    "Failed to load risk limits from %s: %s, using hardcoded defaults",
+                    path, exc,
+                )
+
+        # Fall back to hardcoded tier tables
+        tiers = MM_TIERS.get(symbol, MM_TIERS_DEFAULT)
+        logger.info("%s: using hardcoded MMR tiers (%d tiers)", symbol, len(tiers))
+        return tiers
 
     def process_tick(self, event: TickerEvent) -> list[PlaceLimitIntent | CancelIntent]:
         """Process one tick of market data (legacy single-phase method).
@@ -325,7 +395,7 @@ class BacktestRunner:
                 raise ValueError(
                     f"wallet_balance is zero with {direction} position value {position_value}"
                 )
-            liq_price = self._estimate_liquidation_price(entry_price, direction)
+            liq_price = self._estimate_liquidation_price(entry_price, direction, position_value)
         else:
             position_value = Decimal("0")
             margin = Decimal("0")
@@ -341,15 +411,28 @@ class BacktestRunner:
             position_value=position_value,
         )
 
-    def _estimate_liquidation_price(self, entry_price: Decimal, direction: str) -> Decimal:
-        """Estimate liquidation price from entry price, leverage, and MMR.
+    def _estimate_liquidation_price(
+        self, entry_price: Decimal, direction: str, position_value: Decimal = Decimal("0")
+    ) -> Decimal:
+        """Estimate liquidation price from entry price, leverage, and tiered MMR.
+
+        Uses tiered maintenance margin when available (position-size-dependent MMR),
+        falling back to flat ``self._mmr`` when no tiers are loaded.
 
         Simplified formula for linear USDT perpetuals (isolated margin):
         - Long:  liq = entry * (1 - 1/leverage + mmr)
         - Short: liq = entry * (1 + 1/leverage - mmr)
         """
         inv_leverage = Decimal(1) / Decimal(self._leverage)
-        mmr = Decimal(str(self._mmr))
+
+        # Use tiered MMR when available — compute effective MMR after deduction
+        if self._mm_tiers is not None and position_value > 0:
+            mm_amount, _raw_mmr = calc_maintenance_margin(
+                position_value, self.symbol, tiers=self._mm_tiers
+            )
+            mmr = mm_amount / position_value if position_value > 0 else _raw_mmr
+        else:
+            mmr = Decimal(str(self._mmr))
 
         if direction == DirectionType.LONG:
             return entry_price * (1 - inv_leverage + mmr)

@@ -259,6 +259,165 @@ class TestBacktestRunnerRiskMultipliers:
         # 100000 * (1 + 0.1 - 0.005) = 100000 * 1.095 = 109500
         assert liq == Decimal("109500")
 
+    def test_estimate_liq_price_tiered_large_position(self, risk_runner):
+        """Large position uses effective MMR (after deduction) from cache tiers."""
+        entry = Decimal("100000")
+        # position_value=5M → cache tier: mmr=0.0077, ded=8460
+        # mm_amount = 5M * 0.0077 - 8460 = 30040
+        # effective_mmr = 30040 / 5000000 = 0.006008
+        position_value = Decimal("5000000")
+        liq = risk_runner._estimate_liquidation_price(entry, DirectionType.LONG, position_value)
+        # 100000 * (1 - 0.1 + 0.006008) = 100000 * 0.906008 = 90600.8
+        expected = entry * (1 - Decimal(1) / Decimal(10) + Decimal("30040") / position_value)
+        assert liq == expected
+
+    def test_estimate_liq_price_tiered_short_large(self, risk_runner):
+        """Large short position uses effective MMR from cache tiers."""
+        entry = Decimal("100000")
+        position_value = Decimal("5000000")
+        liq = risk_runner._estimate_liquidation_price(entry, DirectionType.SHORT, position_value)
+        # effective_mmr = 30040 / 5000000 = 0.006008
+        # 100000 * (1 + 0.1 - 0.006008) = 100000 * 1.093992 = 109399.2
+        expected = entry * (1 + Decimal(1) / Decimal(10) - Decimal("30040") / position_value)
+        assert liq == expected
+
+    def test_estimate_liq_price_falls_back_to_flat_mmr(self):
+        """When no tiers loaded, falls back to flat maintenance_margin_rate."""
+        from backtest.session import BacktestSession
+        config = BacktestStrategyConfig(
+            strat_id="test_flat",
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            maintenance_margin_rate=0.008,
+            enable_risk_multipliers=False,
+        )
+        session = BacktestSession(session_id="test_flat", initial_balance=Decimal("10000"))
+        fill_sim = TradeThroughFillSimulator()
+        order_mgr = BacktestOrderManager(
+            fill_simulator=fill_sim, commission_rate=config.commission_rate,
+        )
+        executor = BacktestExecutor(order_manager=order_mgr)
+        runner = BacktestRunner(strategy_config=config, executor=executor, session=session)
+        # Force no tiers
+        runner._mm_tiers = None
+        liq = runner._estimate_liquidation_price(Decimal("100000"), DirectionType.LONG)
+        # 100000 * (1 - 0.1 + 0.008) = 100000 * 0.908 = 90800
+        assert liq == Decimal("90800")
+
+    def test_estimate_liq_price_with_hardcoded_tiers(self):
+        """When cache file missing, hardcoded tiers are used with effective MMR."""
+        from backtest.session import BacktestSession
+        config = BacktestStrategyConfig(
+            strat_id="test_hc",
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            leverage=10,
+            maintenance_margin_rate=0.005,
+            enable_risk_multipliers=True,
+            risk_limits_cache_path="/nonexistent/path.json",
+        )
+        session = BacktestSession(session_id="test_hc", initial_balance=Decimal("10000"))
+        fill_sim = TradeThroughFillSimulator()
+        order_mgr = BacktestOrderManager(
+            fill_simulator=fill_sim, commission_rate=config.commission_rate,
+        )
+        executor = BacktestExecutor(order_manager=order_mgr)
+        runner = BacktestRunner(strategy_config=config, executor=executor, session=session)
+        # Should have fallen back to hardcoded BTCUSDT tiers
+        assert runner._mm_tiers is not None
+        # 5M → hardcoded tier 2: mmr=0.01, ded=10000
+        # mm=5M*0.01-10000=40000, eff=40000/5M=0.008
+        entry = Decimal("100000")
+        pv = Decimal("5000000")
+        liq = runner._estimate_liquidation_price(entry, DirectionType.LONG, pv)
+        expected = entry * (1 - Decimal(1) / Decimal(10) + Decimal("40000") / pv)
+        assert liq == expected
+
+    def test_build_position_state_uses_tiered_liq(self, risk_runner):
+        """_build_position_state passes position_value to tiered liq estimator."""
+        # 50 BTC at 100000 = 5M position_value → cache tier with deduction
+        risk_runner._long_tracker.process_fill(
+            side=SideType.BUY, qty=Decimal("50"), price=Decimal("100000")
+        )
+        state = risk_runner._build_position_state(
+            risk_runner._long_tracker, Decimal("10000000"), DirectionType.LONG
+        )
+        # position_value=5M → effective_mmr = 30040/5000000 = 0.006008
+        pv = Decimal("5000000")
+        expected_liq = Decimal("100000") * (1 - Decimal(1) / Decimal(10) + Decimal("30040") / pv)
+        assert state.liquidation_price == expected_liq
+
+    def test_load_mm_tiers_from_cache_file(self, tmp_path):
+        """Cache file with valid tiers is loaded correctly."""
+        import json
+        cache = {
+            "BTCUSDT": {
+                "tiers": [
+                    {"max_value": "1000000", "mmr_rate": "0.005", "deduction": "0"},
+                    {"max_value": "Infinity", "mmr_rate": "0.02", "deduction": "5000"},
+                ],
+                "cached_at": "2026-01-01T00:00:00Z",
+            }
+        }
+        cache_file = tmp_path / "risk_cache.json"
+        cache_file.write_text(json.dumps(cache))
+
+        tiers = BacktestRunner._load_mm_tiers("BTCUSDT", str(cache_file))
+        assert len(tiers) == 2
+        assert tiers[0][1] == Decimal("0.005")
+        assert tiers[1][0] == Decimal("Infinity")
+
+    def test_load_mm_tiers_missing_symbol_falls_back(self, tmp_path):
+        """Cache file exists but missing symbol falls back to hardcoded."""
+        import json
+        cache = {"ETHUSDT": {"tiers": [{"max_value": "Infinity", "mmr_rate": "0.01", "deduction": "0"}]}}
+        cache_file = tmp_path / "risk_cache.json"
+        cache_file.write_text(json.dumps(cache))
+
+        tiers = BacktestRunner._load_mm_tiers("BTCUSDT", str(cache_file))
+        # Should fall back to hardcoded BTCUSDT (7 tiers)
+        assert len(tiers) == 7
+
+    def test_load_mm_tiers_malformed_file_falls_back(self, tmp_path):
+        """Malformed JSON falls back to hardcoded tiers."""
+        cache_file = tmp_path / "bad_cache.json"
+        cache_file.write_text("{invalid json")
+
+        tiers = BacktestRunner._load_mm_tiers("BTCUSDT", str(cache_file))
+        assert len(tiers) == 7  # hardcoded BTCUSDT
+
+    def test_load_mm_tiers_invalid_numeric_falls_back(self, tmp_path):
+        """Invalid numeric values in cache fall back to hardcoded tiers."""
+        import json
+        cache = {
+            "BTCUSDT": {
+                "tiers": [
+                    {"max_value": "1000000", "mmr_rate": "not_a_number", "deduction": "0"},
+                ]
+            }
+        }
+        cache_file = tmp_path / "bad_numeric.json"
+        cache_file.write_text(json.dumps(cache))
+
+        tiers = BacktestRunner._load_mm_tiers("BTCUSDT", str(cache_file))
+        assert len(tiers) == 7  # hardcoded BTCUSDT fallback
+
+    def test_load_mm_tiers_null_values_falls_back(self, tmp_path):
+        """Null tier values in cache fall back to hardcoded tiers."""
+        import json
+        cache = {
+            "BTCUSDT": {
+                "tiers": [
+                    {"max_value": "1000000", "mmr_rate": None, "deduction": "0"},
+                ]
+            }
+        }
+        cache_file = tmp_path / "null_cache.json"
+        cache_file.write_text(json.dumps(cache))
+
+        tiers = BacktestRunner._load_mm_tiers("BTCUSDT", str(cache_file))
+        assert len(tiers) == 7  # hardcoded BTCUSDT fallback
+
     def test_build_position_state_empty(self, risk_runner):
         """Empty tracker produces zero-state PositionState."""
         state = risk_runner._build_position_state(
