@@ -286,6 +286,19 @@ class TestBacktestRunnerRiskMultipliers:
         assert state.liquidation_price == Decimal("90500")  # long liq
         assert state.leverage == 10
 
+    def test_build_position_state_zero_wallet_with_position_raises(self, risk_runner):
+        """Zero wallet balance with non-zero position raises ValueError."""
+        # Manually add a position
+        risk_runner._long_tracker.process_fill(
+            side=SideType.BUY, qty=Decimal("0.1"), price=Decimal("100000")
+        )
+
+        # Should raise ValueError when wallet is zero but position exists
+        with pytest.raises(ValueError, match="wallet_balance is zero"):
+            risk_runner._build_position_state(
+                risk_runner._long_tracker, Decimal("0"), DirectionType.LONG
+            )
+
     def test_multiplier_updates_after_fill(self, risk_runner):
         """Risk multipliers recalculate after a fill via _process_fill path."""
         # Manually add a large long position to trigger risk rules
