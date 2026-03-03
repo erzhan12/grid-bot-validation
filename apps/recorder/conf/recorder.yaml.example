@@ -10,6 +10,10 @@ database_url: "sqlite:///recorder.db"
 # Use mainnet by default (set to true for testnet)
 testnet: false
 
+# Capture public trades (high volume, ~85% of storage).
+# Not needed for replay engine which uses ticker snapshots only.
+# capture_public_trades: true
+
 # Writer settings
 batch_size: 100
 flush_interval: 5.0

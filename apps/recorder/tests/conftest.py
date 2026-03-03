@@ -17,9 +17,10 @@ def db():
 
 @pytest.fixture
 def basic_config():
-    """Config with public streams only."""
+    """Config with public streams only (trades enabled for test coverage)."""
     return RecorderConfig(
         symbols=["BTCUSDT"],
+        capture_public_trades=True,
         database_url="sqlite:///:memory:",
         testnet=True,
         batch_size=10,

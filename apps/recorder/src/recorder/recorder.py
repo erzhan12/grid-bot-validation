@@ -155,10 +155,12 @@ class Recorder:
             "flush_interval": self._config.flush_interval,
         }
 
-        self._trade_writer = TradeWriter(**writer_kwargs)
         self._ticker_writer = TickerWriter(**writer_kwargs)
-        await self._trade_writer.start_auto_flush()
         await self._ticker_writer.start_auto_flush()
+
+        if self._config.capture_public_trades:
+            self._trade_writer = TradeWriter(**writer_kwargs)
+            await self._trade_writer.start_auto_flush()
 
         if self._config.account:
             # Seed DB parent records and create a Run for this session
@@ -178,7 +180,7 @@ class Recorder:
         self._public_collector = PublicCollector(
             symbols=self._config.symbols,
             on_ticker=self._handle_ticker,
-            on_trades=self._handle_trades,
+            on_trades=self._handle_trades if self._config.capture_public_trades else None,
             on_gap_detected=self._handle_public_gap,
             testnet=self._config.testnet,
         )

@@ -69,6 +69,7 @@ async def main(config_path: Optional[str] = None) -> int:
     logger.info(f"  Symbols: {config.symbols}")
     logger.info(f"  Testnet: {config.testnet}")
     logger.info(f"  Database: {redact_db_url(config.database_url)}")
+    logger.info(f"  Public trades: {config.capture_public_trades}")
     logger.info(f"  Private streams: {config.account is not None}")
     logger.info(f"  Health log interval: {config.health_log_interval}s")
 

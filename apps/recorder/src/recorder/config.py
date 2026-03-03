@@ -33,6 +33,12 @@ class RecorderConfig(BaseModel):
             raise ValueError("symbols must be non-empty, non-whitespace strings")
         return v
 
+    capture_public_trades: bool = Field(
+        default=False,
+        description="Capture public trades (high volume, ~85%% of storage). "
+        "Not needed for replay engine which uses ticker snapshots only.",
+    )
+
     database_url: str = Field(
         default="sqlite:///recorder.db",
         description="SQLite database path",
