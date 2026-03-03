@@ -588,6 +588,17 @@ class TestParseRiskLimitTiers:
         with pytest.raises(ValueError, match="api_tiers must be a list"):
             parse_risk_limit_tiers({"key": "value"})
 
+    def test_non_dict_elements_raises(self):
+        """Non-dict elements in list raise ValueError, not AttributeError."""
+        with pytest.raises(ValueError, match="api_tiers must contain dict objects"):
+            parse_risk_limit_tiers([123])
+
+        with pytest.raises(ValueError, match="api_tiers must contain dict objects"):
+            parse_risk_limit_tiers([None, {"riskLimitValue": "200000"}])
+
+        with pytest.raises(ValueError, match="api_tiers must contain dict objects"):
+            parse_risk_limit_tiers(["not_a_dict"])
+
     def test_invalid_mmr_rate_above_one(self):
         """MMR rate above 1 raises ValueError."""
         with pytest.raises(ValueError, match="MMR rate .* outside valid range"):
