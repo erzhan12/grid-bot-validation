@@ -48,6 +48,7 @@ def config_with_account():
     """Config with public + private streams."""
     return RecorderConfig(
         symbols=["BTCUSDT"],
+        capture_public_trades=False,
         database_url="sqlite:///:memory:",
         testnet=True,
         batch_size=10,
