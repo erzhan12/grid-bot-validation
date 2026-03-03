@@ -10,6 +10,10 @@ database_url: "sqlite:///recorder.db"
 # Use mainnet by default (set to true for testnet)
 testnet: false
 
+# Set to true if needed for debugging or analysis;
+# significantly increases storage (~85% of total).
+capture_public_trades: false
+
 # Writer settings
 batch_size: 100
 flush_interval: 5.0

@@ -17,6 +17,8 @@ from gridcore.events import (
     PublicTradeEvent,
 )
 
+from grid_db import PublicTrade, Run
+from recorder.config import RecorderConfig
 from recorder.recorder import Recorder, _RECORDER_USER_ID, _RECORDER_ACCOUNT_ID
 
 
@@ -107,6 +109,46 @@ class TestRecorderStartStop:
 
         await recorder.stop()
 
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_no_trade_writer_when_capture_disabled(
+        self, mock_rest_cls, mock_pub_cls, db, make_trade
+    ):
+        """When capture_public_trades=False, trade writer is not created
+        and _handle_trades does not attempt to write."""
+        config = RecorderConfig(
+            symbols=["BTCUSDT"],
+            capture_public_trades=False,
+            database_url="sqlite:///:memory:",
+            testnet=True,
+            batch_size=10,
+            flush_interval=1.0,
+            health_log_interval=60.0,
+        )
+
+        mock_pub = MagicMock()
+        mock_pub.start = AsyncMock()
+        mock_pub.stop = AsyncMock()
+        mock_pub.get_connection_state.return_value = None
+        mock_pub_cls.return_value = mock_pub
+
+        recorder = Recorder(config=config, db=db)
+        await recorder.start()
+
+        assert recorder._trade_writer is None
+        assert recorder._ticker_writer is not None
+
+        # on_trades should have been passed as None to PublicCollector
+        call_kwargs = mock_pub_cls.call_args[1]
+        assert call_kwargs["on_trades"] is None
+
+        # Calling _handle_trades directly should be a no-op (returns None)
+        events = [make_trade(trade_id=f"t{i}") for i in range(3)]
+        result = recorder._handle_trades(events)
+        assert result is None
+
+        await recorder.stop()
+
     @patch("recorder.recorder.PrivateCollector")
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
@@ -139,7 +181,7 @@ class TestRecorderStartStop:
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
     async def test_stop_flushes_writers(
-        self, mock_rest_cls, mock_pub_cls, basic_config, db
+        self, mock_rest_cls, mock_pub_cls, config_with_trades_enabled, db
     ):
         mock_pub = MagicMock()
         mock_pub.start = AsyncMock()
@@ -147,7 +189,7 @@ class TestRecorderStartStop:
         mock_pub.get_connection_state.return_value = None
         mock_pub_cls.return_value = mock_pub
 
-        recorder = Recorder(config=basic_config, db=db)
+        recorder = Recorder(config=config_with_trades_enabled, db=db)
         await recorder.start()
 
         # Writers should be initialized
@@ -282,7 +324,7 @@ class TestRecorderHandlers:
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
     async def test_handle_trades_routes_to_writer(
-        self, mock_rest_cls, mock_pub_cls, basic_config, db, make_trade
+        self, mock_rest_cls, mock_pub_cls, config_with_trades_enabled, db, make_trade
     ):
         mock_pub = MagicMock()
         mock_pub.start = AsyncMock()
@@ -290,7 +332,7 @@ class TestRecorderHandlers:
         mock_pub.get_connection_state.return_value = None
         mock_pub_cls.return_value = mock_pub
 
-        recorder = Recorder(config=basic_config, db=db)
+        recorder = Recorder(config=config_with_trades_enabled, db=db)
         await recorder.start()
 
         events = [make_trade(trade_id=f"t{i}") for i in range(5)]
@@ -305,8 +347,64 @@ class TestRecorderHandlers:
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
     async def test_handle_trades_empty_list_is_noop(
-        self, mock_rest_cls, mock_pub_cls, basic_config, db
+        self, mock_rest_cls, mock_pub_cls, config_with_trades_enabled, db
     ):
+        mock_pub = MagicMock()
+        mock_pub.start = AsyncMock()
+        mock_pub.stop = AsyncMock()
+        mock_pub.get_connection_state.return_value = None
+        mock_pub_cls.return_value = mock_pub
+
+        recorder = Recorder(config=config_with_trades_enabled, db=db)
+        await recorder.start()
+
+        fut = recorder._handle_trades([])
+        assert fut is None
+
+        stats = recorder._trade_writer.get_stats()
+        assert stats["buffer_size"] == 0
+        assert stats["total_written"] == 0
+
+        await recorder.stop()
+
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_public_trades_written_when_capture_enabled(
+        self, mock_rest_cls, mock_pub_cls, config_with_trades_enabled, db, make_trade
+    ):
+        """When capture_public_trades=True, trade events are persisted to DB."""
+        mock_pub = MagicMock()
+        mock_pub.start = AsyncMock()
+        mock_pub.stop = AsyncMock()
+        mock_pub.get_connection_state.return_value = None
+        mock_pub_cls.return_value = mock_pub
+
+        recorder = Recorder(config=config_with_trades_enabled, db=db)
+        await recorder.start()
+
+        # Inject trade events
+        events = [make_trade(trade_id=f"persist_{i}") for i in range(3)]
+        fut = recorder._handle_trades(events)
+        await await_future(fut)
+
+        # Flush remaining buffer
+        await recorder._trade_writer.flush()
+
+        # Verify trades persisted to DB
+        with db.get_session() as session:
+            rows = session.query(PublicTrade).all()
+            assert len(rows) == 3
+            trade_ids = {r.trade_id for r in rows}
+            assert trade_ids == {"persist_0", "persist_1", "persist_2"}
+
+        await recorder.stop()
+
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_public_trades_not_written_when_capture_disabled(
+        self, mock_rest_cls, mock_pub_cls, basic_config, db, make_trade
+    ):
+        """When capture_public_trades=False (default), no trades are written to DB."""
         mock_pub = MagicMock()
         mock_pub.start = AsyncMock()
         mock_pub.stop = AsyncMock()
@@ -316,12 +414,22 @@ class TestRecorderHandlers:
         recorder = Recorder(config=basic_config, db=db)
         await recorder.start()
 
-        fut = recorder._handle_trades([])
-        assert fut is None
+        # Trade writer should not exist
+        assert recorder._trade_writer is None
 
-        stats = recorder._trade_writer.get_stats()
-        assert stats["buffer_size"] == 0
-        assert stats["total_written"] == 0
+        # on_trades should have been passed as None to PublicCollector
+        call_kwargs = mock_pub_cls.call_args[1]
+        assert call_kwargs["on_trades"] is None
+
+        # Calling _handle_trades should be a no-op
+        events = [make_trade(trade_id=f"should_not_persist_{i}") for i in range(3)]
+        result = recorder._handle_trades(events)
+        assert result is None
+
+        # Verify no trades in DB
+        with db.get_session() as session:
+            rows = session.query(PublicTrade).all()
+            assert len(rows) == 0
 
         await recorder.stop()
 
@@ -593,7 +701,7 @@ class TestRecorderStats:
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
     async def test_stats_include_uptime(
-        self, mock_rest_cls, mock_pub_cls, basic_config, db
+        self, mock_rest_cls, mock_pub_cls, config_with_trades_enabled, db
     ):
         mock_pub = MagicMock()
         mock_pub.start = AsyncMock()
@@ -601,7 +709,7 @@ class TestRecorderStats:
         mock_pub.get_connection_state.return_value = None
         mock_pub_cls.return_value = mock_pub
 
-        recorder = Recorder(config=basic_config, db=db)
+        recorder = Recorder(config=config_with_trades_enabled, db=db)
         await recorder.start()
 
         # Genuine timing need: uptime must be non-zero for meaningful stats
@@ -648,7 +756,7 @@ class TestRecorderStats:
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
     async def test_stats_include_message_rates(
-        self, mock_rest_cls, mock_pub_cls, basic_config, db
+        self, mock_rest_cls, mock_pub_cls, config_with_trades_enabled, db
     ):
         mock_pub = MagicMock()
         mock_pub.start = AsyncMock()
@@ -656,7 +764,7 @@ class TestRecorderStats:
         mock_pub.get_connection_state.return_value = None
         mock_pub_cls.return_value = mock_pub
 
-        recorder = Recorder(config=basic_config, db=db)
+        recorder = Recorder(config=config_with_trades_enabled, db=db)
         await recorder.start()
 
         # Genuine timing need: uptime must be non-zero for msgs_per_sec
@@ -747,7 +855,7 @@ class TestRecorderRunPersistence:
 
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
-    async def test_no_run_without_account(
+    async def test_run_created_without_account(
         self, mock_rest_cls, mock_pub_cls, basic_config, db
     ):
         mock_pub = MagicMock()
@@ -759,10 +867,17 @@ class TestRecorderRunPersistence:
         recorder = Recorder(config=basic_config, db=db)
         await recorder.start()
 
-        # No run_id when no account configured
-        assert recorder._run_id is None
+        # Run is always created (replay engine needs it for time range)
+        assert recorder._run_id is not None
 
         await recorder.stop()
+
+        # Verify run is marked completed
+        with db.get_session() as session:
+            run = session.get(Run, str(recorder._run_id))
+            assert run is not None
+            assert run.run_type == "recording"
+            assert run.status == "completed"
 
 
 @pytest.mark.skip(reason="Integration test stub — see docs/features/0008_REVIEW.md residual risks")
