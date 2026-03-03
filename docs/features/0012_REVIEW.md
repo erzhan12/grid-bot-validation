@@ -5,25 +5,13 @@ Rubric: `commands/code_review.md`
 
 ## Findings (ordered by severity)
 
-### [P2] Cache tier loader still crashes on some malformed value types (e.g. `null`) instead of falling back
+### [P2] ~~Cache tier loader still crashes on some malformed value types (e.g. `null`) instead of falling back~~ RESOLVED
 
-`BacktestRunner._load_mm_tiers()` converts tier fields with `Decimal(...)` (`apps/backtest/src/backtest/runner.py:210-213`) and now catches `json.JSONDecodeError`, `KeyError`, `ValueError`, and `ArithmeticError` (`apps/backtest/src/backtest/runner.py:225`).
+`BacktestRunner._load_mm_tiers()` now catches `TypeError` in addition to other exceptions (`runner.py:225`), so `Decimal(None)` falls back to hardcoded tiers. Test added: `test_load_mm_tiers_null_values_falls_back`.
 
-This fixed the `"not_a_number"` path, but malformed cache values like `null` still raise uncaught `TypeError` (`Decimal(None)`), which aborts startup instead of falling back to hardcoded tiers.
+### [P3] ~~`parse_risk_limit_tiers()` raises `AttributeError` for non-dict items despite documented ValueError contract~~ RESOLVED
 
-Repro used during review:
-- `.venv/bin/python -c "... BacktestRunner._load_mm_tiers('BTCUSDT', <cache_with_mmr_rate_null>) ..."`  
-- Result: `TypeError: conversion from NoneType to Decimal is not supported`.
-
-### [P3] `parse_risk_limit_tiers()` raises `AttributeError` for non-dict items despite documented ValueError contract
-
-`parse_risk_limit_tiers()` validates that input is a non-empty list (`packages/gridcore/src/gridcore/pnl.py:159-162`), but does not validate element types before `_TierValidator.sort()` calls `.get(...)` on each element (`packages/gridcore/src/gridcore/pnl.py:183-189`).
-
-So malformed input like `[123]` raises `AttributeError` instead of a predictable validation error (`ValueError`), and this path is not tested in `packages/gridcore/tests/test_pnl.py`.
-
-Repro used during review:
-- `PYTHONPATH=packages/gridcore/src .venv/bin/python -c "from gridcore.pnl import parse_risk_limit_tiers; parse_risk_limit_tiers([123])"`  
-- Result: `AttributeError: 'int' object has no attribute 'get'`.
+`parse_risk_limit_tiers()` now validates element types with `isinstance(t, dict)` check (`pnl.py:554`) and raises `ValueError("api_tiers must contain dict objects")`. Test added: `test_non_dict_elements_raises` covering `int`, `None`, and `str` elements.
 
 ## Plan Implementation Coverage
 
@@ -35,10 +23,10 @@ Implemented and verified:
 - Lint is clean on all changed files.
 
 Remaining gaps:
-- No test currently covers `null` / wrong-type tier fields in cache loader (P2).
-- No test currently covers non-dict elements for `parse_risk_limit_tiers` (P3).
+- ~~No test currently covers `null` / wrong-type tier fields in cache loader (P2).~~ Done.
+- ~~No test currently covers non-dict elements for `parse_risk_limit_tiers` (P3).~~ Done.
 
 ## Test/Lint Evidence
 
-- `uv run pytest -q apps/backtest/tests/test_runner.py packages/gridcore/tests/test_pnl.py` -> `69 passed`
+- `uv run pytest -q apps/backtest/tests/test_runner.py packages/gridcore/tests/test_pnl.py` -> `115 passed`
 - `uv run ruff check apps/backtest/src/backtest/config.py apps/backtest/src/backtest/runner.py apps/backtest/tests/test_runner.py packages/gridcore/src/gridcore/__init__.py packages/gridcore/src/gridcore/pnl.py packages/gridcore/tests/test_pnl.py` -> `All checks passed!`
