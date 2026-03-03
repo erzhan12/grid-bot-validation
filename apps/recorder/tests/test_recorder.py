@@ -18,6 +18,7 @@ from gridcore.events import (
 )
 
 from grid_db import Run
+from recorder.config import RecorderConfig
 from recorder.recorder import Recorder, _RECORDER_USER_ID, _RECORDER_ACCOUNT_ID
 
 
@@ -105,6 +106,46 @@ class TestRecorderStartStop:
 
         assert recorder._private_collector is None
         assert recorder._execution_writer is None
+
+        await recorder.stop()
+
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_no_trade_writer_when_capture_disabled(
+        self, mock_rest_cls, mock_pub_cls, db, make_trade
+    ):
+        """When capture_public_trades=False, trade writer is not created
+        and _handle_trades does not attempt to write."""
+        config = RecorderConfig(
+            symbols=["BTCUSDT"],
+            capture_public_trades=False,
+            database_url="sqlite:///:memory:",
+            testnet=True,
+            batch_size=10,
+            flush_interval=1.0,
+            health_log_interval=60.0,
+        )
+
+        mock_pub = MagicMock()
+        mock_pub.start = AsyncMock()
+        mock_pub.stop = AsyncMock()
+        mock_pub.get_connection_state.return_value = None
+        mock_pub_cls.return_value = mock_pub
+
+        recorder = Recorder(config=config, db=db)
+        await recorder.start()
+
+        assert recorder._trade_writer is None
+        assert recorder._ticker_writer is not None
+
+        # on_trades should have been passed as None to PublicCollector
+        call_kwargs = mock_pub_cls.call_args[1]
+        assert call_kwargs["on_trades"] is None
+
+        # Calling _handle_trades directly should be a no-op (returns None)
+        events = [make_trade(trade_id=f"t{i}") for i in range(3)]
+        result = recorder._handle_trades(events)
+        assert result is None
 
         await recorder.stop()
 
