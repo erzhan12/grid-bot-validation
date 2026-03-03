@@ -17,6 +17,7 @@ from gridcore.events import (
     PublicTradeEvent,
 )
 
+from grid_db import Run
 from recorder.recorder import Recorder, _RECORDER_USER_ID, _RECORDER_ACCOUNT_ID
 
 
@@ -747,7 +748,7 @@ class TestRecorderRunPersistence:
 
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
-    async def test_no_run_without_account(
+    async def test_run_created_without_account(
         self, mock_rest_cls, mock_pub_cls, basic_config, db
     ):
         mock_pub = MagicMock()
@@ -759,10 +760,17 @@ class TestRecorderRunPersistence:
         recorder = Recorder(config=basic_config, db=db)
         await recorder.start()
 
-        # No run_id when no account configured
-        assert recorder._run_id is None
+        # Run is always created (replay engine needs it for time range)
+        assert recorder._run_id is not None
 
         await recorder.stop()
+
+        # Verify run is marked completed
+        with db.get_session() as session:
+            run = session.get(Run, str(recorder._run_id))
+            assert run is not None
+            assert run.run_type == "recording"
+            assert run.status == "completed"
 
 
 @pytest.mark.skip(reason="Integration test stub — see docs/features/0008_REVIEW.md residual risks")

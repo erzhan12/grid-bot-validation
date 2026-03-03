@@ -68,6 +68,7 @@ apps/*/config/secrets.yaml
 # Config files with credentials
 apps/pnl_checker/conf/pnl_checker.yaml
 apps/recorder/conf/recorder.yaml
+apps/replay/conf/replay.yaml
 apps/gridbot/conf/gridbot.yaml
 
 # Recorded data
@@ -75,6 +76,7 @@ data/
 
 # Generated output
 output/
+results/
 apps/pnl_checker/src/pnl_checker/output/
 
 # Runtime caches

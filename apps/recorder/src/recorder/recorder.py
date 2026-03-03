@@ -155,6 +155,10 @@ class Recorder:
             "flush_interval": self._config.flush_interval,
         }
 
+        # Always seed DB records and create a Run for this session.
+        # Replay engine needs a Run row to discover the recording time range.
+        self._run_id = await asyncio.to_thread(self._seed_db_records)
+
         self._ticker_writer = TickerWriter(**writer_kwargs)
         await self._ticker_writer.start_auto_flush()
 
@@ -163,9 +167,6 @@ class Recorder:
             await self._trade_writer.start_auto_flush()
 
         if self._config.account:
-            # Seed DB parent records and create a Run for this session
-            self._run_id = await asyncio.to_thread(self._seed_db_records)
-
             self._execution_writer = ExecutionWriter(**writer_kwargs)
             self._order_writer = OrderWriter(**writer_kwargs)
             self._position_writer = PositionWriter(**writer_kwargs)
@@ -285,11 +286,12 @@ class Recorder:
         await self.stop()
 
     def _seed_db_records(self) -> UUID:
-        """Create parent DB records for private stream persistence.
+        """Create parent DB records for this recording session.
 
-        Ensures User, BybitAccount, Strategy, and Run rows exist so that
-        execution_writer and order_writer can store data with a valid run_id.
-        Uses fixed UUIDs so rows are reused across recorder restarts.
+        Ensures User, BybitAccount, Strategy, and Run rows exist.
+        The Run row tracks the recording time range so the replay engine
+        can auto-discover it. Uses fixed UUIDs so parent rows are reused
+        across recorder restarts; each session gets a unique Run.
 
         Returns:
             The run_id UUID for this recording session.
