@@ -85,7 +85,8 @@ uv run python -m recorder.main --config apps/recorder/conf/recorder.yaml --debug
    sqlite3 data/recorder_btcusdt.db "SELECT COUNT(*) FROM ticker_snapshots;"
    sqlite3 data/recorder_btcusdt.db "SELECT MIN(exchange_ts), MAX(exchange_ts) FROM ticker_snapshots;"
    ```
-5. Expect: thousands of trades, hundreds of ticker snapshots, timestamps spanning ~5 minutes
+5. Expect: hundreds of ticker snapshots, timestamps spanning ~5 minutes
+   > **Note:** If `capture_public_trades: false` (default), the `public_trades` table will be empty. Use `ticker_snapshots` to verify recording is working.
 
 ---
 
