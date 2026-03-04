@@ -167,7 +167,7 @@ class ReplayEngine:
             runner.execute_tick(tick)
 
             tick_count += 1
-            if tick_count % 1000 == 0:
+            if tick_count % 10000 == 0:
                 logger.info(f"Processed {tick_count} ticks...")
 
         logger.info(f"Replay complete: {tick_count} ticks processed")
