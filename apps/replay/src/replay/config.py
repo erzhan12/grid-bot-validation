@@ -41,6 +41,12 @@ class ReplayStrategyConfig(BaseModel):
     max_margin: float = Field(default=8.0, gt=0, description="Maximum margin per position")
     long_koef: float = Field(default=1.0, gt=0, description="Long/short bias multiplier")
 
+    # Risk
+    enable_risk_multipliers: bool = Field(
+        default=False,
+        description="Enable risk-based order size multipliers (disabled for replay by default)",
+    )
+
     # Commission
     commission_rate: Decimal = Field(
         default=Decimal("0.0002"),

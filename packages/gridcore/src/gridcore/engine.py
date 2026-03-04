@@ -29,6 +29,19 @@ class GridEngine:
     The execution layer (live trading or backtest) handles actual order placement.
     """
 
+    # Hedge-mode reduce_only map (matches BBU2 bybit_api_usdt.py:282-313).
+    # Key: (direction, grid_side) → True means close (reduce_only), False means open.
+    #   Long  + Buy  = open position  → False
+    #   Long  + Sell = close position → True
+    #   Short + Sell = open position  → False
+    #   Short + Buy  = close position → True
+    _REDUCE_ONLY_MAP = {
+        ("long", "Buy"): False,
+        ("long", "Sell"): True,
+        ("short", "Sell"): False,
+        ("short", "Buy"): True,
+    }
+
     def __init__(self, symbol: str, tick_size: Decimal, config: GridConfig,
                  strat_id: str, anchor_price: Optional[float] = None):
         """
@@ -354,5 +367,5 @@ class GridEngine:
             qty=Decimal('0'),  # Qty determined by execution layer
             grid_level=grid_level,
             direction=direction,
-            reduce_only=False
+            reduce_only=self._REDUCE_ONLY_MAP[(direction, grid['side'])],
         )

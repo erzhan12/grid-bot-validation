@@ -109,6 +109,7 @@ class ReplayEngine:
             max_margin=config.strategy.max_margin,
             long_koef=config.strategy.long_koef,
             commission_rate=config.strategy.commission_rate,
+            enable_risk_multipliers=config.strategy.enable_risk_multipliers,
         )
 
         session = BacktestSession(initial_balance=config.initial_balance)
@@ -166,7 +167,7 @@ class ReplayEngine:
             runner.execute_tick(tick)
 
             tick_count += 1
-            if tick_count % 10000 == 0:
+            if tick_count % 1000 == 0:
                 logger.info(f"Processed {tick_count} ticks...")
 
         logger.info(f"Replay complete: {tick_count} ticks processed")
