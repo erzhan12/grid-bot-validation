@@ -344,6 +344,8 @@ class BacktestRunner:
 
     def _get_pending_close_qty(self, direction: str) -> Decimal:
         """Sum qty of active reduce_only orders for a direction."""
+        if not self._executor.order_manager.active_orders:
+            return Decimal("0")
         total = Decimal("0")
         for order in self._executor.order_manager.active_orders.values():
             if order.direction == direction and order.reduce_only:
