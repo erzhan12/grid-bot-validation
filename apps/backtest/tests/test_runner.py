@@ -1,5 +1,6 @@
 """Tests for backtest runner."""
 
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -686,3 +687,255 @@ class TestBacktestRunnerRiskIntegration:
                 assert Decimal(order["qty"]) > 0, (
                     f"Order qty must be > 0, got {order['qty']} for {side_key}"
                 )
+
+
+class TestShouldPlaceClose:
+    """Tests for BacktestRunner._should_place_close close-order gating."""
+
+    @pytest.fixture
+    def runner(self, sample_strategy_config, session):
+        """Runner with risk disabled and a fixed qty calculator."""
+        fill_sim = TradeThroughFillSimulator()
+        order_mgr = BacktestOrderManager(
+            fill_simulator=fill_sim,
+            commission_rate=sample_strategy_config.commission_rate,
+        )
+
+        def qty_from_usdt(intent, wallet_balance):
+            if intent.price <= 0:
+                return Decimal("0")
+            return Decimal("100") / intent.price
+
+        executor = BacktestExecutor(order_manager=order_mgr, qty_calculator=qty_from_usdt)
+        return BacktestRunner(
+            strategy_config=sample_strategy_config,
+            executor=executor,
+            session=session,
+        )
+
+    @staticmethod
+    def _close_intent(direction: str, side: str) -> PlaceLimitIntent:
+        """Create a reduce_only PlaceLimitIntent for testing."""
+        return PlaceLimitIntent(
+            symbol="BTCUSDT",
+            side=side,
+            price=Decimal("100000"),
+            qty=Decimal("0"),
+            direction=direction,
+            grid_level=1,
+            reduce_only=True,
+            client_order_id="test_close_001",
+        )
+
+    def test_no_position_returns_false(self, runner):
+        """Close order rejected when no position exists (long)."""
+        intent = self._close_intent(DirectionType.LONG, SideType.SELL)
+        assert runner._should_place_close(intent) is False
+
+    def test_no_position_short_returns_false(self, runner):
+        """Close order rejected when no position exists (short)."""
+        intent = self._close_intent(DirectionType.SHORT, SideType.BUY)
+        assert runner._should_place_close(intent) is False
+
+    def test_position_exists_no_pending_returns_true(self, runner):
+        """Close order allowed when position exists and no pending close orders."""
+        runner._long_tracker.process_fill(
+            side=SideType.BUY, qty=Decimal("0.1"), price=Decimal("100000")
+        )
+        intent = self._close_intent(DirectionType.LONG, SideType.SELL)
+        assert runner._should_place_close(intent) is True
+
+    def test_position_partially_covered_returns_true(self, runner, sample_timestamp):
+        """Close order allowed when position is only partially covered."""
+        runner._long_tracker.process_fill(
+            side=SideType.BUY, qty=Decimal("0.5"), price=Decimal("100000")
+        )
+        # Place one pending close order covering 0.2 of the 0.5 position
+        runner._executor.order_manager.place_order(
+            client_order_id="close_1",
+            symbol="BTCUSDT",
+            side=SideType.SELL,
+            price=Decimal("101000"),
+            qty=Decimal("0.2"),
+            direction=DirectionType.LONG,
+            grid_level=10,
+            timestamp=sample_timestamp,
+            reduce_only=True,
+        )
+        intent = self._close_intent(DirectionType.LONG, SideType.SELL)
+        assert runner._should_place_close(intent) is True
+
+    def test_position_fully_covered_returns_false(self, runner, sample_timestamp):
+        """Close order rejected when position is fully covered by pending close orders."""
+        runner._long_tracker.process_fill(
+            side=SideType.BUY, qty=Decimal("0.3"), price=Decimal("100000")
+        )
+        # Place pending close orders exactly matching position size
+        runner._executor.order_manager.place_order(
+            client_order_id="close_1",
+            symbol="BTCUSDT",
+            side=SideType.SELL,
+            price=Decimal("101000"),
+            qty=Decimal("0.2"),
+            direction=DirectionType.LONG,
+            grid_level=10,
+            timestamp=sample_timestamp,
+            reduce_only=True,
+        )
+        runner._executor.order_manager.place_order(
+            client_order_id="close_2",
+            symbol="BTCUSDT",
+            side=SideType.SELL,
+            price=Decimal("102000"),
+            qty=Decimal("0.1"),
+            direction=DirectionType.LONG,
+            grid_level=11,
+            timestamp=sample_timestamp,
+            reduce_only=True,
+        )
+        intent = self._close_intent(DirectionType.LONG, SideType.SELL)
+        assert runner._should_place_close(intent) is False
+
+    def test_over_hedged_returns_false_and_logs_warning(self, runner, sample_timestamp, caplog):
+        """Over-hedged scenario returns False and logs a warning."""
+        runner._long_tracker.process_fill(
+            side=SideType.BUY, qty=Decimal("0.1"), price=Decimal("100000")
+        )
+        # Pending close qty (0.2) exceeds position size (0.1)
+        runner._executor.order_manager.place_order(
+            client_order_id="close_1",
+            symbol="BTCUSDT",
+            side=SideType.SELL,
+            price=Decimal("101000"),
+            qty=Decimal("0.2"),
+            direction=DirectionType.LONG,
+            grid_level=10,
+            timestamp=sample_timestamp,
+            reduce_only=True,
+        )
+        intent = self._close_intent(DirectionType.LONG, SideType.SELL)
+        with caplog.at_level(logging.WARNING):
+            result = runner._should_place_close(intent)
+
+        assert result is False
+        assert any("Over-hedged" in r.message for r in caplog.records)
+
+    def test_short_direction_uses_short_tracker(self, runner, sample_timestamp):
+        """Close order for short direction checks the short position tracker."""
+        # Long has a position, short does not
+        runner._long_tracker.process_fill(
+            side=SideType.BUY, qty=Decimal("0.5"), price=Decimal("100000")
+        )
+        # Short close should be rejected (no short position)
+        intent = self._close_intent(DirectionType.SHORT, SideType.BUY)
+        assert runner._should_place_close(intent) is False
+
+        # Now add short position
+        runner._short_tracker.process_fill(
+            side=SideType.SELL, qty=Decimal("0.3"), price=Decimal("100000")
+        )
+        assert runner._should_place_close(intent) is True
+
+    def test_non_reduce_only_orders_not_counted(self, runner, sample_timestamp):
+        """Open (non-reduce_only) orders don't count toward pending close qty."""
+        runner._long_tracker.process_fill(
+            side=SideType.BUY, qty=Decimal("0.1"), price=Decimal("100000")
+        )
+        # Place an open order (reduce_only=False) — should not block close placement
+        runner._executor.order_manager.place_order(
+            client_order_id="open_1",
+            symbol="BTCUSDT",
+            side=SideType.SELL,
+            price=Decimal("101000"),
+            qty=Decimal("0.5"),
+            direction=DirectionType.LONG,
+            grid_level=10,
+            timestamp=sample_timestamp,
+            reduce_only=False,
+        )
+        intent = self._close_intent(DirectionType.LONG, SideType.SELL)
+        assert runner._should_place_close(intent) is True
+
+
+class TestGetPendingCloseQty:
+    """Tests for BacktestRunner._get_pending_close_qty helper."""
+
+    @pytest.fixture
+    def runner(self, sample_strategy_config, session):
+        """Runner with risk disabled."""
+        fill_sim = TradeThroughFillSimulator()
+        order_mgr = BacktestOrderManager(
+            fill_simulator=fill_sim,
+            commission_rate=sample_strategy_config.commission_rate,
+        )
+        executor = BacktestExecutor(order_manager=order_mgr)
+        return BacktestRunner(
+            strategy_config=sample_strategy_config,
+            executor=executor,
+            session=session,
+        )
+
+    def test_no_orders_returns_zero(self, runner):
+        """No active orders returns zero."""
+        assert runner._get_pending_close_qty(DirectionType.LONG) == Decimal("0")
+
+    def test_sums_reduce_only_for_direction(self, runner, sample_timestamp):
+        """Sums qty of reduce_only orders for the specified direction."""
+        runner._executor.order_manager.place_order(
+            client_order_id="c1", symbol="BTCUSDT", side=SideType.SELL,
+            price=Decimal("101000"), qty=Decimal("0.1"),
+            direction=DirectionType.LONG, grid_level=10,
+            timestamp=sample_timestamp, reduce_only=True,
+        )
+        runner._executor.order_manager.place_order(
+            client_order_id="c2", symbol="BTCUSDT", side=SideType.SELL,
+            price=Decimal("102000"), qty=Decimal("0.05"),
+            direction=DirectionType.LONG, grid_level=11,
+            timestamp=sample_timestamp, reduce_only=True,
+        )
+        assert runner._get_pending_close_qty(DirectionType.LONG) == Decimal("0.15")
+
+    def test_ignores_non_reduce_only(self, runner, sample_timestamp):
+        """Non-reduce_only orders are not counted."""
+        runner._executor.order_manager.place_order(
+            client_order_id="open_1", symbol="BTCUSDT", side=SideType.BUY,
+            price=Decimal("99000"), qty=Decimal("0.5"),
+            direction=DirectionType.LONG, grid_level=5,
+            timestamp=sample_timestamp, reduce_only=False,
+        )
+        runner._executor.order_manager.place_order(
+            client_order_id="close_1", symbol="BTCUSDT", side=SideType.SELL,
+            price=Decimal("101000"), qty=Decimal("0.1"),
+            direction=DirectionType.LONG, grid_level=10,
+            timestamp=sample_timestamp, reduce_only=True,
+        )
+        assert runner._get_pending_close_qty(DirectionType.LONG) == Decimal("0.1")
+
+    def test_ignores_opposite_direction(self, runner, sample_timestamp):
+        """Reduce_only orders from the opposite direction are not counted."""
+        runner._executor.order_manager.place_order(
+            client_order_id="short_close", symbol="BTCUSDT", side=SideType.BUY,
+            price=Decimal("99000"), qty=Decimal("0.3"),
+            direction=DirectionType.SHORT, grid_level=5,
+            timestamp=sample_timestamp, reduce_only=True,
+        )
+        assert runner._get_pending_close_qty(DirectionType.LONG) == Decimal("0")
+        assert runner._get_pending_close_qty(DirectionType.SHORT) == Decimal("0.3")
+
+    def test_mixed_directions_and_types(self, runner, sample_timestamp):
+        """Correctly filters among mixed directions and reduce_only flags."""
+        orders = [
+            ("l_open", SideType.BUY, Decimal("0.1"), DirectionType.LONG, False),
+            ("l_close1", SideType.SELL, Decimal("0.05"), DirectionType.LONG, True),
+            ("l_close2", SideType.SELL, Decimal("0.03"), DirectionType.LONG, True),
+            ("s_open", SideType.SELL, Decimal("0.2"), DirectionType.SHORT, False),
+            ("s_close", SideType.BUY, Decimal("0.07"), DirectionType.SHORT, True),
+        ]
+        for cid, side, qty, direction, ro in orders:
+            runner._executor.order_manager.place_order(
+                client_order_id=cid, symbol="BTCUSDT", side=side,
+                price=Decimal("100000"), qty=qty, direction=direction,
+                grid_level=1, timestamp=sample_timestamp, reduce_only=ro,
+            )
+        assert runner._get_pending_close_qty(DirectionType.LONG) == Decimal("0.08")
+        assert runner._get_pending_close_qty(DirectionType.SHORT) == Decimal("0.07")

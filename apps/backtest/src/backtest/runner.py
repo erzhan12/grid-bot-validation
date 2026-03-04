@@ -334,6 +334,12 @@ class BacktestRunner:
             return False
 
         pending_qty = self._get_pending_close_qty(intent.direction)
+        if pending_qty > pos_size:
+            logger.warning(
+                "%s: Over-hedged %s close orders: pending_qty=%s > pos_size=%s "
+                "(possible logic error in order tracking)",
+                self.strat_id, intent.direction, pending_qty, pos_size,
+            )
         return pos_size > pending_qty
 
     def _get_pending_close_qty(self, direction: str) -> Decimal:
