@@ -349,7 +349,11 @@ class BacktestRunner:
         return pos_size > pending_qty
 
     def _get_pending_close_qty(self, direction: str) -> Decimal:
-        """Sum qty of active reduce_only orders for a direction."""
+        """Sum qty of active reduce_only orders for a direction.
+
+        O(n) scan over active_orders — acceptable because order count is
+        bounded by grid_count (typically 50-100).
+        """
         if not self._executor.order_manager.active_orders:
             return Decimal("0")
         total = Decimal("0")

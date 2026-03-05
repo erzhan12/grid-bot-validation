@@ -714,7 +714,7 @@ class TestShouldPlaceClose:
         )
 
     @staticmethod
-    def _close_intent(direction: str, side: str) -> PlaceLimitIntent:
+    def _close_intent(direction: DirectionType, side: SideType) -> PlaceLimitIntent:
         """Create a reduce_only PlaceLimitIntent for testing."""
         return PlaceLimitIntent(
             symbol="BTCUSDT",
@@ -814,7 +814,7 @@ class TestShouldPlaceClose:
             reduce_only=True,
         )
         intent = self._close_intent(DirectionType.LONG, SideType.SELL)
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.WARNING, logger="backtest.runner"):
             result = runner._should_place_close(intent)
 
         assert result is False
