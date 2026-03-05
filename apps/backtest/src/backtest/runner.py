@@ -305,13 +305,22 @@ class BacktestRunner:
                 # Matches BBU2 _is_good_to_place() pattern.
                 if intent.reduce_only and not self._should_place_close(intent):
                     continue
-                self._executor.execute_place(
+                result = self._executor.execute_place(
                     intent,
                     timestamp=event.exchange_ts,
                     wallet_balance=self._session.current_balance,
                 )
+                logger.debug(
+                    "%s: Place %s %s @ %s, direction=%s, reduce_only=%s, placed=%s",
+                    self.strat_id, intent.side, intent.qty, intent.price,
+                    intent.direction, intent.reduce_only, result.success,
+                )
             elif isinstance(intent, CancelIntent):
                 self._executor.execute_cancel(intent, timestamp=event.exchange_ts)
+                logger.debug(
+                    "%s: Cancel order %s, reason=%s",
+                    self.strat_id, intent.order_id, intent.reason,
+                )
 
         return intents
 
@@ -399,10 +408,28 @@ class BacktestRunner:
         )
         self._session.record_trade(trade)
 
+        # Refresh margin fields so the log below shows current IM/MM
+        tracker._update_margin()
+
+        # Compute liq_ratio for logging (liq_price / last_price)
+        liq_ratio = 0.0
+        if (
+            self._enable_risk
+            and self._last_price is not None
+            and tracker.state.size > 0
+        ):
+            pv = tracker.state.position_value
+            liq_price = self._estimate_liquidation_price(
+                tracker.state.avg_entry_price, direction, pv
+            )
+            liq_ratio = float(liq_price / self._last_price) if self._last_price else 0.0
+
         logger.debug(
             f"{self.strat_id}: Fill {event.side} {event.qty} @ {event.price}, "
             f"realized_pnl={realized_pnl:.2f}, direction={direction}, "
-            f"pos_size={tracker.state.size}"
+            f"pos_size={tracker.state.size}, "
+            f"liq_ratio={liq_ratio:.4f}, margin={float(tracker.state.position_value / self._session.current_balance):.4f}, "
+            f"imr={tracker.state.imr_rate:.4f}, mmr={tracker.state.mmr_rate:.4f}"
         )
 
         # Recalculate risk multipliers after position change.
