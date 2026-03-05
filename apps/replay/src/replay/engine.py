@@ -109,6 +109,7 @@ class ReplayEngine:
             max_margin=config.strategy.max_margin,
             long_koef=config.strategy.long_koef,
             commission_rate=config.strategy.commission_rate,
+            enable_risk_multipliers=config.strategy.enable_risk_multipliers,
         )
 
         session = BacktestSession(initial_balance=config.initial_balance)

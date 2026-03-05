@@ -1103,3 +1103,104 @@ class TestEngineEdgeCasesAdvanced:
         intents = engine.on_event(exec_event)
         assert len(intents) == 0
         assert engine.last_filled_price == 99800.0
+
+
+class TestReduceOnlyMap:
+    """Tests for _REDUCE_ONLY_MAP: reduce_only flag on PlaceLimitIntent."""
+
+    @pytest.fixture
+    def engine(self):
+        """GridEngine with a small grid for fast intent generation."""
+        config = GridConfig(grid_count=10, grid_step=0.5)
+        return GridEngine(
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            config=config,
+            strat_id="test_ro",
+        )
+
+    @pytest.fixture
+    def ticker(self):
+        """Ticker event at 100000."""
+        now = datetime.now(UTC)
+        return TickerEvent(
+            event_type=EventType.TICKER,
+            symbol="BTCUSDT",
+            exchange_ts=now,
+            local_ts=now,
+            last_price=Decimal("100000.0"),
+            mark_price=Decimal("100000.0"),
+            bid1_price=Decimal("99999.0"),
+            ask1_price=Decimal("100001.0"),
+            funding_rate=Decimal("0.0001"),
+        )
+
+    def test_map_values(self):
+        """_REDUCE_ONLY_MAP has correct open/close semantics."""
+        m = GridEngine._REDUCE_ONLY_MAP
+        # Open orders
+        assert m[("long", "Buy")] is False
+        assert m[("short", "Sell")] is False
+        # Close orders
+        assert m[("long", "Sell")] is True
+        assert m[("short", "Buy")] is True
+
+    def test_long_buy_is_open(self, engine, ticker):
+        """Long direction Buy intents have reduce_only=False (open position)."""
+        intents = engine.on_event(ticker, {"long": [], "short": []})
+        long_buys = [
+            i for i in intents
+            if isinstance(i, PlaceLimitIntent)
+            and i.direction == "long" and i.side == "Buy"
+        ]
+        assert len(long_buys) > 0
+        for intent in long_buys:
+            assert intent.reduce_only is False
+
+    def test_long_sell_is_close(self, engine, ticker):
+        """Long direction Sell intents have reduce_only=True (close position)."""
+        intents = engine.on_event(ticker, {"long": [], "short": []})
+        long_sells = [
+            i for i in intents
+            if isinstance(i, PlaceLimitIntent)
+            and i.direction == "long" and i.side == "Sell"
+        ]
+        assert len(long_sells) > 0
+        for intent in long_sells:
+            assert intent.reduce_only is True
+
+    def test_short_sell_is_open(self, engine, ticker):
+        """Short direction Sell intents have reduce_only=False (open position)."""
+        intents = engine.on_event(ticker, {"long": [], "short": []})
+        short_sells = [
+            i for i in intents
+            if isinstance(i, PlaceLimitIntent)
+            and i.direction == "short" and i.side == "Sell"
+        ]
+        assert len(short_sells) > 0
+        for intent in short_sells:
+            assert intent.reduce_only is False
+
+    def test_short_buy_is_close(self, engine, ticker):
+        """Short direction Buy intents have reduce_only=True (close position)."""
+        intents = engine.on_event(ticker, {"long": [], "short": []})
+        short_buys = [
+            i for i in intents
+            if isinstance(i, PlaceLimitIntent)
+            and i.direction == "short" and i.side == "Buy"
+        ]
+        assert len(short_buys) > 0
+        for intent in short_buys:
+            assert intent.reduce_only is True
+
+    def test_all_intents_have_correct_reduce_only(self, engine, ticker):
+        """Every PlaceLimitIntent matches the _REDUCE_ONLY_MAP."""
+        intents = engine.on_event(ticker, {"long": [], "short": []})
+        place_intents = [i for i in intents if isinstance(i, PlaceLimitIntent)]
+        assert len(place_intents) > 0
+        for intent in place_intents:
+            expected = GridEngine._REDUCE_ONLY_MAP[(intent.direction, intent.side)]
+            assert intent.reduce_only is expected, (
+                f"direction={intent.direction}, side={intent.side}: "
+                f"expected reduce_only={expected}, got {intent.reduce_only}"
+            )

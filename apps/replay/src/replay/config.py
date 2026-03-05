@@ -41,6 +41,18 @@ class ReplayStrategyConfig(BaseModel):
     max_margin: float = Field(default=8.0, gt=0, description="Maximum margin per position")
     long_koef: float = Field(default=1.0, gt=0, description="Long/short bias multiplier")
 
+    # Risk
+    enable_risk_multipliers: bool = Field(
+        default=False,
+        description=(
+            "Enable risk-based order size multipliers. Disabled for replay by default "
+            "because at high leverage (e.g. 10x) the simulated liq_ratio is inherently "
+            "~0.90, which constantly triggers high_liq_risk (threshold 0.84). This is an "
+            "artifact of the leverage math in isolated-margin simulation, not actual danger. "
+            "Disabling prevents false alarms while maintaining accurate order placement logic."
+        ),
+    )
+
     # Commission
     commission_rate: Decimal = Field(
         default=Decimal("0.0002"),

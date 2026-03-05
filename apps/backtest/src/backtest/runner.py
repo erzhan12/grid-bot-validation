@@ -300,6 +300,11 @@ class BacktestRunner:
         # Execute intents (wallet_balance now reflects fills from phase 1)
         for intent in intents:
             if isinstance(intent, PlaceLimitIntent):
+                # Gate close orders: skip if no position to close or position
+                # is already fully covered by pending close orders.
+                # Matches BBU2 _is_good_to_place() pattern.
+                if intent.reduce_only and not self._should_place_close(intent):
+                    continue
                 self._executor.execute_place(
                     intent,
                     timestamp=event.exchange_ts,
@@ -309,6 +314,53 @@ class BacktestRunner:
                 self._executor.execute_cancel(intent, timestamp=event.exchange_ts)
 
         return intents
+
+    def _should_place_close(self, intent: PlaceLimitIntent) -> bool:
+        """Check whether a reduce_only (close) order should be placed.
+
+        Returns False when:
+        - No position exists for this direction (nothing to close).
+        - The position size is already fully covered by pending close orders.
+
+        Matches BBU2 _is_good_to_place() (bybit_api_usdt.py:295-313).
+        """
+        tracker = (
+            self._long_tracker
+            if intent.direction == DirectionType.LONG
+            else self._short_tracker
+        )
+        pos_size = tracker.state.size
+        if pos_size == 0:
+            return False
+
+        pending_qty = self._get_pending_close_qty(intent.direction)
+        if pending_qty > pos_size:
+            close_orders = [
+                f"{o.order_id}: {o.qty}"
+                for o in self._executor.order_manager.active_orders.values()
+                if o.direction == intent.direction and o.reduce_only
+            ]
+            logger.warning(
+                "%s: Over-hedged %s close orders: pending_qty=%s > pos_size=%s "
+                "(possible logic error in order tracking). Active close orders: [%s]",
+                self.strat_id, intent.direction, pending_qty, pos_size,
+                ", ".join(close_orders),
+            )
+        return pos_size > pending_qty
+
+    def _get_pending_close_qty(self, direction: str) -> Decimal:
+        """Sum qty of active reduce_only orders for a direction.
+
+        O(n) scan over active_orders — acceptable because order count is
+        bounded by grid_count (typically 50-100).
+        """
+        if not self._executor.order_manager.active_orders:
+            return Decimal("0")
+        total = Decimal("0")
+        for order in self._executor.order_manager.active_orders.values():
+            if order.direction == direction and order.reduce_only:
+                total += order.qty
+        return total
 
     def _process_fill(self, event: ExecutionEvent) -> None:
         """Process a fill event and update positions.
