@@ -335,10 +335,16 @@ class BacktestRunner:
 
         pending_qty = self._get_pending_close_qty(intent.direction)
         if pending_qty > pos_size:
+            close_orders = [
+                f"{o.order_id}: {o.qty}"
+                for o in self._executor.order_manager.active_orders.values()
+                if o.direction == intent.direction and o.reduce_only
+            ]
             logger.warning(
                 "%s: Over-hedged %s close orders: pending_qty=%s > pos_size=%s "
-                "(possible logic error in order tracking)",
+                "(possible logic error in order tracking). Active close orders: [%s]",
                 self.strat_id, intent.direction, pending_qty, pos_size,
+                ", ".join(close_orders),
             )
         return pos_size > pending_qty
 

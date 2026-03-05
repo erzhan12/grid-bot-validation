@@ -818,7 +818,10 @@ class TestShouldPlaceClose:
             result = runner._should_place_close(intent)
 
         assert result is False
-        assert any("Over-hedged" in r.message for r in caplog.records)
+        warning_records = [r for r in caplog.records if "Over-hedged" in r.message]
+        assert len(warning_records) == 1
+        assert "Active close orders:" in warning_records[0].message
+        assert "0.2" in warning_records[0].message
 
     def test_short_direction_uses_short_tracker(self, runner, sample_timestamp):
         """Close order for short direction checks the short position tracker."""
