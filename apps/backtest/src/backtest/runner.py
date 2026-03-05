@@ -401,7 +401,8 @@ class BacktestRunner:
 
         logger.debug(
             f"{self.strat_id}: Fill {event.side} {event.qty} @ {event.price}, "
-            f"realized_pnl={realized_pnl:.2f}, direction={direction}"
+            f"realized_pnl={realized_pnl:.2f}, direction={direction}, "
+            f"pos_size={tracker.state.size}"
         )
 
         # Recalculate risk multipliers after position change.
