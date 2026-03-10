@@ -43,14 +43,8 @@ class ReplayStrategyConfig(BaseModel):
 
     # Risk
     enable_risk_multipliers: bool = Field(
-        default=False,
-        description=(
-            "Enable risk-based order size multipliers. Disabled for replay by default "
-            "because at high leverage (e.g. 10x) the simulated liq_ratio is inherently "
-            "~0.90, which constantly triggers high_liq_risk (threshold 0.84). This is an "
-            "artifact of the leverage math in isolated-margin simulation, not actual danger. "
-            "Disabling prevents false alarms while maintaining accurate order placement logic."
-        ),
+        default=True,
+        description="Enable risk-based order size multipliers.",
     )
 
     # Commission
