@@ -305,13 +305,22 @@ class BacktestRunner:
                 # Matches BBU2 _is_good_to_place() pattern.
                 if intent.reduce_only and not self._should_place_close(intent):
                     continue
-                self._executor.execute_place(
+                result = self._executor.execute_place(
                     intent,
                     timestamp=event.exchange_ts,
                     wallet_balance=self._session.current_balance,
                 )
+                logger.debug(
+                    "%s: Place %s %s @ %s, direction=%s, reduce_only=%s, placed=%s",
+                    self.strat_id, intent.side, intent.qty, intent.price,
+                    intent.direction, intent.reduce_only, result.success,
+                )
             elif isinstance(intent, CancelIntent):
                 self._executor.execute_cancel(intent, timestamp=event.exchange_ts)
+                logger.debug(
+                    "%s: Cancel order %s, reason=%s",
+                    self.strat_id, intent.order_id, intent.reason,
+                )
 
         return intents
 
@@ -399,9 +408,29 @@ class BacktestRunner:
         )
         self._session.record_trade(trade)
 
+        # Refresh margin fields so the log below shows current IM/MM
+        tracker._update_margin()
+
+        # Compute liq_ratio for logging (liq_price / last_price)
+        liq_ratio = 0.0
+        if (
+            self._enable_risk
+            and self._last_price is not None
+            and tracker.state.size > 0
+        ):
+            position_value = tracker.state.position_value
+            liq_price = self._estimate_liquidation_price(
+                tracker.state.avg_entry_price, direction, position_value,
+                self._session.current_balance,
+            )
+            liq_ratio = float(liq_price / self._last_price) if self._last_price else 0.0
+
         logger.debug(
             f"{self.strat_id}: Fill {event.side} {event.qty} @ {event.price}, "
-            f"realized_pnl={realized_pnl:.2f}, direction={direction}"
+            f"realized_pnl={realized_pnl:.2f}, direction={direction}, "
+            f"pos_size={tracker.state.size}, "
+            f"liq_ratio={liq_ratio:.4f}, margin={float(tracker.state.position_value / self._session.current_balance):.4f}, "
+            f"imr={tracker.state.imr_rate:.4f}, mmr={tracker.state.mmr_rate:.4f}"
         )
 
         # Recalculate risk multipliers after position change.
@@ -447,7 +476,7 @@ class BacktestRunner:
                 raise ValueError(
                     f"wallet_balance is zero with {direction} position value {position_value}"
                 )
-            liq_price = self._estimate_liquidation_price(entry_price, direction, position_value)
+            liq_price = self._estimate_liquidation_price(entry_price, direction, position_value, wallet_balance)
         else:
             position_value = Decimal("0")
             margin = Decimal("0")
@@ -464,32 +493,53 @@ class BacktestRunner:
         )
 
     def _estimate_liquidation_price(
-        self, entry_price: Decimal, direction: str, position_value: Decimal = Decimal("0")
+        self,
+        entry_price: Decimal,
+        direction: str,
+        position_value: Decimal,
+        wallet_balance: Decimal,
     ) -> Decimal:
-        """Estimate liquidation price from entry price, leverage, and tiered MMR.
+        """Estimate liquidation price using Bybit cross-margin formula.
 
-        Uses tiered maintenance margin when available (position-size-dependent MMR),
-        falling back to flat ``self._mmr`` when no tiers are loaded.
+        Cross-margin formula (matches live bot behaviour where the full wallet
+        balance backstops the position):
 
-        Simplified formula for linear USDT perpetuals (isolated margin):
-        - Long:  liq = entry * (1 - 1/leverage + mmr)
-        - Short: liq = entry * (1 + 1/leverage - mmr)
+        - Long:  liq = (qty * entry - available + MM) / qty
+        - Short: liq = (qty * entry + available - MM) / qty
+
+        Where available = wallet_balance (entire balance available as margin).
+
+        Reference: Bybit help-center ``Liquidation-Price-USDT-Contract``,
+        bbu_backtest ``bybit_calculations.py:185-197``.
         """
-        inv_leverage = Decimal(1) / Decimal(self._leverage)
+        if entry_price <= 0 or position_value <= 0:
+            return Decimal("0")
 
-        # Use tiered MMR when available — compute effective MMR after deduction
+        qty = position_value / entry_price
+
+        # Compute maintenance margin (dollar amount)
         if self._mm_tiers is not None and position_value > 0:
-            mm_amount, _raw_mmr = calc_maintenance_margin(
+            mm_amount, _ = calc_maintenance_margin(
                 position_value, self.symbol, tiers=self._mm_tiers
             )
-            mmr = mm_amount / position_value if position_value > 0 else _raw_mmr
         else:
-            mmr = Decimal(str(self._mmr))
+            mm_amount = position_value * Decimal(str(self._mmr))
 
         if direction == DirectionType.LONG:
-            return entry_price * (1 - inv_leverage + mmr)
+            # Long: liq = (qty * entry - available + MM) / qty
+            liq = (qty * entry_price - wallet_balance + mm_amount) / qty
+            # liq <= 0 means wallet fully covers the position (no liquidation risk).
+            # Return 0 to match Bybit behaviour (liqPrice=0 when safe).
+            return max(liq, Decimal("0"))
         else:
-            return entry_price * (1 + inv_leverage - mmr)
+            # Short: liq = (qty * entry + available - MM) / qty
+            liq = (qty * entry_price + wallet_balance - mm_amount) / qty
+            # When wallet >> position, liq is far above market (no real risk).
+            # Bybit returns liqPrice=0 in this case.  Cap at 2× entry to avoid
+            # absurd ratios; return 0 when liq exceeds that (safe).
+            if liq > entry_price * 2:
+                return Decimal("0")
+            return liq
 
     def _update_risk_multipliers(self, last_price: float) -> None:
         """Recalculate risk multipliers from current position state.

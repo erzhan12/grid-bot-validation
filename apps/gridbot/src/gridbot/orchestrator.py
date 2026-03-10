@@ -11,24 +11,20 @@ The orchestrator is the main entry point for the gridbot. It:
 import asyncio
 import logging
 from datetime import datetime, UTC
-from decimal import Decimal
 from typing import Optional
-from uuid import UUID, uuid4
+from uuid import UUID, uuid5
 
 from bybit_adapter.rest_client import BybitRestClient
 from bybit_adapter.ws_client import PublicWebSocketClient, PrivateWebSocketClient
 from bybit_adapter.normalizer import BybitNormalizer
-from grid_db import DatabaseFactory, DatabaseSettings
+from grid_db import DatabaseFactory
 from grid_db import Run, Strategy, BybitAccount, User
 from gridcore import GridAnchorStore
 from gridcore.intents import CancelIntent
 
-from event_saver.writers import (
-    ExecutionWriter,
-    OrderWriter,
-    PositionWriter,
-    WalletWriter,
-)
+from event_saver.main import EventSaver
+from event_saver.config import EventSaverConfig
+from event_saver.collectors import AccountContext
 
 from gridbot.config import GridbotConfig, AccountConfig, StrategyConfig
 from gridbot.executor import IntentExecutor
@@ -110,6 +106,9 @@ class Orchestrator:
         self._health_check_task: Optional[asyncio.Task] = None
         self._order_sync_task: Optional[asyncio.Task] = None
 
+        # Event saver (embedded, optional)
+        self._event_saver: Optional[EventSaver] = None
+
         # WebSocket position data cache: account_name -> symbol -> side -> position_data
         # Follows original bbu2 pattern: WebSocket provides real-time updates,
         # HTTP REST is used only as fallback when WebSocket data is not available
@@ -167,12 +166,16 @@ class Orchestrator:
                     f"orphans={result.orphan_orders}"
                 )
 
+        # Create database Run records (populates _run_ids)
+        await self._create_run_records()
+
+        # Start embedded EventSaver before gridbot WS connect so no events are missed
+        if self._config.enable_event_saver and self._db is not None:
+            await self._start_event_saver()
+
         # Connect WebSocket streams
         for account_name in self._public_ws:
             await self._connect_websockets(account_name)
-
-        # Create database Run records
-        await self._create_run_records()
 
         # Start background tasks
         self._position_check_task = asyncio.create_task(self._position_check_loop())
@@ -212,6 +215,11 @@ class Orchestrator:
             ws.disconnect()
         for ws in self._private_ws.values():
             ws.disconnect()
+
+        # Stop EventSaver
+        if self._event_saver:
+            await self._event_saver.stop()
+            logger.info("EventSaver stopped")
 
         # Update Run records
         await self._update_run_records_stopped()
@@ -740,17 +748,183 @@ class Orchestrator:
                 return config.account
         return None
 
+    async def _start_event_saver(self) -> None:
+        """Create and start the embedded EventSaver.
+
+        Derives symbols from all strategies and creates AccountContext
+        for each configured account. Must be called after _create_run_records()
+        so that _run_ids is populated.
+        """
+        if not self._config.accounts:
+            logger.warning("EventSaver enabled but no accounts configured, skipping")
+            return
+
+        # Collect all symbols across strategies
+        all_symbols = {s.symbol for s in self._config.strategies}
+
+        # Use first account's testnet flag for public streams
+        first_account = self._config.accounts[0]
+
+        es_config = EventSaverConfig(
+            symbols=",".join(sorted(all_symbols)),
+            testnet=first_account.testnet,
+            database_url=self._config.database_url,
+        )
+
+        self._event_saver = EventSaver(config=es_config, db=self._db)
+
+        # Add each account
+        for account_config in self._config.accounts:
+            account_strategies = self._config.get_strategies_for_account(
+                account_config.name
+            )
+
+            # Skip accounts with no strategies — empty symbols means "no filter"
+            # in PrivateCollector, which would over-collect
+            if not account_strategies:
+                logger.warning(
+                    "Skipping EventSaver account %s: no strategies configured",
+                    account_config.name,
+                )
+                continue
+
+            # Derive deterministic UUIDs from account name
+            namespace = UUID("12345678-1234-5678-1234-567812345678")
+            account_id = uuid5(namespace, f"account:{account_config.name}")
+            user_id = uuid5(namespace, f"user:{account_config.name}")
+
+            # Get symbols for this account
+            account_symbols = [s.symbol for s in account_strategies]
+
+            # Look up run_id — only use it when the account has exactly one
+            # strategy. With multiple strategies, Run is strategy-scoped so a
+            # single run_id would mis-tag events for the other strategies.
+            if len(account_strategies) == 1:
+                run_id = self._run_ids.get(account_strategies[0].strat_id)
+            else:
+                run_id = None
+                logger.warning(
+                    "Account %s has %d strategies; setting run_id=None to avoid "
+                    "mis-tagging. Executions/orders will be captured but not "
+                    "linked to a specific Run.",
+                    account_config.name,
+                    len(account_strategies),
+                )
+
+            context = AccountContext(
+                account_id=account_id,
+                user_id=user_id,
+                run_id=run_id,
+                api_key=account_config.api_key,
+                api_secret=account_config.api_secret,
+                environment="testnet" if account_config.testnet else "mainnet",
+                symbols=account_symbols,
+            )
+            await self._event_saver.add_account(context)
+
+        await self._event_saver.start()
+        logger.info(
+            "EventSaver started (symbols=%s, accounts=%d)",
+            sorted(all_symbols),
+            len(self._config.accounts),
+        )
+
     async def _create_run_records(self) -> None:
-        """Create Run records in database."""
+        """Create Run records in database.
+
+        Creates User, BybitAccount, Strategy, and Run rows using
+        deterministic UUIDs derived from account/strategy names.
+        Populates self._run_ids (strat_id -> run_id) for downstream use.
+        """
         if self._db is None:
             return
 
-        # For now, just log - would need proper user/account/strategy IDs
-        logger.info("Database Run record creation would happen here")
+        namespace = UUID("12345678-1234-5678-1234-567812345678")
+
+        try:
+            with self._db.get_session() as session:
+                for account_config in self._config.accounts:
+                    user_id = str(uuid5(namespace, f"user:{account_config.name}"))
+                    account_id = str(uuid5(namespace, f"account:{account_config.name}"))
+                    environment = "testnet" if account_config.testnet else "mainnet"
+
+                    # Upsert User
+                    user = session.get(User, user_id)
+                    if user is None:
+                        user = User(
+                            user_id=user_id,
+                            username=account_config.name,
+                        )
+                        session.add(user)
+
+                    # Upsert BybitAccount
+                    account = session.get(BybitAccount, account_id)
+                    if account is None:
+                        account = BybitAccount(
+                            account_id=account_id,
+                            user_id=user_id,
+                            account_name=account_config.name,
+                            environment=environment,
+                        )
+                        session.add(account)
+
+                    for strat_config in self._config.get_strategies_for_account(
+                        account_config.name
+                    ):
+                        strategy_id = str(
+                            uuid5(namespace, f"strategy:{strat_config.strat_id}")
+                        )
+
+                        # Upsert Strategy
+                        strategy = session.get(Strategy, strategy_id)
+                        if strategy is None:
+                            strategy = Strategy(
+                                strategy_id=strategy_id,
+                                account_id=account_id,
+                                strategy_type="GridStrategy",
+                                symbol=strat_config.symbol,
+                                config_json=strat_config.model_dump(mode="json"),
+                            )
+                            session.add(strategy)
+
+                        # Create Run
+                        run_type = "shadow" if strat_config.shadow_mode else "live"
+                        run = Run(
+                            user_id=user_id,
+                            account_id=account_id,
+                            strategy_id=strategy_id,
+                            run_type=run_type,
+                            status="running",
+                        )
+                        session.add(run)
+                        session.flush()  # populate run.run_id
+
+                        self._run_ids[strat_config.strat_id] = UUID(run.run_id)
+                        logger.info(
+                            "Created Run %s for strategy %s",
+                            run.run_id,
+                            strat_config.strat_id,
+                        )
+
+        except Exception as e:
+            logger.warning("Failed to create Run records: %s", e)
 
     async def _update_run_records_stopped(self) -> None:
         """Update Run records to stopped status."""
-        if self._db is None:
+        if self._db is None or not self._run_ids:
             return
 
-        logger.info("Database Run record update would happen here")
+        try:
+            with self._db.get_session() as session:
+                for strat_id, run_id in self._run_ids.items():
+                    run = session.get(Run, str(run_id))
+                    if run:
+                        run.status = "completed"
+                        run.end_ts = datetime.now(UTC)
+                        logger.info(
+                            "Marked Run %s as completed for strategy %s",
+                            run_id,
+                            strat_id,
+                        )
+        except Exception as e:
+            logger.warning("Failed to update Run records: %s", e)
