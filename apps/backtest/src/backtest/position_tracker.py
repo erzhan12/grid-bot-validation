@@ -214,16 +214,16 @@ class BacktestPositionTracker:
         - calc_initial_margin(position_value, leverage, symbol, tiers)
         - calc_maintenance_margin(position_value, symbol, tiers)
         """
-        pv = calc_position_value(self.state.size, self.state.avg_entry_price)
-        self.state.position_value = pv
-        im, imr = calc_initial_margin(pv, self.leverage, self.symbol, tiers=self.tiers)
+        position_value = calc_position_value(self.state.size, self.state.avg_entry_price)
+        self.state.position_value = position_value
+        im, imr = calc_initial_margin(position_value, self.leverage, self.symbol, tiers=self.tiers)
         self.state.initial_margin = im
         self.state.imr_rate = imr
-        mm, mmr = calc_maintenance_margin(pv, self.symbol, tiers=self.tiers)
-        if pv > 0 and (mm == 0 or mmr == 0):
+        mm, mmr = calc_maintenance_margin(position_value, self.symbol, tiers=self.tiers)
+        if position_value > 0 and (mm == 0 or mmr == 0):
             logger.warning(
                 "Zero MM for non-zero position: pv=%s mm=%s mmr=%s symbol=%s",
-                pv, mm, mmr, self.symbol,
+                position_value, mm, mmr, self.symbol,
             )
         self.state.maintenance_margin = mm
         self.state.mmr_rate = mmr

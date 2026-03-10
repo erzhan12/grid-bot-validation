@@ -7,6 +7,7 @@ from decimal import Decimal
 import pytest
 
 from gridcore import TickerEvent, EventType, PlaceLimitIntent, DirectionType, SideType
+from gridcore.pnl import calc_maintenance_margin
 
 from backtest.runner import BacktestRunner
 from backtest.config import BacktestStrategyConfig
@@ -247,40 +248,58 @@ class TestBacktestRunnerRiskMultipliers:
         assert no_risk_runner.get_amount_multiplier(DirectionType.SHORT, SideType.SELL) == 1.0
 
     def test_estimate_liq_price_long(self, risk_runner):
-        """Long liq price: entry * (1 - 1/lev + mmr)."""
+        """Long liq price: cross-margin formula."""
         entry = Decimal("100000")
-        liq = risk_runner._estimate_liquidation_price(entry, DirectionType.LONG)
-        # 100000 * (1 - 0.1 + 0.005) = 100000 * 0.905 = 90500
-        assert liq == Decimal("90500")
+        # qty = pv / entry = 10000 / 100000 = 0.1
+        # mm = 10000 * 0.005 = 50 (tier 1 from cache, small position)
+        # liq = (0.1 * 100000 - 10000 + 50) / 0.1 = 500 / 0.1 = 5000
+        # With large wallet, liq is very low (far from liquidation) — correct for cross margin
+        pv = Decimal("10000")
+        wallet = Decimal("10000")
+        liq = risk_runner._estimate_liquidation_price(entry, DirectionType.LONG, pv, wallet)
+        qty = pv / entry  # 0.1
+        mm, _ = calc_maintenance_margin(pv, "BTCUSDT", tiers=risk_runner._mm_tiers)
+        expected = (qty * entry - wallet + mm) / qty
+        assert liq == expected
 
     def test_estimate_liq_price_short(self, risk_runner):
-        """Short liq price: entry * (1 + 1/lev - mmr)."""
+        """Short liq price: cross-margin formula."""
         entry = Decimal("100000")
-        liq = risk_runner._estimate_liquidation_price(entry, DirectionType.SHORT)
-        # 100000 * (1 + 0.1 - 0.005) = 100000 * 1.095 = 109500
-        assert liq == Decimal("109500")
+        pv = Decimal("10000")
+        wallet = Decimal("10000")
+        liq = risk_runner._estimate_liquidation_price(entry, DirectionType.SHORT, pv, wallet)
+        qty = pv / entry  # 0.1
+        mm, _ = calc_maintenance_margin(pv, "BTCUSDT", tiers=risk_runner._mm_tiers)
+        expected = (qty * entry + wallet - mm) / qty
+        assert liq == expected
 
     def test_estimate_liq_price_tiered_large_position(self, risk_runner):
-        """Large position uses effective MMR (after deduction) from cache tiers."""
+        """Large position uses tiered MM from cache in cross-margin formula."""
         entry = Decimal("100000")
         # position_value=5M → cache tier: mmr=0.0077, ded=8460
         # mm_amount = 5M * 0.0077 - 8460 = 30040
-        # effective_mmr = 30040 / 5000000 = 0.006008
-        position_value = Decimal("5000000")
-        liq = risk_runner._estimate_liquidation_price(entry, DirectionType.LONG, position_value)
-        # 100000 * (1 - 0.1 + 0.006008) = 100000 * 0.906008 = 90600.8
-        expected = entry * (1 - Decimal(1) / Decimal(10) + Decimal("30040") / position_value)
+        pv = Decimal("5000000")
+        # Wallet smaller than position → meaningful liq price
+        wallet = Decimal("600000")
+        liq = risk_runner._estimate_liquidation_price(entry, DirectionType.LONG, pv, wallet)
+        qty = pv / entry  # 50
+        mm, _ = calc_maintenance_margin(pv, "BTCUSDT", tiers=risk_runner._mm_tiers)
+        expected = (qty * entry - wallet + mm) / qty
         assert liq == expected
+        assert liq > 0  # liq price is positive
+        assert liq < entry  # liq price below entry for long
 
     def test_estimate_liq_price_tiered_short_large(self, risk_runner):
-        """Large short position uses effective MMR from cache tiers."""
+        """Large short position uses tiered MM in cross-margin formula."""
         entry = Decimal("100000")
-        position_value = Decimal("5000000")
-        liq = risk_runner._estimate_liquidation_price(entry, DirectionType.SHORT, position_value)
-        # effective_mmr = 30040 / 5000000 = 0.006008
-        # 100000 * (1 + 0.1 - 0.006008) = 100000 * 1.093992 = 109399.2
-        expected = entry * (1 + Decimal(1) / Decimal(10) - Decimal("30040") / position_value)
+        pv = Decimal("5000000")
+        wallet = Decimal("600000")
+        liq = risk_runner._estimate_liquidation_price(entry, DirectionType.SHORT, pv, wallet)
+        qty = pv / entry  # 50
+        mm, _ = calc_maintenance_margin(pv, "BTCUSDT", tiers=risk_runner._mm_tiers)
+        expected = (qty * entry + wallet - mm) / qty
         assert liq == expected
+        assert liq > entry  # liq price above entry for short
 
     def test_estimate_liq_price_falls_back_to_flat_mmr(self):
         """When no tiers loaded, falls back to flat maintenance_margin_rate."""
@@ -301,12 +320,19 @@ class TestBacktestRunnerRiskMultipliers:
         runner = BacktestRunner(strategy_config=config, executor=executor, session=session)
         # Force no tiers
         runner._mm_tiers = None
-        liq = runner._estimate_liquidation_price(Decimal("100000"), DirectionType.LONG)
-        # 100000 * (1 - 0.1 + 0.008) = 100000 * 0.908 = 90800
-        assert liq == Decimal("90800")
+        entry = Decimal("100000")
+        pv = Decimal("10000")
+        wallet = Decimal("10000")
+        liq = runner._estimate_liquidation_price(entry, DirectionType.LONG, pv, wallet)
+        # qty = 0.1, mm = 10000 * 0.008 = 80
+        # liq = (0.1 * 100000 - 10000 + 80) / 0.1 = 80 / 0.1 = 800
+        qty = pv / entry
+        mm = pv * Decimal("0.008")
+        expected = (qty * entry - wallet + mm) / qty
+        assert liq == expected
 
     def test_estimate_liq_price_with_hardcoded_tiers(self):
-        """When cache file missing, hardcoded tiers are used with effective MMR."""
+        """When cache file missing, hardcoded tiers are used with cross-margin formula."""
         from backtest.session import BacktestSession
         config = BacktestStrategyConfig(
             strat_id="test_hc",
@@ -327,26 +353,33 @@ class TestBacktestRunnerRiskMultipliers:
         # Should have fallen back to hardcoded BTCUSDT tiers
         assert runner._mm_tiers is not None
         # 5M → hardcoded tier 2: mmr=0.01, ded=10000
-        # mm=5M*0.01-10000=40000, eff=40000/5M=0.008
+        # mm=5M*0.01-10000=40000
         entry = Decimal("100000")
         pv = Decimal("5000000")
-        liq = runner._estimate_liquidation_price(entry, DirectionType.LONG, pv)
-        expected = entry * (1 - Decimal(1) / Decimal(10) + Decimal("40000") / pv)
+        wallet = Decimal("600000")
+        liq = runner._estimate_liquidation_price(entry, DirectionType.LONG, pv, wallet)
+        qty = pv / entry  # 50
+        mm, _ = calc_maintenance_margin(pv, "BTCUSDT", tiers=runner._mm_tiers)
+        expected = (qty * entry - wallet + mm) / qty
         assert liq == expected
+        assert liq > 0
 
     def test_build_position_state_uses_tiered_liq(self, risk_runner):
-        """_build_position_state passes position_value to tiered liq estimator."""
+        """_build_position_state passes position_value and wallet to cross-margin liq."""
         # 50 BTC at 100000 = 5M position_value → cache tier with deduction
         risk_runner._long_tracker.process_fill(
             side=SideType.BUY, qty=Decimal("50"), price=Decimal("100000")
         )
+        wallet = Decimal("600000")
         state = risk_runner._build_position_state(
-            risk_runner._long_tracker, Decimal("10000000"), DirectionType.LONG
+            risk_runner._long_tracker, wallet, DirectionType.LONG
         )
-        # position_value=5M → effective_mmr = 30040/5000000 = 0.006008
         pv = Decimal("5000000")
-        expected_liq = Decimal("100000") * (1 - Decimal(1) / Decimal(10) + Decimal("30040") / pv)
+        qty = Decimal("50")
+        mm, _ = calc_maintenance_margin(pv, "BTCUSDT", tiers=risk_runner._mm_tiers)
+        expected_liq = (qty * Decimal("100000") - wallet + mm) / qty
         assert state.liquidation_price == expected_liq
+        assert state.liquidation_price > 0
 
     def test_load_mm_tiers_from_cache_file(self, tmp_path):
         """Cache file with valid tiers is loaded correctly."""
@@ -435,15 +468,21 @@ class TestBacktestRunnerRiskMultipliers:
             side=SideType.BUY, qty=Decimal("0.1"), price=Decimal("100000")
         )
 
+        wallet = Decimal("10000")
         state = risk_runner._build_position_state(
-            risk_runner._long_tracker, Decimal("10000"), DirectionType.LONG
+            risk_runner._long_tracker, wallet, DirectionType.LONG
         )
         assert state.size == Decimal("0.1")
         assert state.entry_price == Decimal("100000")
         # position_value = 0.1 * 100000 = 10000, margin = 10000/10000 = 1.0
         assert state.margin == Decimal("1")
         assert state.position_value == Decimal("10000")
-        assert state.liquidation_price == Decimal("90500")  # long liq
+        # Cross-margin: liq = (qty*entry - wallet + mm) / qty
+        pv = Decimal("10000")
+        qty = pv / Decimal("100000")  # 0.1
+        mm, _ = calc_maintenance_margin(pv, "BTCUSDT", tiers=risk_runner._mm_tiers)
+        expected_liq = (qty * Decimal("100000") - wallet + mm) / qty
+        assert state.liquidation_price == expected_liq
         assert state.leverage == 10
 
     def test_build_position_state_zero_wallet_with_position_raises(self, risk_runner):
