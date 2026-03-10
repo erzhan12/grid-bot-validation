@@ -1703,6 +1703,17 @@ Two-layer: Runner logs + re-raises → Orchestrator catches + sends Telegram ale
 - Thread-safe (daemon thread), graceful degradation if not configured
 - Dependency: `pytelegrambotapi>=4.24.0`
 
+### Embedded EventSaver (`--save-events`)
+
+- CLI flag `--save-events` or config `enable_event_saver: true` starts an embedded `EventSaver` alongside the trading bot
+- EventSaver maintains its own WS connections (separate from orchestrator's) for raw data capture
+- Startup order matters: Run records → EventSaver → gridbot WS connect (no capture gap)
+- `_create_run_records()` creates User/BybitAccount/Strategy/Run rows with deterministic UUIDs via `uuid5(namespace, "type:name")`
+- `_run_ids` dict is keyed by `strat_id` (not account name) — Run is strategy-scoped
+- **Multi-strategy accounts**: `run_id` is set to `None` because `AccountContext` is account-scoped but `Run` is strategy-scoped. Executions/orders are captured but not persisted to DB. Positions/wallet/tickers still work. Fixing this requires per-symbol run_id mapping in EventSaver's normalizer pipeline.
+- Accounts with zero strategies are skipped (empty `symbols=[]` means "no filter" in `PrivateCollector`, which would over-collect)
+- Plan/review docs: `docs/features/0014_PLAN.md`, `docs/features/0014_REVIEW.md`
+
 ### Key Pitfalls
 
 - `RiskConfig` uses `max_margin` (not `min_margin`)
