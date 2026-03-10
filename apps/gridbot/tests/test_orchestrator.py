@@ -645,19 +645,100 @@ class TestOrchestratorPositionCheckLoop:
 
 
 class TestOrchestratorDbRecords:
-    """Tests for database record stubs."""
+    """Tests for database Run record creation and update."""
 
     @pytest.mark.asyncio
-    async def test_create_run_records_with_db(self, gridbot_config):
-        """Test _create_run_records executes when db is present."""
-        orchestrator = Orchestrator(gridbot_config, db=Mock())
+    async def test_create_run_records_skips_when_no_db(self, gridbot_config):
+        """No error when db is None."""
+        orchestrator = Orchestrator(gridbot_config, db=None)
+        await orchestrator._create_run_records()
+        assert orchestrator._run_ids == {}
+
+    @pytest.mark.asyncio
+    async def test_create_run_records_populates_run_ids(self, gridbot_config):
+        """_create_run_records populates _run_ids keyed by strat_id."""
+        from grid_db import DatabaseFactory, DatabaseSettings
+        db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
+        db.create_tables()
+
+        orchestrator = Orchestrator(gridbot_config, db=db)
         await orchestrator._create_run_records()
 
+        assert "btcusdt_test" in orchestrator._run_ids
+        run_id = orchestrator._run_ids["btcusdt_test"]
+        assert run_id is not None
+
+        # Verify Run record exists in DB
+        with db.get_session() as session:
+            from grid_db import Run
+            run = session.get(Run, str(run_id))
+            assert run is not None
+            assert run.status == "running"
+            assert run.run_type == "live"
+
     @pytest.mark.asyncio
-    async def test_update_run_records_stopped_with_db(self, gridbot_config):
-        """Test _update_run_records_stopped executes when db is present."""
+    async def test_create_run_records_shadow_mode(self, account_config):
+        """Shadow-mode strategies create runs with run_type='shadow'."""
+        from grid_db import DatabaseFactory, DatabaseSettings
+        db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
+        db.create_tables()
+
+        shadow_strategy = StrategyConfig(
+            strat_id="shadow_test",
+            account="test_account",
+            symbol="BTCUSDT",
+            tick_size="0.1",
+            shadow_mode=True,
+        )
+        config = GridbotConfig(
+            accounts=[account_config],
+            strategies=[shadow_strategy],
+            database_url="sqlite:///:memory:",
+        )
+
+        orchestrator = Orchestrator(config, db=db)
+        await orchestrator._create_run_records()
+
+        run_id = orchestrator._run_ids["shadow_test"]
+        with db.get_session() as session:
+            from grid_db import Run
+            run = session.get(Run, str(run_id))
+            assert run.run_type == "shadow"
+
+    @pytest.mark.asyncio
+    async def test_update_run_records_marks_completed(self, gridbot_config):
+        """_update_run_records_stopped sets status to 'completed'."""
+        from grid_db import DatabaseFactory, DatabaseSettings
+        db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
+        db.create_tables()
+
+        orchestrator = Orchestrator(gridbot_config, db=db)
+        await orchestrator._create_run_records()
+
+        run_id = orchestrator._run_ids["btcusdt_test"]
+        await orchestrator._update_run_records_stopped()
+
+        with db.get_session() as session:
+            from grid_db import Run
+            run = session.get(Run, str(run_id))
+            assert run.status == "completed"
+            assert run.end_ts is not None
+
+    @pytest.mark.asyncio
+    async def test_update_run_records_skips_when_no_run_ids(self, gridbot_config):
+        """No error when _run_ids is empty."""
         orchestrator = Orchestrator(gridbot_config, db=Mock())
         await orchestrator._update_run_records_stopped()
+
+    @pytest.mark.asyncio
+    async def test_create_run_records_handles_db_error(self, gridbot_config):
+        """DB errors are logged as warnings, not raised."""
+        db = Mock()
+        db.get_session.side_effect = Exception("connection failed")
+
+        orchestrator = Orchestrator(gridbot_config, db=db)
+        await orchestrator._create_run_records()
+        assert orchestrator._run_ids == {}
 
 
 class TestOrchestratorRetryDispatcher:
@@ -672,8 +753,7 @@ class TestOrchestratorRetryDispatcher:
         gridbot_config, account_config, strategy_config,
     ):
         """Test retry queue dispatches CancelIntent to execute_cancel, not execute_place."""
-        from gridcore.intents import CancelIntent, PlaceLimitIntent
-        from unittest.mock import call
+        from gridcore.intents import CancelIntent
 
         orchestrator = Orchestrator(gridbot_config)
         await orchestrator._init_account(account_config)
@@ -1289,3 +1369,364 @@ class TestOrchestratorWalletCache:
 
         # Cache must remain empty — no stale zero stored
         assert "test_account" not in orchestrator._wallet_cache
+
+
+class TestOrchestratorEventSaver:
+    """Tests for embedded EventSaver integration."""
+
+    @pytest.fixture
+    def gridbot_config_with_event_saver(self, account_config, strategy_config):
+        """Gridbot config with event saver enabled."""
+        return GridbotConfig(
+            accounts=[account_config],
+            strategies=[strategy_config],
+            database_url="sqlite:///:memory:",
+            enable_event_saver=True,
+        )
+
+    def _mock_ws(self, mock_private_ws, mock_public_ws, mock_rest_client):
+        """Set up common WS/REST mocks."""
+        mock_public_ws.return_value.connect = Mock()
+        mock_public_ws.return_value.subscribe_ticker = Mock()
+        mock_public_ws.return_value.disconnect = Mock()
+        mock_private_ws.return_value.connect = Mock()
+        mock_private_ws.return_value.subscribe_position = Mock()
+        mock_private_ws.return_value.subscribe_order = Mock()
+        mock_private_ws.return_value.subscribe_execution = Mock()
+        mock_private_ws.return_value.disconnect = Mock()
+        mock_rest_client.return_value.get_open_orders = Mock(return_value=[])
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.EventSaver")
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_event_saver_started_when_flag_enabled(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        mock_event_saver_cls,
+        gridbot_config_with_event_saver,
+    ):
+        """EventSaver.start() is called when enable_event_saver=True."""
+        self._mock_ws(mock_private_ws, mock_public_ws, mock_rest_client)
+
+        mock_saver = AsyncMock()
+        mock_event_saver_cls.return_value = mock_saver
+
+        db = Mock()
+        orchestrator = Orchestrator(gridbot_config_with_event_saver, db=db)
+        await orchestrator.start()
+
+        mock_event_saver_cls.assert_called_once()
+        mock_saver.add_account.assert_called_once()
+        mock_saver.start.assert_called_once()
+
+        await orchestrator.stop()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.EventSaver")
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_event_saver_not_started_when_flag_disabled(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        mock_event_saver_cls,
+        gridbot_config,
+    ):
+        """EventSaver is not created when enable_event_saver=False (default)."""
+        self._mock_ws(mock_private_ws, mock_public_ws, mock_rest_client)
+
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator.start()
+
+        mock_event_saver_cls.assert_not_called()
+        assert orchestrator._event_saver is None
+
+        await orchestrator.stop()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.EventSaver")
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_event_saver_stopped_on_shutdown(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        mock_event_saver_cls,
+        gridbot_config_with_event_saver,
+    ):
+        """EventSaver.stop() is called during orchestrator shutdown."""
+        self._mock_ws(mock_private_ws, mock_public_ws, mock_rest_client)
+
+        mock_saver = AsyncMock()
+        mock_event_saver_cls.return_value = mock_saver
+
+        db = Mock()
+        orchestrator = Orchestrator(gridbot_config_with_event_saver, db=db)
+        await orchestrator.start()
+        await orchestrator.stop()
+
+        mock_saver.stop.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.EventSaver")
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_event_saver_config_and_account_context(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        mock_event_saver_cls,
+        gridbot_config_with_event_saver,
+    ):
+        """EventSaverConfig and AccountContext are wired correctly."""
+        self._mock_ws(mock_private_ws, mock_public_ws, mock_rest_client)
+
+        mock_saver = AsyncMock()
+        mock_event_saver_cls.return_value = mock_saver
+
+        db = Mock()
+        orchestrator = Orchestrator(gridbot_config_with_event_saver, db=db)
+        await orchestrator.start()
+
+        # Verify EventSaverConfig
+        es_config = mock_event_saver_cls.call_args[1]["config"]
+        assert es_config.get_symbols() == ["BTCUSDT"]
+        assert es_config.testnet is True
+        assert es_config.database_url == "sqlite:///:memory:"
+
+        # Verify AccountContext
+        ctx = mock_saver.add_account.call_args[0][0]
+        assert ctx.api_key == "test_key"
+        assert ctx.api_secret == "test_secret"
+        assert ctx.environment == "testnet"
+        assert ctx.symbols == ["BTCUSDT"]
+        # UUIDs are deterministic from account name
+        assert ctx.account_id is not None
+        assert ctx.user_id is not None
+        assert ctx.account_id != ctx.user_id
+
+        await orchestrator.stop()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.EventSaver")
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_event_saver_run_id_from_run_records(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        mock_event_saver_cls,
+        gridbot_config_with_event_saver,
+    ):
+        """run_id in AccountContext reflects _run_ids populated by _create_run_records."""
+        self._mock_ws(mock_private_ws, mock_public_ws, mock_rest_client)
+
+        mock_saver = AsyncMock()
+        mock_event_saver_cls.return_value = mock_saver
+
+        db = Mock()
+        orchestrator = Orchestrator(gridbot_config_with_event_saver, db=db)
+
+        # Simulate _create_run_records populating _run_ids by strat_id
+        from uuid import uuid4
+        fake_run_id = uuid4()
+        original_create = orchestrator._create_run_records
+
+        async def mock_create_run_records():
+            await original_create()
+            orchestrator._run_ids["btcusdt_test"] = fake_run_id
+
+        orchestrator._create_run_records = mock_create_run_records
+
+        await orchestrator.start()
+
+        ctx = mock_saver.add_account.call_args[0][0]
+        assert ctx.run_id == fake_run_id
+
+        await orchestrator.stop()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.EventSaver")
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_event_saver_skips_account_without_strategies(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        mock_event_saver_cls,
+        account_config,
+        strategy_config,
+    ):
+        """Accounts with no strategies are skipped to avoid over-collection."""
+        self._mock_ws(mock_private_ws, mock_public_ws, mock_rest_client)
+
+        idle_account = AccountConfig(
+            name="idle_account",
+            api_key="idle_key",
+            api_secret="idle_secret",
+            testnet=True,
+        )
+        config = GridbotConfig(
+            accounts=[account_config, idle_account],
+            strategies=[strategy_config],  # only for test_account
+            database_url="sqlite:///:memory:",
+            enable_event_saver=True,
+        )
+
+        mock_saver = AsyncMock()
+        mock_event_saver_cls.return_value = mock_saver
+
+        db = Mock()
+        orchestrator = Orchestrator(config, db=db)
+        await orchestrator.start()
+
+        # Only test_account should be added, not idle_account
+        mock_saver.add_account.assert_called_once()
+        ctx = mock_saver.add_account.call_args[0][0]
+        assert ctx.api_key == "test_key"
+
+        await orchestrator.stop()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.EventSaver")
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_event_saver_skipped_when_no_accounts(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        mock_event_saver_cls,
+    ):
+        """EventSaver is not created when accounts list is empty."""
+        self._mock_ws(mock_private_ws, mock_public_ws, mock_rest_client)
+
+        config = GridbotConfig(
+            accounts=[],
+            strategies=[],
+            database_url="sqlite:///:memory:",
+            enable_event_saver=True,
+        )
+
+        db = Mock()
+        orchestrator = Orchestrator(config, db=db)
+        await orchestrator.start()
+
+        mock_event_saver_cls.assert_not_called()
+        assert orchestrator._event_saver is None
+
+        await orchestrator.stop()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.EventSaver")
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_event_saver_mainnet_environment(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        mock_event_saver_cls,
+        strategy_config,
+    ):
+        """AccountContext environment is 'mainnet' when testnet=False."""
+        self._mock_ws(mock_private_ws, mock_public_ws, mock_rest_client)
+
+        mainnet_account = AccountConfig(
+            name="test_account",
+            api_key="key",
+            api_secret="secret",
+            testnet=False,
+        )
+        config = GridbotConfig(
+            accounts=[mainnet_account],
+            strategies=[strategy_config],
+            database_url="sqlite:///:memory:",
+            enable_event_saver=True,
+        )
+
+        mock_saver = AsyncMock()
+        mock_event_saver_cls.return_value = mock_saver
+
+        db = Mock()
+        orchestrator = Orchestrator(config, db=db)
+        await orchestrator.start()
+
+        ctx = mock_saver.add_account.call_args[0][0]
+        assert ctx.environment == "mainnet"
+
+        es_config = mock_event_saver_cls.call_args[1]["config"]
+        assert es_config.testnet is False
+
+        await orchestrator.stop()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.EventSaver")
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_event_saver_multi_strategy_account_gets_no_run_id(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        mock_event_saver_cls,
+        account_config,
+        strategy_config,
+    ):
+        """Multi-strategy accounts get run_id=None to avoid mis-tagging."""
+        self._mock_ws(mock_private_ws, mock_public_ws, mock_rest_client)
+
+        second_strategy = StrategyConfig(
+            strat_id="ethusdt_test",
+            account="test_account",
+            symbol="ETHUSDT",
+            tick_size="0.01",
+        )
+        config = GridbotConfig(
+            accounts=[account_config],
+            strategies=[strategy_config, second_strategy],
+            database_url="sqlite:///:memory:",
+            enable_event_saver=True,
+        )
+
+        mock_saver = AsyncMock()
+        mock_event_saver_cls.return_value = mock_saver
+
+        db = Mock()
+        orchestrator = Orchestrator(config, db=db)
+
+        # Simulate populated _run_ids
+        from uuid import uuid4
+        original_create = orchestrator._create_run_records
+
+        async def mock_create_run_records():
+            await original_create()
+            orchestrator._run_ids["btcusdt_test"] = uuid4()
+            orchestrator._run_ids["ethusdt_test"] = uuid4()
+
+        orchestrator._create_run_records = mock_create_run_records
+
+        await orchestrator.start()
+
+        ctx = mock_saver.add_account.call_args[0][0]
+        assert ctx.run_id is None
+        assert sorted(ctx.symbols) == ["BTCUSDT", "ETHUSDT"]
+
+        await orchestrator.stop()

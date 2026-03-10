@@ -14,7 +14,7 @@ from typing import Optional
 
 from grid_db import DatabaseFactory, DatabaseSettings
 
-from gridbot.config import load_config, GridbotConfig
+from gridbot.config import load_config
 from gridbot.notifier import Notifier
 from gridbot.orchestrator import Orchestrator
 
@@ -72,11 +72,12 @@ def setup_logging(json_file: Optional[str] = None) -> None:
 logger = logging.getLogger(__name__)
 
 
-async def main(config_path: Optional[str] = None) -> int:
+async def main(config_path: Optional[str] = None, save_events: bool = False) -> int:
     """Main async entry point.
 
     Args:
         config_path: Path to configuration file.
+        save_events: Override enable_event_saver flag from CLI.
 
     Returns:
         Exit code (0 for success, non-zero for failure).
@@ -84,6 +85,8 @@ async def main(config_path: Optional[str] = None) -> int:
     # Load configuration
     try:
         config = load_config(config_path)
+        if save_events:
+            config.enable_event_saver = True
         logger.info(f"Loaded configuration with {len(config.strategies)} strategies")
     except FileNotFoundError as e:
         logger.error(f"Configuration file not found: {e}")
@@ -174,6 +177,11 @@ def cli() -> None:
         action="store_true",
         help="Enable debug logging",
     )
+    parser.add_argument(
+        "--save-events",
+        action="store_true",
+        help="Start embedded EventSaver for live data capture",
+    )
 
     args = parser.parse_args()
 
@@ -185,9 +193,12 @@ def cli() -> None:
         logging.getLogger("gridbot").setLevel(logging.DEBUG)
         logging.getLogger("gridcore").setLevel(logging.DEBUG)
 
+    # Override config flag from CLI
+    save_events = args.save_events
+
     # Run main
     try:
-        exit_code = asyncio.run(main(args.config))
+        exit_code = asyncio.run(main(args.config, save_events=save_events))
         sys.exit(exit_code)
     except KeyboardInterrupt:
         logger.info("Interrupted")

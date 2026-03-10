@@ -20,3 +20,6 @@ Step one is to identify and document the specific task or problem we're solving.
 7. After making all necessary commits for this particular task, verify with the user that they're satisfied with the implementation and that the task is complete.
 
 8. At this point if the user is satisfied and the changes are committed, ask if they're ready to move on to the next task or if there's anything else they'd like to adjust with the current implementation.
+
+# Tools
+- Use `uv` to run tests and Python commands (e.g., `uv run pytest ...`), not bare `python -m pytest`.

@@ -219,7 +219,7 @@ class TestCli:
             cli()
 
         assert exc_info.value.code == 0
-        mock_main.assert_called_once_with("myconfig.yaml")
+        mock_main.assert_called_once_with("myconfig.yaml", save_events=False)
         mock_run.assert_called_once()
         _close_dangling_coro(mock_run)
 
@@ -259,5 +259,18 @@ class TestCli:
 
             cli()
 
-        mock_main.assert_called_once_with(None)
+        mock_main.assert_called_once_with(None, save_events=False)
+        _close_dangling_coro(mock_run)
+
+    def test_parses_save_events_flag(self):
+        mock_main = AsyncMock(return_value=0)
+        with patch("sys.argv", ["gridbot", "--save-events"]), \
+             patch("gridbot.main.setup_logging"), \
+             patch("gridbot.main.main", new=mock_main), \
+             patch("gridbot.main.asyncio.run", return_value=0) as mock_run, \
+             pytest.raises(SystemExit):
+
+            cli()
+
+        mock_main.assert_called_once_with(None, save_events=True)
         _close_dangling_coro(mock_run)
