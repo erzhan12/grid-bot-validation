@@ -4,11 +4,13 @@ Loads trading bot configuration from YAML file with Pydantic validation.
 """
 
 import os
+import re
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
 import yaml
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -97,6 +99,12 @@ class GridbotConfig(BaseModel):
         description="Seconds to cache wallet balance (0 to disable caching)",
     )
 
+    # Auth error cooldown
+    auth_cooldown_minutes: int = Field(
+        default=30,
+        description="Minutes to wait between auth error retry cycles (per strategy)",
+    )
+
     # Event saver
     enable_event_saver: bool = Field(
         default=False,
@@ -175,7 +183,20 @@ def load_config(config_path: Optional[str] = None) -> GridbotConfig:
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
+    load_dotenv()
+
     with open(path) as f:
-        data = yaml.safe_load(f)
+        raw = f.read()
+
+    # Expand ${VAR_NAME} placeholders from environment variables
+    def _expand_env(match: re.Match) -> str:
+        var_name = match.group(1)
+        value = os.environ.get(var_name)
+        if value is None:
+            raise ValueError(f"Environment variable '{var_name}' not set (referenced in config)")
+        return value
+
+    expanded = re.sub(r"\$\{(\w+)}", _expand_env, raw)
+    data = yaml.safe_load(expanded)
 
     return GridbotConfig(**data)

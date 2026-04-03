@@ -376,3 +376,102 @@ class TestRetryQueueBackoff:
         expected_retry = datetime.now(UTC) + timedelta(seconds=2.0)
         # Allow some tolerance
         assert abs((item.next_retry_ts - expected_retry).total_seconds()) < 0.1
+
+
+class TestRetryQueuePaused:
+    """Tests for is_paused behavior."""
+
+    @pytest.mark.asyncio
+    async def test_paused_skips_processing(self, place_intent, success_result):
+        """Test process_due skips all items when paused."""
+        executor = Mock(return_value=success_result)
+        queue = RetryQueue(
+            executor_func=executor,
+            initial_backoff_seconds=0.01,
+            is_paused=lambda: True,
+        )
+        queue.add(place_intent, "error")
+        await asyncio.sleep(0.02)
+
+        processed = await queue.process_due()
+
+        assert processed == 0
+        assert queue.size == 1  # item still in queue
+        executor.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_paused_mid_batch_stops_processing(self, place_intent, failure_result):
+        """Test process_due stops mid-batch when pause activates."""
+        call_count = 0
+        paused = False
+
+        def executor_that_pauses(intent):
+            nonlocal call_count, paused
+            call_count += 1
+            if call_count >= 2:
+                paused = True
+            return failure_result
+
+        queue = RetryQueue(
+            executor_func=executor_that_pauses,
+            max_attempts=5,
+            initial_backoff_seconds=0.01,
+            is_paused=lambda: paused,
+        )
+
+        # Add 3 items
+        for _ in range(3):
+            queue.add(place_intent, "error")
+        await asyncio.sleep(0.02)
+
+        # Force all items due
+        for item in queue._queue:
+            item.next_retry_ts = datetime.now(UTC)
+
+        await queue.process_due()
+
+        # Should have tried 2 items (second one triggers pause, third skipped)
+        assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_unpaused_processes_normally(self, place_intent, success_result):
+        """Test process_due works when not paused."""
+        executor = Mock(return_value=success_result)
+        queue = RetryQueue(
+            executor_func=executor,
+            initial_backoff_seconds=0.01,
+            is_paused=lambda: False,
+        )
+        queue.add(place_intent, "error")
+        await asyncio.sleep(0.02)
+
+        processed = await queue.process_due()
+
+        assert processed == 1
+        assert queue.size == 0
+
+
+class TestRetryQueueStopStartCycle:
+    """Tests for stop/start cycle (P2 fix)."""
+
+    @pytest.mark.asyncio
+    async def test_start_stop_start_processes_items(self, place_intent, success_result):
+        """Test retry queue works after stop -> start cycle."""
+        executor = Mock(return_value=success_result)
+        queue = RetryQueue(
+            executor_func=executor,
+            initial_backoff_seconds=0.01,
+            check_interval_seconds=0.01,
+        )
+
+        await queue.start()
+        await queue.stop()
+        await queue.start()
+
+        queue.add(place_intent, "error")
+        await asyncio.sleep(0.05)
+
+        # Item should have been processed by background loop
+        assert queue.size == 0
+
+        await queue.stop()

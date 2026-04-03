@@ -76,6 +76,7 @@ class RetryQueue:
         initial_backoff_seconds: float = 1.0,
         backoff_multiplier: float = 2.0,
         check_interval_seconds: float = 1.0,
+        is_paused: Optional[Callable[[], bool]] = None,
     ):
         """Initialize retry queue.
 
@@ -86,6 +87,7 @@ class RetryQueue:
             initial_backoff_seconds: Initial backoff delay.
             backoff_multiplier: Multiplier for exponential backoff.
             check_interval_seconds: How often to check for due items.
+            is_paused: Optional callable returning True to skip processing (e.g. auth cooldown).
         """
         self._executor_func = executor_func
         self._max_attempts = max_attempts
@@ -93,9 +95,11 @@ class RetryQueue:
         self._initial_backoff = initial_backoff_seconds
         self._backoff_multiplier = backoff_multiplier
         self._check_interval = check_interval_seconds
+        self._is_paused = is_paused or (lambda: False)
 
         self._queue: list[RetryItem] = []
         self._running = False
+        self._stopped = False
         self._task: Optional[asyncio.Task] = None
 
     @property
@@ -159,10 +163,16 @@ class RetryQueue:
         Returns:
             Number of items processed (success or permanently failed).
         """
+        if self._is_paused():
+            return 0
+
         processed = 0
         items_to_remove = []
 
         for item in self._queue:
+            if self._stopped:
+                break
+
             if not item.is_due():
                 continue
 
@@ -184,6 +194,10 @@ class RetryQueue:
                 items_to_remove.append(item)
                 processed += 1
                 continue
+
+            # Re-check pause before each retry (cooldown may have activated mid-batch)
+            if self._is_paused():
+                break
 
             # Attempt retry
             logger.info(
@@ -235,12 +249,14 @@ class RetryQueue:
             return
 
         self._running = True
+        self._stopped = False
         self._task = asyncio.create_task(self._run_loop())
         logger.info("Retry queue background task started")
 
     async def stop(self) -> None:
         """Stop background task."""
         self._running = False
+        self._stopped = True
 
         if self._task:
             self._task.cancel()

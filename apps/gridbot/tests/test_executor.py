@@ -6,7 +6,7 @@ from unittest.mock import Mock, MagicMock
 import pytest
 
 from gridcore.intents import PlaceLimitIntent, CancelIntent
-from gridbot.executor import IntentExecutor, OrderResult, CancelResult
+from gridbot.executor import IntentExecutor, OrderResult, CancelResult, AUTH_ERROR_CODES
 
 
 @pytest.fixture
@@ -254,3 +254,140 @@ class TestPositionIndex:
         )
         assert executor._get_position_idx("long") == 10
         assert executor._get_position_idx("short") == 20
+
+
+class TestAuthErrorDetection:
+    """Tests for auth error detection and cooldown."""
+
+    def test_is_auth_error_permission_denied(self):
+        """Test detection of permission denied error."""
+        error = "Bybit API error in place_order: [10005] Permission denied"
+        assert IntentExecutor._is_auth_error(error) is True
+
+    def test_is_auth_error_invalid_key(self):
+        """Test detection of invalid API key error."""
+        assert IntentExecutor._is_auth_error("[10003] Invalid API key") is True
+
+    def test_is_auth_error_sign_error(self):
+        """Test detection of signature error."""
+        assert IntentExecutor._is_auth_error("[10004] Sign error") is True
+
+    def test_is_auth_error_key_expired(self):
+        """Test detection of API key expired error."""
+        assert IntentExecutor._is_auth_error("[33004] API key expired") is True
+
+    def test_is_auth_error_non_auth(self):
+        """Test non-auth errors are not flagged."""
+        assert IntentExecutor._is_auth_error("[110001] Order not found") is False
+
+    def test_is_auth_error_no_code(self):
+        """Test error strings without error codes."""
+        assert IntentExecutor._is_auth_error("Connection timeout") is False
+
+    def test_all_auth_codes_covered(self):
+        """Verify all AUTH_ERROR_CODES are detected."""
+        for code in AUTH_ERROR_CODES:
+            assert IntentExecutor._is_auth_error(f"[{code}] some error") is True
+
+    def test_cooldown_after_consecutive_auth_failures(self, mock_rest_client, place_intent):
+        """Test cooldown activates after max_auth_failures consecutive auth errors."""
+        mock_rest_client.place_order.side_effect = Exception(
+            "Bybit API error in place_order: [10005] Permission denied"
+        )
+        executor = IntentExecutor(mock_rest_client, max_auth_failures=3)
+
+        for i in range(2):
+            result = executor.execute_place(place_intent)
+            assert result.success is False
+            assert executor.auth_cooldown is False
+            assert executor.auth_failure_count == i + 1
+
+        # Third failure triggers cooldown
+        result = executor.execute_place(place_intent)
+        assert result.success is False
+        assert executor.auth_cooldown is True
+        assert executor.auth_failure_count == 3
+
+    def test_non_auth_error_resets_counter(self, mock_rest_client, place_intent):
+        """Test non-auth error resets the consecutive auth failure counter."""
+        executor = IntentExecutor(mock_rest_client, max_auth_failures=5)
+
+        # Two auth errors
+        mock_rest_client.place_order.side_effect = Exception("[10005] Permission denied")
+        executor.execute_place(place_intent)
+        executor.execute_place(place_intent)
+        assert executor.auth_failure_count == 2
+
+        # One non-auth error resets
+        mock_rest_client.place_order.side_effect = Exception("[110001] Order not found")
+        executor.execute_place(place_intent)
+        assert executor.auth_failure_count == 0
+
+    def test_success_resets_counter(self, mock_rest_client, place_intent):
+        """Test successful call resets the auth failure counter."""
+        executor = IntentExecutor(mock_rest_client, max_auth_failures=5)
+
+        # Auth errors
+        mock_rest_client.place_order.side_effect = Exception("[10005] Permission denied")
+        executor.execute_place(place_intent)
+        executor.execute_place(place_intent)
+        assert executor.auth_failure_count == 2
+
+        # Success resets
+        mock_rest_client.place_order.side_effect = None
+        mock_rest_client.place_order.return_value = {"orderId": "123"}
+        executor.execute_place(place_intent)
+        assert executor.auth_failure_count == 0
+
+    def test_cancel_auth_error_counts(self, mock_rest_client, cancel_intent):
+        """Test auth errors on cancel also count toward cooldown."""
+        mock_rest_client.cancel_order.side_effect = Exception("[10005] Permission denied")
+        executor = IntentExecutor(mock_rest_client, max_auth_failures=2)
+
+        executor.execute_cancel(cancel_intent)
+        assert executor.auth_failure_count == 1
+
+        executor.execute_cancel(cancel_intent)
+        assert executor.auth_cooldown is True
+
+    def test_reset_auth_cooldown(self, mock_rest_client):
+        """Test reset_auth_cooldown clears state."""
+        executor = IntentExecutor(mock_rest_client, max_auth_failures=1)
+        executor._auth_failure_count = 5
+        executor._auth_cooldown = True
+
+        executor.reset_auth_cooldown()
+
+        assert executor.auth_failure_count == 0
+        assert executor.auth_cooldown is False
+
+    def test_on_cooldown_entered_callback(self, mock_rest_client, place_intent):
+        """Test callback fires when cooldown activates."""
+        callback = Mock()
+        mock_rest_client.place_order.side_effect = Exception("[10005] Permission denied")
+        executor = IntentExecutor(
+            mock_rest_client, max_auth_failures=2, on_cooldown_entered=callback,
+        )
+
+        executor.execute_place(place_intent)
+        callback.assert_not_called()
+
+        executor.execute_place(place_intent)
+        callback.assert_called_once()
+
+    def test_callback_fires_only_once_per_cooldown(self, mock_rest_client, place_intent):
+        """Test callback doesn't fire again on subsequent auth errors during same cooldown."""
+        callback = Mock()
+        mock_rest_client.place_order.side_effect = Exception("[10005] Permission denied")
+        executor = IntentExecutor(
+            mock_rest_client, max_auth_failures=2, on_cooldown_entered=callback,
+        )
+
+        # Trigger cooldown
+        executor.execute_place(place_intent)
+        executor.execute_place(place_intent)
+        assert callback.call_count == 1
+
+        # More failures during cooldown — callback should not fire again
+        executor.execute_place(place_intent)
+        assert callback.call_count == 1

@@ -8,6 +8,7 @@ Usage:
 import argparse
 import asyncio
 import logging
+import os
 import signal
 import sys
 from typing import Optional
@@ -122,11 +123,19 @@ async def main(config_path: Optional[str] = None, save_events: bool = False) -> 
     # Create orchestrator
     orchestrator = Orchestrator(config, db, notifier=notifier)
 
-    # Set up signal handlers
+    # Set up signal handlers.  First Ctrl+C requests graceful shutdown;
+    # second Ctrl+C force-exits (needed because synchronous REST calls
+    # block the event loop and prevent the shutdown event from being processed).
     shutdown_event = asyncio.Event()
+    _shutdown_requested = False
 
     def signal_handler(sig, frame):
-        logger.info(f"Received signal {sig}, initiating shutdown")
+        nonlocal _shutdown_requested
+        if _shutdown_requested:
+            logger.warning("Second interrupt received, forcing exit")
+            os._exit(130)
+        _shutdown_requested = True
+        logger.info(f"Received signal {sig}, initiating shutdown (press Ctrl+C again to force)")
         shutdown_event.set()
 
     signal.signal(signal.SIGINT, signal_handler)

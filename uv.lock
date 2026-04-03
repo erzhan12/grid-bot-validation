@@ -394,6 +394,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pytelegrambotapi" },
+    { name = "python-dotenv" },
     { name = "pyyaml" },
 ]
 
@@ -406,6 +407,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pydantic-settings", specifier = ">=2.0" },
     { name = "pytelegrambotapi", specifier = ">=4.24.0" },
+    { name = "python-dotenv", specifier = ">=1.0" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]
 

@@ -10,7 +10,7 @@ The orchestrator is the main entry point for the gridbot. It:
 
 import asyncio
 import logging
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
 from typing import Optional
 from uuid import UUID, uuid5
 
@@ -88,6 +88,7 @@ class Orchestrator:
         # Runners and supporting components
         self._runners: dict[str, StrategyRunner] = {}  # strat_id -> runner
         self._executors: dict[str, IntentExecutor] = {}  # account_name -> executor
+        self._strategy_executors: dict[str, IntentExecutor] = {}  # strat_id -> executor
         self._reconcilers: dict[str, Reconciler] = {}  # account_name -> reconciler
         self._retry_queues: dict[str, RetryQueue] = {}  # strat_id -> queue
 
@@ -119,6 +120,10 @@ class Orchestrator:
         # NOTE: single lock covers all accounts; acceptable for low account counts.
         # TODO: switch to per-account locks if account count grows beyond ~10.
         self._wallet_cache_lock = asyncio.Lock()  # safe outside event loop (Python 3.10+)
+
+        # Auth cooldown tracking
+        self._auth_cooldown_until: dict[str, datetime] = {}  # strat_id -> expiry
+        self._auth_cooldown_cycles: dict[str, int] = {}  # strat_id -> cumulative cycle count
 
     @property
     def running(self) -> bool:
@@ -197,6 +202,16 @@ class Orchestrator:
         self._running = False
         self._shutdown_event.set()
 
+        # Disconnect WebSockets first to stop new events from flowing in
+        for ws in self._public_ws.values():
+            ws.disconnect()
+        for ws in self._private_ws.values():
+            ws.disconnect()
+
+        # Stop retry queues (before cancelling tasks so they exit cleanly)
+        for queue in self._retry_queues.values():
+            await queue.stop()
+
         # Stop background tasks
         for task in (self._position_check_task, self._health_check_task, self._order_sync_task):
             if task:
@@ -205,16 +220,6 @@ class Orchestrator:
                     await task
                 except asyncio.CancelledError:
                     pass
-
-        # Stop retry queues
-        for queue in self._retry_queues.values():
-            await queue.stop()
-
-        # Disconnect WebSockets
-        for ws in self._public_ws.values():
-            ws.disconnect()
-        for ws in self._private_ws.values():
-            ws.disconnect()
 
         # Stop EventSaver
         if self._event_saver:
@@ -253,14 +258,27 @@ class Orchestrator:
         # Create normalizer
         self._normalizers[name] = BybitNormalizer()
 
+        # Collect symbols for this account
+        account_symbols = [
+            s.symbol for s in self._config.get_strategies_for_account(name)
+        ]
+
         # Create WebSocket clients (but don't connect yet)
+        # Callbacks are set at construction time; connect() subscribes automatically.
         self._public_ws[name] = PublicWebSocketClient(
+            symbols=account_symbols,
             testnet=account_config.testnet,
+            on_ticker=lambda msg, a=name: self._on_ticker(
+                a, msg.get("data", {}).get("symbol", ""), msg
+            ),
         )
         self._private_ws[name] = PrivateWebSocketClient(
             api_key=account_config.api_key,
             api_secret=account_config.api_secret,
             testnet=account_config.testnet,
+            on_position=lambda msg, a=name: self._on_position(a, msg),
+            on_order=lambda msg, a=name: self._on_order(a, msg),
+            on_execution=lambda msg, a=name: self._on_execution(a, msg),
         )
 
         logger.info(f"Initialized account: {name}")
@@ -275,6 +293,7 @@ class Orchestrator:
         executor = IntentExecutor(
             base_executor._client,
             shadow_mode=strategy_config.shadow_mode,
+            on_cooldown_entered=lambda sid=strat_id: self._on_auth_cooldown_entered(sid),
         )
 
         # Create retry queue with dispatcher that routes by intent type
@@ -287,6 +306,7 @@ class Orchestrator:
             executor_func=_dispatch_intent,
             max_attempts=3,
             max_elapsed_seconds=30.0,
+            is_paused=lambda: executor.auth_cooldown,
         )
         self._retry_queues[strat_id] = retry_queue
 
@@ -299,6 +319,7 @@ class Orchestrator:
             notifier=self._notifier,
         )
         self._runners[strat_id] = runner
+        self._strategy_executors[strat_id] = executor
 
         logger.info(
             f"Initialized strategy: {strat_id} (symbol={strategy_config.symbol}, "
@@ -323,35 +344,13 @@ class Orchestrator:
             self._account_to_runners[account].append(runner)
 
     async def _connect_websockets(self, account_name: str) -> None:
-        """Connect WebSocket streams for an account."""
-        # Get symbols for this account
-        symbols = set()
-        for runner in self._account_to_runners.get(account_name, []):
-            symbols.add(runner.symbol)
+        """Connect WebSocket streams for an account.
 
-        # Connect public WebSocket and subscribe to tickers
-        public_ws = self._public_ws[account_name]
-        public_ws.connect()
-
-        for symbol in symbols:
-            public_ws.subscribe_ticker(
-                symbol=symbol,
-                callback=lambda msg, s=symbol, a=account_name: self._on_ticker(a, s, msg),
-            )
-
-        # Connect private WebSocket and subscribe to streams
-        private_ws = self._private_ws[account_name]
-        private_ws.connect()
-
-        private_ws.subscribe_position(
-            callback=lambda msg, a=account_name: self._on_position(a, msg),
-        )
-        private_ws.subscribe_order(
-            callback=lambda msg, a=account_name: self._on_order(a, msg),
-        )
-        private_ws.subscribe_execution(
-            callback=lambda msg, a=account_name: self._on_execution(a, msg),
-        )
+        Callbacks are already configured at construction time in _init_account.
+        connect() subscribes to all streams automatically.
+        """
+        self._public_ws[account_name].connect()
+        self._private_ws[account_name].connect()
 
         logger.info(f"Connected WebSockets for account: {account_name}")
 
@@ -373,6 +372,37 @@ class Orchestrator:
                 )
         except Exception as e:
             self._notifier.alert_exception("_on_ticker", e, error_key="ws_on_ticker")
+
+    def _on_auth_cooldown_entered(self, strat_id: str) -> None:
+        """Called by executor when auth cooldown activates.
+
+        Works regardless of whether the failure came from the ticker path
+        or the retry queue path.
+        """
+        cycle = self._auth_cooldown_cycles.get(strat_id, 0) + 1
+        self._auth_cooldown_cycles[strat_id] = cycle
+
+        cooldown_minutes = self._config.auth_cooldown_minutes
+        expiry = datetime.now(UTC) + timedelta(minutes=cooldown_minutes)
+        self._auth_cooldown_until[strat_id] = expiry
+
+        executor = self._strategy_executors.get(strat_id)
+        failure_count = executor.auth_failure_count if executor else "?"
+
+        # Clear retry queue — stale intents would fail with the same auth error,
+        # and fresh intents at current prices will be generated after cooldown.
+        retry_queue = self._retry_queues.get(strat_id)
+        if retry_queue:
+            cleared = retry_queue.clear()
+            if cleared:
+                logger.info(f"Cleared {cleared} items from retry queue for {strat_id}")
+
+        msg = (
+            f"Strategy {strat_id}: {failure_count} consecutive auth errors, "
+            f"entering {cooldown_minutes}-min cooldown (cycle {cycle})"
+        )
+        logger.error(msg)
+        self._notifier.alert(msg, error_key=f"auth_cooldown_{strat_id}")
 
     def _on_position(self, account_name: str, message: dict) -> None:
         """Handle position WebSocket message.
@@ -619,6 +649,25 @@ class Orchestrator:
             try:
                 await asyncio.sleep(_HEALTH_CHECK_INTERVAL)
 
+                # Check auth cooldown expiry
+                now = datetime.now(UTC)
+                for strat_id in list(self._auth_cooldown_until.keys()):
+                    expiry = self._auth_cooldown_until[strat_id]
+                    if now >= expiry:
+                        executor = self._strategy_executors.get(strat_id)
+                        cycle = self._auth_cooldown_cycles.get(strat_id, 1)
+                        if executor:
+                            executor.reset_auth_cooldown()
+                            msg = (
+                                f"Strategy {strat_id}: cooldown expired (cycle {cycle}), "
+                                f"resuming order execution"
+                            )
+                            logger.info(msg)
+                            self._notifier.alert(
+                                msg, error_key=f"auth_cooldown_resume_{strat_id}",
+                            )
+                        del self._auth_cooldown_until[strat_id]
+
                 for account_name in list(self._public_ws.keys()):
                     # Check public WS
                     pub_ws = self._public_ws.get(account_name)
@@ -629,17 +678,7 @@ class Orchestrator:
                         )
                         try:
                             pub_ws.disconnect()
-                            pub_ws.connect()
-                            # Re-subscribe tickers
-                            symbols = {
-                                r.symbol
-                                for r in self._account_to_runners.get(account_name, [])
-                            }
-                            for symbol in symbols:
-                                pub_ws.subscribe_ticker(
-                                    symbol=symbol,
-                                    callback=lambda msg, s=symbol, a=account_name: self._on_ticker(a, s, msg),
-                                )
+                            pub_ws.connect()  # re-subscribes automatically via callbacks
                             logger.info(f"Public WS reconnected for {account_name}")
                         except Exception as e:
                             self._notifier.alert_exception(
@@ -656,16 +695,7 @@ class Orchestrator:
                         )
                         try:
                             priv_ws.disconnect()
-                            priv_ws.connect()
-                            priv_ws.subscribe_position(
-                                callback=lambda msg, a=account_name: self._on_position(a, msg),
-                            )
-                            priv_ws.subscribe_order(
-                                callback=lambda msg, a=account_name: self._on_order(a, msg),
-                            )
-                            priv_ws.subscribe_execution(
-                                callback=lambda msg, a=account_name: self._on_execution(a, msg),
-                            )
+                            priv_ws.connect()  # re-subscribes automatically via callbacks
                             logger.info(f"Private WS reconnected for {account_name}")
                         except Exception as e:
                             self._notifier.alert_exception(
