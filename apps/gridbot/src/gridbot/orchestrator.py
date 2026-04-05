@@ -19,7 +19,7 @@ from bybit_adapter.ws_client import PublicWebSocketClient, PrivateWebSocketClien
 from bybit_adapter.normalizer import BybitNormalizer
 from grid_db import DatabaseFactory
 from grid_db import Run, Strategy, BybitAccount, User
-from gridcore import GridAnchorStore
+from gridcore import GridAnchorStore, InstrumentInfo
 from gridcore.intents import CancelIntent
 
 from event_saver.main import EventSaver
@@ -310,10 +310,16 @@ class Orchestrator:
         )
         self._retry_queues[strat_id] = retry_queue
 
+        # Fetch instrument info for qty rounding
+        instrument_info = await self._fetch_instrument_info(
+            strategy_config.symbol, account_name
+        )
+
         # Create runner
         runner = StrategyRunner(
             strategy_config=strategy_config,
             executor=executor,
+            instrument_info=instrument_info,
             anchor_store=self._anchor_store,
             on_intent_failed=lambda intent, error: retry_queue.add(intent, error),
             notifier=self._notifier,
@@ -569,6 +575,66 @@ class Orchestrator:
 
         logger.warning("No USDT balance found in wallet response for %s: %s", account_name, wallet)
         return 0.0
+
+    async def _fetch_instrument_info(
+        self, symbol: str, account_name: str
+    ) -> Optional[InstrumentInfo]:
+        """Fetch instrument info from Bybit API for qty rounding.
+
+        Uses the account's REST client session (public endpoint).
+        Falls back to sensible defaults if fetch fails.
+
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT").
+            account_name: Account name (for REST client access).
+
+        Returns:
+            InstrumentInfo or None if fetch fails.
+        """
+        try:
+            rest_client = self._rest_clients[account_name]
+
+            def _fetch():
+                response = rest_client._session.get_instruments_info(
+                    category="linear", symbol=symbol
+                )
+                if response.get("retCode") != 0:
+                    logger.warning(f"Instrument info API error: {response.get('retMsg')}")
+                    return None
+
+                instruments = response.get("result", {}).get("list", [])
+                if not instruments:
+                    logger.warning(f"No instrument found for {symbol}")
+                    return None
+
+                info = instruments[0]
+                lot_filter = info.get("lotSizeFilter", {})
+                price_filter = info.get("priceFilter", {})
+
+                from decimal import Decimal
+
+                qty_step = Decimal(lot_filter.get("qtyStep", "0.001"))
+                tick_size = Decimal(price_filter.get("tickSize", "0.1"))
+
+                return InstrumentInfo(
+                    symbol=symbol,
+                    qty_step=qty_step,
+                    tick_size=tick_size,
+                    min_qty=Decimal(lot_filter.get("minOrderQty", "0.001")),
+                    max_qty=Decimal(lot_filter.get("maxOrderQty", "1000")),
+                )
+
+            info = await asyncio.to_thread(_fetch)
+            if info:
+                logger.info(
+                    f"Fetched instrument info for {symbol}: "
+                    f"qty_step={info.qty_step}, tick_size={info.tick_size}"
+                )
+            return info
+
+        except Exception as e:
+            logger.warning(f"Failed to fetch instrument info for {symbol}: {e}")
+            return None
 
     async def _position_check_loop(self) -> None:
         """Periodic position check loop.
