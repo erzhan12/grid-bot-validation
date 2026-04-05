@@ -199,6 +199,9 @@ make test-integration
 - **Helper methods**: `_cancel_limit(limit, reason)` and `_cancel_all_limits(limits, reason)` for DRY CancelIntent creation
 - **OrderUpdateEvent**: Tracks `pending_orders` dict (client_order_id → order_id). Statuses: 'New'/'PartiallyFilled' (pending), 'Filled'/'Cancelled'/'Rejected' (terminal). Does NOT track 'Active' (V3 legacy, see Bybit V5 note below)
 - **GridEngine emits `qty=0`** — qty is always computed by execution layer's `qty_calculator`
+- **InstrumentInfo** lives in `gridcore/instrument_info.py` (shared by backtest, replay, gridbot). Provider/fetcher stays in each app layer.
+- **Live gridbot qty resolution**: `StrategyRunner._resolve_qty()` composes `_qty_calculator` (from config amount) with `get_amount_multiplier()` (risk). `PlaceLimitIntent` is frozen, so `dataclasses.replace()` creates a new intent with resolved qty.
+- **Wallet balance for qty**: Stored on `StrategyRunner._wallet_balance`, updated each `on_position_update()`. Tests must set `runner._wallet_balance` or orders resolve to qty=0 and get skipped.
 
 ### Position Risk Module (`position.py`)
 

@@ -1874,3 +1874,70 @@ class TestOrchestratorAuthCooldown:
         orchestrator._on_auth_cooldown_entered("btcusdt_test")
 
         assert retry_queue.size == 0
+
+
+class TestFetchInstrumentInfo:
+    """Tests for _fetch_instrument_info."""
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_fetch_success(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config,
+    ):
+        """Successful fetch returns InstrumentInfo."""
+        rest_client = mock_rest_client.return_value
+        rest_client.get_instruments_info.return_value = {
+            "lotSizeFilter": {"qtyStep": "0.001", "minOrderQty": "0.001", "maxOrderQty": "100"},
+            "priceFilter": {"tickSize": "0.1"},
+        }
+
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+
+        info = await orchestrator._fetch_instrument_info("BTCUSDT", "test_account")
+        assert info is not None
+        assert info.qty_step == Decimal("0.001")
+        assert info.tick_size == Decimal("0.1")
+        rest_client.get_instruments_info.assert_called_once_with("BTCUSDT")
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_fetch_api_error_returns_none(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config,
+    ):
+        """API exception returns None gracefully."""
+        rest_client = mock_rest_client.return_value
+        rest_client.get_instruments_info.side_effect = Exception("API error")
+
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+
+        info = await orchestrator._fetch_instrument_info("BTCUSDT", "test_account")
+        assert info is None
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_fetch_invalid_params_returns_none(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config,
+    ):
+        """Zero qty_step in response returns None."""
+        rest_client = mock_rest_client.return_value
+        rest_client.get_instruments_info.return_value = {
+            "lotSizeFilter": {"qtyStep": "0", "minOrderQty": "0.001", "maxOrderQty": "100"},
+            "priceFilter": {"tickSize": "0.1"},
+        }
+
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+
+        info = await orchestrator._fetch_instrument_info("BTCUSDT", "test_account")
+        assert info is None

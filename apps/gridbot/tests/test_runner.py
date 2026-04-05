@@ -6,7 +6,7 @@ from unittest.mock import Mock, MagicMock
 
 import pytest
 
-from gridcore import TickerEvent, ExecutionEvent, OrderUpdateEvent, EventType
+from gridcore import TickerEvent, ExecutionEvent, OrderUpdateEvent, EventType, InstrumentInfo
 from gridcore.intents import PlaceLimitIntent, CancelIntent
 
 from gridbot.config import StrategyConfig
@@ -56,12 +56,28 @@ def mock_executor():
 
 
 @pytest.fixture
-def runner(strategy_config, mock_executor):
-    """Create strategy runner."""
-    return StrategyRunner(
+def instrument_info():
+    """Sample instrument info for qty rounding."""
+    return InstrumentInfo(
+        symbol="BTCUSDT",
+        qty_step=Decimal("0.001"),
+        tick_size=Decimal("0.1"),
+        min_qty=Decimal("0.001"),
+        max_qty=Decimal("1000"),
+    )
+
+
+@pytest.fixture
+def runner(strategy_config, mock_executor, instrument_info):
+    """Create strategy runner with wallet balance set for qty resolution."""
+    r = StrategyRunner(
         strategy_config=strategy_config,
         executor=mock_executor,
+        instrument_info=instrument_info,
     )
+    # Set wallet balance so qty_calculator can resolve (x0.001 = 0.1% of wallet)
+    r._wallet_balance = Decimal("10000")
+    return r
 
 
 @pytest.fixture
@@ -466,6 +482,147 @@ class TestStrategyRunnerFailureCallback:
         await runner._execute_place_intent(intent)
 
         callback.assert_called_once_with(intent, "Network error")
+
+
+class TestQtyResolution:
+    """Tests for order qty resolution (engine emits qty=0, runner fills it in)."""
+
+    def test_resolve_qty_wallet_fraction(self, runner):
+        """x0.001 amount with wallet=10000 and price=50000 → 10000*0.001/50000 = 0.0002 → rounds to 0.001."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+            qty=Decimal("0"), grid_level=1, direction="long",
+        )
+        resolved = runner._resolve_qty(intent)
+        # 10000 * 0.001 / 50000 = 0.0002, rounded up to qty_step=0.001
+        assert resolved.qty == Decimal("0.001")
+
+    def test_resolve_qty_fixed_usdt(self, strategy_config, mock_executor, instrument_info):
+        """Fixed USDT amount: '100' with price=50000 → 100/50000 = 0.002."""
+        strategy_config.amount = "100"
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+        )
+        runner._wallet_balance = Decimal("10000")
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+            qty=Decimal("0"), grid_level=1, direction="long",
+        )
+        resolved = runner._resolve_qty(intent)
+        assert resolved.qty == Decimal("0.002")
+
+    def test_resolve_qty_fixed_base(self, strategy_config, mock_executor, instrument_info):
+        """Fixed base amount: 'b0.005' → always 0.005."""
+        strategy_config.amount = "b0.005"
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+        )
+        runner._wallet_balance = Decimal("10000")
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+            qty=Decimal("0"), grid_level=1, direction="long",
+        )
+        resolved = runner._resolve_qty(intent)
+        assert resolved.qty == Decimal("0.005")
+
+    def test_resolve_qty_applies_risk_multiplier_and_rerounds(self, runner):
+        """Risk multiplier scales the base qty, then re-rounds to qty_step."""
+        # Set a multiplier of 0.5 for long Buy
+        runner._long_position.amount_multiplier = {"Buy": 0.5, "Sell": 1.0}
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+            qty=Decimal("0"), grid_level=1, direction="long",
+        )
+        resolved = runner._resolve_qty(intent)
+        # base=0.001 * 0.5 = 0.0005, re-rounded UP to qty_step=0.001
+        assert resolved.qty == Decimal("0.001")
+
+    def test_resolve_qty_skips_nonzero(self, runner):
+        """Intent with qty>0 passes through unchanged."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+            qty=Decimal("0.123"), grid_level=1, direction="long",
+        )
+        resolved = runner._resolve_qty(intent)
+        assert resolved.qty == Decimal("0.123")
+
+    def test_resolve_qty_zero_wallet_returns_zero(self, strategy_config, mock_executor, instrument_info):
+        """With wallet=0, qty resolves to 0."""
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+        )
+        # wallet_balance defaults to 0
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+            qty=Decimal("0"), grid_level=1, direction="long",
+        )
+        resolved = runner._resolve_qty(intent)
+        assert resolved.qty == Decimal("0")
+
+    def test_resolve_qty_no_instrument_info(self, strategy_config, mock_executor):
+        """Without instrument_info, qty is unrounded."""
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=None,
+        )
+        runner._wallet_balance = Decimal("10000")
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+            qty=Decimal("0"), grid_level=1, direction="long",
+        )
+        resolved = runner._resolve_qty(intent)
+        # 10000 * 0.001 / 50000 = 0.0002 (no rounding applied)
+        assert resolved.qty == Decimal("0.0002")
+
+    def test_invalid_amount_string_raises(self, strategy_config, mock_executor, instrument_info):
+        """Invalid amount string raises ValueError at construction."""
+        strategy_config.amount = "abc"
+        with pytest.raises(ValueError, match="invalid amount string"):
+            StrategyRunner(
+                strategy_config=strategy_config,
+                executor=mock_executor,
+                instrument_info=instrument_info,
+            )
+
+    @pytest.mark.asyncio
+    async def test_execute_place_skips_zero_qty(self, strategy_config, mock_executor, instrument_info):
+        """Orders with resolved qty=0 are not sent to exchange."""
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+        )
+        # wallet_balance=0 -> qty=0 -> order skipped
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+            qty=Decimal("0"), grid_level=1, direction="long",
+        )
+        await runner._execute_place_intent(intent)
+        mock_executor.execute_place.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_wallet_balance_updated_on_position_update(self, runner):
+        """on_position_update stores wallet_balance for qty computation."""
+        await runner.on_position_update(
+            long_position=None,
+            short_position=None,
+            wallet_balance=25000.0,
+            last_close=50000.0,
+        )
+        assert runner._wallet_balance == Decimal("25000.0")
 
 
 class TestSameOrderDetection:
@@ -1273,6 +1430,7 @@ class TestRunnerAuthCooldown:
         )
 
         runner = StrategyRunner(strategy_config=strategy_config, executor=executor)
+        runner._wallet_balance = Decimal("10000")
 
         ticker = TickerEvent(
             event_type=EventType.TICKER,
