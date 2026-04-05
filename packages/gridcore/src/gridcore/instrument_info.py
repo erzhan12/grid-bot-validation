@@ -5,8 +5,7 @@ Provider/fetcher logic lives in app layers (backtest, gridbot).
 """
 
 import logging
-import math
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP, ROUND_UP
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -37,12 +36,12 @@ class InstrumentInfo:
         """Round quantity up to nearest qty_step (matching bbu2 behavior)."""
         if qty <= 0:
             return Decimal("0")
-        steps = math.ceil(float(qty) / float(self.qty_step))
+        steps = int((qty / self.qty_step).to_integral_value(rounding=ROUND_UP))
         return Decimal(str(steps)) * self.qty_step
 
     def round_price(self, price: Decimal) -> Decimal:
         """Round price to nearest tick_size."""
-        steps = round(float(price) / float(self.tick_size))
+        steps = int((price / self.tick_size).to_integral_value(rounding=ROUND_HALF_UP))
         return Decimal(str(steps)) * self.tick_size
 
     def to_dict(self) -> dict:

@@ -491,6 +491,20 @@ class StrategyRunner:
         # Re-round after multiplier to ensure qty aligns with exchange qty_step
         if self._instrument_info and resolved_qty > 0:
             resolved_qty = self._instrument_info.round_qty(resolved_qty)
+            if resolved_qty < self._instrument_info.min_qty:
+                logger.warning(
+                    f"{self.strat_id}: Resolved qty {resolved_qty} below min_qty "
+                    f"{self._instrument_info.min_qty} for {intent.side} {intent.direction} "
+                    f"at {intent.price}"
+                )
+                return replace(intent, qty=Decimal("0"))
+            if resolved_qty > self._instrument_info.max_qty:
+                logger.warning(
+                    f"{self.strat_id}: Resolved qty {resolved_qty} exceeds max_qty "
+                    f"{self._instrument_info.max_qty} for {intent.side} {intent.direction} "
+                    f"at {intent.price}, clamping"
+                )
+                resolved_qty = self._instrument_info.max_qty
 
         if resolved_qty <= 0:
             logger.warning(
