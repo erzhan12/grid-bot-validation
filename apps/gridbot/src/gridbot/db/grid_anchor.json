@@ -1,7 +1,0 @@
-{
-  "ltcusdt_test": {
-    "anchor_price": 52.9,
-    "grid_step": 0.3,
-    "grid_count": 20
-  }
-}

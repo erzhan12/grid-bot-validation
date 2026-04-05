@@ -54,6 +54,7 @@ htmlcov/
 *.sqlite
 *.sqlite3
 /db/
+**/db/grid_anchor.json
 
 # Logs
 *.log
