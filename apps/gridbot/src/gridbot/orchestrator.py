@@ -595,11 +595,16 @@ class Orchestrator:
             rest_client = self._rest_clients[account_name]
             raw = await asyncio.to_thread(rest_client.get_instruments_info, symbol)
             info = InstrumentInfo.from_bybit_response(symbol, raw)
-            if info:
-                logger.info(
-                    f"Fetched instrument info for {symbol}: "
-                    f"qty_step={info.qty_step}, tick_size={info.tick_size}"
+            if info is None:
+                logger.warning(
+                    f"Invalid instrument params from API for {symbol}, "
+                    f"will use defaults"
                 )
+                return None
+            logger.info(
+                f"Fetched instrument info for {symbol}: "
+                f"qty_step={info.qty_step}, tick_size={info.tick_size}"
+            )
             return info
 
         except Exception as e:

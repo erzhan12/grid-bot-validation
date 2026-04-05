@@ -23,6 +23,10 @@ class InstrumentInfo:
         min_qty: Decimal,
         max_qty: Decimal,
     ):
+        if qty_step <= 0:
+            raise ValueError(f"qty_step must be positive, got {qty_step}")
+        if tick_size <= 0:
+            raise ValueError(f"tick_size must be positive, got {tick_size}")
         self.symbol = symbol
         self.qty_step = qty_step
         self.tick_size = tick_size
@@ -31,6 +35,8 @@ class InstrumentInfo:
 
     def round_qty(self, qty: Decimal) -> Decimal:
         """Round quantity up to nearest qty_step (matching bbu2 behavior)."""
+        if qty <= 0:
+            return Decimal("0")
         steps = math.ceil(float(qty) / float(self.qty_step))
         return Decimal(str(steps)) * self.qty_step
 

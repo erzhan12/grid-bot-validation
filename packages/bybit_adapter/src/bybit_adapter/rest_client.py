@@ -704,6 +704,9 @@ class BybitRestClient:
         Reference:
             https://bybit-exchange.github.io/docs/v5/market/instrument
         """
+        if not _SYMBOL_RE.match(symbol):
+            raise ValueError(f"Invalid symbol format: {symbol!r}")
+
         logger.debug(f"Fetching instruments info for {symbol}")
         self._wait_for_rate_limit("query")
 
