@@ -15,6 +15,7 @@ strategies:
     max_margin: 5.0
     shadow_mode: false  # start with shadow mode to avoid real orders
 
-database_url: "sqlite:////Users/erzhan/DATA/PROJ/grid-bot-validation/db/gridbot_test.db"
+database_url: "${DATABASE_URL}"
 
 enable_event_saver: true
+auth_cooldown_minutes: 30

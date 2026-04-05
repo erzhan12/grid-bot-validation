@@ -6,3 +6,4 @@
 [X] Add risk calculations to backtest (integrate gridcore.Position risk multipliers with margin=positionValue/walletBalance)
 [X] Move margin ratio calculation to gridcore (currently inline in gridbot runner.py:477-478 and pnl_checker calculator.py)
 [X] Move position_value calculation in gridbot runner.py to use gridcore.pnl.calc_position_value
+[ ] Wire order qty computation: engine sets qty=Decimal('0') (gridcore/engine.py:367), expects execution layer to resolve from config `amount` (e.g. "x0.001" wallet fraction) and position.amount_multiplier — currently nothing fills it in, so all orders hit the exchange with qty=0

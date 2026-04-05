@@ -20,7 +20,8 @@ logger = logging.getLogger(__name__)
 # Bybit error codes that indicate auth/permission problems (not retryable)
 AUTH_ERROR_CODES = {10003, 10004, 10005, 33004}
 
-_ERR_CODE_RE = re.compile(r"\[(\d+)\]")
+# Matches both our _check_response format [NNNNN] and pybit's native format (ErrCode: NNNNN)
+_ERR_CODE_RE = re.compile(r"(?:\[(\d+)\]|\(ErrCode:\s*(\d+)\))")
 
 
 @dataclass
@@ -121,7 +122,7 @@ class IntentExecutor:
         """Check if error string contains a Bybit auth error code."""
         match = _ERR_CODE_RE.search(error)
         if match:
-            code = int(match.group(1))
+            code = int(match.group(1) or match.group(2))
             return code in AUTH_ERROR_CODES
         return False
 

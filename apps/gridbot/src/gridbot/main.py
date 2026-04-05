@@ -110,6 +110,7 @@ async def main(config_path: Optional[str] = None, save_events: bool = False) -> 
                 elif "memory" in config.database_url:
                     settings.db_name = ":memory:"
             db = DatabaseFactory(settings)
+            db.create_tables()
             logger.info(f"Database initialized: {config.database_url}")
         except Exception as e:
             logger.warning(f"Failed to initialize database: {e}")

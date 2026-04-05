@@ -289,6 +289,24 @@ class TestAuthErrorDetection:
         for code in AUTH_ERROR_CODES:
             assert IntentExecutor._is_auth_error(f"[{code}] some error") is True
 
+    def test_is_auth_error_pybit_errcode_format(self):
+        """Test detection of pybit (ErrCode: NNNNN) format."""
+        error = (
+            "Permission denied, please check your API key permissions. "
+            "(ErrCode: 10005) (ErrTime: 14:13:32)."
+        )
+        assert IntentExecutor._is_auth_error(error) is True
+
+    def test_is_auth_error_pybit_non_auth(self):
+        """Test non-auth errors in pybit format are not flagged."""
+        error = "Order not found. (ErrCode: 110001) (ErrTime: 14:13:32)."
+        assert IntentExecutor._is_auth_error(error) is False
+
+    def test_all_auth_codes_covered_pybit_format(self):
+        """Verify all AUTH_ERROR_CODES are detected in pybit format."""
+        for code in AUTH_ERROR_CODES:
+            assert IntentExecutor._is_auth_error(f"Some error. (ErrCode: {code})") is True
+
     def test_cooldown_after_consecutive_auth_failures(self, mock_rest_client, place_intent):
         """Test cooldown activates after max_auth_failures consecutive auth errors."""
         mock_rest_client.place_order.side_effect = Exception(
