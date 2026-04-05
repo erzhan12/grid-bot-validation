@@ -5,10 +5,10 @@ and the exchange. It handles the actual order placement and cancellation.
 """
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, UTC
-from decimal import Decimal
-from typing import Optional
+from typing import Callable, Optional
 
 from bybit_adapter.rest_client import BybitRestClient
 from gridcore.intents import PlaceLimitIntent, CancelIntent
@@ -16,6 +16,11 @@ from gridcore.position import DirectionType
 
 
 logger = logging.getLogger(__name__)
+
+# Bybit error codes that indicate auth/permission problems (not retryable)
+AUTH_ERROR_CODES = {10003, 10004, 10005, 33004}
+
+_ERR_CODE_RE = re.compile(r"\[(\d+)\]")
 
 
 @dataclass
@@ -68,6 +73,8 @@ class IntentExecutor:
         shadow_mode: bool = False,
         position_idx_long: int = 1,
         position_idx_short: int = 2,
+        max_auth_failures: int = 5,
+        on_cooldown_entered: Optional[Callable[[], None]] = None,
     ):
         """Initialize executor.
 
@@ -76,16 +83,64 @@ class IntentExecutor:
             shadow_mode: If True, log intents without executing.
             position_idx_long: Position index for long direction (hedge mode).
             position_idx_short: Position index for short direction (hedge mode).
+            max_auth_failures: Consecutive auth errors before entering cooldown.
+            on_cooldown_entered: Callback fired when auth cooldown activates.
         """
         self._client = rest_client
         self._shadow_mode = shadow_mode
         self._position_idx_long = position_idx_long
         self._position_idx_short = position_idx_short
+        self._max_auth_failures = max_auth_failures
+        self._auth_failure_count = 0
+        self._auth_cooldown = False
+        self._on_cooldown_entered = on_cooldown_entered
 
     @property
     def shadow_mode(self) -> bool:
         """Whether executor is in shadow mode."""
         return self._shadow_mode
+
+    @property
+    def auth_cooldown(self) -> bool:
+        """Whether executor is in auth error cooldown."""
+        return self._auth_cooldown
+
+    @property
+    def auth_failure_count(self) -> int:
+        """Number of consecutive auth failures."""
+        return self._auth_failure_count
+
+    def reset_auth_cooldown(self) -> None:
+        """Reset auth cooldown state. Called by orchestrator after cooldown expires."""
+        self._auth_failure_count = 0
+        self._auth_cooldown = False
+        logger.info("Auth cooldown reset, resuming order execution")
+
+    @staticmethod
+    def _is_auth_error(error: str) -> bool:
+        """Check if error string contains a Bybit auth error code."""
+        match = _ERR_CODE_RE.search(error)
+        if match:
+            code = int(match.group(1))
+            return code in AUTH_ERROR_CODES
+        return False
+
+    def _handle_error(self, error: str) -> None:
+        """Track auth errors and enter cooldown if threshold reached."""
+        if self._is_auth_error(error):
+            self._auth_failure_count += 1
+            logger.warning(
+                f"Auth error ({self._auth_failure_count}/{self._max_auth_failures}): {error}"
+            )
+            if self._auth_failure_count >= self._max_auth_failures and not self._auth_cooldown:
+                self._auth_cooldown = True
+                logger.error(
+                    f"Auth cooldown activated after {self._auth_failure_count} consecutive failures"
+                )
+                if self._on_cooldown_entered:
+                    self._on_cooldown_entered()
+        else:
+            self._auth_failure_count = 0
 
     def execute_place(self, intent: PlaceLimitIntent) -> OrderResult:
         """Execute a place order intent.
@@ -128,10 +183,12 @@ class IntentExecutor:
                 f"qty={intent.qty} price={intent.price} order_id={order_id}"
             )
 
+            self._auth_failure_count = 0
             return OrderResult(success=True, order_id=order_id)
 
         except Exception as e:
             logger.error(f"Failed to place order: {e}")
+            self._handle_error(str(e))
             return OrderResult(success=False, error=str(e))
 
     def execute_cancel(self, intent: CancelIntent) -> CancelResult:
@@ -161,6 +218,7 @@ class IntentExecutor:
                     f"Cancelled order: {intent.symbol} "
                     f"order_id={intent.order_id} reason={intent.reason}"
                 )
+                self._auth_failure_count = 0
             else:
                 logger.warning(
                     f"Cancel returned False: {intent.symbol} "
@@ -171,6 +229,7 @@ class IntentExecutor:
 
         except Exception as e:
             logger.error(f"Failed to cancel order: {e}")
+            self._handle_error(str(e))
             return CancelResult(success=False, error=str(e))
 
     def execute_batch(

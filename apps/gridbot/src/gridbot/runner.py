@@ -33,9 +33,8 @@ from gridcore import (
 )
 
 from gridbot.config import StrategyConfig
-from gridbot.executor import IntentExecutor, OrderResult, CancelResult
+from gridbot.executor import IntentExecutor
 from gridbot.notifier import Notifier
-from gridbot.retry_queue import RetryQueue
 
 
 logger = logging.getLogger(__name__)
@@ -493,7 +492,14 @@ class StrategyRunner:
 
     async def _execute_intents(self, intents: list[PlaceLimitIntent | CancelIntent]) -> None:
         """Execute a list of intents."""
+        if self._executor.auth_cooldown:
+            logger.debug(f"{self.strat_id}: Auth cooldown active, skipping {len(intents)} intents")
+            return
+
         for intent in intents:
+            if self._executor.auth_cooldown:
+                logger.debug(f"{self.strat_id}: Auth cooldown activated mid-batch, skipping remaining intents")
+                break
             if isinstance(intent, PlaceLimitIntent):
                 await self._execute_place_intent(intent)
             elif isinstance(intent, CancelIntent):

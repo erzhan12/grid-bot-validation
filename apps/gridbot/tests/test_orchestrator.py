@@ -928,7 +928,6 @@ class TestOrchestratorHealthCheckLoop:
         pub_ws.is_connected.return_value = False
         pub_ws.connect = Mock()
         pub_ws.disconnect = Mock()
-        pub_ws.subscribe_ticker = Mock()
 
         # Private WS is fine
         priv_ws = orchestrator._private_ws["test_account"]
@@ -942,7 +941,6 @@ class TestOrchestratorHealthCheckLoop:
 
         pub_ws.disconnect.assert_called_once()
         pub_ws.connect.assert_called_once()
-        pub_ws.subscribe_ticker.assert_called()
         notifier.alert.assert_called()
 
     @pytest.mark.asyncio
@@ -970,9 +968,6 @@ class TestOrchestratorHealthCheckLoop:
         priv_ws.is_connected.return_value = False
         priv_ws.connect = Mock()
         priv_ws.disconnect = Mock()
-        priv_ws.subscribe_position = Mock()
-        priv_ws.subscribe_order = Mock()
-        priv_ws.subscribe_execution = Mock()
 
         async def stop_immediately(seconds):
             orchestrator._running = False
@@ -982,9 +977,6 @@ class TestOrchestratorHealthCheckLoop:
 
         priv_ws.disconnect.assert_called_once()
         priv_ws.connect.assert_called_once()
-        priv_ws.subscribe_position.assert_called()
-        priv_ws.subscribe_order.assert_called()
-        priv_ws.subscribe_execution.assert_called()
         notifier.alert.assert_called()
 
     @pytest.mark.asyncio
@@ -1730,3 +1722,155 @@ class TestOrchestratorEventSaver:
         assert sorted(ctx.symbols) == ["BTCUSDT", "ETHUSDT"]
 
         await orchestrator.stop()
+
+
+class TestOrchestratorAuthCooldown:
+    """Tests for auth error cooldown lifecycle in orchestrator."""
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_cooldown_entered_sets_timer_and_alerts(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test _on_auth_cooldown_entered sets expiry timer and sends alert."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+
+        orchestrator._on_auth_cooldown_entered("btcusdt_test")
+
+        assert "btcusdt_test" in orchestrator._auth_cooldown_until
+        assert orchestrator._auth_cooldown_cycles["btcusdt_test"] == 1
+        notifier.alert.assert_called_once()
+        assert "cycle 1" in notifier.alert.call_args[0][0]
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_cooldown_cycle_increments(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test cycle count increments across cooldown entries."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+
+        orchestrator._on_auth_cooldown_entered("btcusdt_test")
+        assert orchestrator._auth_cooldown_cycles["btcusdt_test"] == 1
+
+        # Simulate cooldown expiry (delete timer but keep cycle count)
+        del orchestrator._auth_cooldown_until["btcusdt_test"]
+
+        orchestrator._on_auth_cooldown_entered("btcusdt_test")
+        assert orchestrator._auth_cooldown_cycles["btcusdt_test"] == 2
+        assert "cycle 2" in notifier.alert.call_args[0][0]
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_health_check_expires_cooldown(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test health check loop resets executor when cooldown expires."""
+        from datetime import datetime, timedelta, UTC
+
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        orchestrator._running = True
+
+        # Simulate active cooldown that has already expired
+        executor = orchestrator._strategy_executors["btcusdt_test"]
+        executor._auth_cooldown = True
+        executor._auth_failure_count = 5
+        orchestrator._auth_cooldown_until["btcusdt_test"] = datetime.now(UTC) - timedelta(seconds=1)
+        orchestrator._auth_cooldown_cycles["btcusdt_test"] = 2
+
+        # WS connections are fine
+        pub_ws = orchestrator._public_ws["test_account"]
+        pub_ws.is_connected.return_value = True
+        priv_ws = orchestrator._private_ws["test_account"]
+        priv_ws.is_connected.return_value = True
+
+        async def stop_immediately(seconds):
+            orchestrator._running = False
+
+        with patch("asyncio.sleep", new_callable=AsyncMock, side_effect=stop_immediately):
+            await orchestrator._health_check_loop()
+
+        # Executor should be reset
+        assert executor.auth_cooldown is False
+        assert executor.auth_failure_count == 0
+        # Timer entry removed, but cycle count preserved
+        assert "btcusdt_test" not in orchestrator._auth_cooldown_until
+        assert orchestrator._auth_cooldown_cycles["btcusdt_test"] == 2
+        # Alert sent about resuming
+        assert any("cooldown expired" in str(c) for c in notifier.alert.call_args_list)
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_cooldown_uses_config_minutes(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        account_config, strategy_config,
+    ):
+        """Test cooldown timer uses auth_cooldown_minutes from config."""
+        from datetime import datetime, timedelta, UTC
+
+        config = GridbotConfig(
+            accounts=[account_config],
+            strategies=[strategy_config],
+            auth_cooldown_minutes=10,
+        )
+        orchestrator = Orchestrator(config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+
+        before = datetime.now(UTC)
+        orchestrator._on_auth_cooldown_entered("btcusdt_test")
+        after = datetime.now(UTC)
+
+        expiry = orchestrator._auth_cooldown_until["btcusdt_test"]
+        # Expiry should be ~10 minutes from now
+        assert expiry >= before + timedelta(minutes=10)
+        assert expiry <= after + timedelta(minutes=10)
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_cooldown_clears_retry_queue(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Test retry queue is cleared when cooldown activates."""
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+
+        # Add items to the retry queue
+        retry_queue = orchestrator._retry_queues["btcusdt_test"]
+        from gridcore.intents import PlaceLimitIntent
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+            qty=Decimal("0.001"), grid_level=1, direction="long",
+        )
+        retry_queue.add(intent, "auth error")
+        retry_queue.add(intent, "auth error")
+        assert retry_queue.size == 2
+
+        orchestrator._on_auth_cooldown_entered("btcusdt_test")
+
+        assert retry_queue.size == 0

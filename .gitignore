@@ -33,6 +33,7 @@ env/
 # IDE
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *~
@@ -52,6 +53,7 @@ htmlcov/
 *.db
 *.sqlite
 *.sqlite3
+/db/
 
 # Logs
 *.log

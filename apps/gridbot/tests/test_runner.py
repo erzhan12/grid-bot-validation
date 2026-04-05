@@ -2,7 +2,7 @@
 
 from datetime import datetime, UTC
 from decimal import Decimal
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import Mock, MagicMock
 
 import pytest
 
@@ -47,6 +47,7 @@ def mock_executor():
     """Create mock executor."""
     executor = Mock(spec=IntentExecutor)
     executor.shadow_mode = False
+    executor.auth_cooldown = False
     executor.execute_place = MagicMock(
         return_value=OrderResult(success=True, order_id="order_123")
     )
@@ -140,7 +141,7 @@ class TestStrategyRunnerTicker:
     @pytest.mark.asyncio
     async def test_on_ticker_builds_grid(self, runner, ticker_event):
         """Test ticker event builds grid on first call."""
-        intents = await runner.on_ticker(ticker_event)
+        await runner.on_ticker(ticker_event)
 
         # Grid should be built, intents generated
         assert len(runner.engine.grid.grid) > 0
@@ -1231,3 +1232,92 @@ class TestSameOrderDetection:
         # Buffer still has only 1 entry (the fully filled one)
         assert len(runner._recent_executions_long) == 1
         assert runner.same_order_error is False
+
+
+class TestRunnerAuthCooldown:
+    """Tests for runner skipping intents during auth cooldown."""
+
+    @pytest.mark.asyncio
+    async def test_skips_intents_when_auth_cooldown_active(self, strategy_config):
+        """Test intents are skipped when executor.auth_cooldown is True."""
+        executor = Mock(spec=IntentExecutor)
+        executor.shadow_mode = False
+        executor.auth_cooldown = True
+        executor.execute_place = MagicMock(
+            return_value=OrderResult(success=True, order_id="order_123")
+        )
+
+        runner = StrategyRunner(strategy_config=strategy_config, executor=executor)
+
+        ticker = TickerEvent(
+            event_type=EventType.TICKER,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            last_price=Decimal("50000.0"),
+        )
+        await runner.on_ticker(ticker)
+
+        # Grid was built (engine processed ticker) but no orders placed
+        assert len(runner.engine.grid.grid) > 0
+        executor.execute_place.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_executes_intents_when_cooldown_cleared(self, strategy_config):
+        """Test intents execute normally when auth_cooldown is False."""
+        executor = Mock(spec=IntentExecutor)
+        executor.shadow_mode = False
+        executor.auth_cooldown = False
+        executor.execute_place = MagicMock(
+            return_value=OrderResult(success=True, order_id="order_123")
+        )
+
+        runner = StrategyRunner(strategy_config=strategy_config, executor=executor)
+
+        ticker = TickerEvent(
+            event_type=EventType.TICKER,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            last_price=Decimal("50000.0"),
+        )
+        await runner.on_ticker(ticker)
+
+        # Orders should have been placed
+        assert executor.execute_place.called
+
+    @pytest.mark.asyncio
+    async def test_stops_mid_batch_when_cooldown_activates(self, strategy_config):
+        """Test remaining intents are skipped if cooldown activates mid-batch."""
+        executor = Mock(spec=IntentExecutor)
+        executor.shadow_mode = False
+        executor.auth_cooldown = False
+
+        call_count = 0
+
+        def place_that_triggers_cooldown(intent):
+            nonlocal call_count
+            call_count += 1
+            # First call triggers cooldown
+            executor.auth_cooldown = True
+            return OrderResult(success=False, error="[10005] Permission denied")
+
+        executor.execute_place = place_that_triggers_cooldown
+        executor.execute_cancel = MagicMock(return_value=CancelResult(success=True))
+
+        runner = StrategyRunner(strategy_config=strategy_config, executor=executor)
+
+        # Manually call _execute_intents with multiple intents
+        intents = [
+            PlaceLimitIntent.create(
+                symbol="BTCUSDT", side="Buy", price=Decimal(str(50000 - i * 100)),
+                qty=Decimal("0.001"), grid_level=i, direction="long",
+            )
+            for i in range(5)
+        ]
+
+        await runner._execute_intents(intents)
+
+        # Only the first intent should have been executed;
+        # the rest skipped because cooldown activated
+        assert call_count == 1
