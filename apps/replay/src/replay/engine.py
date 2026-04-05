@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 
 from grid_db import DatabaseFactory, Run, RunRepository, redact_db_url
 
-from gridcore import DirectionType
+from gridcore import DirectionType, create_qty_calculator
 
 from backtest.config import BacktestStrategyConfig, WindDownMode
 from backtest.data_provider import HistoricalDataProvider, InMemoryDataProvider
@@ -319,39 +319,9 @@ class ReplayEngine:
     def _create_qty_calculator(self, config, instrument_info):
         """Create qty calculator from amount pattern.
 
-        Mirrors BacktestEngine._create_qty_calculator().
+        Delegates to gridcore.create_qty_calculator for shared logic.
         """
-        amount_str = config.amount
-
-        if amount_str.startswith("x"):
-            fraction = Decimal(amount_str[1:])
-
-            def qty_from_fraction(intent, wallet_balance):
-                if intent.price <= 0:
-                    return Decimal("0")
-                raw_qty = wallet_balance * fraction / intent.price
-                return instrument_info.round_qty(raw_qty)
-
-            return qty_from_fraction
-
-        elif amount_str.startswith("b"):
-            base_qty = Decimal(amount_str[1:])
-
-            def qty_fixed_base(intent, wallet_balance):
-                return instrument_info.round_qty(base_qty)
-
-            return qty_fixed_base
-
-        else:
-            usdt_amount = Decimal(amount_str)
-
-            def qty_from_usdt(intent, wallet_balance):
-                if intent.price <= 0:
-                    return Decimal("0")
-                raw_qty = usdt_amount / intent.price
-                return instrument_info.round_qty(raw_qty)
-
-            return qty_from_usdt
+        return create_qty_calculator(config.amount, instrument_info)
 
     def _wind_down(
         self,

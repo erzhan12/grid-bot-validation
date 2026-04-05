@@ -581,8 +581,8 @@ class Orchestrator:
     ) -> Optional[InstrumentInfo]:
         """Fetch instrument info from Bybit API for qty rounding.
 
-        Uses the account's REST client session (public endpoint).
-        Falls back to sensible defaults if fetch fails.
+        Uses the account's REST client public endpoint.
+        Returns None if fetch fails (qty rounding will be skipped).
 
         Args:
             symbol: Trading pair (e.g., "BTCUSDT").
@@ -593,38 +593,8 @@ class Orchestrator:
         """
         try:
             rest_client = self._rest_clients[account_name]
-
-            def _fetch():
-                response = rest_client._session.get_instruments_info(
-                    category="linear", symbol=symbol
-                )
-                if response.get("retCode") != 0:
-                    logger.warning(f"Instrument info API error: {response.get('retMsg')}")
-                    return None
-
-                instruments = response.get("result", {}).get("list", [])
-                if not instruments:
-                    logger.warning(f"No instrument found for {symbol}")
-                    return None
-
-                info = instruments[0]
-                lot_filter = info.get("lotSizeFilter", {})
-                price_filter = info.get("priceFilter", {})
-
-                from decimal import Decimal
-
-                qty_step = Decimal(lot_filter.get("qtyStep", "0.001"))
-                tick_size = Decimal(price_filter.get("tickSize", "0.1"))
-
-                return InstrumentInfo(
-                    symbol=symbol,
-                    qty_step=qty_step,
-                    tick_size=tick_size,
-                    min_qty=Decimal(lot_filter.get("minOrderQty", "0.001")),
-                    max_qty=Decimal(lot_filter.get("maxOrderQty", "1000")),
-                )
-
-            info = await asyncio.to_thread(_fetch)
+            raw = await asyncio.to_thread(rest_client.get_instruments_info, symbol)
+            info = InstrumentInfo.from_bybit_response(symbol, raw)
             if info:
                 logger.info(
                     f"Fetched instrument info for {symbol}: "

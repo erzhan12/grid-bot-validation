@@ -758,3 +758,41 @@ class TestGetTransactionLogAll:
         assert len(result) == 3
         assert truncated is True
         assert mock_session.get_transaction_log.call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# get_instruments_info
+# ---------------------------------------------------------------------------
+
+
+class TestGetInstrumentsInfo:
+    def test_returns_instrument_dict(self, client, mock_session):
+        """Returns first instrument from response list."""
+        instrument = {
+            "symbol": "BTCUSDT",
+            "lotSizeFilter": {"qtyStep": "0.001"},
+            "priceFilter": {"tickSize": "0.1"},
+        }
+        mock_session.get_instruments_info.return_value = _ok_response(
+            {"list": [instrument]}
+        )
+
+        result = client.get_instruments_info("BTCUSDT")
+        assert result == instrument
+        mock_session.get_instruments_info.assert_called_once_with(
+            category="linear", symbol="BTCUSDT"
+        )
+
+    def test_raises_on_empty_list(self, client, mock_session):
+        """Raises when no instrument found."""
+        mock_session.get_instruments_info.return_value = _ok_response({"list": []})
+
+        with pytest.raises(Exception, match="No instrument found"):
+            client.get_instruments_info("INVALID")
+
+    def test_raises_on_api_error(self, client, mock_session):
+        """Raises on API error response."""
+        mock_session.get_instruments_info.return_value = _error_response()
+
+        with pytest.raises(Exception, match="Bybit API error"):
+            client.get_instruments_info("BTCUSDT")

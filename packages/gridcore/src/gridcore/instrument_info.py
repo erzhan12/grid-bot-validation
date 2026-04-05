@@ -4,8 +4,12 @@ Pure data class with no external dependencies.
 Provider/fetcher logic lives in app layers (backtest, gridbot).
 """
 
+import logging
 import math
 from decimal import Decimal
+from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class InstrumentInfo:
@@ -54,4 +58,36 @@ class InstrumentInfo:
             tick_size=Decimal(data["tick_size"]),
             min_qty=Decimal(data["min_qty"]),
             max_qty=Decimal(data["max_qty"]),
+        )
+
+    @classmethod
+    def from_bybit_response(cls, symbol: str, instrument: dict) -> Optional["InstrumentInfo"]:
+        """Parse a single instrument entry from Bybit get_instruments_info response.
+
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT").
+            instrument: Single instrument dict from response["result"]["list"][0].
+
+        Returns:
+            InstrumentInfo if valid, None if params are invalid (zero qty_step/tick_size).
+        """
+        lot_filter = instrument.get("lotSizeFilter", {})
+        price_filter = instrument.get("priceFilter", {})
+
+        qty_step = Decimal(lot_filter.get("qtyStep", "0.001"))
+        tick_size = Decimal(price_filter.get("tickSize", "0.1"))
+
+        if qty_step <= 0 or tick_size <= 0:
+            logger.warning(
+                f"Invalid instrument params for {symbol}: "
+                f"qty_step={qty_step}, tick_size={tick_size}"
+            )
+            return None
+
+        return cls(
+            symbol=symbol,
+            qty_step=qty_step,
+            tick_size=tick_size,
+            min_qty=Decimal(lot_filter.get("minOrderQty", "0.001")),
+            max_qty=Decimal(lot_filter.get("maxOrderQty", "1000")),
         )

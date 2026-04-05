@@ -31,6 +31,7 @@ from gridcore import (
     DirectionType,
     calc_position_value,
     calc_margin_ratio,
+    create_qty_calculator,
 )
 
 from gridbot.config import StrategyConfig
@@ -119,7 +120,9 @@ class StrategyRunner:
 
         # Qty computation
         self._instrument_info = instrument_info
-        self._qty_calculator = self._create_qty_calculator()
+        self._qty_calculator = create_qty_calculator(
+            strategy_config.amount, instrument_info
+        )
         self._wallet_balance: Decimal = Decimal("0")
 
         # Load anchor if available and config matches
@@ -470,56 +473,11 @@ class StrategyRunner:
         else:
             return self._short_position.get_amount_multiplier()[side]
 
-    def _create_qty_calculator(self) -> Callable[[PlaceLimitIntent, Decimal], Decimal]:
-        """Create qty calculator from config amount pattern.
-
-        Mirrors backtest's _create_qty_calculator: parses amount string
-        and returns a function that computes base qty (before risk multiplier).
-
-        Amount formats:
-        - "x0.001": Fraction of wallet balance (0.1%)
-        - "b0.001": Fixed base currency amount (BTC)
-        - "100": Fixed USDT amount
-        """
-        amount_str = self._config.amount
-        instrument = self._instrument_info
-
-        def _round(raw_qty: Decimal) -> Decimal:
-            return instrument.round_qty(raw_qty) if instrument else raw_qty
-
-        if amount_str.startswith("x"):
-            fraction = Decimal(amount_str[1:])
-
-            def qty_from_fraction(intent: PlaceLimitIntent, wallet_balance: Decimal) -> Decimal:
-                if intent.price <= 0:
-                    return Decimal("0")
-                return _round(wallet_balance * fraction / intent.price)
-
-            return qty_from_fraction
-
-        elif amount_str.startswith("b"):
-            base_qty = Decimal(amount_str[1:])
-
-            def qty_fixed_base(intent: PlaceLimitIntent, wallet_balance: Decimal) -> Decimal:
-                return _round(base_qty)
-
-            return qty_fixed_base
-
-        else:
-            usdt_amount = Decimal(amount_str)
-
-            def qty_from_usdt(intent: PlaceLimitIntent, wallet_balance: Decimal) -> Decimal:
-                if intent.price <= 0:
-                    return Decimal("0")
-                return _round(usdt_amount / intent.price)
-
-            return qty_from_usdt
-
     def _resolve_qty(self, intent: PlaceLimitIntent) -> PlaceLimitIntent:
         """Resolve qty=0 intent to actual order quantity.
 
         Composes base qty (from amount config) with risk multiplier,
-        matching the backtest _apply_risk_to_qty pattern.
+        then re-rounds to qty_step so the result is exchange-valid.
 
         Returns a new intent with resolved qty, or the original if qty > 0.
         """
@@ -529,6 +487,10 @@ class StrategyRunner:
         base_qty = self._qty_calculator(intent, self._wallet_balance)
         multiplier = self.get_amount_multiplier(intent.direction, intent.side)
         resolved_qty = base_qty * Decimal(str(multiplier))
+
+        # Re-round after multiplier to ensure qty aligns with exchange qty_step
+        if self._instrument_info and resolved_qty > 0:
+            resolved_qty = self._instrument_info.round_qty(resolved_qty)
 
         if resolved_qty <= 0:
             logger.warning(

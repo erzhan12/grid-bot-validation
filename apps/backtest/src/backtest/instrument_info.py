@@ -61,27 +61,7 @@ class InstrumentInfoProvider:
                 logger.warning(f"No instrument found for {symbol}")
                 return None
 
-            info = instruments[0]
-            lot_filter = info.get("lotSizeFilter", {})
-            price_filter = info.get("priceFilter", {})
-
-            qty_step = Decimal(lot_filter.get("qtyStep", "0.001"))
-            tick_size = Decimal(price_filter.get("tickSize", "0.1"))
-
-            if qty_step <= 0 or tick_size <= 0:
-                logger.warning(
-                    f"Invalid instrument params for {symbol}: "
-                    f"qty_step={qty_step}, tick_size={tick_size}"
-                )
-                return None
-
-            return InstrumentInfo(
-                symbol=symbol,
-                qty_step=qty_step,
-                tick_size=tick_size,
-                min_qty=Decimal(lot_filter.get("minOrderQty", "0.001")),
-                max_qty=Decimal(lot_filter.get("maxOrderQty", "1000")),
-            )
+            return InstrumentInfo.from_bybit_response(symbol, instruments[0])
 
         except Exception as e:
             logger.warning(f"Error fetching instrument info: {e}")
