@@ -677,12 +677,16 @@ class Orchestrator:
                     # Get last close from engine
                     last_close = runner.engine.last_close or 0.0
 
-                    await runner.on_position_update(
-                        long_position=long_pos,
-                        short_position=short_pos,
-                        wallet_balance=wallet_balance,
-                        last_close=last_close,
-                    )
+                    try:
+                        await runner.on_position_update(
+                            long_position=long_pos,
+                            short_position=short_pos,
+                            wallet_balance=wallet_balance,
+                            last_close=last_close,
+                        )
+                    except Exception as e:
+                        logger.error("Position update failed for runner %s: %s", runner.strat_id, e)
+                        raise
 
             except asyncio.TimeoutError:
                 if startup:

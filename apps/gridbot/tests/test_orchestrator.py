@@ -351,6 +351,115 @@ class TestOrchestratorLifecycle:
 
         await orchestrator.stop()
 
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_start_position_fetch_rest_api_timeout(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        gridbot_config,
+        account_config,
+        strategy_config,
+    ):
+        """Test start() continues when REST get_positions times out."""
+        mock_public_ws.return_value.connect = Mock()
+        mock_public_ws.return_value.subscribe_ticker = Mock()
+        mock_private_ws.return_value.connect = Mock()
+        mock_private_ws.return_value.subscribe_position = Mock()
+        mock_private_ws.return_value.subscribe_order = Mock()
+        mock_private_ws.return_value.subscribe_execution = Mock()
+        mock_rest_client.return_value.get_open_orders = Mock(return_value=[])
+
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+
+        # Wallet balance succeeds but get_positions hangs (triggers TimeoutError)
+        rest_client = orchestrator._rest_clients["test_account"]
+        rest_client.get_wallet_balance.return_value = {
+            "list": [{"coin": [{"coin": "USDT", "walletBalance": "10000"}]}]
+        }
+        rest_client.get_positions.side_effect = asyncio.TimeoutError()
+
+        # Patch wait_for to propagate the TimeoutError from get_positions
+        original_wait_for = asyncio.wait_for
+
+        async def patched_wait_for(coro, *, timeout):
+            try:
+                return await coro
+            except asyncio.TimeoutError:
+                raise
+
+        with patch("asyncio.wait_for", side_effect=patched_wait_for):
+            await orchestrator.start()
+
+        # Background tasks should still have started
+        assert orchestrator._position_check_task is not None
+        assert orchestrator._health_check_task is not None
+        assert orchestrator._order_sync_task is not None
+
+        await orchestrator.stop()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_start_position_update_runner_exception(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        gridbot_config,
+        account_config,
+        strategy_config,
+    ):
+        """Test start() continues when runner.on_position_update raises."""
+        mock_public_ws.return_value.connect = Mock()
+        mock_public_ws.return_value.subscribe_ticker = Mock()
+        mock_private_ws.return_value.connect = Mock()
+        mock_private_ws.return_value.subscribe_position = Mock()
+        mock_private_ws.return_value.subscribe_order = Mock()
+        mock_private_ws.return_value.subscribe_execution = Mock()
+        mock_rest_client.return_value.get_open_orders = Mock(return_value=[])
+
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+
+        # Mock wallet balance and positions via REST
+        rest_client = orchestrator._rest_clients["test_account"]
+        rest_client.get_wallet_balance.return_value = {
+            "list": [{"coin": [{"coin": "USDT", "walletBalance": "10000"}]}]
+        }
+        rest_client.get_positions.return_value = [
+            {"symbol": "BTCUSDT", "side": "Buy", "size": "0"},
+            {"symbol": "BTCUSDT", "side": "Sell", "size": "0"},
+        ]
+
+        # Make runner.on_position_update raise
+        runner = orchestrator._runners["btcusdt_test"]
+        runner.on_position_update = AsyncMock(
+            side_effect=RuntimeError("runner exploded")
+        )
+
+        # start() should complete without raising
+        await orchestrator.start()
+
+        # Runner was called (and failed)
+        runner.on_position_update.assert_called_once()
+
+        # Background tasks should still have started
+        assert orchestrator._position_check_task is not None
+        assert orchestrator._health_check_task is not None
+        assert orchestrator._order_sync_task is not None
+
+        await orchestrator.stop()
+
 
 class TestOrchestratorGuardClauses:
     """Tests for guard clauses in start/stop and run_until_shutdown."""
