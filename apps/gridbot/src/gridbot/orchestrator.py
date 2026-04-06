@@ -685,18 +685,24 @@ class Orchestrator:
                             last_close=last_close,
                         )
                     except Exception as e:
-                        logger.error("Position update failed for runner %s: %s", runner.strat_id, e)
+                        logger.error(
+                            "Position update failed for runner %s: %s",
+                            runner.strat_id, e, exc_info=True,
+                        )
                         raise
 
             except asyncio.TimeoutError:
+                msg = f"Timeout (30s) fetching positions for {account_name}"
                 if startup:
-                    logger.warning(
-                        "Timeout (30s) fetching initial positions for %s during startup. "
-                        "Runners may not have multipliers until next periodic check.",
-                        account_name,
-                    )
+                    msg += ". Runners may not have multipliers until next periodic check"
+                    logger.warning(msg)
                 else:
-                    logger.error("Timeout (30s) fetching positions for %s", account_name)
+                    logger.error(msg)
+                self._notifier.alert_exception(
+                    "_fetch_and_update_positions",
+                    asyncio.TimeoutError(msg),
+                    error_key=f"position_fetch_{account_name}",
+                )
             except Exception as e:
                 if startup:
                     logger.warning(
@@ -706,6 +712,10 @@ class Orchestrator:
                     )
                 else:
                     logger.error("Position check error for %s: %s", account_name, e)
+                self._notifier.alert_exception(
+                    "_fetch_and_update_positions", e,
+                    error_key=f"position_fetch_{account_name}",
+                )
 
     async def _position_check_loop(self) -> None:
         """Periodic position check loop."""
