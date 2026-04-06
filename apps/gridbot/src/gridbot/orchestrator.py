@@ -689,7 +689,12 @@ class Orchestrator:
                             "Position update failed for runner %s: %s",
                             runner.strat_id, e, exc_info=True,
                         )
-                        raise
+                        self._notifier.alert_exception(
+                            f"runner.on_position_update({runner.strat_id})",
+                            e,
+                            error_key=f"position_update_{account_name}_{runner.strat_id}",
+                        )
+                        # Continue to next runner instead of raising
 
             except asyncio.TimeoutError:
                 msg = f"Timeout (30s) fetching positions for {account_name}"
