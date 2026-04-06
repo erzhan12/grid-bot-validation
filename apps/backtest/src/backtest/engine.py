@@ -10,7 +10,7 @@ from decimal import Decimal
 from typing import Iterator, Optional
 
 from grid_db import DatabaseFactory
-from gridcore import DirectionType, SideType
+from gridcore import DirectionType, SideType, create_qty_calculator
 
 from backtest.config import BacktestConfig, BacktestStrategyConfig, WindDownMode
 from backtest.data_provider import HistoricalDataProvider, InMemoryDataProvider, DataRangeInfo
@@ -301,12 +301,7 @@ class BacktestEngine:
     ):
         """Create qty calculator function based on config amount pattern.
 
-        Amount formats:
-        - "100" or "100.0": Fixed USDT amount
-        - "x0.001": Fraction of wallet balance (0.1%)
-        - "b0.001": BTC equivalent amount
-
-        Quantities are rounded up to instrument's qty_step (matching bbu2 behavior).
+        Delegates to gridcore.create_qty_calculator for shared logic.
 
         Args:
             config: Strategy configuration.
@@ -315,41 +310,7 @@ class BacktestEngine:
         Returns:
             Callable that takes (intent, wallet_balance) and returns qty.
         """
-        amount_str = config.amount
-
-        if amount_str.startswith("x"):
-            # Wallet fraction
-            fraction = Decimal(amount_str[1:])
-
-            def qty_from_fraction(intent, wallet_balance):
-                # qty = wallet * fraction / price
-                if intent.price <= 0:
-                    return Decimal("0")
-                raw_qty = wallet_balance * fraction / intent.price
-                return instrument_info.round_qty(raw_qty)
-
-            return qty_from_fraction
-
-        elif amount_str.startswith("b"):
-            # BTC equivalent (fixed size in base currency)
-            base_qty = Decimal(amount_str[1:])
-
-            def qty_fixed_base(intent, wallet_balance):
-                return instrument_info.round_qty(base_qty)
-
-            return qty_fixed_base
-
-        else:
-            # Fixed USDT amount
-            usdt_amount = Decimal(amount_str)
-
-            def qty_from_usdt(intent, wallet_balance):
-                if intent.price <= 0:
-                    return Decimal("0")
-                raw_qty = usdt_amount / intent.price
-                return instrument_info.round_qty(raw_qty)
-
-            return qty_from_usdt
+        return create_qty_calculator(config.amount, instrument_info)
 
     def _process_tick(self, tick) -> None:
         """Process tick for all runners with proper equity timing.

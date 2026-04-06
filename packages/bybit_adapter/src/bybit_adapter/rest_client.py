@@ -688,6 +688,41 @@ class BybitRestClient:
         logger.debug(f"Fetched ticker for {symbol}")
         return tickers[0]
 
+    def get_instruments_info(self, symbol: str, category: str = "linear") -> dict:
+        """Fetch instrument trading parameters (qty_step, tick_size, etc.).
+
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDT")
+            category: Product category (default "linear")
+
+        Returns:
+            Single instrument dict with lotSizeFilter, priceFilter, etc.
+
+        Raises:
+            Exception: If API call fails or no instrument found
+
+        Reference:
+            https://bybit-exchange.github.io/docs/v5/market/instrument
+        """
+        if not _SYMBOL_RE.match(symbol):
+            raise ValueError(f"Invalid symbol format: {symbol!r}")
+
+        logger.debug(f"Fetching instruments info for {symbol}")
+        self._wait_for_rate_limit("query")
+
+        response = self._session.get_instruments_info(
+            category=category,
+            symbol=symbol,
+        )
+        self._check_response(response, "get_instruments_info")
+
+        instruments = response.get("result", {}).get("list", [])
+        if not instruments:
+            raise Exception(f"No instrument found for {symbol}")
+
+        logger.debug(f"Fetched instrument info for {symbol}")
+        return instruments[0]
+
     def get_transaction_log(
         self,
         symbol: Optional[str] = None,

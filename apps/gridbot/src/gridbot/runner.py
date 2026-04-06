@@ -9,8 +9,9 @@ The runner is responsible for:
 """
 
 import logging
+import math
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, UTC
 from decimal import Decimal
 from typing import Optional, Callable
@@ -18,6 +19,7 @@ from typing import Optional, Callable
 from gridcore import (
     GridEngine,
     GridConfig,
+    InstrumentInfo,
     Position,
     PositionState,
     RiskConfig,
@@ -30,6 +32,7 @@ from gridcore import (
     DirectionType,
     calc_position_value,
     calc_margin_ratio,
+    create_qty_calculator,
 )
 
 from gridbot.config import StrategyConfig
@@ -38,6 +41,15 @@ from gridbot.notifier import Notifier
 
 
 logger = logging.getLogger(__name__)
+
+# Pre-built Decimal values for known Position multipliers (0.5, 1.0, 1.5, 2.0)
+# to avoid float→str→Decimal conversion on every order.
+_FLOAT_TO_DECIMAL = {
+    0.5: Decimal("0.5"),
+    1.0: Decimal("1"),
+    1.5: Decimal("1.5"),
+    2.0: Decimal("2"),
+}
 
 
 @dataclass
@@ -95,6 +107,7 @@ class StrategyRunner:
         self,
         strategy_config: StrategyConfig,
         executor: IntentExecutor,
+        instrument_info: Optional[InstrumentInfo] = None,
         anchor_store: Optional[GridAnchorStore] = None,
         on_intent_failed: Optional[Callable[[PlaceLimitIntent | CancelIntent, str], None]] = None,
         notifier: Optional[Notifier] = None,
@@ -104,6 +117,7 @@ class StrategyRunner:
         Args:
             strategy_config: Strategy configuration.
             executor: Intent executor for API calls.
+            instrument_info: Instrument info for qty rounding (None uses no rounding).
             anchor_store: Optional anchor store for grid persistence.
             on_intent_failed: Callback when intent execution fails (for retry queue).
             notifier: Alert notifier for same-order error Telegram alerts.
@@ -113,6 +127,13 @@ class StrategyRunner:
         self._anchor_store = anchor_store
         self._on_intent_failed = on_intent_failed
         self._notifier = notifier
+
+        # Qty computation
+        self._instrument_info = instrument_info
+        self._qty_calculator = create_qty_calculator(
+            strategy_config.amount, instrument_info
+        )
+        self._wallet_balance: Decimal = Decimal("0")
 
         # Load anchor if available and config matches
         anchor_price = self._load_anchor()
@@ -391,6 +412,9 @@ class StrategyRunner:
             Exception: Re-raised after logging so orchestrator can handle notification.
         """
         try:
+            # Store wallet balance for qty computation
+            self._wallet_balance = Decimal(str(wallet_balance))
+
             # Build PositionState objects
             long_state = self._build_position_state(long_position, wallet_balance, DirectionType.LONG)
             short_state = self._build_position_state(short_position, wallet_balance, DirectionType.SHORT)
@@ -459,6 +483,57 @@ class StrategyRunner:
         else:
             return self._short_position.get_amount_multiplier()[side]
 
+    def _resolve_qty(self, intent: PlaceLimitIntent) -> PlaceLimitIntent:
+        """Resolve qty=0 intent to actual order quantity.
+
+        Composes base qty (from amount config) with risk multiplier,
+        then re-rounds to qty_step so the result is exchange-valid.
+
+        Returns a new intent with resolved qty, or the original if qty > 0.
+        """
+        if intent.qty > 0:
+            return intent
+
+        base_qty = self._qty_calculator(intent, self._wallet_balance)
+        mult_float = self.get_amount_multiplier(intent.direction, intent.side)
+        if not math.isfinite(mult_float):
+            logger.error(
+                f"{self.strat_id}: Invalid multiplier {mult_float} for "
+                f"{intent.side} {intent.direction}"
+            )
+            return replace(intent, qty=Decimal("0"))
+        multiplier = _FLOAT_TO_DECIMAL.get(mult_float, Decimal(str(mult_float)))
+        resolved_qty = base_qty * multiplier
+
+        # Re-round after multiplier to ensure qty aligns with exchange qty_step
+        if self._instrument_info and resolved_qty > 0:
+            resolved_qty = self._instrument_info.round_qty(resolved_qty)
+            if resolved_qty < self._instrument_info.min_qty:
+                logger.warning(
+                    f"{self.strat_id}: Resolved qty {resolved_qty} below min_qty "
+                    f"{self._instrument_info.min_qty} for {intent.side} {intent.direction} "
+                    f"at {intent.price}"
+                )
+                return replace(intent, qty=Decimal("0"))
+            if resolved_qty > self._instrument_info.max_qty:
+                logger.warning(
+                    f"{self.strat_id}: Resolved qty {resolved_qty} exceeds max_qty "
+                    f"{self._instrument_info.max_qty} for {intent.side} {intent.direction} "
+                    f"at {intent.price}, clamping"
+                )
+                resolved_qty = self._instrument_info.max_qty
+
+        if resolved_qty <= 0:
+            log_level = logging.DEBUG if self._wallet_balance == 0 else logging.WARNING
+            logger.log(
+                log_level,
+                f"{self.strat_id}: Resolved qty=0 for {intent.side} {intent.direction} "
+                f"at {intent.price} (base={base_qty}, mult={multiplier}, "
+                f"wallet={self._wallet_balance})",
+            )
+
+        return replace(intent, qty=resolved_qty)
+
     def _build_position_state(
         self, position_data: Optional[dict], wallet_balance: float, direction: str = DirectionType.LONG
     ) -> Optional[PositionState]:
@@ -507,6 +582,12 @@ class StrategyRunner:
 
     async def _execute_place_intent(self, intent: PlaceLimitIntent) -> None:
         """Execute a place order intent."""
+        # Resolve qty (engine emits qty=0, we fill it in)
+        intent = self._resolve_qty(intent)
+        if intent.qty <= 0:
+            logger.debug(f"{self.strat_id}: Skipping order with qty<=0 at {intent.price}")
+            return
+
         # Check for duplicate
         if intent.client_order_id in self._tracked_orders:
             tracked = self._tracked_orders[intent.client_order_id]
