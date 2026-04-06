@@ -279,6 +279,37 @@ class TestOrchestratorLifecycle:
         mock_private_ws.return_value.disconnect.assert_called()
 
 
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_start_calls_initial_position_fetch(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        gridbot_config,
+    ):
+        """Test start() fetches positions before starting background tasks."""
+        mock_public_ws.return_value.connect = Mock()
+        mock_public_ws.return_value.subscribe_ticker = Mock()
+        mock_private_ws.return_value.connect = Mock()
+        mock_private_ws.return_value.subscribe_position = Mock()
+        mock_private_ws.return_value.subscribe_order = Mock()
+        mock_private_ws.return_value.subscribe_execution = Mock()
+        mock_rest_client.return_value.get_open_orders = Mock(return_value=[])
+
+        orchestrator = Orchestrator(gridbot_config)
+
+        with patch.object(
+            orchestrator, "_fetch_and_update_positions", new_callable=AsyncMock
+        ) as mock_fetch:
+            await orchestrator.start()
+            mock_fetch.assert_called_once()
+
+        await orchestrator.stop()
+
+
 class TestOrchestratorGuardClauses:
     """Tests for guard clauses in start/stop and run_until_shutdown."""
 

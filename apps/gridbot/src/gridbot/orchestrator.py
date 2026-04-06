@@ -139,7 +139,8 @@ class Orchestrator:
         3. Creates strategy runners
         4. Performs startup reconciliation
         5. Connects WebSocket streams
-        6. Creates database Run records
+        6. Fetches initial positions via REST API
+        7. Creates database Run records
         """
         if self._running:
             return
@@ -183,6 +184,7 @@ class Orchestrator:
             await self._connect_websockets(account_name)
 
         # Initial position fetch so runners have multipliers before first ticker
+        logger.info("Fetching initial positions before starting background tasks")
         await self._fetch_and_update_positions()
 
         # Start background tasks
