@@ -378,23 +378,21 @@ class TestOrchestratorLifecycle:
         await orchestrator._init_strategy(strategy_config)
         orchestrator._build_routing_maps()
 
-        # Wallet balance succeeds but get_positions hangs (triggers TimeoutError)
+        # Wallet balance succeeds but get_positions times out
         rest_client = orchestrator._rest_clients["test_account"]
         rest_client.get_wallet_balance.return_value = {
             "list": [{"coin": [{"coin": "USDT", "walletBalance": "10000"}]}]
         }
-        rest_client.get_positions.side_effect = asyncio.TimeoutError()
 
-        # Patch wait_for to propagate the TimeoutError from get_positions
-        original_wait_for = asyncio.wait_for
+        # Mock to_thread to raise TimeoutError only for get_positions
+        original_to_thread = asyncio.to_thread
 
-        async def patched_wait_for(coro, *, timeout):
-            try:
-                return await coro
-            except asyncio.TimeoutError:
-                raise
+        async def mock_to_thread(func, *args, **kwargs):
+            if func == rest_client.get_positions:
+                raise asyncio.TimeoutError()
+            return await original_to_thread(func, *args, **kwargs)
 
-        with patch("asyncio.wait_for", side_effect=patched_wait_for):
+        with patch("asyncio.to_thread", side_effect=mock_to_thread):
             await orchestrator.start()
 
         # Background tasks should still have started
