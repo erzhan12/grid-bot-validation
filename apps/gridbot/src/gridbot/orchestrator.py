@@ -593,7 +593,10 @@ class Orchestrator:
         """
         try:
             rest_client = self._rest_clients[account_name]
-            raw = await asyncio.to_thread(rest_client.get_instruments_info, symbol)
+            raw = await asyncio.wait_for(
+                asyncio.to_thread(rest_client.get_instruments_info, symbol),
+                timeout=10,
+            )
             info = InstrumentInfo.from_bybit_response(symbol, raw)
             if info is None:
                 logger.warning(

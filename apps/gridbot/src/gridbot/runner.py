@@ -41,6 +41,15 @@ from gridbot.notifier import Notifier
 
 logger = logging.getLogger(__name__)
 
+# Pre-built Decimal values for known Position multipliers (0.5, 1.0, 1.5, 2.0)
+# to avoid float→str→Decimal conversion on every order.
+_FLOAT_TO_DECIMAL = {
+    0.5: Decimal("0.5"),
+    1.0: Decimal("1"),
+    1.5: Decimal("1.5"),
+    2.0: Decimal("2"),
+}
+
 
 @dataclass
 class TrackedOrder:
@@ -485,8 +494,9 @@ class StrategyRunner:
             return intent
 
         base_qty = self._qty_calculator(intent, self._wallet_balance)
-        multiplier = self.get_amount_multiplier(intent.direction, intent.side)
-        resolved_qty = base_qty * Decimal(str(multiplier))
+        mult_float = self.get_amount_multiplier(intent.direction, intent.side)
+        multiplier = _FLOAT_TO_DECIMAL.get(mult_float, Decimal(str(mult_float)))
+        resolved_qty = base_qty * multiplier
 
         # Re-round after multiplier to ensure qty aligns with exchange qty_step
         if self._instrument_info and resolved_qty > 0:
