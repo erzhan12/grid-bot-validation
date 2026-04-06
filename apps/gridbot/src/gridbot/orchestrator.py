@@ -635,8 +635,9 @@ class Orchestrator:
                 rest_client = self._rest_clients[account_name]
 
                 # Fetch wallet balance (cached to reduce API calls)
+                timeout = self._config.rest_fetch_timeout
                 wallet_balance = await asyncio.wait_for(
-                    self._get_wallet_balance(account_name), timeout=10.0
+                    self._get_wallet_balance(account_name), timeout=timeout
                 )
 
                 # Check if we need to fall back to REST for positions
@@ -655,10 +656,13 @@ class Orchestrator:
                     if long_pos is None or short_pos is None:
                         # Lazy fetch REST positions (once per account)
                         if rest_positions is None:
-                            # Note: Thread continues after timeout until HTTP request completes
+                            # Note: asyncio.to_thread cannot cancel the underlying
+                            # thread on timeout; it runs until the HTTP request
+                            # completes. pybit.HTTP is synchronous with no async
+                            # alternative, so this is the best we can do.
                             rest_positions = await asyncio.wait_for(
                                 asyncio.to_thread(rest_client.get_positions),
-                                timeout=10.0,
+                                timeout=timeout,
                             )
                             logger.debug(
                                 f"Fetched positions from REST for {account_name} "
@@ -698,18 +702,20 @@ class Orchestrator:
                         # Continue to next runner instead of raising
 
             except asyncio.TimeoutError:
-                msg = f"Timeout (10s) fetching positions for {account_name}"
+                msg = (
+                    f"Timeout ({timeout}s) fetching positions for {account_name}"
+                )
                 if startup:
                     msg += ". Runners may not have multipliers until next periodic check"
                     logger.warning(msg)
                 else:
                     logger.error(msg)
-                exc = asyncio.TimeoutError(msg)
-                self._notifier.alert_exception(
-                    "_fetch_and_update_positions",
-                    exc,
-                    error_key=f"position_fetch_{account_name}",
-                )
+                    exc = asyncio.TimeoutError(msg)
+                    self._notifier.alert_exception(
+                        "_fetch_and_update_positions",
+                        exc,
+                        error_key=f"position_fetch_{account_name}",
+                    )
             except Exception as e:
                 if startup:
                     logger.warning(
@@ -719,10 +725,10 @@ class Orchestrator:
                     )
                 else:
                     logger.error("Position check error for %s: %s", account_name, e)
-                self._notifier.alert_exception(
-                    "_fetch_and_update_positions", e,
-                    error_key=f"position_fetch_{account_name}",
-                )
+                    self._notifier.alert_exception(
+                        "_fetch_and_update_positions", e,
+                        error_key=f"position_fetch_{account_name}",
+                    )
 
     async def _position_check_loop(self) -> None:
         """Periodic position check loop."""
