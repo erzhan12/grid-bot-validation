@@ -635,7 +635,9 @@ class Orchestrator:
                 rest_client = self._rest_clients[account_name]
 
                 # Fetch wallet balance (cached to reduce API calls)
-                wallet_balance = await self._get_wallet_balance(account_name)
+                wallet_balance = await asyncio.wait_for(
+                    self._get_wallet_balance(account_name), timeout=30.0
+                )
 
                 # Check if we need to fall back to REST for positions
                 # (REST sync ensures freshness even when WS data exists)
