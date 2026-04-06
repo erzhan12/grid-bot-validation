@@ -279,6 +279,186 @@ class TestOrchestratorLifecycle:
         mock_private_ws.return_value.disconnect.assert_called()
 
 
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_start_calls_initial_position_fetch(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        gridbot_config,
+    ):
+        """Test start() fetches positions before starting background tasks."""
+        mock_public_ws.return_value.connect = Mock()
+        mock_public_ws.return_value.subscribe_ticker = Mock()
+        mock_private_ws.return_value.connect = Mock()
+        mock_private_ws.return_value.subscribe_position = Mock()
+        mock_private_ws.return_value.subscribe_order = Mock()
+        mock_private_ws.return_value.subscribe_execution = Mock()
+        mock_rest_client.return_value.get_open_orders = Mock(return_value=[])
+
+        orchestrator = Orchestrator(gridbot_config)
+
+        with patch.object(
+            orchestrator, "_fetch_and_update_positions", new_callable=AsyncMock
+        ) as mock_fetch:
+            await orchestrator.start()
+            mock_fetch.assert_called_once_with(startup=True)
+
+        await orchestrator.stop()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_start_position_fetch_timeout_handling(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        gridbot_config,
+        account_config,
+        strategy_config,
+    ):
+        """Test start() continues gracefully when position fetch times out."""
+        mock_public_ws.return_value.connect = Mock()
+        mock_public_ws.return_value.subscribe_ticker = Mock()
+        mock_private_ws.return_value.connect = Mock()
+        mock_private_ws.return_value.subscribe_position = Mock()
+        mock_private_ws.return_value.subscribe_order = Mock()
+        mock_private_ws.return_value.subscribe_execution = Mock()
+        mock_rest_client.return_value.get_open_orders = Mock(return_value=[])
+
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+
+        # Mock wallet balance to raise TimeoutError (simulates REST hang)
+        orchestrator._get_wallet_balance = AsyncMock(
+            side_effect=asyncio.TimeoutError()
+        )
+
+        # start() should complete without raising
+        await orchestrator.start()
+
+        # Background tasks should still have started
+        assert orchestrator._position_check_task is not None
+        assert orchestrator._health_check_task is not None
+        assert orchestrator._order_sync_task is not None
+
+        await orchestrator.stop()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_start_position_fetch_rest_api_timeout(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        gridbot_config,
+        account_config,
+        strategy_config,
+    ):
+        """Test start() continues when REST get_positions times out."""
+        mock_public_ws.return_value.connect = Mock()
+        mock_public_ws.return_value.subscribe_ticker = Mock()
+        mock_private_ws.return_value.connect = Mock()
+        mock_private_ws.return_value.subscribe_position = Mock()
+        mock_private_ws.return_value.subscribe_order = Mock()
+        mock_private_ws.return_value.subscribe_execution = Mock()
+        mock_rest_client.return_value.get_open_orders = Mock(return_value=[])
+
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+
+        # Wallet balance succeeds but get_positions times out
+        rest_client = orchestrator._rest_clients["test_account"]
+        rest_client.get_wallet_balance.return_value = {
+            "list": [{"coin": [{"coin": "USDT", "walletBalance": "10000"}]}]
+        }
+
+        # Mock to_thread to raise TimeoutError only for get_positions
+        original_to_thread = asyncio.to_thread
+
+        async def mock_to_thread(func, *args, **kwargs):
+            if func == rest_client.get_positions:
+                raise asyncio.TimeoutError()
+            return await original_to_thread(func, *args, **kwargs)
+
+        with patch("asyncio.to_thread", side_effect=mock_to_thread):
+            await orchestrator.start()
+
+        # Background tasks should still have started
+        assert orchestrator._position_check_task is not None
+        assert orchestrator._health_check_task is not None
+        assert orchestrator._order_sync_task is not None
+
+        await orchestrator.stop()
+
+    @pytest.mark.asyncio
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    async def test_start_position_update_runner_exception(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        gridbot_config,
+        account_config,
+        strategy_config,
+    ):
+        """Test start() continues when runner.on_position_update raises."""
+        mock_public_ws.return_value.connect = Mock()
+        mock_public_ws.return_value.subscribe_ticker = Mock()
+        mock_private_ws.return_value.connect = Mock()
+        mock_private_ws.return_value.subscribe_position = Mock()
+        mock_private_ws.return_value.subscribe_order = Mock()
+        mock_private_ws.return_value.subscribe_execution = Mock()
+        mock_rest_client.return_value.get_open_orders = Mock(return_value=[])
+
+        orchestrator = Orchestrator(gridbot_config)
+        await orchestrator._init_account(account_config)
+        await orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+
+        # Mock wallet balance and positions via REST
+        rest_client = orchestrator._rest_clients["test_account"]
+        rest_client.get_wallet_balance.return_value = {
+            "list": [{"coin": [{"coin": "USDT", "walletBalance": "10000"}]}]
+        }
+        rest_client.get_positions.return_value = [
+            {"symbol": "BTCUSDT", "side": "Buy", "size": "0"},
+            {"symbol": "BTCUSDT", "side": "Sell", "size": "0"},
+        ]
+
+        # Make runner.on_position_update raise
+        runner = orchestrator._runners["btcusdt_test"]
+        runner.on_position_update = AsyncMock(
+            side_effect=RuntimeError("runner exploded")
+        )
+
+        # start() should complete without raising
+        await orchestrator.start()
+
+        # Runner was called (and failed)
+        runner.on_position_update.assert_called_once()
+
+        # Background tasks should still have started
+        assert orchestrator._position_check_task is not None
+        assert orchestrator._health_check_task is not None
+        assert orchestrator._order_sync_task is not None
+
+        await orchestrator.stop()
+
+
 class TestOrchestratorGuardClauses:
     """Tests for guard clauses in start/stop and run_until_shutdown."""
 

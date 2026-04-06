@@ -98,6 +98,10 @@ class GridbotConfig(BaseModel):
         default=300.0,
         description="Seconds to cache wallet balance (0 to disable caching)",
     )
+    rest_fetch_timeout: float = Field(
+        default=10.0,
+        description="Seconds to wait for REST API calls (positions, wallet balance)",
+    )
 
     # Auth error cooldown
     auth_cooldown_minutes: int = Field(
