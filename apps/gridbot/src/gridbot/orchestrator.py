@@ -185,7 +185,7 @@ class Orchestrator:
 
         # Initial position fetch so runners have multipliers before first ticker
         logger.info("Fetching initial positions before starting background tasks")
-        await self._fetch_and_update_positions()
+        await self._fetch_and_update_positions(startup=True)
 
         # Start background tasks
         self._position_check_task = asyncio.create_task(self._position_check_loop())
@@ -619,13 +619,16 @@ class Orchestrator:
             logger.warning(f"Failed to fetch instrument info for {symbol}: {e}")
             return None
 
-    async def _fetch_and_update_positions(self) -> None:
+    async def _fetch_and_update_positions(self, *, startup: bool = False) -> None:
         """Fetch positions and wallet balance, then update all runners.
 
         Following original bbu2 pattern:
         1. Use WebSocket position data as primary source (real-time)
         2. Fall back to REST API when WebSocket data is not available
         3. Periodically sync via REST to ensure data freshness
+
+        Args:
+            startup: If True, log warnings with startup context on failure.
         """
         for account_name, runners in list(self._account_to_runners.items()):
             try:
@@ -650,7 +653,10 @@ class Orchestrator:
                     if long_pos is None or short_pos is None:
                         # Lazy fetch REST positions (once per account)
                         if rest_positions is None:
-                            rest_positions = await asyncio.to_thread(rest_client.get_positions)
+                            rest_positions = await asyncio.wait_for(
+                                asyncio.to_thread(rest_client.get_positions),
+                                timeout=30.0,
+                            )
                             logger.debug(
                                 f"Fetched positions from REST for {account_name} "
                                 f"(WS data incomplete)"
@@ -677,7 +683,14 @@ class Orchestrator:
                     )
 
             except Exception as e:
-                logger.error("Position check error for %s: %s", account_name, e)
+                if startup:
+                    logger.warning(
+                        "Failed to fetch initial positions for %s during startup: %s. "
+                        "Runners may not have multipliers until next periodic check.",
+                        account_name, e,
+                    )
+                else:
+                    logger.error("Position check error for %s: %s", account_name, e)
 
     async def _position_check_loop(self) -> None:
         """Periodic position check loop."""
