@@ -182,6 +182,9 @@ class Orchestrator:
         for account_name in self._public_ws:
             await self._connect_websockets(account_name)
 
+        # Initial position fetch so runners have multipliers before first ticker
+        await self._fetch_and_update_positions()
+
         # Start background tasks
         self._position_check_task = asyncio.create_task(self._position_check_loop())
         self._health_check_task = asyncio.create_task(self._health_check_loop())
@@ -614,70 +617,72 @@ class Orchestrator:
             logger.warning(f"Failed to fetch instrument info for {symbol}: {e}")
             return None
 
-    async def _position_check_loop(self) -> None:
-        """Periodic position check loop.
+    async def _fetch_and_update_positions(self) -> None:
+        """Fetch positions and wallet balance, then update all runners.
 
         Following original bbu2 pattern:
         1. Use WebSocket position data as primary source (real-time)
         2. Fall back to REST API when WebSocket data is not available
         3. Periodically sync via REST to ensure data freshness
         """
+        for account_name, runners in list(self._account_to_runners.items()):
+            try:
+                rest_client = self._rest_clients[account_name]
+
+                # Fetch wallet balance (cached to reduce API calls)
+                wallet_balance = await self._get_wallet_balance(account_name)
+
+                # Check if we need to fall back to REST for positions
+                # (REST sync ensures freshness even when WS data exists)
+                rest_positions = None
+
+                # Update each runner
+                for runner in runners:
+                    symbol = runner.symbol
+
+                    # Try WebSocket data first (real-time)
+                    long_pos = self._get_position_from_ws(account_name, symbol, "Buy")
+                    short_pos = self._get_position_from_ws(account_name, symbol, "Sell")
+
+                    # Fall back to REST if WebSocket data not available
+                    if long_pos is None or short_pos is None:
+                        # Lazy fetch REST positions (once per account)
+                        if rest_positions is None:
+                            rest_positions = await asyncio.to_thread(rest_client.get_positions)
+                            logger.debug(
+                                f"Fetched positions from REST for {account_name} "
+                                f"(WS data incomplete)"
+                            )
+
+                        # Find positions from REST response
+                        for pos in rest_positions:
+                            if pos.get("symbol") != symbol:
+                                continue
+                            side = pos.get("side", "")
+                            if side == "Buy" and long_pos is None:
+                                long_pos = pos
+                            elif side == "Sell" and short_pos is None:
+                                short_pos = pos
+
+                    # Get last close from engine
+                    last_close = runner.engine.last_close or 0.0
+
+                    await runner.on_position_update(
+                        long_position=long_pos,
+                        short_position=short_pos,
+                        wallet_balance=wallet_balance,
+                        last_close=last_close,
+                    )
+
+            except Exception as e:
+                logger.error("Position check error for %s: %s", account_name, e)
+
+    async def _position_check_loop(self) -> None:
+        """Periodic position check loop."""
         while self._running:
             try:
                 await asyncio.sleep(self._config.position_check_interval)
-
-                for account_name, runners in list(self._account_to_runners.items()):
-                    try:
-                        rest_client = self._rest_clients[account_name]
-
-                        # Fetch wallet balance (cached to reduce API calls)
-                        wallet_balance = await self._get_wallet_balance(account_name)
-
-                        # Check if we need to fall back to REST for positions
-                        # (REST sync ensures freshness even when WS data exists)
-                        rest_positions = None
-
-                        # Update each runner
-                        for runner in runners:
-                            symbol = runner.symbol
-
-                            # Try WebSocket data first (real-time)
-                            long_pos = self._get_position_from_ws(account_name, symbol, "Buy")
-                            short_pos = self._get_position_from_ws(account_name, symbol, "Sell")
-
-                            # Fall back to REST if WebSocket data not available
-                            if long_pos is None or short_pos is None:
-                                # Lazy fetch REST positions (once per account)
-                                if rest_positions is None:
-                                    rest_positions = await asyncio.to_thread(rest_client.get_positions)
-                                    logger.debug(
-                                        f"Fetched positions from REST for {account_name} "
-                                        f"(WS data incomplete)"
-                                    )
-
-                                # Find positions from REST response
-                                for pos in rest_positions:
-                                    if pos.get("symbol") != symbol:
-                                        continue
-                                    side = pos.get("side", "")
-                                    if side == "Buy" and long_pos is None:
-                                        long_pos = pos
-                                    elif side == "Sell" and short_pos is None:
-                                        short_pos = pos
-
-                            # Get last close from engine
-                            last_close = runner.engine.last_close or 0.0
-
-                            await runner.on_position_update(
-                                long_position=long_pos,
-                                short_position=short_pos,
-                                wallet_balance=wallet_balance,
-                                last_close=last_close,
-                            )
-
-                    except Exception as e:
-                        logger.error("Position check error for %s: %s", account_name, e)
-
+                await self._fetch_and_update_positions()
             except asyncio.CancelledError:
                 break
             except Exception as e:
