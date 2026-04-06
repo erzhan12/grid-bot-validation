@@ -9,6 +9,7 @@ The runner is responsible for:
 """
 
 import logging
+import math
 from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, UTC
@@ -495,6 +496,12 @@ class StrategyRunner:
 
         base_qty = self._qty_calculator(intent, self._wallet_balance)
         mult_float = self.get_amount_multiplier(intent.direction, intent.side)
+        if not math.isfinite(mult_float):
+            logger.error(
+                f"{self.strat_id}: Invalid multiplier {mult_float} for "
+                f"{intent.side} {intent.direction}"
+            )
+            return replace(intent, qty=Decimal("0"))
         multiplier = _FLOAT_TO_DECIMAL.get(mult_float, Decimal(str(mult_float)))
         resolved_qty = base_qty * multiplier
 
@@ -517,10 +524,12 @@ class StrategyRunner:
                 resolved_qty = self._instrument_info.max_qty
 
         if resolved_qty <= 0:
-            logger.warning(
+            log_level = logging.DEBUG if self._wallet_balance == 0 else logging.WARNING
+            logger.log(
+                log_level,
                 f"{self.strat_id}: Resolved qty=0 for {intent.side} {intent.direction} "
                 f"at {intent.price} (base={base_qty}, mult={multiplier}, "
-                f"wallet={self._wallet_balance})"
+                f"wallet={self._wallet_balance})",
             )
 
         return replace(intent, qty=resolved_qty)

@@ -36,13 +36,13 @@ class InstrumentInfo:
         """Round quantity up to nearest qty_step (matching bbu2 behavior)."""
         if qty <= 0:
             return Decimal("0")
-        steps = int((qty / self.qty_step).to_integral_value(rounding=ROUND_UP))
-        return Decimal(str(steps)) * self.qty_step
+        steps = (qty / self.qty_step).to_integral_value(rounding=ROUND_UP)
+        return steps * self.qty_step
 
     def round_price(self, price: Decimal) -> Decimal:
         """Round price to nearest tick_size."""
-        steps = int((price / self.tick_size).to_integral_value(rounding=ROUND_HALF_UP))
-        return Decimal(str(steps)) * self.tick_size
+        steps = (price / self.tick_size).to_integral_value(rounding=ROUND_HALF_UP)
+        return steps * self.tick_size
 
     def to_dict(self) -> dict:
         """Convert to dictionary for caching."""

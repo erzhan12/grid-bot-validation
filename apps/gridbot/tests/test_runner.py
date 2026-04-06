@@ -625,6 +625,172 @@ class TestQtyResolution:
         assert runner._wallet_balance == Decimal("25000.0")
 
 
+class TestResolveQtyExtended:
+    """Extended tests for _resolve_qty covering multipliers, min/max clamping, and edge cases."""
+
+    def test_multiplier_1_5(self, strategy_config, mock_executor, instrument_info):
+        """Risk multiplier 1.5 scales qty and re-rounds."""
+        strategy_config.amount = "100"
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+        )
+        runner._wallet_balance = Decimal("10000")
+        runner._long_position.amount_multiplier = {"Buy": 1.5, "Sell": 1.0}
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+            qty=Decimal("0"), grid_level=1, direction="long",
+        )
+        resolved = runner._resolve_qty(intent)
+        # base = 100/50000 = 0.002, * 1.5 = 0.003
+        assert resolved.qty == Decimal("0.003")
+
+    def test_multiplier_2_0(self, strategy_config, mock_executor, instrument_info):
+        """Risk multiplier 2.0 doubles qty."""
+        strategy_config.amount = "100"
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+        )
+        runner._wallet_balance = Decimal("10000")
+        runner._long_position.amount_multiplier = {"Buy": 2.0, "Sell": 1.0}
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+            qty=Decimal("0"), grid_level=1, direction="long",
+        )
+        resolved = runner._resolve_qty(intent)
+        # base = 100/50000 = 0.002, * 2.0 = 0.004
+        assert resolved.qty == Decimal("0.004")
+
+    def test_multiplier_0_5_rerounds(self, strategy_config, mock_executor, instrument_info):
+        """Multiplier 0.5 halves qty, then re-rounds up to qty_step."""
+        strategy_config.amount = "b0.003"
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+        )
+        runner._wallet_balance = Decimal("10000")
+        runner._long_position.amount_multiplier = {"Buy": 0.5, "Sell": 1.0}
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+            qty=Decimal("0"), grid_level=1, direction="long",
+        )
+        resolved = runner._resolve_qty(intent)
+        # base = 0.003 (rounded to 0.003), * 0.5 = 0.0015, re-rounds up to 0.002
+        assert resolved.qty == Decimal("0.002")
+
+    def test_min_qty_clamping(self, strategy_config, mock_executor):
+        """Qty below min_qty returns 0."""
+        info = InstrumentInfo(
+            symbol="BTCUSDT",
+            qty_step=Decimal("0.001"),
+            tick_size=Decimal("0.1"),
+            min_qty=Decimal("0.01"),  # high min_qty
+            max_qty=Decimal("1000"),
+        )
+        strategy_config.amount = "b0.001"
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=info,
+        )
+        runner._wallet_balance = Decimal("10000")
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+            qty=Decimal("0"), grid_level=1, direction="long",
+        )
+        resolved = runner._resolve_qty(intent)
+        # 0.001 < min_qty 0.01 → qty=0
+        assert resolved.qty == Decimal("0")
+
+    def test_max_qty_clamping(self, strategy_config, mock_executor):
+        """Qty above max_qty is clamped."""
+        info = InstrumentInfo(
+            symbol="BTCUSDT",
+            qty_step=Decimal("0.001"),
+            tick_size=Decimal("0.1"),
+            min_qty=Decimal("0.001"),
+            max_qty=Decimal("0.005"),  # low max_qty
+        )
+        strategy_config.amount = "b0.01"
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=info,
+        )
+        runner._wallet_balance = Decimal("10000")
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+            qty=Decimal("0"), grid_level=1, direction="long",
+        )
+        resolved = runner._resolve_qty(intent)
+        # 0.01 > max_qty 0.005 → clamped to 0.005
+        assert resolved.qty == Decimal("0.005")
+
+    def test_inf_multiplier_returns_zero(self, strategy_config, mock_executor, instrument_info):
+        """Infinite multiplier returns qty=0."""
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+        )
+        runner._wallet_balance = Decimal("10000")
+        runner._long_position.amount_multiplier = {"Buy": float("inf"), "Sell": 1.0}
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+            qty=Decimal("0"), grid_level=1, direction="long",
+        )
+        resolved = runner._resolve_qty(intent)
+        assert resolved.qty == Decimal("0")
+
+    def test_nan_multiplier_returns_zero(self, strategy_config, mock_executor, instrument_info):
+        """NaN multiplier returns qty=0."""
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+        )
+        runner._wallet_balance = Decimal("10000")
+        runner._long_position.amount_multiplier = {"Buy": float("nan"), "Sell": 1.0}
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+            qty=Decimal("0"), grid_level=1, direction="long",
+        )
+        resolved = runner._resolve_qty(intent)
+        assert resolved.qty == Decimal("0")
+
+    def test_zero_wallet_logs_debug_not_warning(self, strategy_config, mock_executor, instrument_info, caplog):
+        """When wallet_balance=0, qty=0 log is DEBUG, not WARNING."""
+        import logging
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+        )
+        # wallet_balance defaults to 0
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+            qty=Decimal("0"), grid_level=1, direction="long",
+        )
+        with caplog.at_level(logging.DEBUG):
+            runner._resolve_qty(intent)
+
+        qty_zero_records = [r for r in caplog.records if "Resolved qty=0" in r.message]
+        assert len(qty_zero_records) == 1
+        assert qty_zero_records[0].levelno == logging.DEBUG
+
+
 class TestSameOrderDetection:
     """Tests for same-order detection (bbu2-style safety check)."""
 
