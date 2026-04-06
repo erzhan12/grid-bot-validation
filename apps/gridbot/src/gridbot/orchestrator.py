@@ -684,6 +684,15 @@ class Orchestrator:
                         last_close=last_close,
                     )
 
+            except asyncio.TimeoutError:
+                if startup:
+                    logger.warning(
+                        "Timeout (30s) fetching initial positions for %s during startup. "
+                        "Runners may not have multipliers until next periodic check.",
+                        account_name,
+                    )
+                else:
+                    logger.error("Timeout (30s) fetching positions for %s", account_name)
             except Exception as e:
                 if startup:
                     logger.warning(
