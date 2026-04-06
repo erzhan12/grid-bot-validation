@@ -636,7 +636,7 @@ class Orchestrator:
 
                 # Fetch wallet balance (cached to reduce API calls)
                 wallet_balance = await asyncio.wait_for(
-                    self._get_wallet_balance(account_name), timeout=30.0
+                    self._get_wallet_balance(account_name), timeout=10.0
                 )
 
                 # Check if we need to fall back to REST for positions
@@ -655,9 +655,10 @@ class Orchestrator:
                     if long_pos is None or short_pos is None:
                         # Lazy fetch REST positions (once per account)
                         if rest_positions is None:
+                            # Note: Thread continues after timeout until HTTP request completes
                             rest_positions = await asyncio.wait_for(
                                 asyncio.to_thread(rest_client.get_positions),
-                                timeout=30.0,
+                                timeout=10.0,
                             )
                             logger.debug(
                                 f"Fetched positions from REST for {account_name} "
@@ -697,15 +698,16 @@ class Orchestrator:
                         # Continue to next runner instead of raising
 
             except asyncio.TimeoutError:
-                msg = f"Timeout (30s) fetching positions for {account_name}"
+                msg = f"Timeout (10s) fetching positions for {account_name}"
                 if startup:
                     msg += ". Runners may not have multipliers until next periodic check"
                     logger.warning(msg)
                 else:
                     logger.error(msg)
+                exc = asyncio.TimeoutError(msg)
                 self._notifier.alert_exception(
                     "_fetch_and_update_positions",
-                    asyncio.TimeoutError(msg),
+                    exc,
                     error_key=f"position_fetch_{account_name}",
                 )
             except Exception as e:
