@@ -423,7 +423,8 @@ class StrategyRunner:
             self._long_position.size = long_state.size if long_state else Decimal('0')
             self._short_position.size = short_state.size if short_state else Decimal('0')
 
-            # Calculate position ratio (use float for ratio arithmetic)
+            # Convert Decimal sizes to float: position_ratio is stored as float (position.py:98)
+            # and mixing Decimal/float in division raises TypeError
             long_size = float(long_state.size) if long_state else 0.0
             short_size = float(short_state.size) if short_state else 0.0
 
