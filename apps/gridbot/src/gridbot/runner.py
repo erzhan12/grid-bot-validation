@@ -423,9 +423,9 @@ class StrategyRunner:
             self._long_position.size = long_state.size if long_state else Decimal('0')
             self._short_position.size = short_state.size if short_state else Decimal('0')
 
-            # Calculate position ratio
-            long_size = long_state.size if long_state else 0.0
-            short_size = short_state.size if short_state else 0.0
+            # Calculate position ratio (use float for ratio arithmetic)
+            long_size = float(long_state.size) if long_state else 0.0
+            short_size = float(short_state.size) if short_state else 0.0
 
             if short_size > 0:
                 position_ratio = long_size / short_size
