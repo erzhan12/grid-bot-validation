@@ -58,7 +58,7 @@ class TrackedOrder:
 
     client_order_id: str
     order_id: Optional[str] = None
-    intent: PlaceLimitIntent = None
+    intent: Optional[PlaceLimitIntent] = None
     status: str = "pending"  # 'pending', 'placed', 'filled', 'cancelled', 'failed'
     placed_ts: datetime = field(default_factory=lambda: datetime.now(UTC))
 
@@ -419,6 +419,10 @@ class StrategyRunner:
             long_state = self._build_position_state(long_position, wallet_balance, DirectionType.LONG)
             short_state = self._build_position_state(short_position, wallet_balance, DirectionType.SHORT)
 
+            # Update position sizes (used by _is_good_to_place)
+            self._long_position.size = long_state.size if long_state else Decimal('0')
+            self._short_position.size = short_state.size if short_state else Decimal('0')
+
             # Calculate position ratio
             long_size = long_state.size if long_state else 0.0
             short_size = short_state.size if short_state else 0.0
@@ -580,12 +584,59 @@ class StrategyRunner:
             elif isinstance(intent, CancelIntent):
                 await self._execute_cancel_intent(intent)
 
+    def _is_good_to_place(self, intent: PlaceLimitIntent) -> bool:
+        """Check if reduce-only order can be placed without exceeding position size.
+
+        For open orders (not reduce_only), always returns True.
+        For close orders (reduce_only), checks that total reduce-only qty
+        already on the book + new order qty doesn't exceed position size.
+
+        Reference: bbu_reference/bbu2-master/bybit_api_usdt.py:295-313
+        """
+        if not intent.reduce_only:
+            return True
+
+        direction = intent.direction
+        position_size = (self._long_position.size if direction == 'long'
+                         else self._short_position.size)
+
+        if position_size == Decimal('0'):
+            logger.debug(
+                f"{self.strat_id}: Rejecting reduce-only order at {intent.price} - "
+                f"position size is zero (position update may not have arrived yet)"
+            )
+            return False
+
+        close_side_map = {'long': 'Sell', 'short': 'Buy'}
+        close_side = close_side_map[direction]
+
+        total_reduce_qty = intent.qty
+        for tracked in self._tracked_orders.values():
+            if tracked.status != "placed":
+                continue
+            if tracked.intent is None:
+                continue
+            if (tracked.intent.reduce_only
+                    and tracked.intent.side == close_side
+                    and tracked.intent.direction == direction):
+                total_reduce_qty += tracked.intent.qty
+
+        return position_size > total_reduce_qty
+
     async def _execute_place_intent(self, intent: PlaceLimitIntent) -> None:
         """Execute a place order intent."""
         # Resolve qty (engine emits qty=0, we fill it in)
         intent = self._resolve_qty(intent)
         if intent.qty <= 0:
             logger.debug(f"{self.strat_id}: Skipping order with qty<=0 at {intent.price}")
+            return
+
+        # Check if reduce-only order would exceed position size (bbu2 _is_good_to_place)
+        if not self._is_good_to_place(intent):
+            logger.debug(
+                f"{self.strat_id}: Skipping reduce-only order at {intent.price} - "
+                f"would exceed position size"
+            )
             return
 
         # Check for duplicate

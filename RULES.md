@@ -212,6 +212,15 @@ make test-integration
   - Long: High liq → Moderate liq (modifies opposite) → Low margin → Position ratios
   - Short: High liq → Position ratios/margin → Moderate liq (modifies opposite)
 - **SHORT position bug**: Reference code had incorrect liq risk logic (`<` instead of `>`). Higher ratio = closer to liquidation for shorts.
+- **Position.size**: Stored on `Position` object, updated in `StrategyRunner.on_position_update()` from both REST and WS paths. Used by `_is_good_to_place()` to validate reduce-only orders.
+
+### Pre-placement Validation (`_is_good_to_place`)
+
+- **Reference**: `bbu_reference/bbu2-master/bybit_api_usdt.py:295-313`
+- **Purpose**: Prevents placing reduce-only close orders when total reduce-only qty on the book would exceed position size. Without this, Bybit rejects with error 110017 ("orderQty will be truncated to zero") and the retry queue keeps retrying.
+- **Logic**: Open orders always pass. For reduce-only orders: sum all placed reduce-only orders for that direction + new order qty, reject if `position_size <= total_reduce_qty` (strict `>`).
+- **Location**: `StrategyRunner._is_good_to_place()` in `apps/gridbot/src/gridbot/runner.py`, called from `_execute_place_intent()` after qty resolution.
+- **Position size source**: `Position.size` attribute set in `on_position_update()`. Defaults to `Decimal('0')` until first `on_position_update()` call, which safely rejects reduce-only orders during startup.
 
 ### Enums
 
@@ -761,7 +770,8 @@ Successfully implemented a multi-tenant grid trading bot using gridcore strategy
 2. **Position Risk Management**
    - `StrategyRunner` owns linked `Position` pair (long/short)
    - `on_position_update()` calculates `position_ratio` and `amount_multiplier`
-   - Periodic position check (default 63s) via `orchestrator._position_check_loop()`
+   - Initial position fetch via REST at startup (`_fetch_and_update_positions()` in `start()`) so runners have multipliers before first ticker
+   - Periodic position check (default 63s) via `orchestrator._position_check_loop()` which calls the same `_fetch_and_update_positions()`
 
 3. **Event Routing**
    - `_symbol_to_runners`: routes ticker events by symbol

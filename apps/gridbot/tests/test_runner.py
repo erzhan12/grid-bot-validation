@@ -1645,3 +1645,161 @@ class TestRunnerAuthCooldown:
         # Only the first intent should have been executed;
         # the rest skipped because cooldown activated
         assert call_count == 1
+
+
+class TestIsGoodToPlace:
+    """Tests for _is_good_to_place reduce-only order validation.
+
+    Reference: bbu_reference/bbu2-master/bybit_api_usdt.py:295-313
+    """
+
+    def test_open_order_always_good(self, runner):
+        """Non-reduce-only (open) orders are always good to place."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.001"), grid_level=1, direction="long",
+            reduce_only=False,
+        )
+        assert runner._is_good_to_place(intent) is True
+
+    def test_reduce_only_within_position_size(self, runner):
+        """Reduce-only order is good when qty fits within position size."""
+        runner._short_position.size = Decimal("0.1")
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.05"), grid_level=1, direction="short",
+            reduce_only=True,
+        )
+        assert runner._is_good_to_place(intent) is True
+
+    def test_reduce_only_equals_position_size(self, runner):
+        """Reduce-only order is rejected when qty equals position size (strict >)."""
+        runner._short_position.size = Decimal("0.1")
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.1"), grid_level=1, direction="short",
+            reduce_only=True,
+        )
+        assert runner._is_good_to_place(intent) is False
+
+    def test_reduce_only_exceeds_position_size(self, runner):
+        """Reduce-only order is rejected when qty exceeds position size."""
+        runner._short_position.size = Decimal("0.1")
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.2"), grid_level=1, direction="short",
+            reduce_only=True,
+        )
+        assert runner._is_good_to_place(intent) is False
+
+    def test_reduce_only_accounts_for_existing_orders(self, runner):
+        """Existing placed reduce-only orders are counted toward the total."""
+        runner._short_position.size = Decimal("0.1")
+
+        # Simulate an existing placed reduce-only Buy order for short direction
+        existing_intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("48000"),
+            qty=Decimal("0.05"), grid_level=2, direction="short",
+            reduce_only=True,
+        )
+        tracked = TrackedOrder(
+            client_order_id=existing_intent.client_order_id,
+            order_id="existing_order_1",
+            intent=existing_intent,
+            status="placed",
+        )
+        runner._tracked_orders[existing_intent.client_order_id] = tracked
+
+        # New order: 0.05 existing + 0.06 new = 0.11 > 0.1 position
+        new_intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.06"), grid_level=1, direction="short",
+            reduce_only=True,
+        )
+        assert runner._is_good_to_place(new_intent) is False
+
+    def test_reduce_only_ignores_non_placed_orders(self, runner):
+        """Only 'placed' orders count — filled/failed/cancelled are ignored."""
+        runner._short_position.size = Decimal("0.1")
+
+        # Existing filled order should not count
+        filled_intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("48000"),
+            qty=Decimal("0.05"), grid_level=2, direction="short",
+            reduce_only=True,
+        )
+        tracked = TrackedOrder(
+            client_order_id=filled_intent.client_order_id,
+            order_id="filled_order_1",
+            intent=filled_intent,
+            status="filled",
+        )
+        runner._tracked_orders[filled_intent.client_order_id] = tracked
+
+        # New order: only 0.05 new, position is 0.1 -> good
+        new_intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.05"), grid_level=1, direction="short",
+            reduce_only=True,
+        )
+        assert runner._is_good_to_place(new_intent) is True
+
+    def test_reduce_only_zero_position_rejects(self, runner):
+        """Reduce-only order is rejected when position size is zero."""
+        runner._short_position.size = Decimal("0")
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.001"), grid_level=1, direction="short",
+            reduce_only=True,
+        )
+        assert runner._is_good_to_place(intent) is False
+
+    def test_reduce_only_long_direction(self, runner):
+        """Reduce-only Sell order for long direction respects long position size."""
+        runner._long_position.size = Decimal("0.1")
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Sell", price=Decimal("51000"),
+            qty=Decimal("0.05"), grid_level=1, direction="long",
+            reduce_only=True,
+        )
+        assert runner._is_good_to_place(intent) is True
+
+    def test_direction_string_enum_compatibility(self, runner):
+        """close_side_map works with plain string direction (PlaceLimitIntent.direction is str)."""
+        runner._long_position.size = Decimal("0.1")
+        runner._short_position.size = Decimal("0.1")
+
+        # direction="long" (plain string, not DirectionType.LONG)
+        long_intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Sell", price=Decimal("51000"),
+            qty=Decimal("0.05"), grid_level=1, direction="long",
+            reduce_only=True,
+        )
+        assert runner._is_good_to_place(long_intent) is True
+
+        # direction="short" (plain string, not DirectionType.SHORT)
+        short_intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.05"), grid_level=1, direction="short",
+            reduce_only=True,
+        )
+        assert runner._is_good_to_place(short_intent) is True
+
+    @pytest.mark.asyncio
+    async def test_execute_place_skips_when_not_good(self, runner, mock_executor):
+        """_execute_place_intent skips order when _is_good_to_place returns False."""
+        runner._wallet_balance = Decimal("10000")
+        runner._short_position.size = Decimal("0")
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.001"), grid_level=1, direction="short",
+            reduce_only=True,
+        )
+        await runner._execute_place_intent(intent)
+        mock_executor.execute_place.assert_not_called()
