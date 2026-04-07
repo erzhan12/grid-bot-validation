@@ -180,15 +180,31 @@ class TestStrategyRunnerOrderTracking:
         assert orders == {"long": [], "short": []}
 
     def test_inject_open_orders(self, runner):
-        """Test injecting open orders from exchange."""
+        """Test injecting open orders from exchange (keyed by orderId)."""
         orders = [
-            {"orderLinkId": "order_1", "orderId": "exchange_1"},
-            {"orderLinkId": "order_2", "orderId": "exchange_2"},
+            {"orderId": "exchange_1", "orderLinkId": "link_1",
+             "price": "49000", "qty": "0.001", "side": "Buy"},
+            {"orderId": "exchange_2",
+             "price": "51000", "qty": "0.001", "side": "Sell"},
         ]
         runner.inject_open_orders(orders)
 
         counts = runner.get_tracked_order_count()
         assert counts["placed"] == 2
+        # Tracked by orderId
+        assert "exchange_1" in runner._tracked_orders
+        assert "exchange_2" in runner._tracked_orders
+
+    def test_inject_open_orders_skips_without_order_id(self, runner):
+        """Orders without orderId are skipped."""
+        orders = [
+            {"orderLinkId": "link_only"},
+            {"orderId": "exchange_1", "price": "49000", "qty": "0.001", "side": "Buy"},
+        ]
+        runner.inject_open_orders(orders)
+
+        counts = runner.get_tracked_order_count()
+        assert counts["placed"] == 1
 
     def test_get_tracked_order_count(self, runner):
         """Test getting tracked order counts."""
@@ -487,6 +503,91 @@ class TestStrategyRunnerOrderUpdate:
         await runner.on_order_update(event)
 
         assert runner._tracked_orders[intent.client_order_id].status == "cancelled"
+
+
+class TestFindTrackedOrder:
+    """Tests for _find_tracked_order (order_link_id and order_id lookup)."""
+
+    @pytest.mark.asyncio
+    async def test_order_update_finds_by_order_id(self, runner, mock_executor):
+        """Order update finds tracked order by order_id when order_link_id is empty."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000.0"),
+            qty=Decimal("0.001"), grid_level=5, direction="long",
+        )
+        await runner._execute_place_intent(intent)
+
+        # Simulate fill event with empty order_link_id (no orderLinkId sent to Bybit)
+        event = OrderUpdateEvent(
+            event_type=EventType.ORDER_UPDATE,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            order_id="order_123",
+            order_link_id="",
+            status="Filled",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            leaves_qty=Decimal("0"),
+        )
+
+        await runner.on_order_update(event)
+
+        assert runner._tracked_orders[intent.client_order_id].status == "filled"
+
+    @pytest.mark.asyncio
+    async def test_execution_finds_by_order_id(self, runner, mock_executor):
+        """Execution event finds tracked order by order_id when order_link_id is empty."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000.0"),
+            qty=Decimal("0.001"), grid_level=5, direction="long",
+        )
+        await runner._execute_place_intent(intent)
+
+        event = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            order_id="order_123",
+            order_link_id="",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            leaves_qty=Decimal("0"),
+            exec_id="exec_1",
+            closed_size=Decimal("0"),
+        )
+
+        await runner.on_execution(event)
+
+        assert runner._tracked_orders[intent.client_order_id].status == "filled"
+
+    @pytest.mark.asyncio
+    async def test_injected_order_found_by_order_id(self, runner, mock_executor):
+        """Injected orders (keyed by orderId) are found via order_id lookup."""
+        runner.inject_open_orders([
+            {"orderId": "exch_1", "price": "49000", "qty": "0.001", "side": "Buy"},
+        ])
+
+        event = OrderUpdateEvent(
+            event_type=EventType.ORDER_UPDATE,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            order_id="exch_1",
+            order_link_id="",
+            status="Cancelled",
+            side="Buy",
+            price=Decimal("49000"),
+            qty=Decimal("0.001"),
+            leaves_qty=Decimal("0"),
+        )
+
+        await runner.on_order_update(event)
+
+        assert runner._tracked_orders["exch_1"].status == "cancelled"
 
 
 class TestStrategyRunnerFailureCallback:
@@ -1688,6 +1789,74 @@ class TestIsGoodToPlace:
 
     Reference: bbu_reference/bbu2-master/bybit_api_usdt.py:295-313
     """
+
+    def test_exact_duplicate_rejected(self, runner):
+        """Exact duplicate (same price, qty, side, reduce_only) is rejected."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.001"), grid_level=1, direction="long",
+            reduce_only=False,
+        )
+        # Simulate an existing placed order with identical params
+        tracked = TrackedOrder(
+            client_order_id=intent.client_order_id,
+            order_id="existing_order_1",
+            intent=intent,
+            status="placed",
+        )
+        runner._tracked_orders["existing_key"] = tracked
+
+        # Same params, different client_order_id
+        dup_intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.001"), grid_level=2, direction="long",
+            reduce_only=False,
+        )
+        assert runner._is_good_to_place(dup_intent) is False
+
+    def test_exact_duplicate_different_qty_allowed(self, runner):
+        """Order with same price but different qty is not a duplicate."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.001"), grid_level=1, direction="long",
+            reduce_only=False,
+        )
+        tracked = TrackedOrder(
+            client_order_id=intent.client_order_id,
+            order_id="existing_order_1",
+            intent=intent,
+            status="placed",
+        )
+        runner._tracked_orders["existing_key"] = tracked
+
+        different_qty = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.002"), grid_level=2, direction="long",
+            reduce_only=False,
+        )
+        assert runner._is_good_to_place(different_qty) is True
+
+    def test_exact_duplicate_ignores_non_placed(self, runner):
+        """Only 'placed' orders trigger duplicate rejection."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.001"), grid_level=1, direction="long",
+            reduce_only=False,
+        )
+        tracked = TrackedOrder(
+            client_order_id=intent.client_order_id,
+            order_id="filled_order",
+            intent=intent,
+            status="filled",
+        )
+        runner._tracked_orders["filled_key"] = tracked
+
+        dup_intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.001"), grid_level=2, direction="long",
+            reduce_only=False,
+        )
+        assert runner._is_good_to_place(dup_intent) is True
 
     def test_open_order_always_good(self, runner):
         """Non-reduce-only (open) orders are always good to place."""

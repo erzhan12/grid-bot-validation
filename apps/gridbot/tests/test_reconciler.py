@@ -100,52 +100,41 @@ class TestReconcilerStartup:
         assert len(result.errors) == 0
 
     @pytest.mark.asyncio
-    async def test_reconcile_startup_with_our_orders(self, reconciler, runner, mock_rest_client):
-        """Test startup reconciliation with orders matching our pattern."""
+    async def test_reconcile_startup_with_orders(self, reconciler, runner, mock_rest_client):
+        """Test startup reconciliation injects all open orders."""
         mock_rest_client.get_open_orders.return_value = [
-            {"orderId": "ex_1", "orderLinkId": "abc123def456789a"},  # 16 hex chars
-            {"orderId": "ex_2", "orderLinkId": "fedcba9876543210"},  # 16 hex chars
+            {"orderId": "ex_1", "orderLinkId": "abc123def456789a",
+             "price": "49000", "qty": "0.001", "side": "Buy"},
+            {"orderId": "ex_2",
+             "price": "51000", "qty": "0.001", "side": "Sell"},
         ]
 
         result = await reconciler.reconcile_startup(runner)
 
         assert result.orders_fetched == 2
         assert result.orders_injected == 2
-        assert result.orphan_orders == 0
 
-        # Check orders were injected
         counts = runner.get_tracked_order_count()
         assert counts["placed"] == 2
 
     @pytest.mark.asyncio
-    async def test_reconcile_startup_with_orphan_orders(self, reconciler, runner, mock_rest_client):
-        """Test startup reconciliation with orphan orders."""
+    async def test_reconcile_startup_no_longer_filters_by_order_link_id(
+        self, reconciler, runner, mock_rest_client
+    ):
+        """All open orders are injected regardless of orderLinkId pattern."""
         mock_rest_client.get_open_orders.return_value = [
-            {"orderId": "ex_1", "orderLinkId": "abc123def456789a"},  # Our order
-            {"orderId": "ex_2", "orderLinkId": "manual_order"},  # Orphan (not hex)
-            {"orderId": "ex_3", "orderLinkId": "short"},  # Orphan (too short)
+            {"orderId": "ex_1", "orderLinkId": "abc123def456789a",
+             "price": "49000", "qty": "0.001", "side": "Buy"},
+            {"orderId": "ex_2", "orderLinkId": "manual_order",
+             "price": "50000", "qty": "0.001", "side": "Sell"},
+            {"orderId": "ex_3",
+             "price": "51000", "qty": "0.001", "side": "Buy", "reduceOnly": True},
         ]
 
         result = await reconciler.reconcile_startup(runner)
 
         assert result.orders_fetched == 3
-        assert result.orders_injected == 1
-        assert result.orphan_orders == 2
-
-    @pytest.mark.asyncio
-    async def test_reconcile_startup_cancel_orphans(self, reconciler, runner, mock_rest_client):
-        """Test startup reconciliation cancelling orphan orders."""
-        mock_rest_client.get_open_orders.return_value = [
-            {"orderId": "ex_1", "orderLinkId": "manual_order"},  # Orphan
-        ]
-
-        result = await reconciler.reconcile_startup(runner, cancel_orphans=True)
-
-        assert result.orphan_orders == 1
-        mock_rest_client.cancel_order.assert_called_once_with(
-            symbol="BTCUSDT",
-            order_id="ex_1",
-        )
+        assert result.orders_injected == 3
 
     @pytest.mark.asyncio
     async def test_reconcile_startup_api_error(self, reconciler, runner, mock_rest_client):
@@ -165,14 +154,12 @@ class TestReconcilerReconnect:
     @pytest.mark.asyncio
     async def test_reconcile_reconnect_in_sync(self, reconciler, runner, mock_rest_client):
         """Test reconnect when state is in sync."""
-        # Inject an order into runner first
         runner.inject_open_orders([
-            {"orderId": "ex_1", "orderLinkId": "abc123def456789a"},
+            {"orderId": "ex_1", "price": "49000", "qty": "0.001", "side": "Buy"},
         ])
 
-        # Exchange returns the same order
         mock_rest_client.get_open_orders.return_value = [
-            {"orderId": "ex_1", "orderLinkId": "abc123def456789a"},
+            {"orderId": "ex_1"},
         ]
 
         result = await reconciler.reconcile_reconnect(runner)
@@ -183,29 +170,23 @@ class TestReconcilerReconnect:
     @pytest.mark.asyncio
     async def test_reconcile_reconnect_missing_on_exchange(self, reconciler, runner, mock_rest_client):
         """Test reconnect when order is in memory but not on exchange."""
-        # Inject an order into runner
         runner.inject_open_orders([
-            {"orderId": "ex_1", "orderLinkId": "abc123def456789a"},
+            {"orderId": "ex_1", "price": "49000", "qty": "0.001", "side": "Buy"},
         ])
 
-        # Exchange returns empty (order was filled/cancelled)
         mock_rest_client.get_open_orders.return_value = []
 
         result = await reconciler.reconcile_reconnect(runner)
 
         assert result.orders_fetched == 0
-
-        # Order should be marked as cancelled
-        assert runner._tracked_orders["abc123def456789a"].status == "cancelled"
+        # Tracked by orderId
+        assert runner._tracked_orders["ex_1"].status == "cancelled"
 
     @pytest.mark.asyncio
     async def test_reconcile_reconnect_missing_in_memory(self, reconciler, runner, mock_rest_client):
         """Test reconnect when order is on exchange but not in memory."""
-        # Runner has no orders
-
-        # Exchange has an order we don't know about
         mock_rest_client.get_open_orders.return_value = [
-            {"orderId": "ex_new", "orderLinkId": "new123abc456789a"},
+            {"orderId": "ex_new", "price": "50000", "qty": "0.001", "side": "Sell"},
         ]
 
         result = await reconciler.reconcile_reconnect(runner)
@@ -248,17 +229,3 @@ class TestBuildLimitOrdersDict:
         assert len(result["short"]) == 1
 
 
-class TestIsHex:
-    """Tests for _is_hex helper."""
-
-    def test_valid_hex(self, reconciler):
-        """Test valid hex strings."""
-        assert reconciler._is_hex("abc123") is True
-        assert reconciler._is_hex("ABCDEF") is True
-        assert reconciler._is_hex("0123456789abcdef") is True
-
-    def test_invalid_hex(self, reconciler):
-        """Test invalid hex strings."""
-        assert reconciler._is_hex("xyz") is False
-        assert reconciler._is_hex("hello") is False
-        assert reconciler._is_hex("12g34") is False

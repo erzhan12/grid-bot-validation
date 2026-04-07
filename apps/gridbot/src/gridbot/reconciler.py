@@ -61,16 +61,15 @@ class Reconciler:
     async def reconcile_startup(
         self,
         runner: StrategyRunner,
-        cancel_orphans: bool = False,
     ) -> ReconciliationResult:
         """Reconcile state on startup.
 
-        Fetches open orders from exchange and injects them into the runner.
-        Detects orphan orders (orders on exchange not matching our pattern).
+        Fetches all open limit orders from exchange and injects them into the runner.
+        Since we no longer send orderLinkId to Bybit, all orders for this symbol
+        are assumed to belong to this strategy.
 
         Args:
             runner: StrategyRunner to reconcile.
-            cancel_orphans: If True, cancel orders not matching our pattern.
 
         Returns:
             ReconciliationResult with operation details.
@@ -89,45 +88,15 @@ class Reconciler:
                 f"{runner.strat_id}: Fetched {len(open_orders)} open orders from exchange"
             )
 
-            # Separate our orders from orphans
-            our_orders = []
-            orphan_orders = []
+            # Inject all open orders into runner.
+            # We no longer send orderLinkId to Bybit, so we can't distinguish
+            # "our" orders from others by orderLinkId pattern. All limit orders
+            # for this symbol are assumed to belong to this strategy.
+            result.orders_injected = len(open_orders)
 
-            for order in open_orders:
-                order_link_id = order.get("orderLinkId", "")
-                # Our orders have 16-char hex client_order_id (SHA256 hash prefix)
-                if order_link_id and len(order_link_id) == 16 and self._is_hex(order_link_id):
-                    our_orders.append(order)
-                else:
-                    orphan_orders.append(order)
-
-            result.orders_injected = len(our_orders)
-            result.orphan_orders = len(orphan_orders)
-
-            # Inject our orders into runner
-            if our_orders:
-                runner.inject_open_orders(our_orders)
-                logger.info(f"{runner.strat_id}: Injected {len(our_orders)} orders")
-
-            # Handle orphan orders
-            if orphan_orders:
-                logger.warning(
-                    f"{runner.strat_id}: Found {len(orphan_orders)} orphan orders "
-                    f"(orders not matching our pattern)"
-                )
-
-                if cancel_orphans:
-                    for order in orphan_orders:
-                        try:
-                            self._client.cancel_order(
-                                symbol=runner.symbol,
-                                order_id=order.get("orderId"),
-                            )
-                            logger.info(
-                                f"{runner.strat_id}: Cancelled orphan order {order.get('orderId')}"
-                            )
-                        except Exception as e:
-                            result.errors.append(f"Failed to cancel orphan: {e}")
+            if open_orders:
+                runner.inject_open_orders(open_orders)
+                logger.info(f"{runner.strat_id}: Injected {len(open_orders)} orders")
 
         except Exception as e:
             logger.error(f"{runner.strat_id}: Reconciliation error: {e}")
@@ -245,10 +214,3 @@ class Reconciler:
 
         return result
 
-    def _is_hex(self, s: str) -> bool:
-        """Check if string is valid hexadecimal."""
-        try:
-            int(s, 16)
-            return True
-        except ValueError:
-            return False

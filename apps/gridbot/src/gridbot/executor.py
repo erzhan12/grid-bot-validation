@@ -175,7 +175,6 @@ class IntentExecutor:
                 price=str(intent.price),
                 reduce_only=intent.reduce_only,
                 position_idx=position_idx,
-                order_link_id=intent.client_order_id,
             )
 
             order_id = result.get("orderId")
