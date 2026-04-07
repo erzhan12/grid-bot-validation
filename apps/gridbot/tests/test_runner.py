@@ -349,6 +349,42 @@ class TestStrategyRunnerPositionUpdate:
         assert "Sell" in short_mult
 
     @pytest.mark.asyncio
+    async def test_on_position_update_decimal_float_type_safety(self, runner):
+        """Regression: ratio calculation must not raise TypeError when mixing Decimal/float.
+
+        PositionState.size is Decimal but the None-fallback was float 0.0,
+        causing 'unsupported operand type(s) for /: float and Decimal'.
+        Test all three combos: both exist, only long, only short.
+        """
+        long_pos = {"size": "1.0", "avgPrice": "50000", "liqPrice": "40000"}
+        short_pos = {"size": "0.5", "avgPrice": "50000", "liqPrice": "60000"}
+
+        # Both positions present (Decimal / Decimal)
+        await runner.on_position_update(
+            long_position=long_pos, short_position=short_pos,
+            wallet_balance=10000.0, last_close=50000.0,
+        )
+        # Long ratio survives; short's is overwritten by calculate_amount_multiplier
+        assert runner._long_position.position_ratio == 2.0  # 1.0 / 0.5
+
+        # Only long (Decimal / float-fallback)
+        await runner.on_position_update(
+            long_position=long_pos, short_position=None,
+            wallet_balance=10000.0, last_close=50000.0,
+        )
+        # Short's ratio survives since calculate is not called (short_state is None)
+        assert runner._short_position.position_ratio == float("inf")
+
+        # Only short (float-fallback / Decimal)
+        await runner.on_position_update(
+            long_position=None, short_position=short_pos,
+            wallet_balance=10000.0, last_close=50000.0,
+        )
+        # Long's ratio survives since calculate is not called (long_state is None)
+        # long_size=0.0 / short_size=0.5 = 0.0
+        assert runner._long_position.position_ratio == 0.0
+
+    @pytest.mark.asyncio
     async def test_on_position_update_no_positions_keeps_default_multipliers(self, runner):
         """Test multipliers stay at defaults when no positions exist."""
         await runner.on_position_update(
