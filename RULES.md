@@ -220,7 +220,7 @@ make test-integration
 - **Purpose**: Prevents placing reduce-only close orders when total reduce-only qty on the book would exceed position size. Without this, Bybit rejects with error 110017 ("orderQty will be truncated to zero") and the retry queue keeps retrying.
 - **Logic**: Open orders always pass. For reduce-only orders: sum all placed reduce-only orders for that direction + new order qty, reject if `position_size <= total_reduce_qty` (strict `>`).
 - **Location**: `StrategyRunner._is_good_to_place()` in `apps/gridbot/src/gridbot/runner.py`, called from `_execute_place_intent()` after qty resolution.
-- **Position size source**: `Position.size` attribute set in `on_position_update()`.
+- **Position size source**: `Position.size` attribute set in `on_position_update()`. Defaults to `Decimal('0')` until first `on_position_update()` call, which safely rejects reduce-only orders during startup.
 
 ### Enums
 

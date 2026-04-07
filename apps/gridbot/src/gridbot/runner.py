@@ -58,7 +58,7 @@ class TrackedOrder:
 
     client_order_id: str
     order_id: Optional[str] = None
-    intent: PlaceLimitIntent = None
+    intent: Optional[PlaceLimitIntent] = None
     status: str = "pending"  # 'pending', 'placed', 'filled', 'cancelled', 'failed'
     placed_ts: datetime = field(default_factory=lambda: datetime.now(UTC))
 
@@ -597,10 +597,17 @@ class StrategyRunner:
             return True
 
         direction = intent.direction
-        position_size = (self._long_position.size if direction == DirectionType.LONG
+        position_size = (self._long_position.size if direction == 'long'
                          else self._short_position.size)
 
-        close_side_map = {DirectionType.LONG: 'Sell', DirectionType.SHORT: 'Buy'}
+        if position_size == Decimal('0'):
+            logger.debug(
+                f"{self.strat_id}: Rejecting reduce-only order at {intent.price} - "
+                f"position size is zero (position update may not have arrived yet)"
+            )
+            return False
+
+        close_side_map = {'long': 'Sell', 'short': 'Buy'}
         close_side = close_side_map[direction]
 
         total_reduce_qty = intent.qty

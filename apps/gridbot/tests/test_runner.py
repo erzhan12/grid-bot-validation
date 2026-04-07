@@ -1769,6 +1769,27 @@ class TestIsGoodToPlace:
         )
         assert runner._is_good_to_place(intent) is True
 
+    def test_direction_string_enum_compatibility(self, runner):
+        """close_side_map works with plain string direction (PlaceLimitIntent.direction is str)."""
+        runner._long_position.size = Decimal("0.1")
+        runner._short_position.size = Decimal("0.1")
+
+        # direction="long" (plain string, not DirectionType.LONG)
+        long_intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Sell", price=Decimal("51000"),
+            qty=Decimal("0.05"), grid_level=1, direction="long",
+            reduce_only=True,
+        )
+        assert runner._is_good_to_place(long_intent) is True
+
+        # direction="short" (plain string, not DirectionType.SHORT)
+        short_intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.05"), grid_level=1, direction="short",
+            reduce_only=True,
+        )
+        assert runner._is_good_to_place(short_intent) is True
+
     @pytest.mark.asyncio
     async def test_execute_place_skips_when_not_good(self, runner, mock_executor):
         """_execute_place_intent skips order when _is_good_to_place returns False."""
