@@ -96,6 +96,7 @@ class Position:
         self.risk_config = risk_config
         self.amount_multiplier = {self.SIDE_BUY: 1.0, self.SIDE_SELL: 1.0}
         self.position_ratio = 1.0
+        self.size: Decimal = Decimal('0')
         self._opposite: Optional['Position'] = None
 
     def set_opposite(self, opposite: 'Position') -> None:
