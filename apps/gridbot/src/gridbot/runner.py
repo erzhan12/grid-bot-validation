@@ -648,7 +648,7 @@ class StrategyRunner:
             return True
 
         direction = intent.direction
-        position_size = (self._long_position.size if direction == 'long'
+        position_size = (self._long_position.size if direction == DirectionType.LONG
                          else self._short_position.size)
 
         if position_size == Decimal('0'):
@@ -658,7 +658,7 @@ class StrategyRunner:
             )
             return False
 
-        close_side_map = {'long': 'Sell', 'short': 'Buy'}
+        close_side_map = {DirectionType.LONG: 'Sell', DirectionType.SHORT: 'Buy'}
         close_side = close_side_map[direction]
 
         total_reduce_qty = intent.qty
@@ -761,9 +761,9 @@ class StrategyRunner:
             reduce_only = order.get("reduceOnly", False)
             if price and qty and side:
                 if side == "Buy":
-                    direction = "short" if reduce_only else "long"
+                    direction = DirectionType.SHORT if reduce_only else DirectionType.LONG
                 elif side == "Sell":
-                    direction = "long" if reduce_only else "short"
+                    direction = DirectionType.LONG if reduce_only else DirectionType.SHORT
                 else:
                     logger.warning(
                         f"{self.strat_id}: Skipping injected order {order_id} "
