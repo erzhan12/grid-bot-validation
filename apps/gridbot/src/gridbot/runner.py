@@ -165,10 +165,13 @@ class StrategyRunner:
         #   _tracked_by_order_id: exchange order_id → TrackedOrder (secondary index)
         #   _placed_order_signatures: {(price, qty, side, reduce_only)} for O(1)
         #       duplicate detection (replaces O(n) iteration over all tracked orders)
-        # All three are kept in sync via _index_as_placed() / _unindex_placed().
+        #   _reduce_only_qty: (direction, close_side) → Decimal total reduce-only qty
+        #       for O(1) position-size check in _is_good_to_place()
+        # All four are kept in sync via _index_as_placed() / _unindex_placed().
         self._tracked_orders: dict[str, TrackedOrder] = {}
         self._tracked_by_order_id: dict[str, TrackedOrder] = {}
         self._placed_order_signatures: set[tuple] = set()
+        self._reduce_only_qty: dict[tuple[str, str], Decimal] = {}
 
         # Position state
         self._last_position_check: Optional[datetime] = None
@@ -613,19 +616,29 @@ class StrategyRunner:
         return (intent.price, intent.qty, intent.side, intent.reduce_only)
 
     def _index_as_placed(self, tracked: TrackedOrder) -> None:
-        """Add a tracked order to secondary indexes (order_id + signature)."""
+        """Add a tracked order to secondary indexes (order_id + signature + reduce qty)."""
         if tracked.order_id:
             self._tracked_by_order_id[tracked.order_id] = tracked
         if tracked.intent:
             self._placed_order_signatures.add(self._order_signature(tracked.intent))
+            if tracked.intent.reduce_only:
+                key = (tracked.intent.direction, tracked.intent.side)
+                self._reduce_only_qty[key] = (
+                    self._reduce_only_qty.get(key, Decimal("0")) + tracked.intent.qty
+                )
 
-    def _rebuild_signature_set(self) -> None:
-        """Rebuild _placed_order_signatures from _tracked_orders (defensive recovery)."""
-        self._placed_order_signatures = {
-            self._order_signature(t.intent)
-            for t in self._tracked_orders.values()
-            if t.status == "placed" and t.intent
-        }
+    def _rebuild_indexes(self) -> None:
+        """Rebuild secondary indexes from _tracked_orders (defensive recovery)."""
+        self._placed_order_signatures = set()
+        self._reduce_only_qty = {}
+        for t in self._tracked_orders.values():
+            if t.status == "placed" and t.intent:
+                self._placed_order_signatures.add(self._order_signature(t.intent))
+                if t.intent.reduce_only:
+                    key = (t.intent.direction, t.intent.side)
+                    self._reduce_only_qty[key] = (
+                        self._reduce_only_qty.get(key, Decimal("0")) + t.intent.qty
+                    )
 
     def _unindex_placed(self, tracked: TrackedOrder) -> None:
         """Remove a tracked order from secondary indexes."""
@@ -636,11 +649,17 @@ class StrategyRunner:
             if sig not in self._placed_order_signatures:
                 logger.error(
                     f"{self.strat_id}: Signature not found when unindexing "
-                    f"order {tracked.client_order_id} — rebuilding signature set"
+                    f"order {tracked.client_order_id} — rebuilding indexes"
                 )
-                self._rebuild_signature_set()
-                return
+                self._rebuild_indexes()
             self._placed_order_signatures.discard(sig)
+            if tracked.intent.reduce_only:
+                key = (tracked.intent.direction, tracked.intent.side)
+                new_val = self._reduce_only_qty.get(key, Decimal("0")) - tracked.intent.qty
+                if new_val > Decimal("0"):
+                    self._reduce_only_qty[key] = new_val
+                else:
+                    self._reduce_only_qty.pop(key, None)
 
     def _find_tracked_order(
         self, order_link_id: Optional[str], order_id: Optional[str]
@@ -692,16 +711,11 @@ class StrategyRunner:
         close_side_map = {DirectionType.LONG: 'Sell', DirectionType.SHORT: 'Buy'}
         close_side = close_side_map[direction]
 
-        total_reduce_qty = intent.qty
-        for tracked in self._tracked_orders.values():
-            if tracked.status != "placed":
-                continue
-            if tracked.intent is None:
-                continue
-            if (tracked.intent.reduce_only
-                    and tracked.intent.side == close_side
-                    and tracked.intent.direction == direction):
-                total_reduce_qty += tracked.intent.qty
+        # O(1) lookup via _reduce_only_qty index
+        existing_reduce_qty = self._reduce_only_qty.get(
+            (direction, close_side), Decimal("0")
+        )
+        total_reduce_qty = intent.qty + existing_reduce_qty
 
         return position_size > total_reduce_qty
 

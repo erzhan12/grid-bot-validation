@@ -1963,6 +1963,7 @@ class TestIsGoodToPlace:
             status="placed",
         )
         runner._tracked_orders[existing_intent.client_order_id] = tracked
+        runner._index_as_placed(tracked)
 
         # New order: 0.05 existing + 0.06 new = 0.11 > 0.1 position
         new_intent = PlaceLimitIntent.create(
@@ -2109,33 +2110,49 @@ class TestIsGoodToPlace:
         assert sig not in runner._placed_order_signatures
 
     def test_signature_rebuild_on_mismatch(self, runner):
-        """Signature set is rebuilt when unindexing detects a missing signature."""
-        intent = PlaceLimitIntent.create(
+        """Rebuild restores other orders' signatures when mismatch detected."""
+        # Order A — the one we'll unindex
+        intent_a = PlaceLimitIntent.create(
             symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
             qty=Decimal("0.001"), grid_level=5, direction="long",
             reduce_only=False,
         )
-        tracked = TrackedOrder(
-            client_order_id=intent.client_order_id,
-            order_id="order_999",
-            intent=intent,
+        tracked_a = TrackedOrder(
+            client_order_id=intent_a.client_order_id,
+            order_id="order_a",
+            intent=intent_a,
             status="placed",
         )
-        runner._tracked_orders[intent.client_order_id] = tracked
-        runner._index_as_placed(tracked)
+        runner._tracked_orders[intent_a.client_order_id] = tracked_a
+        runner._index_as_placed(tracked_a)
 
-        sig = runner._order_signature(intent)
-        assert sig in runner._placed_order_signatures
+        # Order B — should survive the rebuild
+        intent_b = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Sell", price=Decimal("51000"),
+            qty=Decimal("0.002"), grid_level=6, direction="long",
+            reduce_only=False,
+        )
+        tracked_b = TrackedOrder(
+            client_order_id=intent_b.client_order_id,
+            order_id="order_b",
+            intent=intent_b,
+            status="placed",
+        )
+        runner._tracked_orders[intent_b.client_order_id] = tracked_b
+        runner._index_as_placed(tracked_b)
+
+        sig_a = runner._order_signature(intent_a)
+        sig_b = runner._order_signature(intent_b)
 
         # Corrupt the set by clearing it
         runner._placed_order_signatures.clear()
-        assert sig not in runner._placed_order_signatures
 
-        # Unindex triggers rebuild because signature is missing
-        runner._unindex_placed(tracked)
+        # Unindex A triggers rebuild (sig_a missing), then discards sig_a
+        runner._unindex_placed(tracked_a)
 
-        # Rebuild restores the signature for the still-placed order
-        assert sig in runner._placed_order_signatures
+        # A's signature removed, B's signature restored by rebuild
+        assert sig_a not in runner._placed_order_signatures
+        assert sig_b in runner._placed_order_signatures
 
     @pytest.mark.asyncio
     async def test_execute_place_skips_when_not_good(self, runner, mock_executor):
