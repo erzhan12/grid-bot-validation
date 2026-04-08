@@ -104,7 +104,11 @@ class Reconciler:
 
             if open_orders:
                 runner.inject_open_orders(open_orders)
-                logger.info(f"{runner.strat_id}: Injected {len(open_orders)} orders")
+                logger.warning(
+                    f"{runner.strat_id}: Injecting {len(open_orders)} open orders. "
+                    f"If any manual orders exist for {runner.symbol}, they will be "
+                    f"managed by the bot. Stop the bot before placing manual orders."
+                )
 
         except Exception as e:
             logger.error(f"{runner.strat_id}: Reconciliation error: {e}")
