@@ -219,6 +219,26 @@ class TestStrategyRunnerOrderTracking:
         assert runner._find_tracked_order(None, "ex_new") is not None
         assert runner._find_tracked_order("ex_new", None) is not None  # client_id == order_id
 
+    @pytest.mark.parametrize("side,reduce_only,expected_direction", [
+        ("Buy", False, "long"),
+        ("Buy", True, "short"),
+        ("Sell", False, "short"),
+        ("Sell", True, "long"),
+    ])
+    def test_inject_open_orders_derives_direction(
+        self, runner, side, reduce_only, expected_direction,
+    ):
+        """Direction is correctly derived from side+reduceOnly for all 4 combinations."""
+        orders = [
+            {"orderId": "ex_1", "price": "50000", "qty": "0.001",
+             "side": side, "reduceOnly": reduce_only},
+        ]
+        runner.inject_open_orders(orders)
+
+        tracked = runner._tracked_by_order_id["ex_1"]
+        assert tracked.intent is not None
+        assert tracked.intent.direction == expected_direction
+
     def test_inject_open_orders_skips_without_order_id(self, runner):
         """Orders without orderId are skipped."""
         orders = [
