@@ -180,7 +180,7 @@ class TestStrategyRunnerOrderTracking:
         assert orders == {"long": [], "short": []}
 
     def test_inject_open_orders(self, runner):
-        """Test injecting open orders from exchange (keyed by orderId)."""
+        """Test injecting open orders from exchange (keyed by client_order_id)."""
         orders = [
             {"orderId": "exchange_1", "orderLinkId": "link_1",
              "price": "49000", "qty": "0.001", "side": "Buy"},
@@ -191,9 +191,11 @@ class TestStrategyRunnerOrderTracking:
 
         counts = runner.get_tracked_order_count()
         assert counts["placed"] == 2
-        # Tracked by orderId
-        assert "exchange_1" in runner._tracked_orders
+        # Keyed by client_order_id (orderLinkId when present, orderId otherwise)
+        assert "link_1" in runner._tracked_orders
         assert "exchange_2" in runner._tracked_orders
+        # Findable by order_id via secondary index
+        assert runner._tracked_by_order_id["exchange_1"].client_order_id == "link_1"
 
     def test_inject_open_orders_skips_without_order_id(self, runner):
         """Orders without orderId are skipped."""

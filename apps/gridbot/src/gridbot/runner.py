@@ -160,9 +160,9 @@ class StrategyRunner:
         )
         self._long_position, self._short_position = Position.create_linked_pair(risk_config)
 
-        # Order tracking
+        # Order tracking: keyed by client_order_id (consistent for both placed and injected)
         self._tracked_orders: dict[str, TrackedOrder] = {}
-        # Secondary index: order_id → TrackedOrder (for O(1) lookup by exchange ID)
+        # Secondary index: exchange order_id → TrackedOrder (O(1) lookup)
         self._tracked_by_order_id: dict[str, TrackedOrder] = {}
         # Signature set for O(1) exact-duplicate detection: (price, qty, side, reduce_only)
         self._placed_order_signatures: set[tuple] = set()
@@ -614,9 +614,10 @@ class StrategyRunner:
     def _find_tracked_order(
         self, order_link_id: Optional[str], order_id: Optional[str]
     ) -> Optional[TrackedOrder]:
-        """Find a tracked order by order_link_id (dict key) or order_id (index lookup).
+        """Find a tracked order by client_order_id or order_id. Both O(1).
 
-        Both lookups are O(1). Tries primary dict key first, then secondary index.
+        Tries _tracked_orders (keyed by client_order_id) first, then
+        _tracked_by_order_id (secondary index on exchange order_id).
         """
         if order_link_id and order_link_id in self._tracked_orders:
             return self._tracked_orders[order_link_id]
@@ -733,8 +734,10 @@ class StrategyRunner:
     def inject_open_orders(self, orders: list[dict]) -> None:
         """Inject open orders from exchange (for reconciliation on startup).
 
-        Tracks by orderId as primary key. Orders without orderId are skipped.
-        orderLinkId is stored if present but not required (new orders won't have one).
+        Each order is stored in _tracked_orders keyed by client_order_id
+        (orderLinkId if present, otherwise orderId). Orders without orderId
+        are skipped. The _tracked_by_order_id secondary index provides O(1)
+        lookup by exchange order_id.
 
         Args:
             orders: List of order dicts from exchange.
@@ -777,14 +780,15 @@ class StrategyRunner:
                     reduce_only=reduce_only,
                 )
 
-            # Use orderId as tracking key
+            # Key by client_order_id (consistent with _execute_place_intent)
+            client_id = order_link_id or order_id
             tracked = TrackedOrder(
-                client_order_id=order_link_id or order_id,
+                client_order_id=client_id,
                 order_id=order_id,
                 intent=intent,
                 status="placed",
             )
-            self._tracked_orders[order_id] = tracked
+            self._tracked_orders[client_id] = tracked
             self._index_as_placed(tracked)
             injected += 1
 
@@ -799,6 +803,16 @@ class StrategyRunner:
         if tracked:
             self._unindex_placed(tracked)
             tracked.mark_cancelled()
+
+    def get_placed_order_ids(self) -> set[str]:
+        """Get exchange order_ids of all placed (active) orders.
+
+        Used by reconciler to compare in-memory state with exchange state.
+        """
+        return {
+            oid for oid, t in self._tracked_by_order_id.items()
+            if t.status == "placed"
+        }
 
     def get_tracked_order_count(self) -> dict[str, int]:
         """Get count of tracked orders by status."""

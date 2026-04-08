@@ -143,13 +143,8 @@ class Reconciler:
                 if order.get("orderId")
             }
 
-            # Get tracked orders from runner
-            tracked = runner._tracked_orders
-            tracked_order_ids = {
-                t.order_id
-                for t in tracked.values()
-                if t.order_id and t.status == "placed"
-            }
+            # Get placed order IDs from runner
+            tracked_order_ids = runner.get_placed_order_ids()
 
             # Find discrepancies
             missing_on_exchange = tracked_order_ids - exchange_order_ids
