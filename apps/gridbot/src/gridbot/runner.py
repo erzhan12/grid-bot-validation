@@ -89,6 +89,10 @@ class StrategyRunner:
     - Order tracking
     - Position risk management
 
+    Class constants:
+        INDEX_CORRUPTION_THRESHOLD: Number of consecutive index corruptions
+            before raising RuntimeError (default 3).
+
     Example:
         config = StrategyConfig(...)
         executor = IntentExecutor(rest_client)
@@ -102,6 +106,8 @@ class StrategyRunner:
         await runner.on_ticker(ticker_event)
         await runner.on_execution(execution_event)
     """
+
+    INDEX_CORRUPTION_THRESHOLD = 3
 
     def __init__(
         self,
@@ -172,6 +178,7 @@ class StrategyRunner:
         self._tracked_by_order_id: dict[str, TrackedOrder] = {}
         self._placed_order_signatures: set[tuple] = set()
         self._reduce_only_qty: dict[tuple[str, str], Decimal] = {}
+        self._index_corruption_count: int = 0
 
         # Position state
         self._last_position_check: Optional[datetime] = None
@@ -647,15 +654,19 @@ class StrategyRunner:
         if tracked.intent:
             sig = self._order_signature(tracked.intent)
             if sig not in self._placed_order_signatures:
+                self._index_corruption_count += 1
                 logger.critical(
                     f"{self.strat_id}: Signature not found when unindexing "
-                    f"order {tracked.client_order_id} — rebuilding indexes"
+                    f"order {tracked.client_order_id} — rebuilding indexes "
+                    f"(corruption #{self._index_corruption_count})"
                 )
                 self._rebuild_indexes()
-                raise RuntimeError(
-                    f"Index corruption detected for order {tracked.client_order_id} "
-                    f"- indexes rebuilt but investigate root cause"
-                )
+                if self._index_corruption_count >= self.INDEX_CORRUPTION_THRESHOLD:
+                    raise RuntimeError(
+                        f"Index corruption detected {self._index_corruption_count} times "
+                        f"for strategy {self.strat_id} — investigate root cause"
+                    )
+                return
             self._placed_order_signatures.discard(sig)
             if tracked.intent.reduce_only:
                 key = (tracked.intent.direction, tracked.intent.side)

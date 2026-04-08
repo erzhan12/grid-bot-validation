@@ -2147,13 +2147,42 @@ class TestIsGoodToPlace:
         # Corrupt the set by clearing it
         runner._placed_order_signatures.clear()
 
-        # Unindex A triggers rebuild + raises RuntimeError on corruption
-        with pytest.raises(RuntimeError, match="Index corruption detected"):
-            runner._unindex_placed(tracked_a)
+        # First corruption: recovers via rebuild, does not raise
+        runner._unindex_placed(tracked_a)
+        assert runner._index_corruption_count == 1
 
-        # B's signature restored by rebuild; A's included too (still "placed" at
-        # time of rebuild — the raise prevents the subsequent discard)
+        # B's signature restored by rebuild
         assert sig_b in runner._placed_order_signatures
+
+    def test_signature_corruption_raises_after_threshold(self, runner):
+        """RuntimeError raised after INDEX_CORRUPTION_THRESHOLD consecutive corruptions."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.001"), grid_level=5, direction="long",
+            reduce_only=False,
+        )
+        tracked = TrackedOrder(
+            client_order_id=intent.client_order_id,
+            order_id="order_x",
+            intent=intent,
+            status="placed",
+        )
+        runner._tracked_orders[intent.client_order_id] = tracked
+        runner._index_as_placed(tracked)
+
+        # Simulate repeated corruptions up to threshold
+        for i in range(runner.INDEX_CORRUPTION_THRESHOLD - 1):
+            runner._placed_order_signatures.clear()
+            runner._unindex_placed(tracked)
+            # Re-index for next iteration
+            runner._index_as_placed(tracked)
+
+        assert runner._index_corruption_count == runner.INDEX_CORRUPTION_THRESHOLD - 1
+
+        # Next corruption hits threshold and raises
+        runner._placed_order_signatures.clear()
+        with pytest.raises(RuntimeError, match="Index corruption detected"):
+            runner._unindex_placed(tracked)
 
     @pytest.mark.asyncio
     async def test_execute_place_skips_when_not_good(self, runner, mock_executor):

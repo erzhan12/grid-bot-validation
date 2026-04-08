@@ -787,6 +787,7 @@ Successfully implemented a multi-tenant grid trading bot using gridcore strategy
    - **Startup**: fetch all open limit orders for the symbol, inject into runner via `inject_open_orders()`
    - **Order Ownership Assumption**: Since `orderLinkId` is not sent to Bybit, `reconcile_startup` assumes ALL open limit orders for `runner.symbol` belong to that strategy. The `allow_shared_symbol` config flag (default `False`) enforces this at startup by rejecting duplicate `(account, symbol)` pairs across strategies. Set `allow_shared_symbol: true` only if you understand the risk of order cross-contamination between strategies sharing the same symbol.
    - **Risk**: If manual orders are placed on the same symbol while the strategy is running, they will be incorrectly tracked by the strategy, potentially causing incorrect grid state. To safely manually intervene, stop the strategy first, make manual changes, then restart.
+   - **CRITICAL**: Before starting the bot for the first time on an account that has been used for manual trading, either (1) close all existing orders for the symbol, or (2) set `allow_shared_symbol: true` and understand that order ownership cannot be guaranteed.
    - **Reconnect**: compare exchange state with in-memory, update tracked orders
    - **Periodic Order Sync (2026-02-16)**: Matches bbu2's `LIMITS_READ_INTERVAL` pattern (61s by default)
      - **Purpose**: Continuously reconcile order state via REST API to catch missed WebSocket updates

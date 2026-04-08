@@ -165,7 +165,10 @@ class Orchestrator:
             account_name = self._get_account_for_strategy(runner.strat_id)
             reconciler = self._reconcilers.get(account_name)
             if reconciler:
-                result = await reconciler.reconcile_startup(runner)
+                result = await reconciler.reconcile_startup(
+                    runner,
+                    allow_shared_symbol=self._config.allow_shared_symbol,
+                )
                 logger.info(
                     f"{runner.strat_id}: Reconciliation complete - "
                     f"fetched={result.orders_fetched}, injected={result.orders_injected}, "

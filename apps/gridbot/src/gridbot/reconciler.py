@@ -69,6 +69,7 @@ class Reconciler:
     async def reconcile_startup(
         self,
         runner: StrategyRunner,
+        allow_shared_symbol: bool = False,
     ) -> ReconciliationResult:
         """Reconcile state on startup.
 
@@ -103,8 +104,23 @@ class Reconciler:
             result.orders_injected = len(open_orders)
 
             if open_orders:
+                if not allow_shared_symbol:
+                    # Check for orders without orderLinkId — likely manual orders
+                    # that predate the bot. Warn loudly since we'll adopt them all.
+                    no_link_id = [
+                        o for o in open_orders
+                        if not o.get("orderLinkId")
+                    ]
+                    if no_link_id:
+                        logger.error(
+                            f"{runner.strat_id}: Found {len(no_link_id)} orders "
+                            f"without orderLinkId for {runner.symbol} — these may "
+                            f"be manual orders. All will be adopted by the bot. "
+                            f"Close manual orders or set allow_shared_symbol: true."
+                        )
+
                 runner.inject_open_orders(open_orders)
-                logger.warning(
+                logger.error(
                     f"{runner.strat_id}: Injecting {len(open_orders)} open orders. "
                     f"If any manual orders exist for {runner.symbol}, they will be "
                     f"managed by the bot. Stop the bot before placing manual orders."
