@@ -153,10 +153,8 @@ class Reconciler:
                     f"but not on exchange (likely filled/cancelled)"
                 )
                 # Update tracked orders to reflect they're no longer on exchange
-                for client_id, tracked_order in tracked.items():
-                    if tracked_order.order_id in missing_on_exchange:
-                        # Mark as cancelled (or could be filled - would need execution check)
-                        tracked_order.mark_cancelled()
+                for order_id in missing_on_exchange:
+                    runner.mark_order_cancelled_by_order_id(order_id)
 
             if missing_in_memory:
                 logger.warning(

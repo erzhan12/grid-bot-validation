@@ -162,6 +162,10 @@ class StrategyRunner:
 
         # Order tracking
         self._tracked_orders: dict[str, TrackedOrder] = {}
+        # Secondary index: order_id → TrackedOrder (for O(1) lookup by exchange ID)
+        self._tracked_by_order_id: dict[str, TrackedOrder] = {}
+        # Signature set for O(1) exact-duplicate detection: (price, qty, side, reduce_only)
+        self._placed_order_signatures: set[tuple] = set()
 
         # Position state
         self._last_position_check: Optional[datetime] = None
@@ -335,6 +339,7 @@ class StrategyRunner:
             # Update tracked order status
             tracked = self._find_tracked_order(event.order_link_id, event.order_id)
             if tracked:
+                self._unindex_placed(tracked)
                 tracked.mark_filled()
                 logger.info(
                     f"{self.strat_id}: Order filled: {event.symbol} {event.side} "
@@ -373,12 +378,15 @@ class StrategyRunner:
             tracked = self._find_tracked_order(event.order_link_id, event.order_id)
             if tracked:
                 if event.status in ("Filled",):
+                    self._unindex_placed(tracked)
                     tracked.mark_filled()
                 elif event.status in ("Cancelled", "Rejected"):
+                    self._unindex_placed(tracked)
                     tracked.mark_cancelled()
                 elif event.status in ("New", "PartiallyFilled"):
                     if tracked.order_id is None:
                         tracked.mark_placed(event.order_id)
+                        self._index_as_placed(tracked)
 
             # Pass to engine (update state regardless of error)
             intents = self._engine.on_event(event)
@@ -584,21 +592,36 @@ class StrategyRunner:
             elif isinstance(intent, CancelIntent):
                 await self._execute_cancel_intent(intent)
 
+    @staticmethod
+    def _order_signature(intent: PlaceLimitIntent) -> tuple:
+        """Build signature tuple for duplicate detection."""
+        return (intent.price, intent.qty, intent.side, intent.reduce_only)
+
+    def _index_as_placed(self, tracked: TrackedOrder) -> None:
+        """Add a tracked order to secondary indexes (order_id + signature)."""
+        if tracked.order_id:
+            self._tracked_by_order_id[tracked.order_id] = tracked
+        if tracked.intent:
+            self._placed_order_signatures.add(self._order_signature(tracked.intent))
+
+    def _unindex_placed(self, tracked: TrackedOrder) -> None:
+        """Remove a tracked order from secondary indexes."""
+        if tracked.order_id:
+            self._tracked_by_order_id.pop(tracked.order_id, None)
+        if tracked.intent:
+            self._placed_order_signatures.discard(self._order_signature(tracked.intent))
+
     def _find_tracked_order(
         self, order_link_id: Optional[str], order_id: Optional[str]
     ) -> Optional[TrackedOrder]:
-        """Find a tracked order by order_link_id (dict key) or order_id (value scan).
+        """Find a tracked order by order_link_id (dict key) or order_id (index lookup).
 
-        Tries direct key lookup first (O(1)), falls back to scanning by order_id.
-        Needed because new orders (without orderLinkId sent to Bybit) won't have
-        order_link_id in exchange events, and injected orders are keyed by orderId.
+        Both lookups are O(1). Tries primary dict key first, then secondary index.
         """
         if order_link_id and order_link_id in self._tracked_orders:
             return self._tracked_orders[order_link_id]
         if order_id:
-            for tracked in self._tracked_orders.values():
-                if tracked.order_id == order_id:
-                    return tracked
+            return self._tracked_by_order_id.get(order_id)
         return None
 
     def _is_good_to_place(self, intent: PlaceLimitIntent) -> bool:
@@ -611,21 +634,14 @@ class StrategyRunner:
 
         Reference: bbu_reference/bbu2-master/bybit_api_usdt.py:295-313
         """
-        # Exact-duplicate check (bbu2-style)
-        for tracked in self._tracked_orders.values():
-            if tracked.status != "placed":
-                continue
-            if tracked.intent is None:
-                continue
-            if (tracked.intent.price == intent.price
-                    and tracked.intent.qty == intent.qty
-                    and tracked.intent.side == intent.side
-                    and tracked.intent.reduce_only == intent.reduce_only):
-                logger.debug(
-                    f"{self.strat_id}: Rejecting exact duplicate order at "
-                    f"price={intent.price} qty={intent.qty} side={intent.side}"
-                )
-                return False
+        # Exact-duplicate check (bbu2-style) — O(1) via signature set
+        sig = self._order_signature(intent)
+        if sig in self._placed_order_signatures:
+            logger.debug(
+                f"{self.strat_id}: Rejecting exact duplicate order at "
+                f"price={intent.price} qty={intent.qty} side={intent.side}"
+            )
+            return False
 
         if not intent.reduce_only:
             return True
@@ -695,6 +711,7 @@ class StrategyRunner:
 
         if result.success:
             tracked.mark_placed(result.order_id)
+            self._index_as_placed(tracked)
         else:
             tracked.mark_failed()
             if self._on_intent_failed:
@@ -704,12 +721,11 @@ class StrategyRunner:
         """Execute a cancel order intent."""
         result = self._executor.execute_cancel(intent)
 
-        # Update tracked order if we have it
-        for tracked in self._tracked_orders.values():
-            if tracked.order_id == intent.order_id:
-                if result.success:
-                    tracked.mark_cancelled()
-                break
+        # Update tracked order if we have it (O(1) via secondary index)
+        tracked = self._tracked_by_order_id.get(intent.order_id)
+        if tracked and result.success:
+            self._unindex_placed(tracked)
+            tracked.mark_cancelled()
 
         if not result.success and self._on_intent_failed:
             self._on_intent_failed(intent, result.error)
@@ -765,9 +781,20 @@ class StrategyRunner:
                 status="placed",
             )
             self._tracked_orders[order_id] = tracked
+            self._index_as_placed(tracked)
             injected += 1
 
         logger.info(f"{self.strat_id}: Injected {injected} open orders")
+
+    def mark_order_cancelled_by_order_id(self, order_id: str) -> None:
+        """Mark a tracked order as cancelled by its exchange order_id.
+
+        Used by reconciler when exchange state diverges from in-memory state.
+        """
+        tracked = self._tracked_by_order_id.get(order_id)
+        if tracked:
+            self._unindex_placed(tracked)
+            tracked.mark_cancelled()
 
     def get_tracked_order_count(self) -> dict[str, int]:
         """Get count of tracked orders by status."""

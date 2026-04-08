@@ -1805,6 +1805,7 @@ class TestIsGoodToPlace:
             status="placed",
         )
         runner._tracked_orders["existing_key"] = tracked
+        runner._index_as_placed(tracked)
 
         # Same params, different client_order_id
         dup_intent = PlaceLimitIntent.create(
@@ -1828,6 +1829,7 @@ class TestIsGoodToPlace:
             status="placed",
         )
         runner._tracked_orders["existing_key"] = tracked
+        runner._index_as_placed(tracked)
 
         different_qty = PlaceLimitIntent.create(
             symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
