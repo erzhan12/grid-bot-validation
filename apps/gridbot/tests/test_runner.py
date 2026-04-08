@@ -2108,6 +2108,35 @@ class TestIsGoodToPlace:
 
         assert sig not in runner._placed_order_signatures
 
+    def test_signature_rebuild_on_mismatch(self, runner):
+        """Signature set is rebuilt when unindexing detects a missing signature."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.001"), grid_level=5, direction="long",
+            reduce_only=False,
+        )
+        tracked = TrackedOrder(
+            client_order_id=intent.client_order_id,
+            order_id="order_999",
+            intent=intent,
+            status="placed",
+        )
+        runner._tracked_orders[intent.client_order_id] = tracked
+        runner._index_as_placed(tracked)
+
+        sig = runner._order_signature(intent)
+        assert sig in runner._placed_order_signatures
+
+        # Corrupt the set by clearing it
+        runner._placed_order_signatures.clear()
+        assert sig not in runner._placed_order_signatures
+
+        # Unindex triggers rebuild because signature is missing
+        runner._unindex_placed(tracked)
+
+        # Rebuild restores the signature for the still-placed order
+        assert sig in runner._placed_order_signatures
+
     @pytest.mark.asyncio
     async def test_execute_place_skips_when_not_good(self, runner, mock_executor):
         """_execute_place_intent skips order when _is_good_to_place returns False."""

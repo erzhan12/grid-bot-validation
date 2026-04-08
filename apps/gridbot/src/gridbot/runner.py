@@ -619,6 +619,14 @@ class StrategyRunner:
         if tracked.intent:
             self._placed_order_signatures.add(self._order_signature(tracked.intent))
 
+    def _rebuild_signature_set(self) -> None:
+        """Rebuild _placed_order_signatures from _tracked_orders (defensive recovery)."""
+        self._placed_order_signatures = {
+            self._order_signature(t.intent)
+            for t in self._tracked_orders.values()
+            if t.status == "placed" and t.intent
+        }
+
     def _unindex_placed(self, tracked: TrackedOrder) -> None:
         """Remove a tracked order from secondary indexes."""
         if tracked.order_id:
@@ -626,10 +634,12 @@ class StrategyRunner:
         if tracked.intent:
             sig = self._order_signature(tracked.intent)
             if sig not in self._placed_order_signatures:
-                logger.warning(
+                logger.error(
                     f"{self.strat_id}: Signature not found when unindexing "
-                    f"order {tracked.client_order_id}"
+                    f"order {tracked.client_order_id} — rebuilding signature set"
                 )
+                self._rebuild_signature_set()
+                return
             self._placed_order_signatures.discard(sig)
 
     def _find_tracked_order(
