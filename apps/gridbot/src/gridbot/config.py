@@ -118,6 +118,17 @@ class GridbotConfig(BaseModel):
     # Notifications
     notification: Optional[NotificationConfig] = None
 
+    # Safety
+    allow_shared_symbol: bool = Field(
+        default=False,
+        description=(
+            "Allow multiple strategies on the same (account, symbol) pair. "
+            "Since orderLinkId is not sent to Bybit, reconcile_startup assumes "
+            "ALL open orders for a symbol belong to one strategy. Enable only "
+            "if you understand the risk of order cross-contamination."
+        ),
+    )
+
     @field_validator("wallet_cache_interval", "order_sync_interval")
     @classmethod
     def non_negative(cls, v: float) -> float:
@@ -134,6 +145,25 @@ class GridbotConfig(BaseModel):
                 raise ValueError(
                     f"Strategy '{strategy.strat_id}' references unknown account '{strategy.account}'"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def validate_no_shared_symbol(self):
+        """Prevent multiple strategies on the same (account, symbol) unless explicitly allowed."""
+        if self.allow_shared_symbol:
+            return self
+        seen: dict[tuple[str, str], str] = {}
+        for strategy in self.strategies:
+            key = (strategy.account, strategy.symbol)
+            if key in seen:
+                raise ValueError(
+                    f"Strategies '{seen[key]}' and '{strategy.strat_id}' share "
+                    f"account='{strategy.account}' symbol='{strategy.symbol}'. "
+                    f"Since orderLinkId is not sent to Bybit, reconcile_startup "
+                    f"assumes ALL open orders for a symbol belong to one strategy. "
+                    f"Set allow_shared_symbol=true if you understand the risk."
+                )
+            seen[key] = strategy.strat_id
         return self
 
     def get_account(self, name: str) -> Optional[AccountConfig]:

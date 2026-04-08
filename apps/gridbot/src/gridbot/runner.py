@@ -160,11 +160,14 @@ class StrategyRunner:
         )
         self._long_position, self._short_position = Position.create_linked_pair(risk_config)
 
-        # Order tracking: keyed by client_order_id (consistent for both placed and injected)
+        # Order tracking with O(1) lookups on all access patterns:
+        #   _tracked_orders: client_order_id → TrackedOrder (primary dict)
+        #   _tracked_by_order_id: exchange order_id → TrackedOrder (secondary index)
+        #   _placed_order_signatures: {(price, qty, side, reduce_only)} for O(1)
+        #       duplicate detection (replaces O(n) iteration over all tracked orders)
+        # All three are kept in sync via _index_as_placed() / _unindex_placed().
         self._tracked_orders: dict[str, TrackedOrder] = {}
-        # Secondary index: exchange order_id → TrackedOrder (O(1) lookup)
         self._tracked_by_order_id: dict[str, TrackedOrder] = {}
-        # Signature set for O(1) exact-duplicate detection: (price, qty, side, reduce_only)
         self._placed_order_signatures: set[tuple] = set()
 
         # Position state
@@ -754,31 +757,38 @@ class StrategyRunner:
             # Derive direction from side+reduceOnly (Bybit orders don't carry direction).
             # Buy+not reduce = opening long, Buy+reduce = closing short,
             # Sell+not reduce = opening short, Sell+reduce = closing long.
-            intent = None
             price = order.get("price")
             qty = order.get("qty")
             side = order.get("side")
             reduce_only = order.get("reduceOnly", False)
-            if price and qty and side:
-                if side == "Buy":
-                    direction = DirectionType.SHORT if reduce_only else DirectionType.LONG
-                elif side == "Sell":
-                    direction = DirectionType.LONG if reduce_only else DirectionType.SHORT
-                else:
-                    logger.warning(
-                        f"{self.strat_id}: Skipping injected order {order_id} "
-                        f"with unrecognized side={side!r}"
-                    )
-                    continue
-                intent = PlaceLimitIntent.create(
-                    symbol=order.get("symbol", self._config.symbol),
-                    side=side,
-                    price=Decimal(str(price)),
-                    qty=Decimal(str(qty)),
-                    grid_level=0,
-                    direction=direction,
-                    reduce_only=reduce_only,
+
+            if not (price and qty and side):
+                logger.warning(
+                    f"{self.strat_id}: Skipping injected order {order_id} "
+                    f"with missing price/qty/side"
                 )
+                continue
+
+            if side == "Buy":
+                direction = DirectionType.SHORT if reduce_only else DirectionType.LONG
+            elif side == "Sell":
+                direction = DirectionType.LONG if reduce_only else DirectionType.SHORT
+            else:
+                logger.warning(
+                    f"{self.strat_id}: Skipping injected order {order_id} "
+                    f"with unrecognized side={side!r}"
+                )
+                continue
+
+            intent = PlaceLimitIntent.create(
+                symbol=order.get("symbol", self._config.symbol),
+                side=side,
+                price=Decimal(str(price)),
+                qty=Decimal(str(qty)),
+                grid_level=0,
+                direction=direction,
+                reduce_only=reduce_only,
+            )
 
             # Key by client_order_id (consistent with _execute_place_intent)
             client_id = order_link_id or order_id
