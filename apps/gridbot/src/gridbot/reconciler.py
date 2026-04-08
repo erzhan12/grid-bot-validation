@@ -20,11 +20,19 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ReconciliationResult:
-    """Result of a reconciliation operation."""
+    """Result of a reconciliation operation.
+
+    Attributes:
+        orders_fetched: Number of open orders fetched from exchange.
+        orders_injected: Number of orders injected into the runner.
+        untracked_orders_on_exchange: Orders on exchange with no matching
+            in-memory tracked order (only set during reconnect reconciliation).
+        errors: List of error messages encountered.
+    """
 
     orders_fetched: int = 0
     orders_injected: int = 0
-    orphan_orders: int = 0
+    untracked_orders_on_exchange: int = 0
     errors: list[str] = None
 
     def __post_init__(self):
@@ -43,8 +51,8 @@ class Reconciler:
 
         # On startup
         result = await reconciler.reconcile_startup(runner)
-        if result.orphan_orders > 0:
-            logger.warning(f"Found {result.orphan_orders} orphan orders")
+        if result.untracked_orders_on_exchange > 0:
+            logger.warning(f"Found {result.untracked_orders_on_exchange} orphan orders")
 
         # On WebSocket reconnect
         result = await reconciler.reconcile_reconnect(runner)
@@ -161,7 +169,7 @@ class Reconciler:
                     f"{runner.strat_id}: {len(missing_in_memory)} orders on exchange "
                     f"but not in memory (orphans or missed updates)"
                 )
-                result.orphan_orders = len(missing_in_memory)
+                result.untracked_orders_on_exchange = len(missing_in_memory)
 
                 # Inject missing orders
                 orders_to_inject = [

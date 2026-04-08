@@ -69,7 +69,7 @@ class TestReconciliationResult:
         result = ReconciliationResult()
         assert result.orders_fetched == 0
         assert result.orders_injected == 0
-        assert result.orphan_orders == 0
+        assert result.untracked_orders_on_exchange == 0
         assert result.errors == []
 
     def test_custom_values(self):
@@ -77,11 +77,11 @@ class TestReconciliationResult:
         result = ReconciliationResult(
             orders_fetched=10,
             orders_injected=8,
-            orphan_orders=2,
+            untracked_orders_on_exchange=2,
         )
         assert result.orders_fetched == 10
         assert result.orders_injected == 8
-        assert result.orphan_orders == 2
+        assert result.untracked_orders_on_exchange == 2
 
 
 class TestReconcilerStartup:
@@ -96,7 +96,7 @@ class TestReconcilerStartup:
 
         assert result.orders_fetched == 0
         assert result.orders_injected == 0
-        assert result.orphan_orders == 0
+        assert result.untracked_orders_on_exchange == 0
         assert len(result.errors) == 0
 
     @pytest.mark.asyncio
@@ -165,7 +165,7 @@ class TestReconcilerReconnect:
         result = await reconciler.reconcile_reconnect(runner)
 
         assert result.orders_fetched == 1
-        assert result.orphan_orders == 0
+        assert result.untracked_orders_on_exchange == 0
 
     @pytest.mark.asyncio
     async def test_reconcile_reconnect_missing_on_exchange(self, reconciler, runner, mock_rest_client):
@@ -192,7 +192,7 @@ class TestReconcilerReconnect:
         result = await reconciler.reconcile_reconnect(runner)
 
         assert result.orders_fetched == 1
-        assert result.orphan_orders == 1
+        assert result.untracked_orders_on_exchange == 1
         assert result.orders_injected == 1
 
 

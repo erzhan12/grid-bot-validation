@@ -762,7 +762,11 @@ class StrategyRunner:
                 elif side == "Sell":
                     direction = "long" if reduce_only else "short"
                 else:
-                    direction = "long"
+                    logger.warning(
+                        f"{self.strat_id}: Skipping injected order {order_id} "
+                        f"with unrecognized side={side!r}"
+                    )
+                    continue
                 intent = PlaceLimitIntent.create(
                     symbol=order.get("symbol", self._config.symbol),
                     side=side,

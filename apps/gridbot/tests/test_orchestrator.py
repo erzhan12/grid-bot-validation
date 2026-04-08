@@ -1255,7 +1255,7 @@ class TestOrchestratorOrderSyncLoop:
         reconciler.reconcile_reconnect.return_value = ReconciliationResult(
             orders_fetched=5,
             orders_injected=0,
-            orphan_orders=0,
+            untracked_orders_on_exchange=0,
         )
 
         # Run one iteration then stop
@@ -1349,7 +1349,7 @@ class TestOrchestratorOrderSyncLoop:
         reconciler.reconcile_reconnect.return_value = ReconciliationResult(
             orders_fetched=10,
             orders_injected=2,
-            orphan_orders=1,
+            untracked_orders_on_exchange=1,
         )
 
         async def stop_after_first(seconds):
