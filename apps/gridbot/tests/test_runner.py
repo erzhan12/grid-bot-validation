@@ -2147,11 +2147,12 @@ class TestIsGoodToPlace:
         # Corrupt the set by clearing it
         runner._placed_order_signatures.clear()
 
-        # Unindex A triggers rebuild (sig_a missing), then discards sig_a
-        runner._unindex_placed(tracked_a)
+        # Unindex A triggers rebuild + raises RuntimeError on corruption
+        with pytest.raises(RuntimeError, match="Index corruption detected"):
+            runner._unindex_placed(tracked_a)
 
-        # A's signature removed, B's signature restored by rebuild
-        assert sig_a not in runner._placed_order_signatures
+        # B's signature restored by rebuild; A's included too (still "placed" at
+        # time of rebuild — the raise prevents the subsequent discard)
         assert sig_b in runner._placed_order_signatures
 
     @pytest.mark.asyncio

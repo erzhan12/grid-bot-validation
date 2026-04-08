@@ -647,11 +647,15 @@ class StrategyRunner:
         if tracked.intent:
             sig = self._order_signature(tracked.intent)
             if sig not in self._placed_order_signatures:
-                logger.error(
+                logger.critical(
                     f"{self.strat_id}: Signature not found when unindexing "
                     f"order {tracked.client_order_id} — rebuilding indexes"
                 )
                 self._rebuild_indexes()
+                raise RuntimeError(
+                    f"Index corruption detected for order {tracked.client_order_id} "
+                    f"- indexes rebuilt but investigate root cause"
+                )
             self._placed_order_signatures.discard(sig)
             if tracked.intent.reduce_only:
                 key = (tracked.intent.direction, tracked.intent.side)
