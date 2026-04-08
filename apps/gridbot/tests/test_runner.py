@@ -197,6 +197,28 @@ class TestStrategyRunnerOrderTracking:
         # Findable by order_id via secondary index
         assert runner._tracked_by_order_id["exchange_1"].client_order_id == "link_1"
 
+    def test_inject_open_orders_with_and_without_order_link_id(self, runner):
+        """Orders from old sessions (with orderLinkId) and new sessions (without) coexist."""
+        orders = [
+            {"orderId": "ex_old", "orderLinkId": "old_link_abc",
+             "price": "49000", "qty": "0.001", "side": "Buy"},
+            {"orderId": "ex_new",
+             "price": "51000", "qty": "0.001", "side": "Sell"},
+        ]
+        runner.inject_open_orders(orders)
+
+        counts = runner.get_tracked_order_count()
+        assert counts["placed"] == 2
+
+        # Old order keyed by orderLinkId, findable by both paths
+        assert runner._find_tracked_order("old_link_abc", None) is not None
+        assert runner._find_tracked_order(None, "ex_old") is not None
+        assert runner._find_tracked_order("old_link_abc", None).order_id == "ex_old"
+
+        # New order keyed by orderId, findable by order_id index
+        assert runner._find_tracked_order(None, "ex_new") is not None
+        assert runner._find_tracked_order("ex_new", None) is not None  # client_id == order_id
+
     def test_inject_open_orders_skips_without_order_id(self, runner):
         """Orders without orderId are skipped."""
         orders = [

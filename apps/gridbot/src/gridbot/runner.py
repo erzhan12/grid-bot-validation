@@ -780,17 +780,30 @@ class StrategyRunner:
                 )
                 continue
 
+            try:
+                dec_price = Decimal(str(price))
+                dec_qty = Decimal(str(qty))
+            except Exception:
+                logger.warning(
+                    f"{self.strat_id}: Skipping injected order {order_id} "
+                    f"with invalid price={price!r} or qty={qty!r}"
+                )
+                continue
+
             intent = PlaceLimitIntent.create(
                 symbol=order.get("symbol", self._config.symbol),
                 side=side,
-                price=Decimal(str(price)),
-                qty=Decimal(str(qty)),
+                price=dec_price,
+                qty=dec_qty,
                 grid_level=0,
                 direction=direction,
                 reduce_only=reduce_only,
             )
 
-            # Key by client_order_id (consistent with _execute_place_intent)
+            # Prefer orderLinkId as key for backward compatibility: old orders
+            # (placed before this change) still have orderLinkId on the exchange,
+            # so events for those orders arrive with order_link_id set. New orders
+            # won't have one, so we fall back to orderId.
             client_id = order_link_id or order_id
             tracked = TrackedOrder(
                 client_order_id=client_id,
