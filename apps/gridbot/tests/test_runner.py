@@ -2042,6 +2042,73 @@ class TestIsGoodToPlace:
         assert runner._is_good_to_place(short_intent) is True
 
     @pytest.mark.asyncio
+    async def test_signature_set_lifecycle_fill(self, runner, mock_executor):
+        """Signature is added on place and removed on fill."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.001"), grid_level=5, direction="long",
+            reduce_only=False,
+        )
+        sig = runner._order_signature(intent)
+
+        # Before placing — signature absent
+        assert sig not in runner._placed_order_signatures
+
+        # Place the order
+        await runner._execute_place_intent(intent)
+        assert sig in runner._placed_order_signatures
+
+        # Fill the order via on_order_update
+        fill_event = OrderUpdateEvent(
+            event_type=EventType.ORDER_UPDATE,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            order_id="order_123",
+            order_link_id=intent.client_order_id,
+            status="Filled",
+            side="Buy",
+            price=Decimal("49000"),
+            qty=Decimal("0.001"),
+            leaves_qty=Decimal("0"),
+        )
+        await runner.on_order_update(fill_event)
+
+        # After fill — signature removed
+        assert sig not in runner._placed_order_signatures
+
+    @pytest.mark.asyncio
+    async def test_signature_set_lifecycle_cancel(self, runner, mock_executor):
+        """Signature is added on place and removed on cancel."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Sell", price=Decimal("51000"),
+            qty=Decimal("0.002"), grid_level=6, direction="short",
+            reduce_only=False,
+        )
+        sig = runner._order_signature(intent)
+
+        await runner._execute_place_intent(intent)
+        assert sig in runner._placed_order_signatures
+
+        # Cancel the order
+        cancel_event = OrderUpdateEvent(
+            event_type=EventType.ORDER_UPDATE,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            order_id="order_456",
+            order_link_id=intent.client_order_id,
+            status="Cancelled",
+            side="Sell",
+            price=Decimal("51000"),
+            qty=Decimal("0.002"),
+            leaves_qty=Decimal("0"),
+        )
+        await runner.on_order_update(cancel_event)
+
+        assert sig not in runner._placed_order_signatures
+
+    @pytest.mark.asyncio
     async def test_execute_place_skips_when_not_good(self, runner, mock_executor):
         """_execute_place_intent skips order when _is_good_to_place returns False."""
         runner._wallet_balance = Decimal("10000")

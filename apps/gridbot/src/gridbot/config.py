@@ -122,10 +122,12 @@ class GridbotConfig(BaseModel):
     allow_shared_symbol: bool = Field(
         default=False,
         description=(
-            "Allow multiple strategies on the same (account, symbol) pair. "
+            "IMPORTANT: Allow multiple strategies on the same (account, symbol) pair. "
             "Since orderLinkId is not sent to Bybit, reconcile_startup assumes "
-            "ALL open orders for a symbol belong to one strategy. Enable only "
-            "if you understand the risk of order cross-contamination."
+            "ALL open orders for a symbol belong to one strategy. Risk: strategies "
+            "sharing a symbol will interfere with each other's orders. Do not enable "
+            "unless you have a specific need and understand the order cross-contamination "
+            "risk. Also ensure no manual orders are placed for symbols used by the bot."
         ),
     )
 

@@ -624,7 +624,13 @@ class StrategyRunner:
         if tracked.order_id:
             self._tracked_by_order_id.pop(tracked.order_id, None)
         if tracked.intent:
-            self._placed_order_signatures.discard(self._order_signature(tracked.intent))
+            sig = self._order_signature(tracked.intent)
+            if sig not in self._placed_order_signatures:
+                logger.warning(
+                    f"{self.strat_id}: Signature not found when unindexing "
+                    f"order {tracked.client_order_id}"
+                )
+            self._placed_order_signatures.discard(sig)
 
     def _find_tracked_order(
         self, order_link_id: Optional[str], order_id: Optional[str]
