@@ -596,6 +596,18 @@ class StrategyRunner:
                 await self._execute_cancel_intent(intent)
 
     @staticmethod
+    def _derive_direction_from_order(side: str, reduce_only: bool) -> Optional[DirectionType]:
+        """Derive grid direction from Bybit order side and reduceOnly flag.
+
+        Returns None for unrecognized side values.
+        """
+        if side == "Buy":
+            return DirectionType.SHORT if reduce_only else DirectionType.LONG
+        elif side == "Sell":
+            return DirectionType.LONG if reduce_only else DirectionType.SHORT
+        return None
+
+    @staticmethod
     def _order_signature(intent: PlaceLimitIntent) -> tuple:
         """Build signature tuple for duplicate detection."""
         return (intent.price, intent.qty, intent.side, intent.reduce_only)
@@ -769,11 +781,8 @@ class StrategyRunner:
                 )
                 continue
 
-            if side == "Buy":
-                direction = DirectionType.SHORT if reduce_only else DirectionType.LONG
-            elif side == "Sell":
-                direction = DirectionType.LONG if reduce_only else DirectionType.SHORT
-            else:
+            direction = self._derive_direction_from_order(side, reduce_only)
+            if direction is None:
                 logger.warning(
                     f"{self.strat_id}: Skipping injected order {order_id} "
                     f"with unrecognized side={side!r}"
