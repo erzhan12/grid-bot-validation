@@ -125,10 +125,11 @@ class Reconciler:
 
         if open_orders:
             runner.inject_open_orders(open_orders)
-            logger.error(
-                f"{runner.strat_id}: Injecting {len(open_orders)} open orders. "
-                f"If any manual orders exist for {runner.symbol}, they will be "
-                f"managed by the bot. Stop the bot before placing manual orders."
+            logger.warning(
+                f"{runner.strat_id}: WARNING — injecting {len(open_orders)} open "
+                f"orders for {runner.symbol}. If any manual orders exist, they "
+                f"will be adopted by the bot. Stop the bot before placing manual "
+                f"orders on this symbol."
             )
 
         return result

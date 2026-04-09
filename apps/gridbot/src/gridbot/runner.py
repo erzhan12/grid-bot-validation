@@ -666,8 +666,20 @@ class StrategyRunner:
                         f"Index corruption detected {self._index_corruption_count} times "
                         f"for strategy {self.strat_id} — investigate root cause"
                     )
-                # Fall through: after rebuild, the sig is back in the set
-                # (order still "placed"), so discard + reduce_qty cleanup must run.
+                # After rebuild, sig should be present because the tracked order
+                # is still "placed" at this point (status transitions happen
+                # after _unindex_placed). If it's still missing, the tracked
+                # order's intent diverged from _order_signature semantics —
+                # deeper bug that warrants another corruption count.
+                if sig not in self._placed_order_signatures:
+                    self._index_corruption_count += 1
+                    logger.critical(
+                        f"{self.strat_id}: Signature still missing after rebuild "
+                        f"for order {tracked.client_order_id} — tracked intent "
+                        f"may not match _order_signature semantics "
+                        f"(corruption #{self._index_corruption_count})"
+                    )
+                    return
             self._placed_order_signatures.discard(sig)
             if tracked.intent.reduce_only:
                 key = (tracked.intent.direction, tracked.intent.side)
@@ -860,6 +872,16 @@ class StrategyRunner:
             # so events for those orders arrive with order_link_id set. New orders
             # won't have one, so we fall back to orderId.
             client_id = order_link_id or order_id
+
+            # Guard against key collisions (e.g., orderLinkId equal to some
+            # existing orderId, or duplicate injection of the same order).
+            if client_id in self._tracked_orders:
+                logger.warning(
+                    f"{self.strat_id}: Skipping injected order {order_id} — "
+                    f"key collision on client_id={client_id}"
+                )
+                continue
+
             tracked = TrackedOrder(
                 client_order_id=client_id,
                 order_id=order_id,

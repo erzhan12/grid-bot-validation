@@ -250,6 +250,19 @@ class TestStrategyRunnerOrderTracking:
         counts = runner.get_tracked_order_count()
         assert counts["placed"] == 1
 
+    def test_inject_open_orders_skips_key_collision(self, runner):
+        """Duplicate client_id (e.g. re-injected order) is skipped."""
+        orders = [
+            {"orderId": "ex_1", "orderLinkId": "link_a",
+             "price": "49000", "qty": "0.001", "side": "Buy"},
+            {"orderId": "ex_2", "orderLinkId": "link_a",  # same orderLinkId
+             "price": "50000", "qty": "0.002", "side": "Sell"},
+        ]
+        runner.inject_open_orders(orders)
+
+        counts = runner.get_tracked_order_count()
+        assert counts["placed"] == 1  # second skipped
+
     def test_get_tracked_order_count(self, runner):
         """Test getting tracked order counts."""
         counts = runner.get_tracked_order_count()
@@ -1925,7 +1938,7 @@ class TestIsGoodToPlace:
         assert runner._is_good_to_place(intent) is True
 
     def test_reduce_only_equals_position_size(self, runner):
-        """Reduce-only order is rejected when qty equals position size (strict >)."""
+        """Reduce-only order is rejected when total qty equals position size (position_size > total is False when equal)."""
         runner._short_position.size = Decimal("0.1")
 
         intent = PlaceLimitIntent.create(
