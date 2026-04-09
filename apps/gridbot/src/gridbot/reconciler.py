@@ -69,7 +69,6 @@ class Reconciler:
     async def reconcile_startup(
         self,
         runner: StrategyRunner,
-        allow_shared_symbol: bool = False,
     ) -> ReconciliationResult:
         """Reconcile state on startup.
 
@@ -101,26 +100,13 @@ class Reconciler:
             f"{runner.strat_id}: Fetched {len(open_orders)} open orders from exchange"
         )
 
-        # Refuse to start if open orders exist without orderLinkId and
-        # allow_shared_symbol is not set — prevents silent adoption of
-        # manual orders. Raises outside the API error handler so this
-        # error propagates up and halts startup.
-        if open_orders and not allow_shared_symbol:
-            no_link_id = [o for o in open_orders if not o.get("orderLinkId")]
-            if no_link_id:
-                raise RuntimeError(
-                    f"{runner.strat_id}: Refusing to start — found "
-                    f"{len(no_link_id)} open order(s) without orderLinkId for "
-                    f"{runner.symbol}. These may be manual orders that would be "
-                    f"silently adopted by the bot. Either close all manual orders "
-                    f"for this symbol, or set allow_shared_symbol: true in config "
-                    f"if you understand the order cross-contamination risk."
-                )
-
         # Inject all open orders into runner.
         # We no longer send orderLinkId to Bybit, so we can't distinguish
-        # "our" orders from others by orderLinkId pattern. All limit orders
-        # for this symbol are assumed to belong to this strategy.
+        # "our" orders from others by orderLinkId presence. All limit orders
+        # for this symbol are assumed to belong to this strategy. Manual order
+        # protection is enforced at config level via allow_shared_symbol (which
+        # rejects duplicate (account, symbol) pairs across strategies) and via
+        # operator discipline (close manual orders before starting the bot).
         result.orders_injected = len(open_orders)
 
         if open_orders:

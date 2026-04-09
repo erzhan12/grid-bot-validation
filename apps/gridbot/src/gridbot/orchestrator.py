@@ -165,15 +165,17 @@ class Orchestrator:
             account_name = self._get_account_for_strategy(runner.strat_id)
             reconciler = self._reconcilers.get(account_name)
             if reconciler:
-                result = await reconciler.reconcile_startup(
-                    runner,
-                    allow_shared_symbol=self._config.allow_shared_symbol,
-                )
+                result = await reconciler.reconcile_startup(runner)
                 logger.info(
                     f"{runner.strat_id}: Reconciliation complete - "
                     f"fetched={result.orders_fetched}, injected={result.orders_injected}, "
                     f"untracked={result.untracked_orders_on_exchange}"
                 )
+                if self._config.allow_shared_symbol:
+                    logger.warning(
+                        f"{runner.strat_id}: Running with allow_shared_symbol=true "
+                        f"- order cross-contamination risk active"
+                    )
 
         # Create database Run records (populates _run_ids)
         await self._create_run_records()

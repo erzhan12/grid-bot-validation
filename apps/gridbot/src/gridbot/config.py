@@ -127,7 +127,10 @@ class GridbotConfig(BaseModel):
             "ALL open orders for a symbol belong to one strategy. Risk: strategies "
             "sharing a symbol will interfere with each other's orders. Do not enable "
             "unless you have a specific need and understand the order cross-contamination "
-            "risk. Also ensure no manual orders are placed for symbols used by the bot."
+            "risk. Also ensure no manual orders are placed for symbols used by the bot. "
+            "Note: During migration from orderLinkId-based tracking to orderId-based "
+            "tracking, you may need to temporarily enable this flag for one restart "
+            "cycle, or close all existing orders before deploying this change."
         ),
     )
 
