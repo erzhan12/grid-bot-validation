@@ -636,16 +636,31 @@ class StrategyRunner:
 
     def _rebuild_indexes(self) -> None:
         """Rebuild secondary indexes from _tracked_orders (defensive recovery)."""
+        logger.warning(
+            f"{self.strat_id}: Rebuilding indexes from "
+            f"{len(self._tracked_orders)} tracked orders"
+        )
         self._placed_order_signatures = set()
         self._reduce_only_qty = {}
+        self._tracked_by_order_id = {}
         for t in self._tracked_orders.values():
-            if t.status == "placed" and t.intent:
-                self._placed_order_signatures.add(self._order_signature(t.intent))
-                if t.intent.reduce_only:
-                    key = (t.intent.direction, t.intent.side)
-                    self._reduce_only_qty[key] = (
-                        self._reduce_only_qty.get(key, Decimal("0")) + t.intent.qty
+            if t.order_id:
+                self._tracked_by_order_id[t.order_id] = t
+            if t.intent is None:
+                continue
+            if t.status != "placed":
+                if t.status not in ("filled", "cancelled", "failed", "pending"):
+                    logger.warning(
+                        f"{self.strat_id}: Skipping order {t.client_order_id} "
+                        f"with unexpected status={t.status!r} during rebuild"
                     )
+                continue
+            self._placed_order_signatures.add(self._order_signature(t.intent))
+            if t.intent.reduce_only:
+                key = (t.intent.direction, t.intent.side)
+                self._reduce_only_qty[key] = (
+                    self._reduce_only_qty.get(key, Decimal("0")) + t.intent.qty
+                )
 
     def _unindex_placed(self, tracked: TrackedOrder) -> None:
         """Remove a tracked order from secondary indexes."""
@@ -670,7 +685,9 @@ class StrategyRunner:
                 # is still "placed" at this point (status transitions happen
                 # after _unindex_placed). If it's still missing, the tracked
                 # order's intent diverged from _order_signature semantics —
-                # deeper bug that warrants another corruption count.
+                # deeper bug that warrants another corruption count. Continue
+                # to the cleanup below regardless, so reduce_only_qty state
+                # stays consistent with the signature set.
                 if sig not in self._placed_order_signatures:
                     self._index_corruption_count += 1
                     logger.critical(
@@ -679,7 +696,6 @@ class StrategyRunner:
                         f"may not match _order_signature semantics "
                         f"(corruption #{self._index_corruption_count})"
                     )
-                    return
             self._placed_order_signatures.discard(sig)
             if tracked.intent.reduce_only:
                 key = (tracked.intent.direction, tracked.intent.side)
@@ -850,10 +866,10 @@ class StrategyRunner:
             try:
                 dec_price = Decimal(str(price))
                 dec_qty = Decimal(str(qty))
-            except Exception:
+            except Exception as e:
                 logger.warning(
                     f"{self.strat_id}: Skipping injected order {order_id} "
-                    f"with invalid price={price!r} or qty={qty!r}"
+                    f"with invalid price={price!r} or qty={qty!r}: {e}"
                 )
                 continue
 

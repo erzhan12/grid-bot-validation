@@ -2197,6 +2197,32 @@ class TestIsGoodToPlace:
         # Reduce-only qty should be cleaned up (not left stale)
         assert key not in runner._reduce_only_qty
 
+    def test_rebuild_indexes_rebuilds_tracked_by_order_id(self, runner):
+        """_rebuild_indexes also rebuilds the _tracked_by_order_id secondary index."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.001"), grid_level=5, direction="long",
+            reduce_only=False,
+        )
+        tracked = TrackedOrder(
+            client_order_id=intent.client_order_id,
+            order_id="order_id_xyz",
+            intent=intent,
+            status="placed",
+        )
+        runner._tracked_orders[intent.client_order_id] = tracked
+        runner._index_as_placed(tracked)
+
+        # Corrupt _tracked_by_order_id
+        runner._tracked_by_order_id.clear()
+        assert "order_id_xyz" not in runner._tracked_by_order_id
+
+        runner._rebuild_indexes()
+
+        # All three secondary indexes restored
+        assert runner._tracked_by_order_id["order_id_xyz"] is tracked
+        assert runner._order_signature(intent) in runner._placed_order_signatures
+
     def test_signature_corruption_raises_after_threshold(self, runner):
         """RuntimeError raised after INDEX_CORRUPTION_THRESHOLD consecutive corruptions."""
         intent = PlaceLimitIntent.create(
