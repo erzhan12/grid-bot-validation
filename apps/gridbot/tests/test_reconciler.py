@@ -101,11 +101,11 @@ class TestReconcilerStartup:
 
     @pytest.mark.asyncio
     async def test_reconcile_startup_with_orders(self, reconciler, runner, mock_rest_client):
-        """Test startup reconciliation injects all open orders."""
+        """Test startup reconciliation injects all open orders (with orderLinkId)."""
         mock_rest_client.get_open_orders.return_value = [
             {"orderId": "ex_1", "orderLinkId": "abc123def456789a",
              "price": "49000", "qty": "0.001", "side": "Buy"},
-            {"orderId": "ex_2",
+            {"orderId": "ex_2", "orderLinkId": "def456abc789012b",
              "price": "51000", "qty": "0.001", "side": "Sell"},
         ]
 
@@ -121,7 +121,7 @@ class TestReconcilerStartup:
     async def test_reconcile_startup_no_longer_filters_by_order_link_id(
         self, reconciler, runner, mock_rest_client
     ):
-        """All open orders are injected regardless of orderLinkId pattern."""
+        """All open orders are injected regardless of orderLinkId pattern when allow_shared_symbol=True."""
         mock_rest_client.get_open_orders.return_value = [
             {"orderId": "ex_1", "orderLinkId": "abc123def456789a",
              "price": "49000", "qty": "0.001", "side": "Buy"},
@@ -131,10 +131,40 @@ class TestReconcilerStartup:
              "price": "51000", "qty": "0.001", "side": "Buy", "reduceOnly": True},
         ]
 
-        result = await reconciler.reconcile_startup(runner)
+        # allow_shared_symbol=True bypasses the manual-order refuse-to-start check
+        result = await reconciler.reconcile_startup(runner, allow_shared_symbol=True)
 
         assert result.orders_fetched == 3
         assert result.orders_injected == 3
+
+    @pytest.mark.asyncio
+    async def test_reconcile_startup_refuses_manual_orders(
+        self, reconciler, runner, mock_rest_client
+    ):
+        """Refuse to start when orders without orderLinkId exist and allow_shared_symbol=False."""
+        mock_rest_client.get_open_orders.return_value = [
+            {"orderId": "ex_1", "orderLinkId": "abc123def456789a",
+             "price": "49000", "qty": "0.001", "side": "Buy"},
+            {"orderId": "ex_manual",
+             "price": "50000", "qty": "0.001", "side": "Sell"},
+        ]
+
+        with pytest.raises(RuntimeError, match="Refusing to start"):
+            await reconciler.reconcile_startup(runner, allow_shared_symbol=False)
+
+    @pytest.mark.asyncio
+    async def test_reconcile_startup_allows_manual_orders_with_flag(
+        self, reconciler, runner, mock_rest_client
+    ):
+        """Adopt manual orders without raising when allow_shared_symbol=True."""
+        mock_rest_client.get_open_orders.return_value = [
+            {"orderId": "ex_manual",
+             "price": "50000", "qty": "0.001", "side": "Sell"},
+        ]
+
+        result = await reconciler.reconcile_startup(runner, allow_shared_symbol=True)
+        assert result.orders_fetched == 1
+        assert result.orders_injected == 1
 
     @pytest.mark.asyncio
     async def test_reconcile_startup_api_error(self, reconciler, runner, mock_rest_client):

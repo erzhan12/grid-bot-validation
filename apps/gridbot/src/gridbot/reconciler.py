@@ -85,50 +85,51 @@ class Reconciler:
         """
         result = ReconciliationResult()
 
+        # Fetch open orders from exchange (API errors caught here)
         try:
-            # Fetch open orders from exchange
             open_orders = self._client.get_open_orders(
                 symbol=runner.symbol,
                 order_type="Limit",
             )
-            result.orders_fetched = len(open_orders)
-
-            logger.info(
-                f"{runner.strat_id}: Fetched {len(open_orders)} open orders from exchange"
-            )
-
-            # Inject all open orders into runner.
-            # We no longer send orderLinkId to Bybit, so we can't distinguish
-            # "our" orders from others by orderLinkId pattern. All limit orders
-            # for this symbol are assumed to belong to this strategy.
-            result.orders_injected = len(open_orders)
-
-            if open_orders:
-                if not allow_shared_symbol:
-                    # Check for orders without orderLinkId — likely manual orders
-                    # that predate the bot. Warn loudly since we'll adopt them all.
-                    no_link_id = [
-                        o for o in open_orders
-                        if not o.get("orderLinkId")
-                    ]
-                    if no_link_id:
-                        logger.error(
-                            f"{runner.strat_id}: Found {len(no_link_id)} orders "
-                            f"without orderLinkId for {runner.symbol} — these may "
-                            f"be manual orders. All will be adopted by the bot. "
-                            f"Close manual orders or set allow_shared_symbol: true."
-                        )
-
-                runner.inject_open_orders(open_orders)
-                logger.error(
-                    f"{runner.strat_id}: Injecting {len(open_orders)} open orders. "
-                    f"If any manual orders exist for {runner.symbol}, they will be "
-                    f"managed by the bot. Stop the bot before placing manual orders."
-                )
-
         except Exception as e:
             logger.error(f"{runner.strat_id}: Reconciliation error: {e}")
             result.errors.append(str(e))
+            return result
+
+        result.orders_fetched = len(open_orders)
+        logger.info(
+            f"{runner.strat_id}: Fetched {len(open_orders)} open orders from exchange"
+        )
+
+        # Refuse to start if open orders exist without orderLinkId and
+        # allow_shared_symbol is not set — prevents silent adoption of
+        # manual orders. Raises outside the API error handler so this
+        # error propagates up and halts startup.
+        if open_orders and not allow_shared_symbol:
+            no_link_id = [o for o in open_orders if not o.get("orderLinkId")]
+            if no_link_id:
+                raise RuntimeError(
+                    f"{runner.strat_id}: Refusing to start — found "
+                    f"{len(no_link_id)} open order(s) without orderLinkId for "
+                    f"{runner.symbol}. These may be manual orders that would be "
+                    f"silently adopted by the bot. Either close all manual orders "
+                    f"for this symbol, or set allow_shared_symbol: true in config "
+                    f"if you understand the order cross-contamination risk."
+                )
+
+        # Inject all open orders into runner.
+        # We no longer send orderLinkId to Bybit, so we can't distinguish
+        # "our" orders from others by orderLinkId pattern. All limit orders
+        # for this symbol are assumed to belong to this strategy.
+        result.orders_injected = len(open_orders)
+
+        if open_orders:
+            runner.inject_open_orders(open_orders)
+            logger.error(
+                f"{runner.strat_id}: Injecting {len(open_orders)} open orders. "
+                f"If any manual orders exist for {runner.symbol}, they will be "
+                f"managed by the bot. Stop the bot before placing manual orders."
+            )
 
         return result
 

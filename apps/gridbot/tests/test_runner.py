@@ -2151,8 +2151,38 @@ class TestIsGoodToPlace:
         runner._unindex_placed(tracked_a)
         assert runner._index_corruption_count == 1
 
-        # B's signature restored by rebuild
+        # B's signature restored by rebuild and still present
         assert sig_b in runner._placed_order_signatures
+        # A's signature discarded after rebuild (the order being unindexed)
+        assert sig_a not in runner._placed_order_signatures
+
+    def test_reduce_only_qty_cleaned_up_after_corruption(self, runner):
+        """After rebuild recovery, reduce-only qty index is properly updated."""
+        runner._short_position.size = Decimal("0.1")
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
+            qty=Decimal("0.05"), grid_level=1, direction="short",
+            reduce_only=True,
+        )
+        tracked = TrackedOrder(
+            client_order_id=intent.client_order_id,
+            order_id="order_r",
+            intent=intent,
+            status="placed",
+        )
+        runner._tracked_orders[intent.client_order_id] = tracked
+        runner._index_as_placed(tracked)
+
+        key = (intent.direction, intent.side)
+        assert runner._reduce_only_qty[key] == Decimal("0.05")
+
+        # Corrupt and unindex
+        runner._placed_order_signatures.clear()
+        runner._unindex_placed(tracked)
+
+        # Reduce-only qty should be cleaned up (not left stale)
+        assert key not in runner._reduce_only_qty
 
     def test_signature_corruption_raises_after_threshold(self, runner):
         """RuntimeError raised after INDEX_CORRUPTION_THRESHOLD consecutive corruptions."""

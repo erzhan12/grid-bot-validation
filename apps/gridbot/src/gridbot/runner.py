@@ -666,7 +666,8 @@ class StrategyRunner:
                         f"Index corruption detected {self._index_corruption_count} times "
                         f"for strategy {self.strat_id} — investigate root cause"
                     )
-                return
+                # Fall through: after rebuild, the sig is back in the set
+                # (order still "placed"), so discard + reduce_qty cleanup must run.
             self._placed_order_signatures.discard(sig)
             if tracked.intent.reduce_only:
                 key = (tracked.intent.direction, tracked.intent.side)
