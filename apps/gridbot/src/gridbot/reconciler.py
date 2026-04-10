@@ -103,10 +103,28 @@ class Reconciler:
         # Inject all open orders into runner.
         # We no longer send orderLinkId to Bybit, so we can't distinguish
         # "our" orders from others by orderLinkId presence. All limit orders
-        # for this symbol are assumed to belong to this strategy. Manual order
-        # protection is enforced at config level via allow_shared_symbol (which
-        # rejects duplicate (account, symbol) pairs across strategies) and via
-        # operator discipline (close manual orders before starting the bot).
+        # for this symbol are assumed to belong to this strategy. Two things
+        # make that assumption safe:
+        #   (1) Multi-strategy collisions are impossible: GridbotConfig
+        #       rejects any configuration with two strategies on the same
+        #       (account, symbol) pair at load time (see
+        #       config.py:validate_no_shared_symbol). bbu2 enforces the same
+        #       invariant structurally via its one-scalar-strat-per-account
+        #       schema.
+        #   (2) Manual orders are handled by the engine, not by reconciler.
+        #       See the IMPORTANT block below for the mechanism.
+        #
+        # IMPORTANT: "adoption" here lasts exactly one ticker event. On the
+        # first on_ticker after startup, GridEngine._place_grid_orders
+        # (packages/gridcore/src/gridcore/engine.py:319-325) cancels any
+        # injected order whose price is not in the current grid_price_set
+        # ('outside_grid' reason), and engine.py:305-312 cancels any at a
+        # grid price with the wrong side ('side_mismatch' reason). Over-limit
+        # cases (engine.py:237-243) trigger a full rebuild that cancels
+        # everything. bbu2 reference: strat.py:154-160, :145-149, :103-104.
+        # Do NOT add a refuse-to-start check here — it would re-break normal
+        # crash-restart (bot's own prior orders look identical to manual ones)
+        # and was already removed in commit 138737a for that reason.
         result.orders_injected = len(open_orders)
 
         if open_orders:

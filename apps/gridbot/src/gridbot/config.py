@@ -118,22 +118,6 @@ class GridbotConfig(BaseModel):
     # Notifications
     notification: Optional[NotificationConfig] = None
 
-    # Safety
-    allow_shared_symbol: bool = Field(
-        default=False,
-        description=(
-            "IMPORTANT: Allow multiple strategies on the same (account, symbol) pair. "
-            "Since orderLinkId is not sent to Bybit, reconcile_startup assumes "
-            "ALL open orders for a symbol belong to one strategy. Risk: strategies "
-            "sharing a symbol will interfere with each other's orders. Do not enable "
-            "unless you have a specific need and understand the order cross-contamination "
-            "risk. Also ensure no manual orders are placed for symbols used by the bot. "
-            "Note: During migration from orderLinkId-based tracking to orderId-based "
-            "tracking, you may need to temporarily enable this flag for one restart "
-            "cycle, or close all existing orders before deploying this change."
-        ),
-    )
-
     @field_validator("wallet_cache_interval", "order_sync_interval")
     @classmethod
     def non_negative(cls, v: float) -> float:
@@ -154,9 +138,22 @@ class GridbotConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_no_shared_symbol(self):
-        """Prevent multiple strategies on the same (account, symbol) unless explicitly allowed."""
-        if self.allow_shared_symbol:
-            return self
+        """Reject multiple strategies on the same (account, symbol) pair.
+
+        Since orderLinkId is not sent to Bybit, there is no way at runtime
+        to tell which strategy placed a given open order. Two strategies on
+        the same (account, symbol) would cancel each other's orders on every
+        tick via the engine's cancel-on-mismatch pass (see
+        gridcore/engine.py:_place_grid_orders).
+
+        bbu2 makes this configuration unrepresentable by construction: its
+        amounts[].strat field is a scalar pointing at a single pair_timeframes
+        entry, and each pair_timeframe has a single symbol, so the bad config
+        cannot be written. Our schema is more flexible, so we reconstruct
+        the same invariant as a pydantic validator. There is no escape hatch —
+        if you need a second strategy on the same symbol, use a different
+        account.
+        """
         seen: dict[tuple[str, str], str] = {}
         for strategy in self.strategies:
             key = (strategy.account, strategy.symbol)
@@ -164,9 +161,13 @@ class GridbotConfig(BaseModel):
                 raise ValueError(
                     f"Strategies '{seen[key]}' and '{strategy.strat_id}' share "
                     f"account='{strategy.account}' symbol='{strategy.symbol}'. "
-                    f"Since orderLinkId is not sent to Bybit, reconcile_startup "
-                    f"assumes ALL open orders for a symbol belong to one strategy. "
-                    f"Set allow_shared_symbol=true if you understand the risk."
+                    f"This is not allowed: since orderLinkId is not sent to "
+                    f"Bybit, two strategies on the same (account, symbol) "
+                    f"cannot be distinguished at runtime and would cancel "
+                    f"each other's orders every tick. bbu2 makes this "
+                    f"unrepresentable by construction; here we reject it at "
+                    f"config load. Use a different account for the second "
+                    f"strategy."
                 )
             seen[key] = strategy.strat_id
         return self

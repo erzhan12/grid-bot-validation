@@ -200,18 +200,6 @@ class TestGridbotConfig:
         with pytest.raises(ValueError, match="share account.*symbol"):
             GridbotConfig(accounts=[account], strategies=strategies)
 
-    def test_shared_symbol_allowed_with_flag(self):
-        """Two strategies on same (account, symbol) allowed when allow_shared_symbol=True."""
-        account = AccountConfig(name="acc", api_key="k", api_secret="s")
-        strategies = [
-            StrategyConfig(strat_id="s1", account="acc", symbol="BTCUSDT", tick_size=Decimal("0.1")),
-            StrategyConfig(strat_id="s2", account="acc", symbol="BTCUSDT", tick_size=Decimal("0.1")),
-        ]
-        config = GridbotConfig(
-            accounts=[account], strategies=strategies, allow_shared_symbol=True,
-        )
-        assert len(config.strategies) == 2
-
     def test_same_symbol_different_accounts_ok(self):
         """Same symbol on different accounts is fine."""
         accounts = [
