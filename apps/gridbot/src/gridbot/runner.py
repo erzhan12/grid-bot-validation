@@ -746,6 +746,10 @@ class StrategyRunner:
                          else self._short_position.size)
 
         if position_size == Decimal('0'):
+            # bbu2-faithful: reject silently. The engine re-emits reduce-only
+            # intents every tick, so any race with a pending position update
+            # self-heals on the next tick. Do NOT "allow through on staleness" —
+            # that would place orders against known-stale state.
             logger.debug(
                 f"{self.strat_id}: Rejecting reduce-only order at {intent.price} - "
                 f"position size is zero (position update may not have arrived yet)"
