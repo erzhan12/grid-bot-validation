@@ -219,7 +219,7 @@ make test-integration
 - **Reference**: `bbu_reference/bbu2-master/bybit_api_usdt.py:295-313`
 - **Purpose**: Prevents placing reduce-only close orders when total reduce-only qty on the book would exceed position size. Without this, Bybit rejects with error 110017 ("orderQty will be truncated to zero") and the retry queue keeps retrying.
 - **Logic**: Open orders always pass. For reduce-only orders: sum all placed reduce-only orders for that direction + new order qty, reject if `position_size <= total_reduce_qty` (strict `>`).
-- **Location**: `StrategyRunner._is_good_to_place()` in `apps/gridbot/src/gridbot/runner.py`, called from `_execute_place_intent()` after qty resolution.
+- **Location**: `StrategyRunner._is_good_to_place(intent, limits)` in `apps/gridbot/src/gridbot/runner.py`, called from `_execute_place_intent()` after qty resolution. Accepts an explicit `limits` dict (same format as `get_limit_orders()`) so the data source is injectable — live can pass exchange data, backtest can pass simulated data.
 - **Position size source**: `Position.size` attribute set in `on_position_update()`. Defaults to `Decimal('0')` until first `on_position_update()` call, which safely rejects reduce-only orders during startup.
 - **Zero-size rejection is intentional, not a bug**: When `position_size == Decimal('0')` the reduce-only order is silently rejected (debug log only). This is bbu2-faithful — bbu2 expresses the same behavior implicitly via `position_size > limits_qty` arithmetic. A race can occur when the engine emits a close intent in the sub-tick window after a fill but before the position update lands; it self-heals on the next tick because the engine re-emits the same reduce-only intent every tick from scratch. **Do NOT "allow through on staleness"** — that would place orders against known-stale state and make things worse. If the position feed itself dies, fix it in the position-update path (heartbeat, REST reconcile), not here. See `runner.py:748-753`.
 
@@ -767,7 +767,7 @@ Successfully implemented a multi-tenant grid trading bot using gridcore strategy
    - `TrackedOrder` dataclass tracks order lifecycle (pending → placed → filled/cancelled)
    - Single primary dict `_tracked_orders` (keyed by client_order_id), no secondary indexes
    - Lookups by exchange `order_id` use linear scan — fine for ~20-40 grid orders (matches bbu2 pattern)
-   - Duplicate/reduce-only checks in `_is_good_to_place()` scan placed orders directly (bbu2 style)
+   - `_is_good_to_place(intent, limits)` accepts explicit order list — injectable data source (bbu2 style)
    - Deterministic `client_order_id` (16-char hex from SHA256) enables deduplication
    - `runner.inject_open_orders()` for startup reconciliation
 

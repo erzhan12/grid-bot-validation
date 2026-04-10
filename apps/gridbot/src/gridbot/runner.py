@@ -309,7 +309,7 @@ class StrategyRunner:
                 return intents
 
             if intents:
-                await self._execute_intents(intents)
+                await self._execute_intents(intents, limit_orders)
 
                 # Save anchor after grid changes
                 if self._anchor_store and len(self._engine.grid.grid) > 1:
@@ -350,7 +350,8 @@ class StrategyRunner:
 
             # Only execute intents if no same-order error
             if intents and not self._same_order_error:
-                await self._execute_intents(intents)
+                limit_orders = self.get_limit_orders()
+                await self._execute_intents(intents, limit_orders)
 
             return intents
         except Exception as e:
@@ -386,7 +387,8 @@ class StrategyRunner:
 
             # Only execute intents if no same-order error
             if intents and not self._same_order_error:
-                await self._execute_intents(intents)
+                limit_orders = self.get_limit_orders()
+                await self._execute_intents(intents, limit_orders)
 
             return intents
         except Exception as e:
@@ -570,7 +572,11 @@ class StrategyRunner:
             position_value=position_value,
         )
 
-    async def _execute_intents(self, intents: list[PlaceLimitIntent | CancelIntent]) -> None:
+    async def _execute_intents(
+        self,
+        intents: list[PlaceLimitIntent | CancelIntent],
+        limits: dict[str, list[dict]],
+    ) -> None:
         """Execute a list of intents."""
         if self._executor.auth_cooldown:
             logger.debug(f"{self.strat_id}: Auth cooldown active, skipping {len(intents)} intents")
@@ -581,7 +587,7 @@ class StrategyRunner:
                 logger.debug(f"{self.strat_id}: Auth cooldown activated mid-batch, skipping remaining intents")
                 break
             if isinstance(intent, PlaceLimitIntent):
-                await self._execute_place_intent(intent)
+                await self._execute_place_intent(intent, limits)
             elif isinstance(intent, CancelIntent):
                 await self._execute_cancel_intent(intent)
 
@@ -613,7 +619,7 @@ class StrategyRunner:
                     return t
         return None
 
-    def _is_good_to_place(self, intent: PlaceLimitIntent) -> bool:
+    def _is_good_to_place(self, intent: PlaceLimitIntent, limits: dict[str, list[dict]]) -> bool:
         """Check if order can be placed (exact-duplicate + reduce-only checks).
 
         1. Exact-duplicate check: if a placed order with same (price, qty, side,
@@ -621,27 +627,32 @@ class StrategyRunner:
         2. For reduce_only orders, checks that total reduce-only qty on the book
            + new order qty doesn't exceed position size.
 
+        Args:
+            intent: The order intent to validate.
+            limits: Current limit orders from get_limit_orders() or exchange.
+                Format: {'long': [order_dicts], 'short': [order_dicts]}.
+
         Reference: bbu_reference/bbu2-master/bybit_api_usdt.py:295-313
         """
         close_side_map = {DirectionType.LONG: 'Sell', DirectionType.SHORT: 'Buy'}
         close_side = close_side_map.get(intent.direction, '')
         reduce_only_qty = Decimal("0")
 
-        for t in self._tracked_orders.values():
-            if t.status != "placed" or t.intent is None:
-                continue
+        all_orders = limits.get('long', []) + limits.get('short', [])
+        for order in all_orders:
             # Exact duplicate check (bbu2 style)
-            if (t.intent.price == intent.price and t.intent.qty == intent.qty
-                    and t.intent.side == intent.side
-                    and t.intent.reduce_only == intent.reduce_only):
+            if (Decimal(order['price']) == intent.price
+                    and Decimal(order['qty']) == intent.qty
+                    and order['side'] == intent.side
+                    and order['reduceOnly'] == intent.reduce_only):
                 logger.debug(
                     f"{self.strat_id}: Rejecting exact duplicate order at "
                     f"price={intent.price} qty={intent.qty} side={intent.side}"
                 )
                 return False
             # Sum reduce_only qty for position-size check
-            if t.intent.reduce_only and t.intent.side == close_side:
-                reduce_only_qty += t.intent.qty
+            if order['reduceOnly'] and order['side'] == close_side:
+                reduce_only_qty += Decimal(order['qty'])
 
         if not intent.reduce_only:
             return True
@@ -659,7 +670,7 @@ class StrategyRunner:
 
         return position_size > (intent.qty + reduce_only_qty)
 
-    async def _execute_place_intent(self, intent: PlaceLimitIntent) -> None:
+    async def _execute_place_intent(self, intent: PlaceLimitIntent, limits: dict[str, list[dict]]) -> None:
         """Execute a place order intent."""
         # Resolve qty (engine emits qty=0, we fill it in)
         intent = self._resolve_qty(intent)
@@ -668,7 +679,7 @@ class StrategyRunner:
             return
 
         # Check duplicate and reduce-only constraints (bbu2 _is_good_to_place)
-        if not self._is_good_to_place(intent):
+        if not self._is_good_to_place(intent, limits):
             logger.debug(
                 f"{self.strat_id}: Skipping order at {intent.price} - "
                 f"rejected by _is_good_to_place"

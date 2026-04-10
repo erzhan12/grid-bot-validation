@@ -13,6 +13,20 @@ from gridbot.config import StrategyConfig
 from gridbot.executor import IntentExecutor, OrderResult, CancelResult
 from gridbot.runner import StrategyRunner, TrackedOrder
 
+EMPTY_LIMITS: dict[str, list[dict]] = {'long': [], 'short': []}
+
+
+def _make_limit_order(intent: PlaceLimitIntent, order_id: str = "test_order") -> dict:
+    """Convert a PlaceLimitIntent to the order dict format returned by get_limit_orders()."""
+    return {
+        'orderId': order_id,
+        'orderLinkId': intent.client_order_id,
+        'price': str(intent.price),
+        'qty': str(intent.qty),
+        'side': intent.side,
+        'reduceOnly': intent.reduce_only,
+    }
+
 
 @pytest.fixture
 def strategy_config():
@@ -290,7 +304,7 @@ class TestStrategyRunnerExecution:
             direction="long",
         )
 
-        await runner._execute_place_intent(intent)
+        await runner._execute_place_intent(intent, EMPTY_LIMITS)
 
         mock_executor.execute_place.assert_called_once_with(intent)
         assert intent.client_order_id in runner._tracked_orders
@@ -312,7 +326,7 @@ class TestStrategyRunnerExecution:
             direction="long",
         )
 
-        await runner._execute_place_intent(intent)
+        await runner._execute_place_intent(intent, EMPTY_LIMITS)
 
         assert runner._tracked_orders[intent.client_order_id].status == "failed"
 
@@ -329,11 +343,11 @@ class TestStrategyRunnerExecution:
         )
 
         # First execution
-        await runner._execute_place_intent(intent)
+        await runner._execute_place_intent(intent, EMPTY_LIMITS)
         call_count = mock_executor.execute_place.call_count
 
         # Second execution (duplicate)
-        await runner._execute_place_intent(intent)
+        await runner._execute_place_intent(intent, EMPTY_LIMITS)
 
         # Should not have been called again
         assert mock_executor.execute_place.call_count == call_count
@@ -507,7 +521,7 @@ class TestStrategyRunnerOrderUpdate:
             grid_level=5,
             direction="long",
         )
-        await runner._execute_place_intent(intent)
+        await runner._execute_place_intent(intent, EMPTY_LIMITS)
 
         # Simulate fill event
         event = OrderUpdateEvent(
@@ -540,7 +554,7 @@ class TestStrategyRunnerOrderUpdate:
             grid_level=5,
             direction="long",
         )
-        await runner._execute_place_intent(intent)
+        await runner._execute_place_intent(intent, EMPTY_LIMITS)
 
         # Simulate cancel event
         event = OrderUpdateEvent(
@@ -572,7 +586,7 @@ class TestFindTrackedOrder:
             symbol="BTCUSDT", side="Buy", price=Decimal("49000.0"),
             qty=Decimal("0.001"), grid_level=5, direction="long",
         )
-        await runner._execute_place_intent(intent)
+        await runner._execute_place_intent(intent, EMPTY_LIMITS)
 
         # Simulate fill event with empty order_link_id (no orderLinkId sent to Bybit)
         event = OrderUpdateEvent(
@@ -600,7 +614,7 @@ class TestFindTrackedOrder:
             symbol="BTCUSDT", side="Buy", price=Decimal("49000.0"),
             qty=Decimal("0.001"), grid_level=5, direction="long",
         )
-        await runner._execute_place_intent(intent)
+        await runner._execute_place_intent(intent, EMPTY_LIMITS)
 
         event = ExecutionEvent(
             event_type=EventType.EXECUTION,
@@ -673,7 +687,7 @@ class TestStrategyRunnerFailureCallback:
             direction="long",
         )
 
-        await runner._execute_place_intent(intent)
+        await runner._execute_place_intent(intent, EMPTY_LIMITS)
 
         callback.assert_called_once_with(intent, "Network error")
 
@@ -804,7 +818,7 @@ class TestQtyResolution:
             symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
             qty=Decimal("0"), grid_level=1, direction="long",
         )
-        await runner._execute_place_intent(intent)
+        await runner._execute_place_intent(intent, EMPTY_LIMITS)
         mock_executor.execute_place.assert_not_called()
 
     @pytest.mark.asyncio
@@ -1469,7 +1483,7 @@ class TestSameOrderDetection:
         # Mock _execute_intents to verify it's not called
         execute_called = False
 
-        async def mock_execute(intents):
+        async def mock_execute(intents, limits):
             nonlocal execute_called
             execute_called = True
 
@@ -1541,7 +1555,7 @@ class TestSameOrderDetection:
         execute_called = False
         original_execute = runner._execute_intents
 
-        async def mock_execute(intents):
+        async def mock_execute(intents, limits):
             nonlocal execute_called
             execute_called = True
             await original_execute(intents)
@@ -1622,7 +1636,7 @@ class TestSameOrderDetection:
         execute_called = False
         original_execute = runner._execute_intents
 
-        async def mock_execute(intents):
+        async def mock_execute(intents, limits):
             nonlocal execute_called
             execute_called = True
             await original_execute(intents)
@@ -1834,7 +1848,7 @@ class TestRunnerAuthCooldown:
             for i in range(5)
         ]
 
-        await runner._execute_intents(intents)
+        await runner._execute_intents(intents, EMPTY_LIMITS)
 
         # Only the first intent should have been executed;
         # the rest skipped because cooldown activated
@@ -1854,14 +1868,7 @@ class TestIsGoodToPlace:
             qty=Decimal("0.001"), grid_level=1, direction="long",
             reduce_only=False,
         )
-        # Simulate an existing placed order with identical params
-        tracked = TrackedOrder(
-            client_order_id=intent.client_order_id,
-            order_id="existing_order_1",
-            intent=intent,
-            status="placed",
-        )
-        runner._tracked_orders["existing_key"] = tracked
+        limits = {'long': [_make_limit_order(intent)], 'short': []}
 
         # Same params, different client_order_id
         dup_intent = PlaceLimitIntent.create(
@@ -1869,7 +1876,7 @@ class TestIsGoodToPlace:
             qty=Decimal("0.001"), grid_level=2, direction="long",
             reduce_only=False,
         )
-        assert runner._is_good_to_place(dup_intent) is False
+        assert runner._is_good_to_place(dup_intent, limits) is False
 
     def test_exact_duplicate_different_qty_allowed(self, runner):
         """Order with same price but different qty is not a duplicate."""
@@ -1878,42 +1885,24 @@ class TestIsGoodToPlace:
             qty=Decimal("0.001"), grid_level=1, direction="long",
             reduce_only=False,
         )
-        tracked = TrackedOrder(
-            client_order_id=intent.client_order_id,
-            order_id="existing_order_1",
-            intent=intent,
-            status="placed",
-        )
-        runner._tracked_orders["existing_key"] = tracked
+        limits = {'long': [_make_limit_order(intent)], 'short': []}
 
         different_qty = PlaceLimitIntent.create(
             symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
             qty=Decimal("0.002"), grid_level=2, direction="long",
             reduce_only=False,
         )
-        assert runner._is_good_to_place(different_qty) is True
+        assert runner._is_good_to_place(different_qty, limits) is True
 
     def test_exact_duplicate_ignores_non_placed(self, runner):
-        """Only 'placed' orders trigger duplicate rejection."""
-        intent = PlaceLimitIntent.create(
-            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
-            qty=Decimal("0.001"), grid_level=1, direction="long",
-            reduce_only=False,
-        )
-        tracked = TrackedOrder(
-            client_order_id=intent.client_order_id,
-            order_id="filled_order",
-            intent=intent,
-            status="filled",
-        )
-        runner._tracked_orders["filled_key"] = tracked
-
+        """Non-placed orders are excluded by get_limit_orders() before reaching
+        _is_good_to_place, so empty limits means no duplicate rejection."""
         dup_intent = PlaceLimitIntent.create(
             symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
             qty=Decimal("0.001"), grid_level=2, direction="long",
             reduce_only=False,
         )
-        assert runner._is_good_to_place(dup_intent) is True
+        assert runner._is_good_to_place(dup_intent, EMPTY_LIMITS) is True
 
     def test_open_order_always_good(self, runner):
         """Non-reduce-only (open) orders are always good to place."""
@@ -1922,7 +1911,7 @@ class TestIsGoodToPlace:
             qty=Decimal("0.001"), grid_level=1, direction="long",
             reduce_only=False,
         )
-        assert runner._is_good_to_place(intent) is True
+        assert runner._is_good_to_place(intent, EMPTY_LIMITS) is True
 
     def test_reduce_only_within_position_size(self, runner):
         """Reduce-only order is good when qty fits within position size."""
@@ -1933,7 +1922,7 @@ class TestIsGoodToPlace:
             qty=Decimal("0.05"), grid_level=1, direction="short",
             reduce_only=True,
         )
-        assert runner._is_good_to_place(intent) is True
+        assert runner._is_good_to_place(intent, EMPTY_LIMITS) is True
 
     def test_reduce_only_equals_position_size(self, runner):
         """Reduce-only order is rejected when total qty equals position size (position_size > total is False when equal)."""
@@ -1944,7 +1933,7 @@ class TestIsGoodToPlace:
             qty=Decimal("0.1"), grid_level=1, direction="short",
             reduce_only=True,
         )
-        assert runner._is_good_to_place(intent) is False
+        assert runner._is_good_to_place(intent, EMPTY_LIMITS) is False
 
     def test_reduce_only_exceeds_position_size(self, runner):
         """Reduce-only order is rejected when qty exceeds position size."""
@@ -1955,7 +1944,7 @@ class TestIsGoodToPlace:
             qty=Decimal("0.2"), grid_level=1, direction="short",
             reduce_only=True,
         )
-        assert runner._is_good_to_place(intent) is False
+        assert runner._is_good_to_place(intent, EMPTY_LIMITS) is False
 
     def test_reduce_only_accounts_for_existing_orders(self, runner):
         """Existing placed reduce-only orders are counted toward the total."""
@@ -1967,13 +1956,7 @@ class TestIsGoodToPlace:
             qty=Decimal("0.05"), grid_level=2, direction="short",
             reduce_only=True,
         )
-        tracked = TrackedOrder(
-            client_order_id=existing_intent.client_order_id,
-            order_id="existing_order_1",
-            intent=existing_intent,
-            status="placed",
-        )
-        runner._tracked_orders[existing_intent.client_order_id] = tracked
+        limits = {'long': [], 'short': [_make_limit_order(existing_intent)]}
 
         # New order: 0.05 existing + 0.06 new = 0.11 > 0.1 position
         new_intent = PlaceLimitIntent.create(
@@ -1981,25 +1964,12 @@ class TestIsGoodToPlace:
             qty=Decimal("0.06"), grid_level=1, direction="short",
             reduce_only=True,
         )
-        assert runner._is_good_to_place(new_intent) is False
+        assert runner._is_good_to_place(new_intent, limits) is False
 
     def test_reduce_only_ignores_non_placed_orders(self, runner):
-        """Only 'placed' orders count — filled/failed/cancelled are ignored."""
+        """Non-placed orders are excluded by get_limit_orders() before reaching
+        _is_good_to_place, so empty limits means no reduce-only qty counted."""
         runner._short_position.size = Decimal("0.1")
-
-        # Existing filled order should not count
-        filled_intent = PlaceLimitIntent.create(
-            symbol="BTCUSDT", side="Buy", price=Decimal("48000"),
-            qty=Decimal("0.05"), grid_level=2, direction="short",
-            reduce_only=True,
-        )
-        tracked = TrackedOrder(
-            client_order_id=filled_intent.client_order_id,
-            order_id="filled_order_1",
-            intent=filled_intent,
-            status="filled",
-        )
-        runner._tracked_orders[filled_intent.client_order_id] = tracked
 
         # New order: only 0.05 new, position is 0.1 -> good
         new_intent = PlaceLimitIntent.create(
@@ -2007,7 +1977,7 @@ class TestIsGoodToPlace:
             qty=Decimal("0.05"), grid_level=1, direction="short",
             reduce_only=True,
         )
-        assert runner._is_good_to_place(new_intent) is True
+        assert runner._is_good_to_place(new_intent, EMPTY_LIMITS) is True
 
     def test_reduce_only_zero_position_rejects(self, runner):
         """Reduce-only order is rejected when position size is zero."""
@@ -2018,7 +1988,7 @@ class TestIsGoodToPlace:
             qty=Decimal("0.001"), grid_level=1, direction="short",
             reduce_only=True,
         )
-        assert runner._is_good_to_place(intent) is False
+        assert runner._is_good_to_place(intent, EMPTY_LIMITS) is False
 
     def test_reduce_only_long_direction(self, runner):
         """Reduce-only Sell order for long direction respects long position size."""
@@ -2029,7 +1999,7 @@ class TestIsGoodToPlace:
             qty=Decimal("0.05"), grid_level=1, direction="long",
             reduce_only=True,
         )
-        assert runner._is_good_to_place(intent) is True
+        assert runner._is_good_to_place(intent, EMPTY_LIMITS) is True
 
     def test_direction_string_enum_compatibility(self, runner):
         """close_side_map works with plain string direction (PlaceLimitIntent.direction is str)."""
@@ -2042,7 +2012,7 @@ class TestIsGoodToPlace:
             qty=Decimal("0.05"), grid_level=1, direction="long",
             reduce_only=True,
         )
-        assert runner._is_good_to_place(long_intent) is True
+        assert runner._is_good_to_place(long_intent, EMPTY_LIMITS) is True
 
         # direction="short" (plain string, not DirectionType.SHORT)
         short_intent = PlaceLimitIntent.create(
@@ -2050,7 +2020,7 @@ class TestIsGoodToPlace:
             qty=Decimal("0.05"), grid_level=1, direction="short",
             reduce_only=True,
         )
-        assert runner._is_good_to_place(short_intent) is True
+        assert runner._is_good_to_place(short_intent, EMPTY_LIMITS) is True
 
     @pytest.mark.asyncio
     async def test_execute_place_skips_when_not_good(self, runner, mock_executor):
@@ -2063,5 +2033,5 @@ class TestIsGoodToPlace:
             qty=Decimal("0.001"), grid_level=1, direction="short",
             reduce_only=True,
         )
-        await runner._execute_place_intent(intent)
+        await runner._execute_place_intent(intent, EMPTY_LIMITS)
         mock_executor.execute_place.assert_not_called()
