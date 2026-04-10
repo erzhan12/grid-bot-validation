@@ -89,10 +89,6 @@ class StrategyRunner:
     - Order tracking
     - Position risk management
 
-    Class constants:
-        INDEX_CORRUPTION_THRESHOLD: Number of consecutive index corruptions
-            before raising RuntimeError (default 3).
-
     Example:
         config = StrategyConfig(...)
         executor = IntentExecutor(rest_client)
@@ -106,8 +102,6 @@ class StrategyRunner:
         await runner.on_ticker(ticker_event)
         await runner.on_execution(execution_event)
     """
-
-    INDEX_CORRUPTION_THRESHOLD = 3
 
     def __init__(
         self,
@@ -166,19 +160,9 @@ class StrategyRunner:
         )
         self._long_position, self._short_position = Position.create_linked_pair(risk_config)
 
-        # Order tracking with O(1) lookups on all access patterns:
-        #   _tracked_orders: client_order_id → TrackedOrder (primary dict)
-        #   _tracked_by_order_id: exchange order_id → TrackedOrder (secondary index)
-        #   _placed_order_signatures: {(price, qty, side, reduce_only)} for O(1)
-        #       duplicate detection (replaces O(n) iteration over all tracked orders)
-        #   _reduce_only_qty: (direction, close_side) → Decimal total reduce-only qty
-        #       for O(1) position-size check in _is_good_to_place()
-        # All four are kept in sync via _index_as_placed() / _unindex_placed().
+        # Order tracking: client_order_id → TrackedOrder.
+        # Lookups by exchange order_id use linear scan (~20-40 orders).
         self._tracked_orders: dict[str, TrackedOrder] = {}
-        self._tracked_by_order_id: dict[str, TrackedOrder] = {}
-        self._placed_order_signatures: set[tuple] = set()
-        self._reduce_only_qty: dict[tuple[str, str], Decimal] = {}
-        self._index_corruption_count: int = 0
 
         # Position state
         self._last_position_check: Optional[datetime] = None
@@ -352,7 +336,6 @@ class StrategyRunner:
             # Update tracked order status
             tracked = self._find_tracked_order(event.order_link_id, event.order_id)
             if tracked:
-                self._unindex_placed(tracked)
                 tracked.mark_filled()
                 logger.info(
                     f"{self.strat_id}: Order filled: {event.symbol} {event.side} "
@@ -391,15 +374,12 @@ class StrategyRunner:
             tracked = self._find_tracked_order(event.order_link_id, event.order_id)
             if tracked:
                 if event.status in ("Filled",):
-                    self._unindex_placed(tracked)
                     tracked.mark_filled()
                 elif event.status in ("Cancelled", "Rejected"):
-                    self._unindex_placed(tracked)
                     tracked.mark_cancelled()
                 elif event.status in ("New", "PartiallyFilled"):
                     if tracked.order_id is None:
                         tracked.mark_placed(event.order_id)
-                        self._index_as_placed(tracked)
 
             # Pass to engine (update state regardless of error)
             intents = self._engine.on_event(event)
@@ -617,106 +597,20 @@ class StrategyRunner:
             return DirectionType.LONG if reduce_only else DirectionType.SHORT
         return None
 
-    @staticmethod
-    def _order_signature(intent: PlaceLimitIntent) -> tuple:
-        """Build signature tuple for duplicate detection."""
-        return (intent.price, intent.qty, intent.side, intent.reduce_only)
-
-    def _index_as_placed(self, tracked: TrackedOrder) -> None:
-        """Add a tracked order to secondary indexes (order_id + signature + reduce qty)."""
-        if tracked.order_id:
-            self._tracked_by_order_id[tracked.order_id] = tracked
-        if tracked.intent:
-            self._placed_order_signatures.add(self._order_signature(tracked.intent))
-            if tracked.intent.reduce_only:
-                key = (tracked.intent.direction, tracked.intent.side)
-                self._reduce_only_qty[key] = (
-                    self._reduce_only_qty.get(key, Decimal("0")) + tracked.intent.qty
-                )
-
-    def _rebuild_indexes(self) -> None:
-        """Rebuild secondary indexes from _tracked_orders (defensive recovery)."""
-        logger.warning(
-            f"{self.strat_id}: Rebuilding indexes from "
-            f"{len(self._tracked_orders)} tracked orders"
-        )
-        self._placed_order_signatures = set()
-        self._reduce_only_qty = {}
-        self._tracked_by_order_id = {}
-        for t in self._tracked_orders.values():
-            if t.order_id:
-                self._tracked_by_order_id[t.order_id] = t
-            if t.intent is None:
-                continue
-            if t.status != "placed":
-                if t.status not in ("filled", "cancelled", "failed", "pending"):
-                    logger.warning(
-                        f"{self.strat_id}: Skipping order {t.client_order_id} "
-                        f"with unexpected status={t.status!r} during rebuild"
-                    )
-                continue
-            self._placed_order_signatures.add(self._order_signature(t.intent))
-            if t.intent.reduce_only:
-                key = (t.intent.direction, t.intent.side)
-                self._reduce_only_qty[key] = (
-                    self._reduce_only_qty.get(key, Decimal("0")) + t.intent.qty
-                )
-
-    def _unindex_placed(self, tracked: TrackedOrder) -> None:
-        """Remove a tracked order from secondary indexes."""
-        if tracked.order_id:
-            self._tracked_by_order_id.pop(tracked.order_id, None)
-        if tracked.intent:
-            sig = self._order_signature(tracked.intent)
-            if sig not in self._placed_order_signatures:
-                self._index_corruption_count += 1
-                logger.critical(
-                    f"{self.strat_id}: Signature not found when unindexing "
-                    f"order {tracked.client_order_id} — rebuilding indexes "
-                    f"(corruption #{self._index_corruption_count})"
-                )
-                self._rebuild_indexes()
-                if self._index_corruption_count >= self.INDEX_CORRUPTION_THRESHOLD:
-                    raise RuntimeError(
-                        f"Index corruption detected {self._index_corruption_count} times "
-                        f"for strategy {self.strat_id} — investigate root cause"
-                    )
-                # After rebuild, sig should be present because the tracked order
-                # is still "placed" at this point (status transitions happen
-                # after _unindex_placed). If it's still missing, the tracked
-                # order's intent diverged from _order_signature semantics —
-                # deeper bug that warrants another corruption count. Continue
-                # to the cleanup below regardless, so reduce_only_qty state
-                # stays consistent with the signature set.
-                if sig not in self._placed_order_signatures:
-                    self._index_corruption_count += 1
-                    logger.critical(
-                        f"{self.strat_id}: Signature still missing after rebuild "
-                        f"for order {tracked.client_order_id} — tracked intent "
-                        f"may not match _order_signature semantics "
-                        f"(corruption #{self._index_corruption_count})"
-                    )
-            self._placed_order_signatures.discard(sig)
-            if tracked.intent.reduce_only:
-                key = (tracked.intent.direction, tracked.intent.side)
-                new_val = self._reduce_only_qty.get(key, Decimal("0")) - tracked.intent.qty
-                if new_val > Decimal("0"):
-                    self._reduce_only_qty[key] = new_val
-                else:
-                    self._reduce_only_qty.pop(key, None)
-
     def _find_tracked_order(
         self, order_link_id: Optional[str], order_id: Optional[str]
     ) -> Optional[TrackedOrder]:
-        """Find a tracked order by client_order_id or order_id. Both O(1).
+        """Find a tracked order by client_order_id or exchange order_id.
 
         Tries _tracked_orders (keyed by client_order_id) first, then
-        _tracked_by_order_id (secondary index on exchange order_id).
+        scans values for matching exchange order_id.
         """
         if order_link_id and order_link_id in self._tracked_orders:
             return self._tracked_orders[order_link_id]
         if order_id:
-            return self._tracked_by_order_id.get(order_id)
+            for t in self._tracked_orders.values():
+                if t.order_id == order_id:
+                    return t
         return None
 
     def _is_good_to_place(self, intent: PlaceLimitIntent) -> bool:
@@ -729,14 +623,25 @@ class StrategyRunner:
 
         Reference: bbu_reference/bbu2-master/bybit_api_usdt.py:295-313
         """
-        # Exact-duplicate check (bbu2-style) — O(1) via signature set
-        sig = self._order_signature(intent)
-        if sig in self._placed_order_signatures:
-            logger.debug(
-                f"{self.strat_id}: Rejecting exact duplicate order at "
-                f"price={intent.price} qty={intent.qty} side={intent.side}"
-            )
-            return False
+        close_side_map = {DirectionType.LONG: 'Sell', DirectionType.SHORT: 'Buy'}
+        close_side = close_side_map.get(intent.direction, '')
+        reduce_only_qty = Decimal("0")
+
+        for t in self._tracked_orders.values():
+            if t.status != "placed" or t.intent is None:
+                continue
+            # Exact duplicate check (bbu2 style)
+            if (t.intent.price == intent.price and t.intent.qty == intent.qty
+                    and t.intent.side == intent.side
+                    and t.intent.reduce_only == intent.reduce_only):
+                logger.debug(
+                    f"{self.strat_id}: Rejecting exact duplicate order at "
+                    f"price={intent.price} qty={intent.qty} side={intent.side}"
+                )
+                return False
+            # Sum reduce_only qty for position-size check
+            if t.intent.reduce_only and t.intent.side == close_side:
+                reduce_only_qty += t.intent.qty
 
         if not intent.reduce_only:
             return True
@@ -746,26 +651,13 @@ class StrategyRunner:
                          else self._short_position.size)
 
         if position_size == Decimal('0'):
-            # bbu2-faithful: reject silently. The engine re-emits reduce-only
-            # intents every tick, so any race with a pending position update
-            # self-heals on the next tick. Do NOT "allow through on staleness" —
-            # that would place orders against known-stale state.
             logger.debug(
                 f"{self.strat_id}: Rejecting reduce-only order at {intent.price} - "
                 f"position size is zero (position update may not have arrived yet)"
             )
             return False
 
-        close_side_map = {DirectionType.LONG: 'Sell', DirectionType.SHORT: 'Buy'}
-        close_side = close_side_map[direction]
-
-        # O(1) lookup via _reduce_only_qty index
-        existing_reduce_qty = self._reduce_only_qty.get(
-            (direction, close_side), Decimal("0")
-        )
-        total_reduce_qty = intent.qty + existing_reduce_qty
-
-        return position_size > total_reduce_qty
+        return position_size > (intent.qty + reduce_only_qty)
 
     async def _execute_place_intent(self, intent: PlaceLimitIntent) -> None:
         """Execute a place order intent."""
@@ -805,7 +697,6 @@ class StrategyRunner:
 
         if result.success:
             tracked.mark_placed(result.order_id)
-            self._index_as_placed(tracked)
         else:
             tracked.mark_failed()
             if self._on_intent_failed:
@@ -815,10 +706,8 @@ class StrategyRunner:
         """Execute a cancel order intent."""
         result = self._executor.execute_cancel(intent)
 
-        # Update tracked order if we have it (O(1) via secondary index)
-        tracked = self._tracked_by_order_id.get(intent.order_id)
+        tracked = self._find_tracked_order(None, intent.order_id)
         if tracked and result.success:
-            self._unindex_placed(tracked)
             tracked.mark_cancelled()
 
         if not result.success and self._on_intent_failed:
@@ -829,8 +718,7 @@ class StrategyRunner:
 
         Each order is stored in _tracked_orders keyed by client_order_id
         (orderLinkId if present, otherwise orderId). Orders without orderId
-        are skipped. The _tracked_by_order_id secondary index provides O(1)
-        lookup by exchange order_id.
+        are skipped.
 
         Args:
             orders: List of order dicts from exchange.
@@ -909,7 +797,6 @@ class StrategyRunner:
                 status="placed",
             )
             self._tracked_orders[client_id] = tracked
-            self._index_as_placed(tracked)
             injected += 1
 
         logger.info(f"{self.strat_id}: Injected {injected} open orders")
@@ -919,9 +806,8 @@ class StrategyRunner:
 
         Used by reconciler when exchange state diverges from in-memory state.
         """
-        tracked = self._tracked_by_order_id.get(order_id)
+        tracked = self._find_tracked_order(None, order_id)
         if tracked:
-            self._unindex_placed(tracked)
             tracked.mark_cancelled()
 
     def get_placed_order_ids(self) -> set[str]:
@@ -930,8 +816,8 @@ class StrategyRunner:
         Used by reconciler to compare in-memory state with exchange state.
         """
         return {
-            oid for oid, t in self._tracked_by_order_id.items()
-            if t.status == "placed"
+            t.order_id for t in self._tracked_orders.values()
+            if t.status == "placed" and t.order_id
         }
 
     def get_tracked_order_count(self) -> dict[str, int]:

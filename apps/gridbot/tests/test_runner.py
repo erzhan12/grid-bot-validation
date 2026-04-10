@@ -194,8 +194,8 @@ class TestStrategyRunnerOrderTracking:
         # Keyed by client_order_id (orderLinkId when present, orderId otherwise)
         assert "link_1" in runner._tracked_orders
         assert "exchange_2" in runner._tracked_orders
-        # Findable by order_id via secondary index
-        assert runner._tracked_by_order_id["exchange_1"].client_order_id == "link_1"
+        # Findable by order_id via scan
+        assert runner._find_tracked_order(None, "exchange_1").client_order_id == "link_1"
 
     def test_inject_open_orders_with_and_without_order_link_id(self, runner):
         """Orders from old sessions (with orderLinkId) and new sessions (without) coexist."""
@@ -235,7 +235,7 @@ class TestStrategyRunnerOrderTracking:
         ]
         runner.inject_open_orders(orders)
 
-        tracked = runner._tracked_by_order_id["ex_1"]
+        tracked = runner._find_tracked_order(None, "ex_1")
         assert tracked.intent is not None
         assert tracked.intent.direction == expected_direction
 
@@ -1862,7 +1862,6 @@ class TestIsGoodToPlace:
             status="placed",
         )
         runner._tracked_orders["existing_key"] = tracked
-        runner._index_as_placed(tracked)
 
         # Same params, different client_order_id
         dup_intent = PlaceLimitIntent.create(
@@ -1886,7 +1885,6 @@ class TestIsGoodToPlace:
             status="placed",
         )
         runner._tracked_orders["existing_key"] = tracked
-        runner._index_as_placed(tracked)
 
         different_qty = PlaceLimitIntent.create(
             symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
@@ -1976,7 +1974,6 @@ class TestIsGoodToPlace:
             status="placed",
         )
         runner._tracked_orders[existing_intent.client_order_id] = tracked
-        runner._index_as_placed(tracked)
 
         # New order: 0.05 existing + 0.06 new = 0.11 > 0.1 position
         new_intent = PlaceLimitIntent.create(
@@ -2054,204 +2051,6 @@ class TestIsGoodToPlace:
             reduce_only=True,
         )
         assert runner._is_good_to_place(short_intent) is True
-
-    @pytest.mark.asyncio
-    async def test_signature_set_lifecycle_fill(self, runner, mock_executor):
-        """Signature is added on place and removed on fill."""
-        intent = PlaceLimitIntent.create(
-            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
-            qty=Decimal("0.001"), grid_level=5, direction="long",
-            reduce_only=False,
-        )
-        sig = runner._order_signature(intent)
-
-        # Before placing — signature absent
-        assert sig not in runner._placed_order_signatures
-
-        # Place the order
-        await runner._execute_place_intent(intent)
-        assert sig in runner._placed_order_signatures
-
-        # Fill the order via on_order_update
-        fill_event = OrderUpdateEvent(
-            event_type=EventType.ORDER_UPDATE,
-            symbol="BTCUSDT",
-            exchange_ts=datetime.now(UTC),
-            local_ts=datetime.now(UTC),
-            order_id="order_123",
-            order_link_id=intent.client_order_id,
-            status="Filled",
-            side="Buy",
-            price=Decimal("49000"),
-            qty=Decimal("0.001"),
-            leaves_qty=Decimal("0"),
-        )
-        await runner.on_order_update(fill_event)
-
-        # After fill — signature removed
-        assert sig not in runner._placed_order_signatures
-
-    @pytest.mark.asyncio
-    async def test_signature_set_lifecycle_cancel(self, runner, mock_executor):
-        """Signature is added on place and removed on cancel."""
-        intent = PlaceLimitIntent.create(
-            symbol="BTCUSDT", side="Sell", price=Decimal("51000"),
-            qty=Decimal("0.002"), grid_level=6, direction="short",
-            reduce_only=False,
-        )
-        sig = runner._order_signature(intent)
-
-        await runner._execute_place_intent(intent)
-        assert sig in runner._placed_order_signatures
-
-        # Cancel the order
-        cancel_event = OrderUpdateEvent(
-            event_type=EventType.ORDER_UPDATE,
-            symbol="BTCUSDT",
-            exchange_ts=datetime.now(UTC),
-            local_ts=datetime.now(UTC),
-            order_id="order_456",
-            order_link_id=intent.client_order_id,
-            status="Cancelled",
-            side="Sell",
-            price=Decimal("51000"),
-            qty=Decimal("0.002"),
-            leaves_qty=Decimal("0"),
-        )
-        await runner.on_order_update(cancel_event)
-
-        assert sig not in runner._placed_order_signatures
-
-    def test_signature_rebuild_on_mismatch(self, runner):
-        """Rebuild restores other orders' signatures when mismatch detected."""
-        # Order A — the one we'll unindex
-        intent_a = PlaceLimitIntent.create(
-            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
-            qty=Decimal("0.001"), grid_level=5, direction="long",
-            reduce_only=False,
-        )
-        tracked_a = TrackedOrder(
-            client_order_id=intent_a.client_order_id,
-            order_id="order_a",
-            intent=intent_a,
-            status="placed",
-        )
-        runner._tracked_orders[intent_a.client_order_id] = tracked_a
-        runner._index_as_placed(tracked_a)
-
-        # Order B — should survive the rebuild
-        intent_b = PlaceLimitIntent.create(
-            symbol="BTCUSDT", side="Sell", price=Decimal("51000"),
-            qty=Decimal("0.002"), grid_level=6, direction="long",
-            reduce_only=False,
-        )
-        tracked_b = TrackedOrder(
-            client_order_id=intent_b.client_order_id,
-            order_id="order_b",
-            intent=intent_b,
-            status="placed",
-        )
-        runner._tracked_orders[intent_b.client_order_id] = tracked_b
-        runner._index_as_placed(tracked_b)
-
-        sig_a = runner._order_signature(intent_a)
-        sig_b = runner._order_signature(intent_b)
-
-        # Corrupt the set by clearing it
-        runner._placed_order_signatures.clear()
-
-        # First corruption: recovers via rebuild, does not raise
-        runner._unindex_placed(tracked_a)
-        assert runner._index_corruption_count == 1
-
-        # B's signature restored by rebuild and still present
-        assert sig_b in runner._placed_order_signatures
-        # A's signature discarded after rebuild (the order being unindexed)
-        assert sig_a not in runner._placed_order_signatures
-
-    def test_reduce_only_qty_cleaned_up_after_corruption(self, runner):
-        """After rebuild recovery, reduce-only qty index is properly updated."""
-        runner._short_position.size = Decimal("0.1")
-
-        intent = PlaceLimitIntent.create(
-            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
-            qty=Decimal("0.05"), grid_level=1, direction="short",
-            reduce_only=True,
-        )
-        tracked = TrackedOrder(
-            client_order_id=intent.client_order_id,
-            order_id="order_r",
-            intent=intent,
-            status="placed",
-        )
-        runner._tracked_orders[intent.client_order_id] = tracked
-        runner._index_as_placed(tracked)
-
-        key = (intent.direction, intent.side)
-        assert runner._reduce_only_qty[key] == Decimal("0.05")
-
-        # Corrupt and unindex
-        runner._placed_order_signatures.clear()
-        runner._unindex_placed(tracked)
-
-        # Reduce-only qty should be cleaned up (not left stale)
-        assert key not in runner._reduce_only_qty
-
-    def test_rebuild_indexes_rebuilds_tracked_by_order_id(self, runner):
-        """_rebuild_indexes also rebuilds the _tracked_by_order_id secondary index."""
-        intent = PlaceLimitIntent.create(
-            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
-            qty=Decimal("0.001"), grid_level=5, direction="long",
-            reduce_only=False,
-        )
-        tracked = TrackedOrder(
-            client_order_id=intent.client_order_id,
-            order_id="order_id_xyz",
-            intent=intent,
-            status="placed",
-        )
-        runner._tracked_orders[intent.client_order_id] = tracked
-        runner._index_as_placed(tracked)
-
-        # Corrupt _tracked_by_order_id
-        runner._tracked_by_order_id.clear()
-        assert "order_id_xyz" not in runner._tracked_by_order_id
-
-        runner._rebuild_indexes()
-
-        # All three secondary indexes restored
-        assert runner._tracked_by_order_id["order_id_xyz"] is tracked
-        assert runner._order_signature(intent) in runner._placed_order_signatures
-
-    def test_signature_corruption_raises_after_threshold(self, runner):
-        """RuntimeError raised after INDEX_CORRUPTION_THRESHOLD consecutive corruptions."""
-        intent = PlaceLimitIntent.create(
-            symbol="BTCUSDT", side="Buy", price=Decimal("49000"),
-            qty=Decimal("0.001"), grid_level=5, direction="long",
-            reduce_only=False,
-        )
-        tracked = TrackedOrder(
-            client_order_id=intent.client_order_id,
-            order_id="order_x",
-            intent=intent,
-            status="placed",
-        )
-        runner._tracked_orders[intent.client_order_id] = tracked
-        runner._index_as_placed(tracked)
-
-        # Simulate repeated corruptions up to threshold
-        for i in range(runner.INDEX_CORRUPTION_THRESHOLD - 1):
-            runner._placed_order_signatures.clear()
-            runner._unindex_placed(tracked)
-            # Re-index for next iteration
-            runner._index_as_placed(tracked)
-
-        assert runner._index_corruption_count == runner.INDEX_CORRUPTION_THRESHOLD - 1
-
-        # Next corruption hits threshold and raises
-        runner._placed_order_signatures.clear()
-        with pytest.raises(RuntimeError, match="Index corruption detected"):
-            runner._unindex_placed(tracked)
 
     @pytest.mark.asyncio
     async def test_execute_place_skips_when_not_good(self, runner, mock_executor):

@@ -765,6 +765,9 @@ Successfully implemented a multi-tenant grid trading bot using gridcore strategy
 
 1. **Order Tracking Pattern**
    - `TrackedOrder` dataclass tracks order lifecycle (pending → placed → filled/cancelled)
+   - Single primary dict `_tracked_orders` (keyed by client_order_id), no secondary indexes
+   - Lookups by exchange `order_id` use linear scan — fine for ~20-40 grid orders (matches bbu2 pattern)
+   - Duplicate/reduce-only checks in `_is_good_to_place()` scan placed orders directly (bbu2 style)
    - Deterministic `client_order_id` (16-char hex from SHA256) enables deduplication
    - `runner.inject_open_orders()` for startup reconciliation
 
