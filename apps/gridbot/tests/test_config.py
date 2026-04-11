@@ -190,6 +190,29 @@ class TestGridbotConfig:
         config = GridbotConfig(accounts=[account], strategies=strategies)
         assert len(config.get_strategies_for_account("multi")) == 2
 
+    def test_shared_symbol_rejected(self):
+        """Two strategies on same (account, symbol) are rejected by default."""
+        account = AccountConfig(name="acc", api_key="k", api_secret="s")
+        strategies = [
+            StrategyConfig(strat_id="s1", account="acc", symbol="BTCUSDT", tick_size=Decimal("0.1")),
+            StrategyConfig(strat_id="s2", account="acc", symbol="BTCUSDT", tick_size=Decimal("0.1")),
+        ]
+        with pytest.raises(ValueError, match="share account.*symbol"):
+            GridbotConfig(accounts=[account], strategies=strategies)
+
+    def test_same_symbol_different_accounts_ok(self):
+        """Same symbol on different accounts is fine."""
+        accounts = [
+            AccountConfig(name="a1", api_key="k1", api_secret="s1"),
+            AccountConfig(name="a2", api_key="k2", api_secret="s2"),
+        ]
+        strategies = [
+            StrategyConfig(strat_id="s1", account="a1", symbol="BTCUSDT", tick_size=Decimal("0.1")),
+            StrategyConfig(strat_id="s2", account="a2", symbol="BTCUSDT", tick_size=Decimal("0.1")),
+        ]
+        config = GridbotConfig(accounts=accounts, strategies=strategies)
+        assert len(config.strategies) == 2
+
     @pytest.mark.parametrize("field", ["wallet_cache_interval", "order_sync_interval"])
     def test_negative_interval_rejected(self, field):
         """Negative interval values are rejected by validator."""

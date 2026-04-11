@@ -208,7 +208,6 @@ class TestExecutorRESTPayloadMapping:
             price=str(intent.price),
             reduce_only=intent.reduce_only,
             position_idx=1 if intent.direction == "long" else 2,
-            order_link_id=intent.client_order_id,
         )
 
     def test_cancel_intent_maps_to_rest_params(self, grid_config, btcusdt_tick_size):

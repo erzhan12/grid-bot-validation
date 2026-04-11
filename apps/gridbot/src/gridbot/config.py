@@ -136,6 +136,42 @@ class GridbotConfig(BaseModel):
                 )
         return self
 
+    @model_validator(mode="after")
+    def validate_no_shared_symbol(self):
+        """Reject multiple strategies on the same (account, symbol) pair.
+
+        Since orderLinkId is not sent to Bybit, there is no way at runtime
+        to tell which strategy placed a given open order. Two strategies on
+        the same (account, symbol) would cancel each other's orders on every
+        tick via the engine's cancel-on-mismatch pass (see
+        gridcore/engine.py:_place_grid_orders).
+
+        bbu2 makes this configuration unrepresentable by construction: its
+        amounts[].strat field is a scalar pointing at a single pair_timeframes
+        entry, and each pair_timeframe has a single symbol, so the bad config
+        cannot be written. Our schema is more flexible, so we reconstruct
+        the same invariant as a pydantic validator. There is no escape hatch —
+        if you need a second strategy on the same symbol, use a different
+        account.
+        """
+        seen: dict[tuple[str, str], str] = {}
+        for strategy in self.strategies:
+            key = (strategy.account, strategy.symbol)
+            if key in seen:
+                raise ValueError(
+                    f"Strategies '{seen[key]}' and '{strategy.strat_id}' share "
+                    f"account='{strategy.account}' symbol='{strategy.symbol}'. "
+                    f"This is not allowed: since orderLinkId is not sent to "
+                    f"Bybit, two strategies on the same (account, symbol) "
+                    f"cannot be distinguished at runtime and would cancel "
+                    f"each other's orders every tick. bbu2 makes this "
+                    f"unrepresentable by construction; here we reject it at "
+                    f"config load. Use a different account for the second "
+                    f"strategy."
+                )
+            seen[key] = strategy.strat_id
+        return self
+
     def get_account(self, name: str) -> Optional[AccountConfig]:
         """Get account config by name."""
         for acc in self.accounts:

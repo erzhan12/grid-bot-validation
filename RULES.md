@@ -219,8 +219,10 @@ make test-integration
 - **Reference**: `bbu_reference/bbu2-master/bybit_api_usdt.py:295-313`
 - **Purpose**: Prevents placing reduce-only close orders when total reduce-only qty on the book would exceed position size. Without this, Bybit rejects with error 110017 ("orderQty will be truncated to zero") and the retry queue keeps retrying.
 - **Logic**: Open orders always pass. For reduce-only orders: sum all placed reduce-only orders for that direction + new order qty, reject if `position_size <= total_reduce_qty` (strict `>`).
-- **Location**: `StrategyRunner._is_good_to_place()` in `apps/gridbot/src/gridbot/runner.py`, called from `_execute_place_intent()` after qty resolution.
+- **Location**: `StrategyRunner._is_good_to_place(intent, limits)` in `apps/gridbot/src/gridbot/runner.py`, called from `_execute_place_intent()` after qty resolution. Accepts an explicit `limits` dict (same format as `get_limit_orders()`) so the data source is injectable — live can pass exchange data, backtest can pass simulated data.
 - **Position size source**: `Position.size` attribute set in `on_position_update()`. Defaults to `Decimal('0')` until first `on_position_update()` call, which safely rejects reduce-only orders during startup.
+- **Decimal conversion safety**: Always use `Decimal(str(value))` — never bare `Decimal(value)` — when converting order dict fields (`price`, `qty`) or any variable that might be a float. `Decimal(0.5)` produces `0.500000000000000027...` which silently breaks equality checks. The `Decimal(str(...))` pattern is safe for strings, floats, and Decimals alike.
+- **Zero-size rejection is intentional, not a bug**: When `position_size == Decimal('0')` the reduce-only order is silently rejected (debug log only). This is bbu2-faithful — bbu2 expresses the same behavior implicitly via `position_size > limits_qty` arithmetic. A race can occur when the engine emits a close intent in the sub-tick window after a fill but before the position update lands; it self-heals on the next tick because the engine re-emits the same reduce-only intent every tick from scratch. **Do NOT "allow through on staleness"** — that would place orders against known-stale state and make things worse. If the position feed itself dies, fix it in the position-update path (heartbeat, REST reconcile), not here. See `runner.py:748-753`.
 
 ### Enums
 
@@ -764,6 +766,9 @@ Successfully implemented a multi-tenant grid trading bot using gridcore strategy
 
 1. **Order Tracking Pattern**
    - `TrackedOrder` dataclass tracks order lifecycle (pending → placed → filled/cancelled)
+   - Single primary dict `_tracked_orders` (keyed by client_order_id), no secondary indexes
+   - Lookups by exchange `order_id` use linear scan — fine for ~20-40 grid orders (matches bbu2 pattern)
+   - `_is_good_to_place(intent, limits)` accepts explicit order list — injectable data source (bbu2 style)
    - Deterministic `client_order_id` (16-char hex from SHA256) enables deduplication
    - `runner.inject_open_orders()` for startup reconciliation
 
@@ -784,9 +789,12 @@ Successfully implemented a multi-tenant grid trading bot using gridcore strategy
    - Useful for validating strategy behavior before live trading
 
 5. **Reconciliation**
-   - **Startup**: fetch open orders, identify "our" orders (16-char hex orderLinkId), inject into runner
+   - **Startup**: fetch all open limit orders for the symbol, inject into runner via `inject_open_orders()`
+   - **Inject is NOT durable adoption (bbu2-faithful)**: Injected orders live for exactly one ticker event. On the first `on_ticker` after startup, `GridEngine._place_grid_orders` (`packages/gridcore/src/gridcore/engine.py:319-325`) cancels any injected order whose price is not in the current `grid_price_set` (`'outside_grid'` reason), and `engine.py:305-312` cancels any at a grid price with the wrong side (`'side_mismatch'` reason). Over-limit cases (`engine.py:237-243`) trigger a full rebuild that cancels everything. Direct port of bbu2 `strat.py:154-160`, `:145-149`, `:103-104`. This means: (a) a "silent adoption of manual orders" security review is a false alarm — the bot does not keep manual orders around, it destroys them on the next tick; (b) the **real** operational concern is the opposite — the bot will **cancel** any limit order on the symbol that doesn't match the grid; (c) do NOT add a refuse-to-start check in `reconcile_startup` — it would re-break normal crash-restart (the bot's own prior orders look identical to manual ones) and was already removed in commit `138737a` for that reason.
+   - **(account, symbol) uniqueness is enforced unconditionally at config load**: Since `orderLinkId` is not sent to Bybit, there is no way at runtime to tell one strategy's orders from another's. Two strategies on the same `(account, symbol)` pair would cancel each other's orders every tick via the cancel-on-mismatch pass described above. `GridbotConfig.validate_no_shared_symbol` (`apps/gridbot/src/gridbot/config.py`) rejects any such configuration at load time with **no escape hatch** — there is no flag to disable it. bbu2 enforces the same invariant structurally: its `amounts[].strat` field is a scalar pointing at a single `pair_timeframes[]` entry, and each `pair_timeframe` has a single `symbol`, so the bad configuration is physically unrepresentable in bbu2's config schema. grid-bot's schema is more flexible (independent `accounts` and `strategies` lists, FK goes `strategy.account → account.name`), so the constraint must be reconstructed as a pydantic validator — but it is enforced just as strictly. If you need a second strategy on the same symbol, use a different account.
+   - **Operational consequence (manual orders get cancelled)**: Any limit order on the symbol that is not at a current grid price, or is at a grid price with the wrong side, will be cancelled by the engine on the next ticker event after it is seen (see the "Inject is NOT durable adoption" bullet above for the exact mechanism). This applies to manual orders placed via the Bybit UI while the bot is running, orders from other tools/scripts on the same account, and stale orders left over from a prior run with different grid parameters. **Manual orders and the grid cannot coexist on the same symbol** — the bot treats "not in my grid" as "cancel it." To manually intervene, stop the bot, make your changes, restart, and accept that anything not matching the grid on restart will be cancelled on the first tick.
+   - **Before first start**: Closing existing orders for the symbol before the first start is recommended for operator clarity (otherwise the bot will cancel them within ~1 second of startup, which is surprising but not incorrect). There is no config flag to disable either the cancel-on-mismatch behavior or the `(account, symbol)` uniqueness check — both are unconditional.
    - **Reconnect**: compare exchange state with in-memory, update tracked orders
-   - **Orphan detection**: orders on exchange not matching our pattern
    - **Periodic Order Sync (2026-02-16)**: Matches bbu2's `LIMITS_READ_INTERVAL` pattern (61s by default)
      - **Purpose**: Continuously reconcile order state via REST API to catch missed WebSocket updates
      - **Implementation**: `Orchestrator._order_sync_loop()` runs as asyncio task, calls `reconciler.reconcile_reconnect()` for each runner

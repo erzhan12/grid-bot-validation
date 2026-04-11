@@ -20,11 +20,19 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ReconciliationResult:
-    """Result of a reconciliation operation."""
+    """Result of a reconciliation operation.
+
+    Attributes:
+        orders_fetched: Number of open orders fetched from exchange.
+        orders_injected: Number of orders injected into the runner.
+        untracked_orders_on_exchange: Orders on exchange with no matching
+            in-memory tracked order (only set during reconnect reconciliation).
+        errors: List of error messages encountered.
+    """
 
     orders_fetched: int = 0
     orders_injected: int = 0
-    orphan_orders: int = 0
+    untracked_orders_on_exchange: int = 0
     errors: list[str] = None
 
     def __post_init__(self):
@@ -43,8 +51,8 @@ class Reconciler:
 
         # On startup
         result = await reconciler.reconcile_startup(runner)
-        if result.orphan_orders > 0:
-            logger.warning(f"Found {result.orphan_orders} orphan orders")
+        if result.untracked_orders_on_exchange > 0:
+            logger.warning(f"Found {result.untracked_orders_on_exchange} orphan orders")
 
         # On WebSocket reconnect
         result = await reconciler.reconcile_reconnect(runner)
@@ -61,77 +69,72 @@ class Reconciler:
     async def reconcile_startup(
         self,
         runner: StrategyRunner,
-        cancel_orphans: bool = False,
     ) -> ReconciliationResult:
         """Reconcile state on startup.
 
-        Fetches open orders from exchange and injects them into the runner.
-        Detects orphan orders (orders on exchange not matching our pattern).
+        Fetches all open limit orders from exchange and injects them into the runner.
+        Since we no longer send orderLinkId to Bybit, all orders for this symbol
+        are assumed to belong to this strategy.
 
         Args:
             runner: StrategyRunner to reconcile.
-            cancel_orphans: If True, cancel orders not matching our pattern.
 
         Returns:
             ReconciliationResult with operation details.
         """
         result = ReconciliationResult()
 
+        # Fetch open orders from exchange (API errors caught here)
         try:
-            # Fetch open orders from exchange
             open_orders = self._client.get_open_orders(
                 symbol=runner.symbol,
                 order_type="Limit",
             )
-            result.orders_fetched = len(open_orders)
-
-            logger.info(
-                f"{runner.strat_id}: Fetched {len(open_orders)} open orders from exchange"
-            )
-
-            # Separate our orders from orphans
-            our_orders = []
-            orphan_orders = []
-
-            for order in open_orders:
-                order_link_id = order.get("orderLinkId", "")
-                # Our orders have 16-char hex client_order_id (SHA256 hash prefix)
-                if order_link_id and len(order_link_id) == 16 and self._is_hex(order_link_id):
-                    our_orders.append(order)
-                else:
-                    orphan_orders.append(order)
-
-            result.orders_injected = len(our_orders)
-            result.orphan_orders = len(orphan_orders)
-
-            # Inject our orders into runner
-            if our_orders:
-                runner.inject_open_orders(our_orders)
-                logger.info(f"{runner.strat_id}: Injected {len(our_orders)} orders")
-
-            # Handle orphan orders
-            if orphan_orders:
-                logger.warning(
-                    f"{runner.strat_id}: Found {len(orphan_orders)} orphan orders "
-                    f"(orders not matching our pattern)"
-                )
-
-                if cancel_orphans:
-                    for order in orphan_orders:
-                        try:
-                            self._client.cancel_order(
-                                symbol=runner.symbol,
-                                order_id=order.get("orderId"),
-                            )
-                            logger.info(
-                                f"{runner.strat_id}: Cancelled orphan order {order.get('orderId')}"
-                            )
-                        except Exception as e:
-                            result.errors.append(f"Failed to cancel orphan: {e}")
-
         except Exception as e:
             logger.error(f"{runner.strat_id}: Reconciliation error: {e}")
             result.errors.append(str(e))
+            return result
+
+        result.orders_fetched = len(open_orders)
+        logger.info(
+            f"{runner.strat_id}: Fetched {len(open_orders)} open orders from exchange"
+        )
+
+        # Inject all open orders into runner.
+        # We no longer send orderLinkId to Bybit, so we can't distinguish
+        # "our" orders from others by orderLinkId presence. All limit orders
+        # for this symbol are assumed to belong to this strategy. Two things
+        # make that assumption safe:
+        #   (1) Multi-strategy collisions are impossible: GridbotConfig
+        #       rejects any configuration with two strategies on the same
+        #       (account, symbol) pair at load time (see
+        #       config.py:validate_no_shared_symbol). bbu2 enforces the same
+        #       invariant structurally via its one-scalar-strat-per-account
+        #       schema.
+        #   (2) Manual orders are handled by the engine, not by reconciler.
+        #       See the IMPORTANT block below for the mechanism.
+        #
+        # IMPORTANT: "adoption" here lasts exactly one ticker event. On the
+        # first on_ticker after startup, GridEngine._place_grid_orders
+        # (packages/gridcore/src/gridcore/engine.py:319-325) cancels any
+        # injected order whose price is not in the current grid_price_set
+        # ('outside_grid' reason), and engine.py:305-312 cancels any at a
+        # grid price with the wrong side ('side_mismatch' reason). Over-limit
+        # cases (engine.py:237-243) trigger a full rebuild that cancels
+        # everything. bbu2 reference: strat.py:154-160, :145-149, :103-104.
+        # Do NOT add a refuse-to-start check here — it would re-break normal
+        # crash-restart (bot's own prior orders look identical to manual ones)
+        # and was already removed in commit 138737a for that reason.
+        result.orders_injected = len(open_orders)
+
+        if open_orders:
+            runner.inject_open_orders(open_orders)
+            logger.warning(
+                f"{runner.strat_id}: WARNING — injecting {len(open_orders)} open "
+                f"orders for {runner.symbol}. If any manual orders exist, they "
+                f"will be adopted by the bot. Stop the bot before placing manual "
+                f"orders on this symbol."
+            )
 
         return result
 
@@ -166,13 +169,8 @@ class Reconciler:
                 if order.get("orderId")
             }
 
-            # Get tracked orders from runner
-            tracked = runner._tracked_orders
-            tracked_order_ids = {
-                t.order_id
-                for t in tracked.values()
-                if t.order_id and t.status == "placed"
-            }
+            # Get placed order IDs from runner
+            tracked_order_ids = runner.get_placed_order_ids()
 
             # Find discrepancies
             missing_on_exchange = tracked_order_ids - exchange_order_ids
@@ -184,17 +182,15 @@ class Reconciler:
                     f"but not on exchange (likely filled/cancelled)"
                 )
                 # Update tracked orders to reflect they're no longer on exchange
-                for client_id, tracked_order in tracked.items():
-                    if tracked_order.order_id in missing_on_exchange:
-                        # Mark as cancelled (or could be filled - would need execution check)
-                        tracked_order.mark_cancelled()
+                for order_id in missing_on_exchange:
+                    runner.mark_order_cancelled_by_order_id(order_id)
 
             if missing_in_memory:
                 logger.warning(
                     f"{runner.strat_id}: {len(missing_in_memory)} orders on exchange "
                     f"but not in memory (orphans or missed updates)"
                 )
-                result.orphan_orders = len(missing_in_memory)
+                result.untracked_orders_on_exchange = len(missing_in_memory)
 
                 # Inject missing orders
                 orders_to_inject = [
@@ -211,44 +207,3 @@ class Reconciler:
 
         return result
 
-    def build_limit_orders_dict(
-        self,
-        open_orders: list[dict],
-    ) -> dict[str, list[dict]]:
-        """Build limit_orders dict in format expected by GridEngine.
-
-        Args:
-            open_orders: List of order dicts from exchange.
-
-        Returns:
-            Dict with 'long' and 'short' keys containing order lists.
-        """
-        result = {"long": [], "short": []}
-
-        for order in open_orders:
-            side = order.get("side", "")
-            reduce_only = order.get("reduceOnly", False)
-
-            # Determine direction based on side and reduce_only
-            # Buy + not reduce_only = opening long = long direction
-            # Buy + reduce_only = closing short = short direction
-            # Sell + not reduce_only = opening short = short direction
-            # Sell + reduce_only = closing long = long direction
-            if side == "Buy":
-                direction = "short" if reduce_only else "long"
-            elif side == "Sell":
-                direction = "long" if reduce_only else "short"
-            else:
-                continue
-
-            result[direction].append(order)
-
-        return result
-
-    def _is_hex(self, s: str) -> bool:
-        """Check if string is valid hexadecimal."""
-        try:
-            int(s, 16)
-            return True
-        except ValueError:
-            return False

@@ -160,7 +160,8 @@ class StrategyRunner:
         )
         self._long_position, self._short_position = Position.create_linked_pair(risk_config)
 
-        # Order tracking
+        # Order tracking: client_order_id → TrackedOrder.
+        # Lookups by exchange order_id use linear scan (~20-40 orders).
         self._tracked_orders: dict[str, TrackedOrder] = {}
 
         # Position state
@@ -308,7 +309,7 @@ class StrategyRunner:
                 return intents
 
             if intents:
-                await self._execute_intents(intents)
+                await self._execute_intents(intents, limit_orders)
 
                 # Save anchor after grid changes
                 if self._anchor_store and len(self._engine.grid.grid) > 1:
@@ -333,12 +334,17 @@ class StrategyRunner:
         """
         try:
             # Update tracked order status
-            if event.order_link_id and event.order_link_id in self._tracked_orders:
-                tracked = self._tracked_orders[event.order_link_id]
+            tracked = self._find_tracked_order(event.order_link_id, event.order_id)
+            if tracked:
                 tracked.mark_filled()
                 logger.info(
                     f"{self.strat_id}: Order filled: {event.symbol} {event.side} "
                     f"qty={event.qty} price={event.price}"
+                )
+            else:
+                logger.debug(
+                    f"{self.strat_id}: Received execution for untracked order "
+                    f"order_id={event.order_id} order_link_id={event.order_link_id!r}"
                 )
 
             # Check for same-order error (bbu2-style safety check)
@@ -349,7 +355,8 @@ class StrategyRunner:
 
             # Only execute intents if no same-order error
             if intents and not self._same_order_error:
-                await self._execute_intents(intents)
+                limit_orders = self.get_limit_orders()
+                await self._execute_intents(intents, limit_orders)
 
             return intents
         except Exception as e:
@@ -370,9 +377,8 @@ class StrategyRunner:
         """
         try:
             # Update tracked order status
-            if event.order_link_id and event.order_link_id in self._tracked_orders:
-                tracked = self._tracked_orders[event.order_link_id]
-
+            tracked = self._find_tracked_order(event.order_link_id, event.order_id)
+            if tracked:
                 if event.status in ("Filled",):
                     tracked.mark_filled()
                 elif event.status in ("Cancelled", "Rejected"):
@@ -380,13 +386,19 @@ class StrategyRunner:
                 elif event.status in ("New", "PartiallyFilled"):
                     if tracked.order_id is None:
                         tracked.mark_placed(event.order_id)
+            else:
+                logger.debug(
+                    f"{self.strat_id}: Received order_update for untracked order "
+                    f"order_id={event.order_id} order_link_id={event.order_link_id!r}"
+                )
 
             # Pass to engine (update state regardless of error)
             intents = self._engine.on_event(event)
 
             # Only execute intents if no same-order error
             if intents and not self._same_order_error:
-                await self._execute_intents(intents)
+                limit_orders = self.get_limit_orders()
+                await self._execute_intents(intents, limit_orders)
 
             return intents
         except Exception as e:
@@ -570,7 +582,11 @@ class StrategyRunner:
             position_value=position_value,
         )
 
-    async def _execute_intents(self, intents: list[PlaceLimitIntent | CancelIntent]) -> None:
+    async def _execute_intents(
+        self,
+        intents: list[PlaceLimitIntent | CancelIntent],
+        limits: dict[str, list[dict]],
+    ) -> None:
         """Execute a list of intents."""
         if self._executor.auth_cooldown:
             logger.debug(f"{self.strat_id}: Auth cooldown active, skipping {len(intents)} intents")
@@ -581,24 +597,78 @@ class StrategyRunner:
                 logger.debug(f"{self.strat_id}: Auth cooldown activated mid-batch, skipping remaining intents")
                 break
             if isinstance(intent, PlaceLimitIntent):
-                await self._execute_place_intent(intent)
+                await self._execute_place_intent(intent, limits)
             elif isinstance(intent, CancelIntent):
                 await self._execute_cancel_intent(intent)
 
-    def _is_good_to_place(self, intent: PlaceLimitIntent) -> bool:
-        """Check if reduce-only order can be placed without exceeding position size.
+    @staticmethod
+    def _derive_direction_from_order(side: str, reduce_only: bool) -> Optional[DirectionType]:
+        """Derive grid direction from Bybit order side and reduceOnly flag.
 
-        For open orders (not reduce_only), always returns True.
-        For close orders (reduce_only), checks that total reduce-only qty
-        already on the book + new order qty doesn't exceed position size.
+        Returns None for unrecognized side values.
+        """
+        if side == "Buy":
+            return DirectionType.SHORT if reduce_only else DirectionType.LONG
+        elif side == "Sell":
+            return DirectionType.LONG if reduce_only else DirectionType.SHORT
+        return None
+
+    def _find_tracked_order(
+        self, order_link_id: Optional[str], order_id: Optional[str]
+    ) -> Optional[TrackedOrder]:
+        """Find a tracked order by client_order_id or exchange order_id.
+
+        Tries _tracked_orders (keyed by client_order_id) first, then
+        scans values for matching exchange order_id.
+        """
+        if order_link_id and order_link_id in self._tracked_orders:
+            return self._tracked_orders[order_link_id]
+        if order_id:
+            for t in self._tracked_orders.values():
+                if t.order_id == order_id:
+                    return t
+        return None
+
+    def _is_good_to_place(self, intent: PlaceLimitIntent, limits: dict[str, list[dict]]) -> bool:
+        """Check if order can be placed (exact-duplicate + reduce-only checks).
+
+        1. Exact-duplicate check: if a placed order with same (price, qty, side,
+           reduce_only) already exists, reject. Matches bbu2 bybit_api_usdt.py:296-300.
+        2. For reduce_only orders, checks that total reduce-only qty on the book
+           + new order qty doesn't exceed position size.
+
+        Args:
+            intent: The order intent to validate.
+            limits: Current limit orders from get_limit_orders() or exchange.
+                Format: {'long': [order_dicts], 'short': [order_dicts]}.
 
         Reference: bbu_reference/bbu2-master/bybit_api_usdt.py:295-313
         """
+        close_side_map = {DirectionType.LONG: 'Sell', DirectionType.SHORT: 'Buy'}
+        close_side = close_side_map.get(intent.direction, '')
+        reduce_only_qty = Decimal("0")
+
+        all_orders = limits.get('long', []) + limits.get('short', [])
+        for order in all_orders:
+            # Exact duplicate check (bbu2 style)
+            if (Decimal(str(order['price'])) == intent.price
+                    and Decimal(str(order['qty'])) == intent.qty
+                    and order['side'] == intent.side
+                    and order['reduceOnly'] == intent.reduce_only):
+                logger.debug(
+                    f"{self.strat_id}: Rejecting exact duplicate order at "
+                    f"price={intent.price} qty={intent.qty} side={intent.side}"
+                )
+                return False
+            # Sum reduce_only qty for position-size check
+            if order['reduceOnly'] and order['side'] == close_side:
+                reduce_only_qty += Decimal(str(order['qty']))
+
         if not intent.reduce_only:
             return True
 
         direction = intent.direction
-        position_size = (self._long_position.size if direction == 'long'
+        position_size = (self._long_position.size if direction == DirectionType.LONG
                          else self._short_position.size)
 
         if position_size == Decimal('0'):
@@ -608,23 +678,9 @@ class StrategyRunner:
             )
             return False
 
-        close_side_map = {'long': 'Sell', 'short': 'Buy'}
-        close_side = close_side_map[direction]
+        return position_size > (intent.qty + reduce_only_qty)
 
-        total_reduce_qty = intent.qty
-        for tracked in self._tracked_orders.values():
-            if tracked.status != "placed":
-                continue
-            if tracked.intent is None:
-                continue
-            if (tracked.intent.reduce_only
-                    and tracked.intent.side == close_side
-                    and tracked.intent.direction == direction):
-                total_reduce_qty += tracked.intent.qty
-
-        return position_size > total_reduce_qty
-
-    async def _execute_place_intent(self, intent: PlaceLimitIntent) -> None:
+    async def _execute_place_intent(self, intent: PlaceLimitIntent, limits: dict[str, list[dict]]) -> None:
         """Execute a place order intent."""
         # Resolve qty (engine emits qty=0, we fill it in)
         intent = self._resolve_qty(intent)
@@ -632,11 +688,11 @@ class StrategyRunner:
             logger.debug(f"{self.strat_id}: Skipping order with qty<=0 at {intent.price}")
             return
 
-        # Check if reduce-only order would exceed position size (bbu2 _is_good_to_place)
-        if not self._is_good_to_place(intent):
+        # Check duplicate and reduce-only constraints (bbu2 _is_good_to_place)
+        if not self._is_good_to_place(intent, limits):
             logger.debug(
-                f"{self.strat_id}: Skipping reduce-only order at {intent.price} - "
-                f"would exceed position size"
+                f"{self.strat_id}: Skipping order at {intent.price} - "
+                f"rejected by _is_good_to_place"
             )
             return
 
@@ -671,12 +727,9 @@ class StrategyRunner:
         """Execute a cancel order intent."""
         result = self._executor.execute_cancel(intent)
 
-        # Update tracked order if we have it
-        for tracked in self._tracked_orders.values():
-            if tracked.order_id == intent.order_id:
-                if result.success:
-                    tracked.mark_cancelled()
-                break
+        tracked = self._find_tracked_order(None, intent.order_id)
+        if tracked and result.success:
+            tracked.mark_cancelled()
 
         if not result.success and self._on_intent_failed:
             self._on_intent_failed(intent, result.error)
@@ -684,25 +737,124 @@ class StrategyRunner:
     def inject_open_orders(self, orders: list[dict]) -> None:
         """Inject open orders from exchange (for reconciliation on startup).
 
+        Each order is stored in _tracked_orders keyed by client_order_id
+        (orderLinkId if present, otherwise orderId). Orders without orderId
+        are skipped.
+
         Args:
             orders: List of order dicts from exchange.
         """
+        injected = 0
         for order in orders:
-            order_link_id = order.get("orderLinkId", "")
             order_id = order.get("orderId", "")
-
-            if not order_link_id:
+            if not order_id:
                 continue
 
-            # Create tracked order
+            order_link_id = order.get("orderLinkId", "")
+
+            # Build a PlaceLimitIntent for duplicate/reduce-only checking.
+            # Derive direction from side+reduceOnly (Bybit orders don't carry direction).
+            # Buy+not reduce = opening long, Buy+reduce = closing short,
+            # Sell+not reduce = opening short, Sell+reduce = closing long.
+            price = order.get("price")
+            qty = order.get("qty")
+            side = order.get("side")
+            reduce_only = order.get("reduceOnly", False)
+
+            if not (price and qty and side):
+                logger.warning(
+                    f"{self.strat_id}: Skipping injected order {order_id} "
+                    f"with missing price/qty/side"
+                )
+                continue
+
+            direction = self._derive_direction_from_order(side, reduce_only)
+            if direction is None:
+                logger.warning(
+                    f"{self.strat_id}: Skipping injected order {order_id} "
+                    f"with unrecognized side={side!r}"
+                )
+                continue
+
+            try:
+                dec_price = Decimal(str(price))
+                dec_qty = Decimal(str(qty))
+            except Exception as e:
+                logger.warning(
+                    f"{self.strat_id}: Skipping injected order {order_id} "
+                    f"with invalid price={price!r} or qty={qty!r}: {e}"
+                )
+                continue
+
+            order_symbol = order.get("symbol")
+            if order_symbol and order_symbol != self._config.symbol:
+                logger.warning(
+                    f"{self.strat_id}: Skipping injected order {order_id} — "
+                    f"symbol mismatch (expected {self._config.symbol}, "
+                    f"got {order_symbol})"
+                )
+                continue
+
+            intent = PlaceLimitIntent.create(
+                symbol=self._config.symbol,
+                side=side,
+                price=dec_price,
+                qty=dec_qty,
+                grid_level=0,
+                direction=direction,
+                reduce_only=reduce_only,
+            )
+
+            # Prefer orderLinkId as key for backward compatibility: old orders
+            # (placed before this change) still have orderLinkId on the exchange,
+            # so events for those orders arrive with order_link_id set. New orders
+            # won't have one, so we fall back to orderId.
+            client_id = order_link_id or order_id
+
+            # Guard against key collisions (e.g., orderLinkId equal to some
+            # existing orderId, or duplicate injection of the same order).
+            if client_id in self._tracked_orders:
+                logger.warning(
+                    f"{self.strat_id}: Skipping injected order {order_id} — "
+                    f"key collision on client_id={client_id}"
+                )
+                continue
+
             tracked = TrackedOrder(
-                client_order_id=order_link_id,
+                client_order_id=client_id,
                 order_id=order_id,
+                intent=intent,
                 status="placed",
             )
-            self._tracked_orders[order_link_id] = tracked
+            self._tracked_orders[client_id] = tracked
+            injected += 1
 
-        logger.info(f"{self.strat_id}: Injected {len(orders)} open orders")
+        skipped = len(orders) - injected
+        if skipped > 0:
+            logger.warning(
+                f"{self.strat_id}: Skipped {skipped} orders during injection "
+                f"(see warnings above)"
+            )
+        logger.info(f"{self.strat_id}: Injected {injected}/{len(orders)} open orders")
+
+    def mark_order_cancelled_by_order_id(self, order_id: str) -> None:
+        """Mark a tracked order as cancelled by its exchange order_id.
+
+        Used by reconciler when exchange state diverges from in-memory state.
+        """
+        tracked = self._find_tracked_order(None, order_id)
+        if tracked:
+            tracked.mark_cancelled()
+
+    def get_placed_order_ids(self) -> set[str]:
+        """Get exchange order_ids of all placed (active) orders.
+
+        Used by reconciler to compare in-memory state with exchange state.
+        """
+        return {
+            t.order_id for t in self._tracked_orders.values()
+            if t.status == "placed" and t.order_id
+        }
 
     def get_tracked_order_count(self) -> dict[str, int]:
         """Get count of tracked orders by status."""

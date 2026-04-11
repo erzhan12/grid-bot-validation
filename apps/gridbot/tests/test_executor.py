@@ -108,7 +108,6 @@ class TestExecutorPlaceOrder:
             price="50000.0",
             reduce_only=False,
             position_idx=1,  # long direction
-            order_link_id=place_intent.client_order_id,
         )
 
     def test_place_order_short_direction(self, executor, mock_rest_client):
@@ -136,7 +135,6 @@ class TestExecutorPlaceOrder:
             price="50000.0",
             reduce_only=False,
             position_idx=2,  # short direction
-            order_link_id=intent.client_order_id,
         )
 
     def test_place_order_failure(self, executor, mock_rest_client, place_intent):

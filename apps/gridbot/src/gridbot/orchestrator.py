@@ -169,7 +169,7 @@ class Orchestrator:
                 logger.info(
                     f"{runner.strat_id}: Reconciliation complete - "
                     f"fetched={result.orders_fetched}, injected={result.orders_injected}, "
-                    f"orphans={result.orphan_orders}"
+                    f"untracked={result.untracked_orders_on_exchange}"
                 )
 
         # Create database Run records (populates _run_ids)
@@ -842,11 +842,11 @@ class Orchestrator:
                                     "%s: Order sync completed with errors: %s",
                                     runner.strat_id, result.errors,
                                 )
-                            elif result.orders_injected > 0 or result.orphan_orders > 0:
+                            elif result.orders_injected > 0 or result.untracked_orders_on_exchange > 0:
                                 logger.info(
-                                    "%s: Order sync - fetched=%d, injected=%d, orphans=%d",
+                                    "%s: Order sync - fetched=%d, injected=%d, untracked=%d",
                                     runner.strat_id, result.orders_fetched,
-                                    result.orders_injected, result.orphan_orders,
+                                    result.orders_injected, result.untracked_orders_on_exchange,
                                 )
                             else:
                                 logger.debug(
