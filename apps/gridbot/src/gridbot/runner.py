@@ -651,8 +651,8 @@ class StrategyRunner:
         all_orders = limits.get('long', []) + limits.get('short', [])
         for order in all_orders:
             # Exact duplicate check (bbu2 style)
-            if (Decimal(order['price']) == intent.price
-                    and Decimal(order['qty']) == intent.qty
+            if (Decimal(str(order['price'])) == intent.price
+                    and Decimal(str(order['qty'])) == intent.qty
                     and order['side'] == intent.side
                     and order['reduceOnly'] == intent.reduce_only):
                 logger.debug(
@@ -662,7 +662,7 @@ class StrategyRunner:
                 return False
             # Sum reduce_only qty for position-size check
             if order['reduceOnly'] and order['side'] == close_side:
-                reduce_only_qty += Decimal(order['qty'])
+                reduce_only_qty += Decimal(str(order['qty']))
 
         if not intent.reduce_only:
             return True
