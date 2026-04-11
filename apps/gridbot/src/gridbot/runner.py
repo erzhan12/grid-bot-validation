@@ -598,6 +598,11 @@ class StrategyRunner:
                 break
             if isinstance(intent, PlaceLimitIntent):
                 await self._execute_place_intent(intent, limits)
+                # Refresh limits after each placement so _is_good_to_place
+                # sees newly placed orders. Without this, multiple reduce-only
+                # intents in the same batch can over-cover the position because
+                # they all check against the same stale snapshot.
+                limits = self.get_limit_orders()
             elif isinstance(intent, CancelIntent):
                 await self._execute_cancel_intent(intent)
 

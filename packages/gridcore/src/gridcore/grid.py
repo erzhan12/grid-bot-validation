@@ -182,13 +182,15 @@ class Grid:
         buy_count = 0
         sell_count = 0
         highest_sell_price = 0
-        lowest_buy_price = self.grid[0]['price'] if self.grid else 0
+        lowest_buy_price = None
         step = self.grid_step / 100
 
         # Single pass to count and find prices
         for grid in self.grid:
             if grid['side'] == GridSideType.BUY:
                 buy_count += 1
+                if lowest_buy_price is None or grid['price'] < lowest_buy_price:
+                    lowest_buy_price = grid['price']
             elif grid['side'] == GridSideType.SELL:
                 sell_count += 1
                 highest_sell_price = grid['price']
@@ -206,7 +208,10 @@ class Grid:
         # Too many sells → shift grid downward
         elif (sell_count - buy_count) / total_count > self.REBALANCE_THRESHOLD:
             self.grid.pop()  # Delete the top line
-            price = self._round_price(lowest_buy_price * (1 - step))
+            # Use tracked lowest BUY price; fall back to grid[0] price when
+            # no BUY entries remain (e.g. all converted to WAIT after fills).
+            base_price = lowest_buy_price if lowest_buy_price is not None else self.grid[0]['price']
+            price = self._round_price(base_price * (1 - step))
             self.grid.insert(0, {'side': GridSideType.BUY, 'price': price})
 
     def __is_too_close(self, price1: float, price2: float) -> bool:

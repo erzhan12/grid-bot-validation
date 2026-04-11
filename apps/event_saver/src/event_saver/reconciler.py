@@ -130,7 +130,10 @@ class GapReconciler:
                 f"(last_persisted_ts: {last_persisted_ts})"
             )
 
-            # Run synchronous REST call in thread to avoid blocking event loop
+            # NOTE: Bybit's public trade endpoint only returns the most recent
+            # trades (no time-range query support). The local filter below
+            # ensures correctness, but reconciliation will miss trades if the
+            # gap is older than the window covered by the latest 1000 trades.
             trades_data = await asyncio.to_thread(
                 self._rest_client.get_recent_trades,
                 symbol=symbol,
@@ -140,6 +143,18 @@ class GapReconciler:
             if not trades_data:
                 logger.debug(f"No trades returned from REST API for {symbol}")
                 return 0
+
+            # Check whether the fetched trades actually cover the gap period
+            trade_timestamps = [int(t.get("time", 0)) for t in trades_data]
+            oldest_fetched_ms = min(trade_timestamps) if trade_timestamps else 0
+            if oldest_fetched_ms > start_ms:
+                logger.warning(
+                    f"Public trade reconciliation for {symbol} has incomplete "
+                    f"coverage: oldest fetched trade ({oldest_fetched_ms}) is "
+                    f"newer than gap start ({start_ms}). "
+                    f"Gap trades before that timestamp are unrecoverable via "
+                    f"the recent-trade endpoint."
+                )
 
             # Filter trades within gap period
             gap_trades = []

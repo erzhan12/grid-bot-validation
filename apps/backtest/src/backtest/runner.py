@@ -24,6 +24,7 @@ from gridcore import (
     PositionState,
     RiskConfig,
 )
+from gridcore.instrument_info import InstrumentInfo
 from gridcore.pnl import calc_position_value, calc_margin_ratio, calc_maintenance_margin, MMTiers, MM_TIERS, MM_TIERS_DEFAULT
 
 from backtest.config import BacktestStrategyConfig
@@ -67,6 +68,7 @@ class BacktestRunner:
         long_tracker: Optional[BacktestPositionTracker] = None,
         short_tracker: Optional[BacktestPositionTracker] = None,
         anchor_price: Optional[float] = None,
+        instrument_info: Optional[InstrumentInfo] = None,
     ):
         """Initialize backtest runner.
 
@@ -77,10 +79,13 @@ class BacktestRunner:
             long_tracker: Position tracker for long direction.
             short_tracker: Position tracker for short direction.
             anchor_price: Optional anchor price for grid initialization.
+            instrument_info: Optional instrument info for qty re-rounding
+                after risk multiplier application.
         """
         self._config = strategy_config
         self._executor = executor
         self._session = session
+        self._instrument_info = instrument_info
 
         # Create GridEngine
         grid_config = GridConfig(
@@ -329,9 +334,11 @@ class BacktestRunner:
 
         Returns False when:
         - No position exists for this direction (nothing to close).
-        - The position size is already fully covered by pending close orders.
+        - The position size is already fully covered by pending close orders
+          plus the new order's resolved qty.
 
-        Matches BBU2 _is_good_to_place() (bybit_api_usdt.py:295-313).
+        Resolves intent qty via the executor's qty_calculator before
+        checking, matching live runner _is_good_to_place() pattern.
         """
         tracker = (
             self._long_tracker
@@ -355,7 +362,8 @@ class BacktestRunner:
                 self.strat_id, intent.direction, pending_qty, pos_size,
                 ", ".join(close_orders),
             )
-        return pos_size > pending_qty
+        intent_qty = self._resolve_intent_qty(intent)
+        return pos_size > (pending_qty + intent_qty)
 
     def _get_pending_close_qty(self, direction: str) -> Decimal:
         """Sum qty of active reduce_only orders for a direction.
@@ -370,6 +378,17 @@ class BacktestRunner:
             if order.direction == direction and order.reduce_only:
                 total += order.qty
         return total
+
+    def _resolve_intent_qty(self, intent: PlaceLimitIntent) -> Decimal:
+        """Resolve qty that executor.execute_place would compute for an intent.
+
+        Engine emits qty=0; the executor's qty_calculator resolves it.
+        This mirrors that resolution so _should_place_close can include
+        the new order's qty in its gate check.
+        """
+        if self._executor.qty_calculator is not None:
+            return self._executor.qty_calculator(intent, self._session.current_balance)
+        return intent.qty
 
     def _process_fill(self, event: ExecutionEvent) -> None:
         """Process a fill event and update positions.
@@ -425,11 +444,16 @@ class BacktestRunner:
             )
             liq_ratio = float(liq_price / self._last_price) if self._last_price else 0.0
 
+        margin = (
+            float(tracker.state.position_value / self._session.current_balance)
+            if self._session.current_balance > 0
+            else 0.0
+        )
         logger.debug(
             f"{self.strat_id}: Fill {event.side} {event.qty} @ {event.price}, "
             f"realized_pnl={realized_pnl:.2f}, direction={direction}, "
             f"pos_size={tracker.state.size}, "
-            f"liq_ratio={liq_ratio:.4f}, margin={float(tracker.state.position_value / self._session.current_balance):.4f}, "
+            f"liq_ratio={liq_ratio:.4f}, margin={margin:.4f}, "
             f"imr={tracker.state.imr_rate:.4f}, mmr={tracker.state.mmr_rate:.4f}"
         )
 
@@ -600,7 +624,8 @@ class BacktestRunner:
         """qty_calculator callback for BacktestExecutor.
 
         Composes with the base qty_calculator: first computes base qty from
-        amount pattern + rounding, then scales by the risk multiplier.
+        amount pattern + rounding, then scales by the risk multiplier,
+        then re-rounds to qty_step (matching live _resolve_qty pattern).
         """
         # Compute base qty using the original calculator (amount/rounding)
         if self._base_qty_calculator is not None:
@@ -609,7 +634,14 @@ class BacktestRunner:
             base_qty = intent.qty
 
         multiplier = self.get_amount_multiplier(intent.direction, intent.side)
-        return base_qty * Decimal(str(multiplier))
+        result = base_qty * Decimal(str(multiplier))
+
+        # Re-round after multiplier to ensure qty aligns with exchange qty_step
+        # (matches live runner _resolve_qty lines 526-527)
+        if self._instrument_info is not None and result > 0:
+            result = self._instrument_info.round_qty(result)
+
+        return result
 
     def _infer_direction(self, side: str) -> str:
         """Infer direction from side when order lookup fails.
