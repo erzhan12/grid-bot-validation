@@ -196,36 +196,3 @@ class TestReconcilerReconnect:
         assert result.orders_injected == 1
 
 
-class TestBuildLimitOrdersDict:
-    """Tests for build_limit_orders_dict method."""
-
-    def test_empty_list(self, reconciler):
-        """Test with empty order list."""
-        result = reconciler.build_limit_orders_dict([])
-        assert result == {"long": [], "short": []}
-
-    def test_buy_orders(self, reconciler):
-        """Test buy order direction determination."""
-        orders = [
-            {"side": "Buy", "reduceOnly": False},  # Opening long
-            {"side": "Buy", "reduceOnly": True},   # Closing short
-        ]
-
-        result = reconciler.build_limit_orders_dict(orders)
-
-        assert len(result["long"]) == 1
-        assert len(result["short"]) == 1
-
-    def test_sell_orders(self, reconciler):
-        """Test sell order direction determination."""
-        orders = [
-            {"side": "Sell", "reduceOnly": False},  # Opening short
-            {"side": "Sell", "reduceOnly": True},   # Closing long
-        ]
-
-        result = reconciler.build_limit_orders_dict(orders)
-
-        assert len(result["long"]) == 1
-        assert len(result["short"]) == 1
-
-

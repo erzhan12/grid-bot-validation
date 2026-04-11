@@ -207,37 +207,3 @@ class Reconciler:
 
         return result
 
-    def build_limit_orders_dict(
-        self,
-        open_orders: list[dict],
-    ) -> dict[str, list[dict]]:
-        """Build limit_orders dict in format expected by GridEngine.
-
-        Args:
-            open_orders: List of order dicts from exchange.
-
-        Returns:
-            Dict with 'long' and 'short' keys containing order lists.
-        """
-        result = {"long": [], "short": []}
-
-        for order in open_orders:
-            side = order.get("side", "")
-            reduce_only = order.get("reduceOnly", False)
-
-            # Determine direction based on side and reduce_only
-            # Buy + not reduce_only = opening long = long direction
-            # Buy + reduce_only = closing short = short direction
-            # Sell + not reduce_only = opening short = short direction
-            # Sell + reduce_only = closing long = long direction
-            if side == "Buy":
-                direction = "short" if reduce_only else "long"
-            elif side == "Sell":
-                direction = "long" if reduce_only else "short"
-            else:
-                continue
-
-            result[direction].append(order)
-
-        return result
-
