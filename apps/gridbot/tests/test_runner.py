@@ -277,6 +277,37 @@ class TestStrategyRunnerOrderTracking:
         counts = runner.get_tracked_order_count()
         assert counts["placed"] == 1  # second skipped
 
+    def test_inject_open_orders_skips_symbol_mismatch(self, runner):
+        """Orders with a symbol different from config are skipped."""
+        orders = [
+            {"orderId": "ex_wrong", "symbol": "ETHUSDT",
+             "price": "3000", "qty": "0.01", "side": "Buy"},
+            {"orderId": "ex_correct", "symbol": "BTCUSDT",
+             "price": "49000", "qty": "0.001", "side": "Buy"},
+            {"orderId": "ex_no_symbol",
+             "price": "51000", "qty": "0.001", "side": "Sell"},
+        ]
+        runner.inject_open_orders(orders)
+
+        counts = runner.get_tracked_order_count()
+        assert counts["placed"] == 2  # ex_wrong skipped
+        assert runner._find_tracked_order(None, "ex_wrong") is None
+        assert runner._find_tracked_order(None, "ex_correct") is not None
+        assert runner._find_tracked_order(None, "ex_no_symbol") is not None
+
+    def test_inject_open_orders_uses_config_symbol(self, runner):
+        """Injected orders always use config symbol, not the order's symbol field."""
+        orders = [
+            {"orderId": "ex_1", "symbol": "BTCUSDT",
+             "price": "49000", "qty": "0.001", "side": "Buy"},
+            {"orderId": "ex_2",
+             "price": "51000", "qty": "0.001", "side": "Sell"},
+        ]
+        runner.inject_open_orders(orders)
+
+        for tracked in runner._tracked_orders.values():
+            assert tracked.intent.symbol == "BTCUSDT"
+
     def test_get_tracked_order_count(self, runner):
         """Test getting tracked order counts."""
         counts = runner.get_tracked_order_count()

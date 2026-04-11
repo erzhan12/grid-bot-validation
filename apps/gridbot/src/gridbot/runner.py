@@ -341,6 +341,11 @@ class StrategyRunner:
                     f"{self.strat_id}: Order filled: {event.symbol} {event.side} "
                     f"qty={event.qty} price={event.price}"
                 )
+            else:
+                logger.debug(
+                    f"{self.strat_id}: Received execution for untracked order "
+                    f"order_id={event.order_id} order_link_id={event.order_link_id!r}"
+                )
 
             # Check for same-order error (bbu2-style safety check)
             self._check_same_orders(event)
@@ -381,6 +386,11 @@ class StrategyRunner:
                 elif event.status in ("New", "PartiallyFilled"):
                     if tracked.order_id is None:
                         tracked.mark_placed(event.order_id)
+            else:
+                logger.debug(
+                    f"{self.strat_id}: Received order_update for untracked order "
+                    f"order_id={event.order_id} order_link_id={event.order_link_id!r}"
+                )
 
             # Pass to engine (update state regardless of error)
             intents = self._engine.on_event(event)
@@ -776,8 +786,17 @@ class StrategyRunner:
                 )
                 continue
 
+            order_symbol = order.get("symbol")
+            if order_symbol and order_symbol != self._config.symbol:
+                logger.warning(
+                    f"{self.strat_id}: Skipping injected order {order_id} — "
+                    f"symbol mismatch (expected {self._config.symbol}, "
+                    f"got {order_symbol})"
+                )
+                continue
+
             intent = PlaceLimitIntent.create(
-                symbol=order.get("symbol", self._config.symbol),
+                symbol=self._config.symbol,
                 side=side,
                 price=dec_price,
                 qty=dec_qty,
@@ -810,7 +829,13 @@ class StrategyRunner:
             self._tracked_orders[client_id] = tracked
             injected += 1
 
-        logger.info(f"{self.strat_id}: Injected {injected} open orders")
+        skipped = len(orders) - injected
+        if skipped > 0:
+            logger.warning(
+                f"{self.strat_id}: Skipped {skipped} orders during injection "
+                f"(see warnings above)"
+            )
+        logger.info(f"{self.strat_id}: Injected {injected}/{len(orders)} open orders")
 
     def mark_order_cancelled_by_order_id(self, order_id: str) -> None:
         """Mark a tracked order as cancelled by its exchange order_id.
