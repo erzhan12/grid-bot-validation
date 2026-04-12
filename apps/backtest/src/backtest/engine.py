@@ -291,6 +291,7 @@ class BacktestEngine:
             session=self._session,
             long_tracker=long_tracker,
             short_tracker=short_tracker,
+            instrument_info=instrument_info,
         )
 
         self._runners[strategy_config.strat_id] = runner

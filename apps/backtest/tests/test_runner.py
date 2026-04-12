@@ -7,6 +7,7 @@ from decimal import Decimal
 import pytest
 
 from gridcore import TickerEvent, EventType, PlaceLimitIntent, DirectionType, SideType
+from gridcore.instrument_info import InstrumentInfo
 from gridcore.pnl import calc_maintenance_margin
 
 from backtest.runner import BacktestRunner
@@ -558,6 +559,54 @@ class TestBacktestRunnerRiskMultipliers:
         result_qty = risk_runner._apply_risk_to_qty(intent, Decimal("10000"))
         assert result_qty == Decimal("0.005")
 
+    def test_apply_risk_re_rounds_to_qty_step(self, risk_config):
+        """Risk multiplier result is re-rounded to instrument qty_step.
+
+        Regression: base_qty=0.001 (rounded) * multiplier=0.5 = 0.0005,
+        which is not a valid qty_step=0.001. Must re-round to 0.001.
+        """
+        session = BacktestSession(session_id="test_round", initial_balance=Decimal("10000"))
+        fill_sim = TradeThroughFillSimulator()
+        order_mgr = BacktestOrderManager(
+            fill_simulator=fill_sim,
+            commission_rate=risk_config.commission_rate,
+        )
+        instrument = InstrumentInfo(
+            symbol="BTCUSDT",
+            qty_step=Decimal("0.001"),
+            tick_size=Decimal("0.1"),
+            min_qty=Decimal("0.001"),
+            max_qty=Decimal("100"),
+        )
+
+        def base_calc(intent, wallet_balance):
+            return Decimal("0.001")  # Already rounded to qty_step
+
+        executor = BacktestExecutor(order_manager=order_mgr, qty_calculator=base_calc)
+        runner = BacktestRunner(
+            strategy_config=risk_config,
+            executor=executor,
+            session=session,
+            instrument_info=instrument,
+        )
+        runner._long_position.set_amount_multiplier(SideType.BUY, 0.5)
+
+        intent = PlaceLimitIntent(
+            symbol="BTCUSDT",
+            side=SideType.BUY,
+            price=Decimal("100000"),
+            qty=Decimal("0"),
+            direction=DirectionType.LONG,
+            grid_level=5,
+            reduce_only=False,
+            client_order_id="test_reround",
+        )
+
+        # Without re-rounding: 0.001 * 0.5 = 0.0005 (invalid)
+        # With re-rounding: round_qty(0.0005, step=0.001) = 0.001
+        result_qty = runner._apply_risk_to_qty(intent, Decimal("10000"))
+        assert result_qty == Decimal("0.001")
+
     def test_config_new_fields_defaults(self):
         """New config fields have correct defaults."""
         config = BacktestStrategyConfig(
@@ -894,6 +943,51 @@ class TestShouldPlaceClose:
             grid_level=10,
             timestamp=sample_timestamp,
             reduce_only=False,
+        )
+        intent = self._close_intent(DirectionType.LONG, SideType.SELL)
+        assert runner._should_place_close(intent) is True
+
+    def test_over_close_blocked_by_resolved_qty(self, runner, sample_timestamp):
+        """Close order rejected when resolved qty + pending would exceed position.
+
+        Regression: position=0.002, pending=0.001, resolved=0.001.
+        Total 0.001+0.001=0.002, not > 0.002 → blocked.
+        Before fix, backtest only checked 0.002 > 0.001 → allowed.
+        """
+        runner._long_tracker.process_fill(
+            side=SideType.BUY, qty=Decimal("0.002"), price=Decimal("100000")
+        )
+        runner._executor.order_manager.place_order(
+            client_order_id="close_1",
+            symbol="BTCUSDT",
+            side=SideType.SELL,
+            price=Decimal("101000"),
+            qty=Decimal("0.001"),
+            direction=DirectionType.LONG,
+            grid_level=10,
+            timestamp=sample_timestamp,
+            reduce_only=True,
+        )
+        # qty_from_usdt resolves 100/100000 = 0.001
+        intent = self._close_intent(DirectionType.LONG, SideType.SELL)
+        assert runner._should_place_close(intent) is False
+
+    def test_resolved_qty_still_allows_when_room_remains(self, runner, sample_timestamp):
+        """Close order allowed when resolved qty + pending still leaves room."""
+        runner._long_tracker.process_fill(
+            side=SideType.BUY, qty=Decimal("0.5"), price=Decimal("100000")
+        )
+        # pending=0.2, resolved=0.001, total=0.201 < 0.5
+        runner._executor.order_manager.place_order(
+            client_order_id="close_1",
+            symbol="BTCUSDT",
+            side=SideType.SELL,
+            price=Decimal("101000"),
+            qty=Decimal("0.2"),
+            direction=DirectionType.LONG,
+            grid_level=10,
+            timestamp=sample_timestamp,
+            reduce_only=True,
         )
         intent = self._close_intent(DirectionType.LONG, SideType.SELL)
         assert runner._should_place_close(intent) is True
