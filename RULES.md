@@ -1734,6 +1734,7 @@ Two-layer: Runner logs + re-raises → Orchestrator catches + sends Telegram ale
 - **Multi-strategy accounts**: `run_id` is set to `None` because `AccountContext` is account-scoped but `Run` is strategy-scoped. Executions/orders are captured but not persisted to DB. Positions/wallet/tickers still work. Fixing this requires per-symbol run_id mapping in EventSaver's normalizer pipeline.
 - Accounts with zero strategies are skipped (empty `symbols=[]` means "no filter" in `PrivateCollector`, which would over-collect)
 - Plan/review docs: `docs/features/0014_PLAN.md`, `docs/features/0014_REVIEW.md`
+- **Debug walkthrough (architecture + breakpoint checklist)**: `docs/architecture/gridbot-save-events-debug.md`
 
 ### Key Pitfalls
 
