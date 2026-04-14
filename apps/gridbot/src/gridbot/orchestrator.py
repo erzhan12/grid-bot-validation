@@ -681,7 +681,7 @@ class Orchestrator:
                     last_close = runner.engine.last_close or 0.0
 
                     try:
-                        await runner.on_position_update(
+                        runner.on_position_update(
                             long_position=long_pos,
                             short_position=short_pos,
                             wallet_balance=wallet_balance,

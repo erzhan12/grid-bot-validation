@@ -441,7 +441,7 @@ class TestOrchestratorLifecycle:
 
         # Make runner.on_position_update raise
         runner = orchestrator._runners["btcusdt_test"]
-        runner.on_position_update = AsyncMock(
+        runner.on_position_update = Mock(
             side_effect=RuntimeError("runner exploded")
         )
 
@@ -716,7 +716,7 @@ class TestOrchestratorPositionCheckLoop:
         mock_runner.strat_id = "btcusdt_test"
         mock_runner.symbol = "BTCUSDT"
         mock_runner.engine.last_close = 42000.0
-        mock_runner.on_position_update = AsyncMock()
+        mock_runner.on_position_update = Mock()
         orchestrator._account_to_runners["test_account"] = [mock_runner]
 
         # Pre-populate WS position cache
@@ -767,7 +767,7 @@ class TestOrchestratorPositionCheckLoop:
         mock_runner.strat_id = "btcusdt_test"
         mock_runner.symbol = "BTCUSDT"
         mock_runner.engine.last_close = 42000.0
-        mock_runner.on_position_update = AsyncMock()
+        mock_runner.on_position_update = Mock()
         orchestrator._account_to_runners["test_account"] = [mock_runner]
 
         # NO WS data

@@ -99,8 +99,8 @@ class StrategyRunner:
         )
 
         # Process events
-        await runner.on_ticker(ticker_event)
-        await runner.on_execution(execution_event)
+        runner.on_ticker(ticker_event)
+        runner.on_execution(execution_event)
     """
 
     def __init__(
@@ -284,7 +284,7 @@ class StrategyRunner:
 
         return {"long": long_orders, "short": short_orders}
 
-    async def on_ticker(self, event: TickerEvent) -> list[PlaceLimitIntent | CancelIntent]:
+    def on_ticker(self, event: TickerEvent) -> list[PlaceLimitIntent | CancelIntent]:
         """Process ticker event.
 
         Args:
@@ -309,7 +309,7 @@ class StrategyRunner:
                 return intents
 
             if intents:
-                await self._execute_intents(intents, limit_orders)
+                self._execute_intents(intents, limit_orders)
 
                 # Save anchor after grid changes
                 if self._anchor_store and len(self._engine.grid.grid) > 1:
@@ -320,7 +320,7 @@ class StrategyRunner:
             logger.error(f"{self.strat_id}: Error in on_ticker: {e}", exc_info=True)
             raise
 
-    async def on_execution(self, event: ExecutionEvent) -> list[PlaceLimitIntent | CancelIntent]:
+    def on_execution(self, event: ExecutionEvent) -> list[PlaceLimitIntent | CancelIntent]:
         """Process execution (fill) event.
 
         Args:
@@ -356,14 +356,14 @@ class StrategyRunner:
             # Only execute intents if no same-order error
             if intents and not self._same_order_error:
                 limit_orders = self.get_limit_orders()
-                await self._execute_intents(intents, limit_orders)
+                self._execute_intents(intents, limit_orders)
 
             return intents
         except Exception as e:
             logger.error(f"{self.strat_id}: Error in on_execution: {e}", exc_info=True)
             raise
 
-    async def on_order_update(self, event: OrderUpdateEvent) -> list[PlaceLimitIntent | CancelIntent]:
+    def on_order_update(self, event: OrderUpdateEvent) -> list[PlaceLimitIntent | CancelIntent]:
         """Process order update event.
 
         Args:
@@ -398,14 +398,14 @@ class StrategyRunner:
             # Only execute intents if no same-order error
             if intents and not self._same_order_error:
                 limit_orders = self.get_limit_orders()
-                await self._execute_intents(intents, limit_orders)
+                self._execute_intents(intents, limit_orders)
 
             return intents
         except Exception as e:
             logger.error(f"{self.strat_id}: Error in on_order_update: {e}", exc_info=True)
             raise
 
-    async def on_position_update(
+    def on_position_update(
         self,
         long_position: Optional[dict],
         short_position: Optional[dict],
@@ -582,7 +582,7 @@ class StrategyRunner:
             position_value=position_value,
         )
 
-    async def _execute_intents(
+    def _execute_intents(
         self,
         intents: list[PlaceLimitIntent | CancelIntent],
         limits: dict[str, list[dict]],
@@ -597,14 +597,14 @@ class StrategyRunner:
                 logger.debug(f"{self.strat_id}: Auth cooldown activated mid-batch, skipping remaining intents")
                 break
             if isinstance(intent, PlaceLimitIntent):
-                await self._execute_place_intent(intent, limits)
+                self._execute_place_intent(intent, limits)
                 # Refresh limits after each placement so _is_good_to_place
                 # sees newly placed orders. Without this, multiple reduce-only
                 # intents in the same batch can over-cover the position because
                 # they all check against the same stale snapshot.
                 limits = self.get_limit_orders()
             elif isinstance(intent, CancelIntent):
-                await self._execute_cancel_intent(intent)
+                self._execute_cancel_intent(intent)
 
     @staticmethod
     def _derive_direction_from_order(side: str, reduce_only: bool) -> Optional[DirectionType]:
@@ -685,7 +685,7 @@ class StrategyRunner:
 
         return position_size > (intent.qty + reduce_only_qty)
 
-    async def _execute_place_intent(self, intent: PlaceLimitIntent, limits: dict[str, list[dict]]) -> None:
+    def _execute_place_intent(self, intent: PlaceLimitIntent, limits: dict[str, list[dict]]) -> None:
         """Execute a place order intent."""
         # Resolve qty (engine emits qty=0, we fill it in)
         intent = self._resolve_qty(intent)
@@ -728,7 +728,7 @@ class StrategyRunner:
             if self._on_intent_failed:
                 self._on_intent_failed(intent, result.error)
 
-    async def _execute_cancel_intent(self, intent: CancelIntent) -> None:
+    def _execute_cancel_intent(self, intent: CancelIntent) -> None:
         """Execute a cancel order intent."""
         result = self._executor.execute_cancel(intent)
 

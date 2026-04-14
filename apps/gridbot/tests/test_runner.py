@@ -167,19 +167,15 @@ class TestStrategyRunnerProperties:
 
 class TestStrategyRunnerTicker:
     """Tests for ticker event processing."""
-
-    @pytest.mark.asyncio
-    async def test_on_ticker_builds_grid(self, runner, ticker_event):
+    def test_on_ticker_builds_grid(self, runner, ticker_event):
         """Test ticker event builds grid on first call."""
-        await runner.on_ticker(ticker_event)
+        runner.on_ticker(ticker_event)
 
         # Grid should be built, intents generated
         assert len(runner.engine.grid.grid) > 0
-
-    @pytest.mark.asyncio
-    async def test_on_ticker_executes_intents(self, runner, mock_executor, ticker_event):
+    def test_on_ticker_executes_intents(self, runner, mock_executor, ticker_event):
         """Test ticker event executes returned intents."""
-        await runner.on_ticker(ticker_event)
+        runner.on_ticker(ticker_event)
 
         # Executor should have been called
         assert mock_executor.execute_place.called or mock_executor.execute_cancel.called
@@ -322,9 +318,7 @@ class TestStrategyRunnerOrderTracking:
 
 class TestStrategyRunnerExecution:
     """Tests for order execution."""
-
-    @pytest.mark.asyncio
-    async def test_execute_place_intent_success(self, runner, mock_executor):
+    def test_execute_place_intent_success(self, runner, mock_executor):
         """Test successful order placement."""
         intent = PlaceLimitIntent.create(
             symbol="BTCUSDT",
@@ -335,14 +329,12 @@ class TestStrategyRunnerExecution:
             direction="long",
         )
 
-        await runner._execute_place_intent(intent, EMPTY_LIMITS)
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
 
         mock_executor.execute_place.assert_called_once_with(intent)
         assert intent.client_order_id in runner._tracked_orders
         assert runner._tracked_orders[intent.client_order_id].status == "placed"
-
-    @pytest.mark.asyncio
-    async def test_execute_place_intent_failure(self, runner, mock_executor):
+    def test_execute_place_intent_failure(self, runner, mock_executor):
         """Test failed order placement."""
         mock_executor.execute_place.return_value = OrderResult(
             success=False, error="Rate limited"
@@ -357,12 +349,10 @@ class TestStrategyRunnerExecution:
             direction="long",
         )
 
-        await runner._execute_place_intent(intent, EMPTY_LIMITS)
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
 
         assert runner._tracked_orders[intent.client_order_id].status == "failed"
-
-    @pytest.mark.asyncio
-    async def test_execute_place_intent_duplicate_skipped(self, runner, mock_executor):
+    def test_execute_place_intent_duplicate_skipped(self, runner, mock_executor):
         """Test duplicate order placement is skipped."""
         intent = PlaceLimitIntent.create(
             symbol="BTCUSDT",
@@ -374,17 +364,15 @@ class TestStrategyRunnerExecution:
         )
 
         # First execution
-        await runner._execute_place_intent(intent, EMPTY_LIMITS)
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
         call_count = mock_executor.execute_place.call_count
 
         # Second execution (duplicate)
-        await runner._execute_place_intent(intent, EMPTY_LIMITS)
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
 
         # Should not have been called again
         assert mock_executor.execute_place.call_count == call_count
-
-    @pytest.mark.asyncio
-    async def test_execute_cancel_intent_success(self, runner, mock_executor):
+    def test_execute_cancel_intent_success(self, runner, mock_executor):
         """Test successful order cancellation."""
         intent = CancelIntent(
             symbol="BTCUSDT",
@@ -392,21 +380,19 @@ class TestStrategyRunnerExecution:
             reason="test",
         )
 
-        await runner._execute_cancel_intent(intent)
+        runner._execute_cancel_intent(intent)
 
         mock_executor.execute_cancel.assert_called_once_with(intent)
 
 
 class TestStrategyRunnerPositionUpdate:
     """Tests for position updates."""
-
-    @pytest.mark.asyncio
-    async def test_on_position_update_calculates_ratio(self, runner):
+    def test_on_position_update_calculates_ratio(self, runner):
         """Test position update calculates position ratio."""
         long_pos = {"size": "1.0", "avgPrice": "50000", "liqPrice": "40000"}
         short_pos = {"size": "0.5", "avgPrice": "50000", "liqPrice": "60000"}
 
-        await runner.on_position_update(
+        runner.on_position_update(
             long_position=long_pos,
             short_position=short_pos,
             wallet_balance=10000.0,
@@ -415,13 +401,11 @@ class TestStrategyRunnerPositionUpdate:
 
         # Long ratio survives; short's is overwritten by calculate_amount_multiplier
         assert runner._long_position.position_ratio == 2.0  # 1.0 / 0.5
-
-    @pytest.mark.asyncio
-    async def test_on_position_update_no_short(self, runner):
+    def test_on_position_update_no_short(self, runner):
         """Test position update with no short position."""
         long_pos = {"size": "1.0", "avgPrice": "50000", "liqPrice": "40000"}
 
-        await runner.on_position_update(
+        runner.on_position_update(
             long_position=long_pos,
             short_position=None,
             wallet_balance=10000.0,
@@ -431,11 +415,9 @@ class TestStrategyRunnerPositionUpdate:
         # Long's ratio is overwritten by calculate_amount_multiplier;
         # short's survives since calculate is not called (short_state is None)
         assert runner._short_position.position_ratio == float("inf")
-
-    @pytest.mark.asyncio
-    async def test_on_position_update_no_positions(self, runner):
+    def test_on_position_update_no_positions(self, runner):
         """Test position update with no positions."""
-        await runner.on_position_update(
+        runner.on_position_update(
             long_position=None,
             short_position=None,
             wallet_balance=10000.0,
@@ -444,14 +426,12 @@ class TestStrategyRunnerPositionUpdate:
 
         assert runner._long_position.position_ratio == 1.0
         assert runner._short_position.position_ratio == 1.0
-
-    @pytest.mark.asyncio
-    async def test_on_position_update_stores_both_multiplier_keys(self, runner):
+    def test_on_position_update_stores_both_multiplier_keys(self, runner):
         """Test that both Buy and Sell multipliers are stored per direction."""
         long_pos = {"size": "1.0", "avgPrice": "50000", "liqPrice": "40000"}
         short_pos = {"size": "0.5", "avgPrice": "50000", "liqPrice": "60000"}
 
-        await runner.on_position_update(
+        runner.on_position_update(
             long_position=long_pos,
             short_position=short_pos,
             wallet_balance=10000.0,
@@ -465,9 +445,7 @@ class TestStrategyRunnerPositionUpdate:
         assert "Sell" in long_mult
         assert "Buy" in short_mult
         assert "Sell" in short_mult
-
-    @pytest.mark.asyncio
-    async def test_on_position_update_decimal_float_type_safety(self, runner):
+    def test_on_position_update_decimal_float_type_safety(self, runner):
         """Regression: ratio calculation must not raise TypeError when mixing Decimal/float.
 
         PositionState.size is Decimal but the None-fallback was float 0.0,
@@ -478,7 +456,7 @@ class TestStrategyRunnerPositionUpdate:
         short_pos = {"size": "0.5", "avgPrice": "50000", "liqPrice": "60000"}
 
         # Both positions present (Decimal / Decimal)
-        await runner.on_position_update(
+        runner.on_position_update(
             long_position=long_pos, short_position=short_pos,
             wallet_balance=10000.0, last_close=50000.0,
         )
@@ -486,7 +464,7 @@ class TestStrategyRunnerPositionUpdate:
         assert runner._long_position.position_ratio == 2.0  # 1.0 / 0.5
 
         # Only long (Decimal / float-fallback)
-        await runner.on_position_update(
+        runner.on_position_update(
             long_position=long_pos, short_position=None,
             wallet_balance=10000.0, last_close=50000.0,
         )
@@ -494,18 +472,16 @@ class TestStrategyRunnerPositionUpdate:
         assert runner._short_position.position_ratio == float("inf")
 
         # Only short (float-fallback / Decimal)
-        await runner.on_position_update(
+        runner.on_position_update(
             long_position=None, short_position=short_pos,
             wallet_balance=10000.0, last_close=50000.0,
         )
         # Long's ratio survives since calculate is not called (long_state is None)
         # long_size=0.0 / short_size=0.5 = 0.0
         assert runner._long_position.position_ratio == 0.0
-
-    @pytest.mark.asyncio
-    async def test_on_position_update_no_positions_keeps_default_multipliers(self, runner):
+    def test_on_position_update_no_positions_keeps_default_multipliers(self, runner):
         """Test multipliers stay at defaults when no positions exist."""
-        await runner.on_position_update(
+        runner.on_position_update(
             long_position=None,
             short_position=None,
             wallet_balance=10000.0,
@@ -539,9 +515,7 @@ class TestStrategyRunnerPositionUpdate:
 
 class TestStrategyRunnerOrderUpdate:
     """Tests for order update events."""
-
-    @pytest.mark.asyncio
-    async def test_on_order_update_fills_tracked(self, runner, mock_executor):
+    def test_on_order_update_fills_tracked(self, runner, mock_executor):
         """Test order update marks tracked order as filled."""
         # First place an order
         intent = PlaceLimitIntent.create(
@@ -552,7 +526,7 @@ class TestStrategyRunnerOrderUpdate:
             grid_level=5,
             direction="long",
         )
-        await runner._execute_place_intent(intent, EMPTY_LIMITS)
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
 
         # Simulate fill event
         event = OrderUpdateEvent(
@@ -569,12 +543,10 @@ class TestStrategyRunnerOrderUpdate:
             leaves_qty=Decimal("0"),
         )
 
-        await runner.on_order_update(event)
+        runner.on_order_update(event)
 
         assert runner._tracked_orders[intent.client_order_id].status == "filled"
-
-    @pytest.mark.asyncio
-    async def test_on_order_update_cancels_tracked(self, runner, mock_executor):
+    def test_on_order_update_cancels_tracked(self, runner, mock_executor):
         """Test order update marks tracked order as cancelled."""
         # First place an order
         intent = PlaceLimitIntent.create(
@@ -585,7 +557,7 @@ class TestStrategyRunnerOrderUpdate:
             grid_level=5,
             direction="long",
         )
-        await runner._execute_place_intent(intent, EMPTY_LIMITS)
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
 
         # Simulate cancel event
         event = OrderUpdateEvent(
@@ -602,22 +574,20 @@ class TestStrategyRunnerOrderUpdate:
             leaves_qty=Decimal("0"),
         )
 
-        await runner.on_order_update(event)
+        runner.on_order_update(event)
 
         assert runner._tracked_orders[intent.client_order_id].status == "cancelled"
 
 
 class TestFindTrackedOrder:
     """Tests for _find_tracked_order (order_link_id and order_id lookup)."""
-
-    @pytest.mark.asyncio
-    async def test_order_update_finds_by_order_id(self, runner, mock_executor):
+    def test_order_update_finds_by_order_id(self, runner, mock_executor):
         """Order update finds tracked order by order_id when order_link_id is empty."""
         intent = PlaceLimitIntent.create(
             symbol="BTCUSDT", side="Buy", price=Decimal("49000.0"),
             qty=Decimal("0.001"), grid_level=5, direction="long",
         )
-        await runner._execute_place_intent(intent, EMPTY_LIMITS)
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
 
         # Simulate fill event with empty order_link_id (no orderLinkId sent to Bybit)
         event = OrderUpdateEvent(
@@ -634,18 +604,16 @@ class TestFindTrackedOrder:
             leaves_qty=Decimal("0"),
         )
 
-        await runner.on_order_update(event)
+        runner.on_order_update(event)
 
         assert runner._tracked_orders[intent.client_order_id].status == "filled"
-
-    @pytest.mark.asyncio
-    async def test_execution_finds_by_order_id(self, runner, mock_executor):
+    def test_execution_finds_by_order_id(self, runner, mock_executor):
         """Execution event finds tracked order by order_id when order_link_id is empty."""
         intent = PlaceLimitIntent.create(
             symbol="BTCUSDT", side="Buy", price=Decimal("49000.0"),
             qty=Decimal("0.001"), grid_level=5, direction="long",
         )
-        await runner._execute_place_intent(intent, EMPTY_LIMITS)
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
 
         event = ExecutionEvent(
             event_type=EventType.EXECUTION,
@@ -662,12 +630,10 @@ class TestFindTrackedOrder:
             closed_size=Decimal("0"),
         )
 
-        await runner.on_execution(event)
+        runner.on_execution(event)
 
         assert runner._tracked_orders[intent.client_order_id].status == "filled"
-
-    @pytest.mark.asyncio
-    async def test_injected_order_found_by_order_id(self, runner, mock_executor):
+    def test_injected_order_found_by_order_id(self, runner, mock_executor):
         """Injected orders (keyed by orderId) are found via order_id lookup."""
         runner.inject_open_orders([
             {"orderId": "exch_1", "price": "49000", "qty": "0.001", "side": "Buy"},
@@ -687,16 +653,14 @@ class TestFindTrackedOrder:
             leaves_qty=Decimal("0"),
         )
 
-        await runner.on_order_update(event)
+        runner.on_order_update(event)
 
         assert runner._tracked_orders["exch_1"].status == "cancelled"
 
 
 class TestStrategyRunnerFailureCallback:
     """Tests for failure callback."""
-
-    @pytest.mark.asyncio
-    async def test_on_intent_failed_called(self, strategy_config, mock_executor):
+    def test_on_intent_failed_called(self, strategy_config, mock_executor):
         """Test failure callback is called on execution failure."""
         callback = Mock()
         mock_executor.execute_place.return_value = OrderResult(
@@ -718,7 +682,7 @@ class TestStrategyRunnerFailureCallback:
             direction="long",
         )
 
-        await runner._execute_place_intent(intent, EMPTY_LIMITS)
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
 
         callback.assert_called_once_with(intent, "Network error")
 
@@ -834,9 +798,7 @@ class TestQtyResolution:
                 executor=mock_executor,
                 instrument_info=instrument_info,
             )
-
-    @pytest.mark.asyncio
-    async def test_execute_place_skips_zero_qty(self, strategy_config, mock_executor, instrument_info):
+    def test_execute_place_skips_zero_qty(self, strategy_config, mock_executor, instrument_info):
         """Orders with resolved qty=0 are not sent to exchange."""
         runner = StrategyRunner(
             strategy_config=strategy_config,
@@ -849,13 +811,11 @@ class TestQtyResolution:
             symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
             qty=Decimal("0"), grid_level=1, direction="long",
         )
-        await runner._execute_place_intent(intent, EMPTY_LIMITS)
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
         mock_executor.execute_place.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_wallet_balance_updated_on_position_update(self, runner):
+    def test_wallet_balance_updated_on_position_update(self, runner):
         """on_position_update stores wallet_balance for qty computation."""
-        await runner.on_position_update(
+        runner.on_position_update(
             long_position=None,
             short_position=None,
             wallet_balance=25000.0,
@@ -1498,8 +1458,6 @@ class TestSameOrderDetection:
         Engine must always see ticker events to keep last_close fresh,
         but no orders are placed while same-order error is active.
         """
-        import asyncio
-
         # Force same-order error
         runner._same_order_error = True
 
@@ -1514,13 +1472,13 @@ class TestSameOrderDetection:
         # Mock _execute_intents to verify it's not called
         execute_called = False
 
-        async def mock_execute(intents, limits):
+        def mock_execute(intents, limits):
             nonlocal execute_called
             execute_called = True
 
         runner._execute_intents = mock_execute
 
-        asyncio.get_event_loop().run_until_complete(runner.on_ticker(ticker))
+        runner.on_ticker(ticker)
 
         # Intents must not have been executed
         assert execute_called is False
@@ -1529,7 +1487,6 @@ class TestSameOrderDetection:
 
     def test_on_execution_updates_grid_but_skips_intents_when_error(self, runner):
         """Test on_execution passes event to engine but skips intent execution when error."""
-        import asyncio
 
         # First, trigger same-order error via two duplicate fills
         event1 = ExecutionEvent(
@@ -1586,14 +1543,14 @@ class TestSameOrderDetection:
         execute_called = False
         original_execute = runner._execute_intents
 
-        async def mock_execute(intents, limits):
+        def mock_execute(intents, limits):
             nonlocal execute_called
             execute_called = True
-            await original_execute(intents)
+            original_execute(intents)
 
         runner._execute_intents = mock_execute
 
-        asyncio.get_event_loop().run_until_complete(runner.on_execution(event3))
+        runner.on_execution(event3)
 
         # Error should still be active (3 consecutive same-price fills)
         assert runner.same_order_error is True
@@ -1646,8 +1603,6 @@ class TestSameOrderDetection:
 
     def test_on_order_update_skips_intents_when_same_order_error(self, runner):
         """Test on_order_update does not execute intents when same-order error active."""
-        import asyncio
-
         runner._same_order_error = True
 
         order_event = OrderUpdateEvent(
@@ -1667,14 +1622,14 @@ class TestSameOrderDetection:
         execute_called = False
         original_execute = runner._execute_intents
 
-        async def mock_execute(intents, limits):
+        def mock_execute(intents, limits):
             nonlocal execute_called
             execute_called = True
-            await original_execute(intents)
+            original_execute(intents)
 
         runner._execute_intents = mock_execute
 
-        asyncio.get_event_loop().run_until_complete(runner.on_order_update(order_event))
+        runner.on_order_update(order_event)
 
         assert runner.same_order_error is True
         assert execute_called is False
@@ -1798,9 +1753,7 @@ class TestSameOrderDetection:
 
 class TestRunnerAuthCooldown:
     """Tests for runner skipping intents during auth cooldown."""
-
-    @pytest.mark.asyncio
-    async def test_skips_intents_when_auth_cooldown_active(self, strategy_config):
+    def test_skips_intents_when_auth_cooldown_active(self, strategy_config):
         """Test intents are skipped when executor.auth_cooldown is True."""
         executor = Mock(spec=IntentExecutor)
         executor.shadow_mode = False
@@ -1818,14 +1771,12 @@ class TestRunnerAuthCooldown:
             local_ts=datetime.now(UTC),
             last_price=Decimal("50000.0"),
         )
-        await runner.on_ticker(ticker)
+        runner.on_ticker(ticker)
 
         # Grid was built (engine processed ticker) but no orders placed
         assert len(runner.engine.grid.grid) > 0
         executor.execute_place.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_executes_intents_when_cooldown_cleared(self, strategy_config):
+    def test_executes_intents_when_cooldown_cleared(self, strategy_config):
         """Test intents execute normally when auth_cooldown is False."""
         executor = Mock(spec=IntentExecutor)
         executor.shadow_mode = False
@@ -1844,13 +1795,11 @@ class TestRunnerAuthCooldown:
             local_ts=datetime.now(UTC),
             last_price=Decimal("50000.0"),
         )
-        await runner.on_ticker(ticker)
+        runner.on_ticker(ticker)
 
         # Orders should have been placed
         assert executor.execute_place.called
-
-    @pytest.mark.asyncio
-    async def test_stops_mid_batch_when_cooldown_activates(self, strategy_config):
+    def test_stops_mid_batch_when_cooldown_activates(self, strategy_config):
         """Test remaining intents are skipped if cooldown activates mid-batch."""
         executor = Mock(spec=IntentExecutor)
         executor.shadow_mode = False
@@ -1879,7 +1828,7 @@ class TestRunnerAuthCooldown:
             for i in range(5)
         ]
 
-        await runner._execute_intents(intents, EMPTY_LIMITS)
+        runner._execute_intents(intents, EMPTY_LIMITS)
 
         # Only the first intent should have been executed;
         # the rest skipped because cooldown activated
@@ -2052,9 +2001,7 @@ class TestIsGoodToPlace:
             reduce_only=True,
         )
         assert runner._is_good_to_place(short_intent, EMPTY_LIMITS) is True
-
-    @pytest.mark.asyncio
-    async def test_execute_place_skips_when_not_good(self, runner, mock_executor):
+    def test_execute_place_skips_when_not_good(self, runner, mock_executor):
         """_execute_place_intent skips order when _is_good_to_place returns False."""
         runner._wallet_balance = Decimal("10000")
         runner._short_position.size = Decimal("0")
@@ -2064,5 +2011,5 @@ class TestIsGoodToPlace:
             qty=Decimal("0.001"), grid_level=1, direction="short",
             reduce_only=True,
         )
-        await runner._execute_place_intent(intent, EMPTY_LIMITS)
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
         mock_executor.execute_place.assert_not_called()
