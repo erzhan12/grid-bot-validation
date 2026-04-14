@@ -575,6 +575,18 @@ class TestInit:
             _, kwargs = mock_http.call_args
             assert kwargs["timeout"] == 25
 
+    def test_zero_timeout_raises_value_error(self):
+        """timeout=0 disables the per-request cap and must be rejected."""
+        with patch("bybit_adapter.rest_client.HTTP"):
+            with pytest.raises(ValueError, match="timeout must be > 0"):
+                BybitRestClient(api_key="k", api_secret="s", timeout=0)
+
+    def test_negative_timeout_raises_value_error(self):
+        """Negative timeout is nonsense and must fail fast."""
+        with patch("bybit_adapter.rest_client.HTTP"):
+            with pytest.raises(ValueError, match="timeout must be > 0"):
+                BybitRestClient(api_key="k", api_secret="s", timeout=-5)
+
 
 # ---------------------------------------------------------------------------
 # get_tickers

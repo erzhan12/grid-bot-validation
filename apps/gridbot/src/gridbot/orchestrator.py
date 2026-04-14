@@ -343,7 +343,29 @@ class Orchestrator:
             self._next_retry_tick = now + _RETRY_TICK_INTERVAL
 
     def request_stop(self) -> None:
-        """Signal the main loop to exit. Safe to call from any thread."""
+        """Signal the main loop to exit. Safe to call from any thread.
+
+        Thread-safety model: `self._running = False` is a single
+        attribute assignment, which is atomic under the CPython GIL.
+        There is no memory barrier, but none is needed — the main
+        loop reads `self._running` at the top of every iteration
+        (every `_CHECK_INTERVAL` = 100 ms), so the worst case is
+        one extra tick of delay before the loop notices the flag.
+
+        `_running` is used ONLY as a loop gate; it does not guard any
+        critical section, protect any invariant across multiple reads,
+        or participate in any happens-before relationship with other
+        shared state. That is why a plain bool is sufficient and a
+        `threading.Event` is unnecessary here. If in the future
+        `_running` starts gating shared-state transitions (e.g. "once
+        _running is False, no thread may touch X"), switch to
+        `threading.Event` at that point to get an explicit barrier.
+        Do NOT preemptively add a lock or Event — it would just add
+        contention to the hot main loop for no benefit today.
+
+        Idempotent: calling this after the loop has already exited is
+        a harmless no-op.
+        """
         self._running = False
 
     def stop(self) -> None:

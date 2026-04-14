@@ -85,7 +85,19 @@ class BybitRestClient:
     _rate_limiter: RateLimiter = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
-        """Initialize HTTP session and rate limiter."""
+        """Initialize HTTP session and rate limiter.
+
+        Validates ``timeout`` eagerly so misconfiguration fails fast at
+        client construction rather than silently propagating to pybit
+        (where ``timeout=0`` would disable the per-request cap and a
+        hung socket could pin the main polling loop indefinitely).
+        """
+        if self.timeout <= 0:
+            raise ValueError(
+                f"BybitRestClient timeout must be > 0, got {self.timeout!r}. "
+                "A non-positive timeout disables the per-request cap and "
+                "allows a single hung socket to block the main polling loop."
+            )
         self._session = HTTP(
             testnet=self.testnet,
             api_key=self.api_key,
