@@ -8,8 +8,9 @@ The orchestrator is the main entry point for the gridbot. It:
 - Creates database Run records
 """
 
-import asyncio
 import logging
+import time
+from collections import deque
 from datetime import datetime, timedelta, UTC
 from typing import Optional
 from uuid import UUID, uuid5
@@ -19,12 +20,14 @@ from bybit_adapter.ws_client import PublicWebSocketClient, PrivateWebSocketClien
 from bybit_adapter.normalizer import BybitNormalizer
 from grid_db import DatabaseFactory
 from grid_db import Run, Strategy, BybitAccount, User
-from gridcore import GridAnchorStore, InstrumentInfo
+from gridcore import (
+    GridAnchorStore,
+    InstrumentInfo,
+    TickerEvent,
+    ExecutionEvent,
+    OrderUpdateEvent,
+)
 from gridcore.intents import CancelIntent
-
-from event_saver.main import EventSaver
-from event_saver.config import EventSaverConfig
-from event_saver.collectors import AccountContext
 
 from gridbot.config import GridbotConfig, AccountConfig, StrategyConfig
 from gridbot.executor import IntentExecutor
@@ -34,6 +37,8 @@ from gridbot.reconciler import Reconciler
 from gridbot.retry_queue import RetryQueue
 
 _HEALTH_CHECK_INTERVAL = 10  # seconds
+_CHECK_INTERVAL = 0.1  # 100 ms main loop tick (bbu2 value)
+_RETRY_TICK_INTERVAL = 1.0  # seconds between retry-queue drains
 
 
 logger = logging.getLogger(__name__)
@@ -54,9 +59,11 @@ class Orchestrator:
         db = DatabaseFactory(DatabaseSettings())
 
         orchestrator = Orchestrator(config, db)
-        await orchestrator.start()
-        await orchestrator.run_until_shutdown()
-        await orchestrator.stop()
+        orchestrator.start()
+        try:
+            orchestrator.run()
+        finally:
+            orchestrator.stop()
     """
 
     def __init__(
@@ -101,14 +108,6 @@ class Orchestrator:
 
         # State
         self._running = False
-        self._shutdown_event = asyncio.Event()
-        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
-        self._position_check_task: Optional[asyncio.Task] = None
-        self._health_check_task: Optional[asyncio.Task] = None
-        self._order_sync_task: Optional[asyncio.Task] = None
-
-        # Event saver (embedded, optional)
-        self._event_saver: Optional[EventSaver] = None
 
         # WebSocket position data cache: account_name -> symbol -> side -> position_data
         # Follows original bbu2 pattern: WebSocket provides real-time updates,
@@ -116,10 +115,22 @@ class Orchestrator:
         self._position_ws_data: dict[str, dict[str, dict[str, dict]]] = {}
 
         # Wallet balance cache: account_name -> (balance, timestamp)
+        # No lock needed: single-thread polling loop is the only reader/writer.
         self._wallet_cache: dict[str, tuple[float, datetime]] = {}
-        # NOTE: single lock covers all accounts; acceptable for low account counts.
-        # TODO: switch to per-account locks if account count grows beyond ~10.
-        self._wallet_cache_lock = asyncio.Lock()  # safe outside event loop (Python 3.10+)
+
+        # WS → main-thread buffers. dict/deque mutations are atomic under CPython GIL.
+        # Ticker: latest-wins cache, symbol -> event.
+        self._latest_ticker: dict[str, TickerEvent] = {}
+        self._last_processed_ticker: dict[str, TickerEvent] = {}
+        # Per-runner pending execution/order events (deques are atomic under GIL).
+        self._pending_executions: dict[str, deque] = {}
+        self._pending_orders: dict[str, deque] = {}
+
+        # Periodic-tick schedulers (bbu2 timestamp-gating pattern).
+        self._next_position_check: float = 0.0
+        self._next_health_check: float = 0.0
+        self._next_order_sync: float = 0.0
+        self._next_retry_tick: float = 0.0
 
         # Auth cooldown tracking
         self._auth_cooldown_until: dict[str, datetime] = {}  # strat_id -> expiry
@@ -130,35 +141,42 @@ class Orchestrator:
         """Whether orchestrator is running."""
         return self._running
 
-    async def start(self) -> None:
-        """Start the orchestrator.
+    def start(self) -> None:
+        """Start the orchestrator (non-blocking initialization).
 
         This initializes all components:
         1. Creates REST clients per account
         2. Creates executors and reconcilers
         3. Creates strategy runners
         4. Performs startup reconciliation
-        5. Connects WebSocket streams
-        6. Fetches initial positions via REST API
-        7. Creates database Run records
+        5. Creates database Run records
+        6. Connects WebSocket streams
+        7. Fetches initial positions via REST API
+        8. Sets _running=True so run() can proceed.
+
+        After start() returns, call run() to enter the blocking polling
+        loop, or stop() to tear everything down.
         """
         if self._running:
             return
 
         logger.info("Starting orchestrator")
-        self._event_loop = asyncio.get_event_loop()
-        self._running = True
 
         # Initialize per-account resources
         for account_config in self._config.accounts:
-            await self._init_account(account_config)
+            self._init_account(account_config)
 
         # Initialize strategies
         for strategy_config in self._config.strategies:
-            await self._init_strategy(strategy_config)
+            self._init_strategy(strategy_config)
 
         # Build routing maps
         self._build_routing_maps()
+
+        # Seed per-runner event buffers
+        for strat_id in self._runners:
+            self._pending_executions[strat_id] = deque()
+            self._pending_orders[strat_id] = deque()
 
         # Perform startup reconciliation
         for runner in self._runners.values():
@@ -173,38 +191,146 @@ class Orchestrator:
                 )
 
         # Create database Run records (populates _run_ids)
-        await self._create_run_records()
+        self._create_run_records()
 
-        # Start embedded EventSaver before gridbot WS connect so no events are missed
-        if self._config.enable_event_saver and self._db is not None:
-            await self._start_event_saver()
-
-        # Connect WebSocket streams
+        # Connect WebSocket streams (pybit internal threads start here)
         for account_name in self._public_ws:
-            await self._connect_websockets(account_name)
+            self._connect_websockets(account_name)
 
         # Initial position fetch so runners have multipliers before first ticker
-        logger.info("Fetching initial positions before starting background tasks")
-        await self._fetch_and_update_positions(startup=True)
+        logger.info("Fetching initial positions before entering main loop")
+        self._fetch_and_update_positions(startup=True)
 
-        # Start background tasks
-        self._position_check_task = asyncio.create_task(self._position_check_loop())
-        self._health_check_task = asyncio.create_task(self._health_check_loop())
-        self._order_sync_task = asyncio.create_task(self._order_sync_loop())
+        # Prime periodic-tick schedulers so the first main loop iteration
+        # does not immediately re-run expensive checks.
+        now = time.monotonic()
+        self._next_position_check = now + self._config.position_check_interval
+        self._next_health_check = now + _HEALTH_CHECK_INTERVAL
+        self._next_order_sync = now  # order sync runs immediately on first tick
+        self._next_retry_tick = now + _RETRY_TICK_INTERVAL
 
-        # Retry queues have no background task — orchestrator ticks them from
-        # the main polling loop (see 0017_PLAN.md Phase 3d).
-
+        self._running = True
         logger.info(f"Orchestrator started with {len(self._runners)} strategies")
 
-    async def stop(self) -> None:
-        """Stop the orchestrator gracefully."""
+    def run(self) -> None:
+        """Main polling loop. Blocks until request_stop() / stop()."""
+        logger.info("Orchestrator main loop started")
+        while self._running:
+            try:
+                self._tick()
+            except Exception as e:
+                logger.error("Main loop tick error: %s", e, exc_info=True)
+                self._notifier.alert_exception("main_loop", e, error_key="main_loop")
+            time.sleep(_CHECK_INTERVAL)
+        logger.info("Orchestrator main loop exited")
+
+    def _tick(self) -> None:
+        """Single iteration of the main polling loop.
+
+        Drains pending events, processes the latest ticker per symbol, and
+        runs time-gated periodic checks. Exceptions are caught one level up
+        in run() so one bad iteration cannot kill the loop.
+        """
+        # 1. Drain pending execution events
+        for runner in self._runners.values():
+            dq = self._pending_executions.get(runner.strat_id)
+            if not dq:
+                continue
+            while True:
+                try:
+                    event = dq.popleft()
+                except IndexError:
+                    break
+                try:
+                    runner.on_execution(event)
+                except Exception as e:
+                    logger.error(
+                        "%s: on_execution error: %s",
+                        runner.strat_id, e, exc_info=True,
+                    )
+                    self._notifier.alert_exception(
+                        "runner.on_execution", e,
+                        error_key=f"on_execution_{runner.strat_id}",
+                    )
+
+        # 2. Drain pending order-update events
+        for runner in self._runners.values():
+            dq = self._pending_orders.get(runner.strat_id)
+            if not dq:
+                continue
+            while True:
+                try:
+                    event = dq.popleft()
+                except IndexError:
+                    break
+                try:
+                    runner.on_order_update(event)
+                except Exception as e:
+                    logger.error(
+                        "%s: on_order_update error: %s",
+                        runner.strat_id, e, exc_info=True,
+                    )
+                    self._notifier.alert_exception(
+                        "runner.on_order_update", e,
+                        error_key=f"on_order_update_{runner.strat_id}",
+                    )
+
+        # 3. Process latest ticker per symbol (coalesced — WS callback
+        #    overwrites older events, so only the freshest is processed).
+        for symbol, runners in self._symbol_to_runners.items():
+            event = self._latest_ticker.get(symbol)
+            if event is None or event is self._last_processed_ticker.get(symbol):
+                continue
+            self._last_processed_ticker[symbol] = event
+            for runner in runners:
+                try:
+                    runner.on_ticker(event)
+                except Exception as e:
+                    logger.error(
+                        "%s: on_ticker error: %s",
+                        runner.strat_id, e, exc_info=True,
+                    )
+                    self._notifier.alert_exception(
+                        "runner.on_ticker", e,
+                        error_key=f"on_ticker_{runner.strat_id}",
+                    )
+
+        # 4. Periodic checks via timestamp gating (bbu2 check_job pattern).
+        now = time.monotonic()
+        if now >= self._next_position_check:
+            self._fetch_and_update_positions()
+            self._next_position_check = now + self._config.position_check_interval
+        if now >= self._next_health_check:
+            self._health_check_once()
+            self._next_health_check = now + _HEALTH_CHECK_INTERVAL
+        if (
+            self._config.order_sync_interval > 0
+            and now >= self._next_order_sync
+        ):
+            self._order_sync_once()
+            self._next_order_sync = now + self._config.order_sync_interval
+        if now >= self._next_retry_tick:
+            for rq in self._retry_queues.values():
+                try:
+                    rq.process_due()
+                except Exception as e:
+                    logger.error("Retry queue tick error: %s", e, exc_info=True)
+                    self._notifier.alert_exception(
+                        "retry_queue.process_due", e, error_key="retry_queue_tick",
+                    )
+            self._next_retry_tick = now + _RETRY_TICK_INTERVAL
+
+    def request_stop(self) -> None:
+        """Signal the main loop to exit. Safe to call from any thread."""
+        self._running = False
+
+    def stop(self) -> None:
+        """Stop the orchestrator gracefully (non-blocking)."""
         if not self._running:
             return
 
         logger.info("Stopping orchestrator")
         self._running = False
-        self._shutdown_event.set()
 
         # Disconnect WebSockets first to stop new events from flowing in
         for ws in self._public_ws.values():
@@ -214,30 +340,12 @@ class Orchestrator:
 
         # Retry queues have no background task to stop (see 0017_PLAN.md).
 
-        # Stop background tasks
-        for task in (self._position_check_task, self._health_check_task, self._order_sync_task):
-            if task:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-        # Stop EventSaver
-        if self._event_saver:
-            await self._event_saver.stop()
-            logger.info("EventSaver stopped")
-
         # Update Run records
-        await self._update_run_records_stopped()
+        self._update_run_records_stopped()
 
         logger.info("Orchestrator stopped")
 
-    async def run_until_shutdown(self) -> None:
-        """Run until shutdown signal received."""
-        await self._shutdown_event.wait()
-
-    async def _init_account(self, account_config: AccountConfig) -> None:
+    def _init_account(self, account_config: AccountConfig) -> None:
         """Initialize resources for an account."""
         name = account_config.name
 
@@ -286,7 +394,7 @@ class Orchestrator:
 
         logger.info(f"Initialized account: {name}")
 
-    async def _init_strategy(self, strategy_config: StrategyConfig) -> None:
+    def _init_strategy(self, strategy_config: StrategyConfig) -> None:
         """Initialize a strategy runner."""
         strat_id = strategy_config.strat_id
         account_name = strategy_config.account
@@ -314,7 +422,7 @@ class Orchestrator:
         self._retry_queues[strat_id] = retry_queue
 
         # Fetch instrument info for qty rounding
-        instrument_info = await self._fetch_instrument_info(
+        instrument_info = self._fetch_instrument_info(
             strategy_config.symbol, account_name
         )
 
@@ -352,7 +460,7 @@ class Orchestrator:
                 self._account_to_runners[account] = []
             self._account_to_runners[account].append(runner)
 
-    async def _connect_websockets(self, account_name: str) -> None:
+    def _connect_websockets(self, account_name: str) -> None:
         """Connect WebSocket streams for an account.
 
         Callbacks are already configured at construction time in _init_account.
@@ -364,21 +472,22 @@ class Orchestrator:
         logger.info(f"Connected WebSockets for account: {account_name}")
 
     def _on_ticker(self, account_name: str, symbol: str, message: dict) -> None:
-        """Handle ticker WebSocket message."""
+        """Handle ticker WebSocket message (runs in pybit WS thread).
+
+        Only writes to `_latest_ticker[symbol]`. The main-loop tick picks
+        up the freshest event and dispatches it to runners. Older events
+        are coalesced away — only the latest ticker ever matters.
+        """
         try:
             normalizer = self._normalizers[account_name]
             event = normalizer.normalize_ticker(message)
-
             if event is None:
                 return
-
-            # Route to all runners for this symbol
-            runners = self._symbol_to_runners.get(symbol, [])
-            for runner in runners:
-                asyncio.run_coroutine_threadsafe(
-                    runner.on_ticker(event),
-                    self._event_loop,
-                )
+            # dict[k] = v is atomic under CPython GIL. Races with the main
+            # loop are benign: worst case we overwrite a value that hasn't
+            # been read yet, but the reader will pick up the newer one on
+            # the next iteration.
+            self._latest_ticker[symbol] = event
         except Exception as e:
             self._notifier.alert_exception("_on_ticker", e, error_key="ws_on_ticker")
 
@@ -471,40 +580,46 @@ class Orchestrator:
             self._notifier.alert_exception("_on_position", e, error_key="ws_on_position")
 
     def _on_order(self, account_name: str, message: dict) -> None:
-        """Handle order WebSocket message."""
+        """Handle order WebSocket message (runs in pybit WS thread).
+
+        Appends each event to the target runner's pending deque. The
+        main-loop tick drains the deque in FIFO order.
+        """
         try:
             normalizer = self._normalizers[account_name]
             events = normalizer.normalize_order(message)
 
             for event in events:
-                # Route to runner for this symbol
                 runners = self._symbol_to_runners.get(event.symbol, [])
                 for runner in runners:
-                    # Filter by account
-                    if self._get_account_for_strategy(runner.strat_id) == account_name:
-                        asyncio.run_coroutine_threadsafe(
-                            runner.on_order_update(event),
-                            self._event_loop,
-                        )
+                    if self._get_account_for_strategy(runner.strat_id) != account_name:
+                        continue
+                    dq = self._pending_orders.get(runner.strat_id)
+                    if dq is not None:
+                        # deque.append is atomic under CPython GIL.
+                        dq.append(event)
         except Exception as e:
             self._notifier.alert_exception("_on_order", e, error_key="ws_on_order")
 
     def _on_execution(self, account_name: str, message: dict) -> None:
-        """Handle execution WebSocket message."""
+        """Handle execution WebSocket message (runs in pybit WS thread).
+
+        Appends each event to the target runner's pending deque. The
+        main-loop tick drains the deque in FIFO order.
+        """
         try:
             normalizer = self._normalizers[account_name]
             events = normalizer.normalize_execution(message)
 
             for event in events:
-                # Route to runner for this symbol
                 runners = self._symbol_to_runners.get(event.symbol, [])
                 for runner in runners:
-                    # Filter by account
-                    if self._get_account_for_strategy(runner.strat_id) == account_name:
-                        asyncio.run_coroutine_threadsafe(
-                            runner.on_execution(event),
-                            self._event_loop,
-                        )
+                    if self._get_account_for_strategy(runner.strat_id) != account_name:
+                        continue
+                    dq = self._pending_executions.get(runner.strat_id)
+                    if dq is not None:
+                        # deque.append is atomic under CPython GIL.
+                        dq.append(event)
         except Exception as e:
             self._notifier.alert_exception("_on_execution", e, error_key="ws_on_execution")
 
@@ -526,11 +641,11 @@ class Orchestrator:
         except (KeyError, TypeError):
             return None
 
-    async def _get_wallet_balance(self, account_name: str) -> float:
+    def _get_wallet_balance(self, account_name: str) -> float:
         """Get wallet balance, using cache if available.
 
-        Uses asyncio.Lock to prevent duplicate REST fetches when multiple
-        async tasks call this concurrently for the same account.
+        Single-thread polling loop: no locking required — the main loop
+        is the only reader/writer of `_wallet_cache`.
 
         Args:
             account_name: Account name.
@@ -540,26 +655,25 @@ class Orchestrator:
         """
         # Check if caching is disabled
         if self._config.wallet_cache_interval <= 0:
-            return await self._fetch_wallet_balance(account_name)
+            return self._fetch_wallet_balance(account_name)
 
-        async with self._wallet_cache_lock:
-            # Check cache (inside lock to prevent duplicate fetches)
-            cached = self._wallet_cache.get(account_name)
-            if cached:
-                balance, timestamp = cached
-                age = (datetime.now(UTC) - timestamp).total_seconds()
-                if age < self._config.wallet_cache_interval:
-                    return balance
+        cached = self._wallet_cache.get(account_name)
+        if cached:
+            balance, timestamp = cached
+            age = (datetime.now(UTC) - timestamp).total_seconds()
+            if age < self._config.wallet_cache_interval:
+                return balance
 
-            # Cache miss or expired - fetch fresh
-            balance = await self._fetch_wallet_balance(account_name)
-            self._wallet_cache[account_name] = (balance, datetime.now(UTC))
-            return balance
+        # Cache miss or expired - fetch fresh
+        balance = self._fetch_wallet_balance(account_name)
+        self._wallet_cache[account_name] = (balance, datetime.now(UTC))
+        return balance
 
-    async def _fetch_wallet_balance(self, account_name: str) -> float:
+    def _fetch_wallet_balance(self, account_name: str) -> float:
         """Fetch wallet balance from REST API.
 
-        Runs synchronous REST call in thread to avoid blocking event loop.
+        pybit's HTTP() caps every request at `rest_fetch_timeout` seconds
+        (plumbed through in P1), so no explicit timeout wrapper is needed.
 
         Args:
             account_name: Account name.
@@ -568,7 +682,7 @@ class Orchestrator:
             Wallet balance in USDT.
         """
         rest_client = self._rest_clients[account_name]
-        wallet = await asyncio.to_thread(rest_client.get_wallet_balance)
+        wallet = rest_client.get_wallet_balance()
 
         for account in wallet.get("list", []):
             for coin in account.get("coin", []):
@@ -579,13 +693,14 @@ class Orchestrator:
         logger.warning("No USDT balance found in wallet response for %s: %s", account_name, wallet)
         return 0.0
 
-    async def _fetch_instrument_info(
+    def _fetch_instrument_info(
         self, symbol: str, account_name: str
     ) -> Optional[InstrumentInfo]:
         """Fetch instrument info from Bybit API for qty rounding.
 
-        Uses the account's REST client public endpoint.
-        Returns None if fetch fails (qty rounding will be skipped).
+        Uses the account's REST client public endpoint. Returns None if
+        fetch fails (qty rounding will be skipped). pybit's HTTP() already
+        caps the request at `rest_fetch_timeout` seconds.
 
         Args:
             symbol: Trading pair (e.g., "BTCUSDT").
@@ -596,10 +711,7 @@ class Orchestrator:
         """
         try:
             rest_client = self._rest_clients[account_name]
-            raw = await asyncio.wait_for(
-                asyncio.to_thread(rest_client.get_instruments_info, symbol),
-                timeout=10,
-            )
+            raw = rest_client.get_instruments_info(symbol)
             info = InstrumentInfo.from_bybit_response(symbol, raw)
             if info is None:
                 logger.warning(
@@ -617,7 +729,7 @@ class Orchestrator:
             logger.warning(f"Failed to fetch instrument info for {symbol}: {e}")
             return None
 
-    async def _fetch_and_update_positions(self, *, startup: bool = False) -> None:
+    def _fetch_and_update_positions(self, *, startup: bool = False) -> None:
         """Fetch positions and wallet balance, then update all runners.
 
         Following original bbu2 pattern:
@@ -632,11 +744,9 @@ class Orchestrator:
             try:
                 rest_client = self._rest_clients[account_name]
 
-                # Fetch wallet balance (cached to reduce API calls)
-                timeout = self._config.rest_fetch_timeout
-                wallet_balance = await asyncio.wait_for(
-                    self._get_wallet_balance(account_name), timeout=timeout
-                )
+                # Fetch wallet balance (cached to reduce API calls).
+                # pybit's HTTP(timeout=...) caps the request; no extra wrapper.
+                wallet_balance = self._get_wallet_balance(account_name)
 
                 # Check if we need to fall back to REST for positions
                 # (REST sync ensures freshness even when WS data exists)
@@ -654,14 +764,7 @@ class Orchestrator:
                     if long_pos is None or short_pos is None:
                         # Lazy fetch REST positions (once per account)
                         if rest_positions is None:
-                            # Note: asyncio.to_thread cannot cancel the underlying
-                            # thread on timeout; it runs until the HTTP request
-                            # completes. pybit.HTTP is synchronous with no async
-                            # alternative, so this is the best we can do.
-                            rest_positions = await asyncio.wait_for(
-                                asyncio.to_thread(rest_client.get_positions),
-                                timeout=timeout,
-                            )
+                            rest_positions = rest_client.get_positions()
                             logger.debug(
                                 f"Fetched positions from REST for {account_name} "
                                 f"(WS data incomplete)"
@@ -699,21 +802,6 @@ class Orchestrator:
                         )
                         # Continue to next runner instead of raising
 
-            except asyncio.TimeoutError:
-                msg = (
-                    f"Timeout ({timeout}s) fetching positions for {account_name}"
-                )
-                if startup:
-                    msg += ". Runners may not have multipliers until next periodic check"
-                    logger.warning(msg)
-                else:
-                    logger.error(msg)
-                    exc = asyncio.TimeoutError(msg)
-                    self._notifier.alert_exception(
-                        "_fetch_and_update_positions",
-                        exc,
-                        error_key=f"position_fetch_{account_name}",
-                    )
             except Exception as e:
                 if startup:
                     logger.warning(
@@ -728,148 +816,111 @@ class Orchestrator:
                         error_key=f"position_fetch_{account_name}",
                     )
 
-    async def _position_check_loop(self) -> None:
-        """Periodic position check loop."""
-        while self._running:
-            try:
-                await asyncio.sleep(self._config.position_check_interval)
-                await self._fetch_and_update_positions()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error("Position check loop error: %s", e)
+    def _health_check_once(self) -> None:
+        """Single-shot WebSocket health check + auth-cooldown expiry sweep.
 
-    async def _health_check_loop(self) -> None:
-        """Periodic WebSocket health check.
-
-        Checks every 10 seconds whether each WebSocket connection is alive.
-        Reconnects only the disconnected ones. Alerts on disconnect/reconnect.
+        Extracted from the former _health_check_loop. The main polling loop
+        schedules this via timestamp gating every _HEALTH_CHECK_INTERVAL
+        seconds.
         """
-        while self._running:
-            try:
-                await asyncio.sleep(_HEALTH_CHECK_INTERVAL)
-
-                # Check auth cooldown expiry
-                now = datetime.now(UTC)
-                for strat_id in list(self._auth_cooldown_until.keys()):
-                    expiry = self._auth_cooldown_until[strat_id]
-                    if now >= expiry:
-                        executor = self._strategy_executors.get(strat_id)
-                        cycle = self._auth_cooldown_cycles.get(strat_id, 1)
-                        if executor:
-                            executor.reset_auth_cooldown()
-                            msg = (
-                                f"Strategy {strat_id}: cooldown expired (cycle {cycle}), "
-                                f"resuming order execution"
-                            )
-                            logger.info(msg)
-                            self._notifier.alert(
-                                msg, error_key=f"auth_cooldown_resume_{strat_id}",
-                            )
-                        del self._auth_cooldown_until[strat_id]
-
-                for account_name in list(self._public_ws.keys()):
-                    # Check public WS
-                    pub_ws = self._public_ws.get(account_name)
-                    if pub_ws and not pub_ws.is_connected():
-                        self._notifier.alert(
-                            f"Public WS disconnected for {account_name}, reconnecting",
-                            error_key=f"ws_pub_disconnect_{account_name}",
+        try:
+            # Check auth cooldown expiry
+            now = datetime.now(UTC)
+            for strat_id in list(self._auth_cooldown_until.keys()):
+                expiry = self._auth_cooldown_until[strat_id]
+                if now >= expiry:
+                    executor = self._strategy_executors.get(strat_id)
+                    cycle = self._auth_cooldown_cycles.get(strat_id, 1)
+                    if executor:
+                        executor.reset_auth_cooldown()
+                        msg = (
+                            f"Strategy {strat_id}: cooldown expired (cycle {cycle}), "
+                            f"resuming order execution"
                         )
-                        try:
-                            pub_ws.disconnect()
-                            pub_ws.connect()  # re-subscribes automatically via callbacks
-                            logger.info(f"Public WS reconnected for {account_name}")
-                        except Exception as e:
-                            self._notifier.alert_exception(
-                                f"Public WS reconnect {account_name}", e,
-                                error_key=f"ws_pub_reconnect_{account_name}",
-                            )
-
-                    # Check private WS
-                    priv_ws = self._private_ws.get(account_name)
-                    if priv_ws and not priv_ws.is_connected():
+                        logger.info(msg)
                         self._notifier.alert(
-                            f"Private WS disconnected for {account_name}, reconnecting",
-                            error_key=f"ws_priv_disconnect_{account_name}",
+                            msg, error_key=f"auth_cooldown_resume_{strat_id}",
                         )
-                        try:
-                            priv_ws.disconnect()
-                            priv_ws.connect()  # re-subscribes automatically via callbacks
-                            logger.info(f"Private WS reconnected for {account_name}")
-                        except Exception as e:
-                            self._notifier.alert_exception(
-                                f"Private WS reconnect {account_name}", e,
-                                error_key=f"ws_priv_reconnect_{account_name}",
-                            )
+                    del self._auth_cooldown_until[strat_id]
 
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                self._notifier.alert_exception(
-                    "_health_check_loop", e, error_key="health_check_loop"
-                )
+            for account_name in list(self._public_ws.keys()):
+                # Check public WS
+                pub_ws = self._public_ws.get(account_name)
+                if pub_ws and not pub_ws.is_connected():
+                    self._notifier.alert(
+                        f"Public WS disconnected for {account_name}, reconnecting",
+                        error_key=f"ws_pub_disconnect_{account_name}",
+                    )
+                    try:
+                        pub_ws.disconnect()
+                        pub_ws.connect()  # re-subscribes automatically via callbacks
+                        logger.info(f"Public WS reconnected for {account_name}")
+                    except Exception as e:
+                        self._notifier.alert_exception(
+                            f"Public WS reconnect {account_name}", e,
+                            error_key=f"ws_pub_reconnect_{account_name}",
+                        )
 
-    async def _order_sync_loop(self) -> None:
-        """Periodic order reconciliation loop.
+                # Check private WS
+                priv_ws = self._private_ws.get(account_name)
+                if priv_ws and not priv_ws.is_connected():
+                    self._notifier.alert(
+                        f"Private WS disconnected for {account_name}, reconnecting",
+                        error_key=f"ws_priv_disconnect_{account_name}",
+                    )
+                    try:
+                        priv_ws.disconnect()
+                        priv_ws.connect()  # re-subscribes automatically via callbacks
+                        logger.info(f"Private WS reconnected for {account_name}")
+                    except Exception as e:
+                        self._notifier.alert_exception(
+                            f"Private WS reconnect {account_name}", e,
+                            error_key=f"ws_priv_reconnect_{account_name}",
+                        )
+        except Exception as e:
+            self._notifier.alert_exception(
+                "_health_check_once", e, error_key="health_check_loop",
+            )
 
-        Fetches open orders from exchange via REST and reconciles with in-memory state.
-        Matches bbu2's LIMITS_READ_INTERVAL pattern (61 seconds by default).
+    def _order_sync_once(self) -> None:
+        """Single-shot order reconciliation sweep.
+
+        Fetches open orders from exchange via REST and reconciles with
+        in-memory state. Matches bbu2's LIMITS_READ_INTERVAL pattern
+        (61 seconds by default). The main polling loop schedules this via
+        timestamp gating every `order_sync_interval` seconds.
         """
-        # Skip if disabled
-        if self._config.order_sync_interval <= 0:
-            logger.info("Order sync loop disabled (order_sync_interval <= 0)")
-            return
+        try:
+            for account_name, runners in list(self._account_to_runners.items()):
+                reconciler = self._reconcilers.get(account_name)
+                if not reconciler:
+                    continue
 
-        while self._running:
-            try:
-                # Reconcile immediately on start, then sleep between cycles.
-                # (Differs from _position_check_loop which sleeps first —
-                # immediate sync on startup ensures order state is fresh.)
-                for account_name, runners in list(self._account_to_runners.items()):
-                    reconciler = self._reconcilers.get(account_name)
-                    if not reconciler:
-                        continue
+                for runner in runners:
+                    try:
+                        result = reconciler.reconcile_reconnect(runner)
 
-                    for runner in runners:
-                        try:
-                            result = reconciler.reconcile_reconnect(runner)
+                        if result.errors:
+                            logger.warning(
+                                "%s: Order sync completed with errors: %s",
+                                runner.strat_id, result.errors,
+                            )
+                        elif result.orders_injected > 0 or result.untracked_orders_on_exchange > 0:
+                            logger.info(
+                                "%s: Order sync - fetched=%d, injected=%d, untracked=%d",
+                                runner.strat_id, result.orders_fetched,
+                                result.orders_injected, result.untracked_orders_on_exchange,
+                            )
+                        else:
+                            logger.debug(
+                                "%s: Order sync - in sync, %d orders checked",
+                                runner.strat_id, result.orders_fetched,
+                            )
 
-                            if result.errors:
-                                logger.warning(
-                                    "%s: Order sync completed with errors: %s",
-                                    runner.strat_id, result.errors,
-                                )
-                            elif result.orders_injected > 0 or result.untracked_orders_on_exchange > 0:
-                                logger.info(
-                                    "%s: Order sync - fetched=%d, injected=%d, untracked=%d",
-                                    runner.strat_id, result.orders_fetched,
-                                    result.orders_injected, result.untracked_orders_on_exchange,
-                                )
-                            else:
-                                logger.debug(
-                                    "%s: Order sync - in sync, %d orders checked",
-                                    runner.strat_id, result.orders_fetched,
-                                )
-
-                        except Exception as e:
-                            logger.error("%s: Order sync error: %s", runner.strat_id, e)
-
-                await asyncio.sleep(self._config.order_sync_interval)
-
-            except asyncio.CancelledError:
-                # CancelledError is a BaseException, not Exception, so it
-                # passes through the inner `except Exception` and is caught
-                # here to cleanly exit the loop on task cancellation.
-                break
-            except Exception as e:
-                # Guards against errors outside the per-runner try/except:
-                # e.g. missing reconciler attribute or asyncio.sleep failure.
-                logger.error("Order sync loop error: %s", e)
-                try:
-                    await asyncio.sleep(self._config.order_sync_interval)
-                except asyncio.CancelledError:
-                    break
+                    except Exception as e:
+                        logger.error("%s: Order sync error: %s", runner.strat_id, e)
+        except Exception as e:
+            logger.error("Order sync sweep error: %s", e)
 
     def _get_account_for_strategy(self, strat_id: str) -> Optional[str]:
         """Get account name for a strategy."""
@@ -878,88 +929,7 @@ class Orchestrator:
                 return config.account
         return None
 
-    async def _start_event_saver(self) -> None:
-        """Create and start the embedded EventSaver.
-
-        Derives symbols from all strategies and creates AccountContext
-        for each configured account. Must be called after _create_run_records()
-        so that _run_ids is populated.
-        """
-        if not self._config.accounts:
-            logger.warning("EventSaver enabled but no accounts configured, skipping")
-            return
-
-        # Collect all symbols across strategies
-        all_symbols = {s.symbol for s in self._config.strategies}
-
-        # Use first account's testnet flag for public streams
-        first_account = self._config.accounts[0]
-
-        es_config = EventSaverConfig(
-            symbols=",".join(sorted(all_symbols)),
-            testnet=first_account.testnet,
-            database_url=self._config.database_url,
-        )
-
-        self._event_saver = EventSaver(config=es_config, db=self._db)
-
-        # Add each account
-        for account_config in self._config.accounts:
-            account_strategies = self._config.get_strategies_for_account(
-                account_config.name
-            )
-
-            # Skip accounts with no strategies — empty symbols means "no filter"
-            # in PrivateCollector, which would over-collect
-            if not account_strategies:
-                logger.warning(
-                    "Skipping EventSaver account %s: no strategies configured",
-                    account_config.name,
-                )
-                continue
-
-            # Derive deterministic UUIDs from account name
-            namespace = UUID("12345678-1234-5678-1234-567812345678")
-            account_id = uuid5(namespace, f"account:{account_config.name}")
-            user_id = uuid5(namespace, f"user:{account_config.name}")
-
-            # Get symbols for this account
-            account_symbols = [s.symbol for s in account_strategies]
-
-            # Look up run_id — only use it when the account has exactly one
-            # strategy. With multiple strategies, Run is strategy-scoped so a
-            # single run_id would mis-tag events for the other strategies.
-            if len(account_strategies) == 1:
-                run_id = self._run_ids.get(account_strategies[0].strat_id)
-            else:
-                run_id = None
-                logger.warning(
-                    "Account %s has %d strategies; setting run_id=None to avoid "
-                    "mis-tagging. Executions/orders will be captured but not "
-                    "linked to a specific Run.",
-                    account_config.name,
-                    len(account_strategies),
-                )
-
-            context = AccountContext(
-                account_id=account_id,
-                user_id=user_id,
-                run_id=run_id,
-                api_key=account_config.api_key,
-                api_secret=account_config.api_secret,
-                environment="testnet" if account_config.testnet else "mainnet",
-                symbols=account_symbols,
-            )
-            await self._event_saver.add_account(context)
-
-        await self._event_saver.start()
-        logger.info(
-            "EventSaver started (symbols=%s, accounts=%d)",
-            sorted(all_symbols),
-            len(self._config.accounts),
-        )
-
-    async def _create_run_records(self) -> None:
+    def _create_run_records(self) -> None:
         """Create Run records in database.
 
         Creates User, BybitAccount, Strategy, and Run rows using
@@ -1039,7 +1009,7 @@ class Orchestrator:
         except Exception as e:
             logger.warning("Failed to create Run records: %s", e)
 
-    async def _update_run_records_stopped(self) -> None:
+    def _update_run_records_stopped(self) -> None:
         """Update Run records to stopped status."""
         if self._db is None or not self._run_ids:
             return
