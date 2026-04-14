@@ -40,6 +40,7 @@ _HEALTH_CHECK_INTERVAL = 10  # seconds
 _CHECK_INTERVAL = 0.1  # 100 ms main loop tick (bbu2 value)
 _RETRY_TICK_INTERVAL = 1.0  # seconds between retry-queue drains
 _POSITION_FETCH_SLOW_THRESHOLD = 2.0  # log a warning if REST position fetch takes longer
+_POSITION_FETCH_MIN_INTERVAL = 1.0  # per-account floor between REST fetches (defense-in-depth)
 
 
 logger = logging.getLogger(__name__)
@@ -143,6 +144,14 @@ class Orchestrator:
         self._next_health_check: float = 0.0
         self._next_order_sync: float = 0.0
         self._next_retry_tick: float = 0.0
+
+        # Per-account floor for blocking REST position fetches. Defense-
+        # in-depth against scheduler glitches or manual re-entry that
+        # could fire two back-to-back fetches and pin the main polling
+        # loop. `_next_position_check` already spaces real ticks by the
+        # configured interval; this floor only matters if something
+        # bypasses that. Keyed by account_name; value is `time.monotonic`.
+        self._last_position_fetch: dict[str, float] = {}
 
         # Auth cooldown tracking
         self._auth_cooldown_until: dict[str, datetime] = {}  # strat_id -> expiry
@@ -587,9 +596,10 @@ class Orchestrator:
         """
         try:
             # Initialize account cache if needed. setdefault is a single
-            # bytecode op and is GIL-atomic.
-            if account_name not in self._position_ws_data:
-                self._position_ws_data[account_name] = {}
+            # C-level call and is GIL-atomic (unlike check-then-assign,
+            # which is two separate bytecode ops and can race with a
+            # reader observing a transiently missing key).
+            account_cache = self._position_ws_data.setdefault(account_name, {})
 
             # Filter and store position data
             for pos in message.get("data", []):
@@ -603,12 +613,11 @@ class Orchestrator:
                 if not symbol or not side:
                     continue
 
-                # Initialize symbol cache if needed
-                if symbol not in self._position_ws_data[account_name]:
-                    self._position_ws_data[account_name][symbol] = {}
+                # Initialize symbol cache if needed — setdefault is atomic.
+                symbol_cache = account_cache.setdefault(symbol, {})
 
                 # Store position data by side — atomic dict-set under GIL.
-                self._position_ws_data[account_name][symbol][side] = pos
+                symbol_cache[side] = pos
 
                 logger.debug(
                     f"Position WS update: {account_name}/{symbol}/{side} "
@@ -681,6 +690,10 @@ class Orchestrator:
     ) -> Optional[dict]:
         """Get position data from WebSocket cache.
 
+        Uses explicit None checks rather than try/except so real type
+        errors (e.g., a cache slot holding a non-dict) surface as bugs
+        instead of being silently masked as "no WS data".
+
         Args:
             account_name: Account name.
             symbol: Trading symbol.
@@ -689,10 +702,13 @@ class Orchestrator:
         Returns:
             Position data dict or None if not available.
         """
-        try:
-            return self._position_ws_data.get(account_name, {}).get(symbol, {}).get(side)
-        except (KeyError, TypeError):
+        account_cache = self._position_ws_data.get(account_name)
+        if account_cache is None:
             return None
+        symbol_cache = account_cache.get(symbol)
+        if symbol_cache is None:
+            return None
+        return symbol_cache.get(side)
 
     def _get_wallet_balance(self, account_name: str) -> float:
         """Get wallet balance, using cache if available.
@@ -794,11 +810,27 @@ class Orchestrator:
             startup: If True, log warnings with startup context on failure.
         """
         for account_name, runners in list(self._account_to_runners.items()):
+            # Short-circuit: per-account minimum interval between blocking
+            # REST fetches. _next_position_check already spaces ticks by
+            # the configured interval, but if anything bypasses the
+            # scheduler (manual call, startup race), this floor prevents
+            # two back-to-back pybit calls from pinning the main loop.
+            # Skipped during startup so the initial fetch always runs.
+            start = time.monotonic()
+            if not startup:
+                last = self._last_position_fetch.get(account_name)
+                if last is not None and (start - last) < _POSITION_FETCH_MIN_INTERVAL:
+                    logger.debug(
+                        "Skipping position fetch for %s: last fetch was %.2fs ago "
+                        "(floor=%.1fs)",
+                        account_name, start - last, _POSITION_FETCH_MIN_INTERVAL,
+                    )
+                    continue
+            self._last_position_fetch[account_name] = start
             # Instrument the whole per-account REST section so we can spot
             # cases where a blocking pybit call stalls the main polling loop.
             # The 2s threshold is well under the 10s pybit timeout but far
             # enough above normal (~100-300ms) to only fire on real stalls.
-            start = time.monotonic()
             try:
                 rest_client = self._rest_clients[account_name]
 

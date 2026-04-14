@@ -121,14 +121,26 @@ def main(config_path: Optional[str] = None) -> int:
     orchestrator = Orchestrator(config, db, notifier=notifier)
 
     # Set up signal handlers. First Ctrl+C requests graceful shutdown;
-    # second Ctrl+C force-exits (in case a synchronous REST call is
-    # blocking the main loop when the signal arrives).
+    # second Ctrl+C force-exits (in case graceful shutdown itself is
+    # hung — e.g. a blocking REST call inside orchestrator.stop() or a
+    # WS disconnect waiting on an unresponsive socket).
     _shutdown_requested = False
 
     def signal_handler(sig, frame):
         nonlocal _shutdown_requested
         if _shutdown_requested:
             logger.warning("Second interrupt received, forcing exit")
+            # os._exit (not sys.exit) is intentional. The second Ctrl+C
+            # is the escape hatch for a hung graceful-shutdown path:
+            # orchestrator.stop() runs in the main() finally block and
+            # may itself be blocked (e.g. pybit REST call or WS teardown).
+            # sys.exit raises SystemExit, which unwinds through finally
+            # blocks — i.e. back into the same stuck cleanup code, or
+            # worse, gets swallowed by a broad except inside stop(). The
+            # _exit(2) syscall terminates the process immediately with
+            # no Python cleanup, which is exactly what "force quit"
+            # requires. Do not "fix" this to sys.exit without first
+            # solving the hung-cleanup problem at its root.
             os._exit(130)
         _shutdown_requested = True
         logger.info(f"Received signal {sig}, initiating shutdown (press Ctrl+C again to force)")
