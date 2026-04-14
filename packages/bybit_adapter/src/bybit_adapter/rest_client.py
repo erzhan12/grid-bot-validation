@@ -71,6 +71,14 @@ class BybitRestClient:
     api_key: str
     api_secret: str
     testnet: bool = True
+    timeout: int = 10
+    """Per-request timeout in seconds passed to pybit's ``HTTP`` session.
+
+    pybit applies this via ``requests.Session.send(..., timeout=self.timeout)``
+    so every REST call is bounded for both connect and read. Combined with
+    pybit's ``force_retry=False`` default, network errors raise immediately
+    instead of blocking the caller.
+    """
     rate_limit_config: RateLimitConfig = field(default_factory=lambda: RateLimitConfig(query_rate=10))
 
     _session: Optional[HTTP] = field(default=None, init=False, repr=False)
@@ -82,6 +90,7 @@ class BybitRestClient:
             testnet=self.testnet,
             api_key=self.api_key,
             api_secret=self.api_secret,
+            timeout=self.timeout,
         )
         self._rate_limiter = RateLimiter(config=self.rate_limit_config)
 

@@ -249,6 +249,7 @@ class Orchestrator:
             api_key=account_config.api_key,
             api_secret=account_config.api_secret,
             testnet=account_config.testnet,
+            timeout=int(self._config.rest_fetch_timeout),
         )
 
         # Create executor
