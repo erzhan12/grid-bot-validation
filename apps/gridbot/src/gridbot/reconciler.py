@@ -50,12 +50,12 @@ class Reconciler:
         reconciler = Reconciler(rest_client)
 
         # On startup
-        result = await reconciler.reconcile_startup(runner)
+        result = reconciler.reconcile_startup(runner)
         if result.untracked_orders_on_exchange > 0:
             logger.warning(f"Found {result.untracked_orders_on_exchange} orphan orders")
 
         # On WebSocket reconnect
-        result = await reconciler.reconcile_reconnect(runner)
+        result = reconciler.reconcile_reconnect(runner)
     """
 
     def __init__(self, rest_client: BybitRestClient):
@@ -66,7 +66,7 @@ class Reconciler:
         """
         self._client = rest_client
 
-    async def reconcile_startup(
+    def reconcile_startup(
         self,
         runner: StrategyRunner,
     ) -> ReconciliationResult:
@@ -138,7 +138,7 @@ class Reconciler:
 
         return result
 
-    async def reconcile_reconnect(
+    def reconcile_reconnect(
         self,
         runner: StrategyRunner,
     ) -> ReconciliationResult:

@@ -87,20 +87,18 @@ class TestReconciliationResult:
 class TestReconcilerStartup:
     """Tests for startup reconciliation."""
 
-    @pytest.mark.asyncio
-    async def test_reconcile_startup_no_orders(self, reconciler, runner, mock_rest_client):
+    def test_reconcile_startup_no_orders(self, reconciler, runner, mock_rest_client):
         """Test startup reconciliation with no open orders."""
         mock_rest_client.get_open_orders.return_value = []
 
-        result = await reconciler.reconcile_startup(runner)
+        result = reconciler.reconcile_startup(runner)
 
         assert result.orders_fetched == 0
         assert result.orders_injected == 0
         assert result.untracked_orders_on_exchange == 0
         assert len(result.errors) == 0
 
-    @pytest.mark.asyncio
-    async def test_reconcile_startup_with_orders(self, reconciler, runner, mock_rest_client):
+    def test_reconcile_startup_with_orders(self, reconciler, runner, mock_rest_client):
         """Test startup reconciliation injects all open orders (with orderLinkId)."""
         mock_rest_client.get_open_orders.return_value = [
             {"orderId": "ex_1", "orderLinkId": "abc123def456789a",
@@ -109,7 +107,7 @@ class TestReconcilerStartup:
              "price": "51000", "qty": "0.001", "side": "Sell"},
         ]
 
-        result = await reconciler.reconcile_startup(runner)
+        result = reconciler.reconcile_startup(runner)
 
         assert result.orders_fetched == 2
         assert result.orders_injected == 2
@@ -117,8 +115,7 @@ class TestReconcilerStartup:
         counts = runner.get_tracked_order_count()
         assert counts["placed"] == 2
 
-    @pytest.mark.asyncio
-    async def test_reconcile_startup_no_longer_filters_by_order_link_id(
+    def test_reconcile_startup_no_longer_filters_by_order_link_id(
         self, reconciler, runner, mock_rest_client
     ):
         """All open orders are injected regardless of orderLinkId pattern."""
@@ -131,17 +128,16 @@ class TestReconcilerStartup:
              "price": "51000", "qty": "0.001", "side": "Buy", "reduceOnly": True},
         ]
 
-        result = await reconciler.reconcile_startup(runner)
+        result = reconciler.reconcile_startup(runner)
 
         assert result.orders_fetched == 3
         assert result.orders_injected == 3
 
-    @pytest.mark.asyncio
-    async def test_reconcile_startup_api_error(self, reconciler, runner, mock_rest_client):
+    def test_reconcile_startup_api_error(self, reconciler, runner, mock_rest_client):
         """Test startup reconciliation with API error."""
         mock_rest_client.get_open_orders.side_effect = Exception("API error")
 
-        result = await reconciler.reconcile_startup(runner)
+        result = reconciler.reconcile_startup(runner)
 
         assert result.orders_fetched == 0
         assert len(result.errors) == 1
@@ -151,8 +147,7 @@ class TestReconcilerStartup:
 class TestReconcilerReconnect:
     """Tests for reconnect reconciliation."""
 
-    @pytest.mark.asyncio
-    async def test_reconcile_reconnect_in_sync(self, reconciler, runner, mock_rest_client):
+    def test_reconcile_reconnect_in_sync(self, reconciler, runner, mock_rest_client):
         """Test reconnect when state is in sync."""
         runner.inject_open_orders([
             {"orderId": "ex_1", "price": "49000", "qty": "0.001", "side": "Buy"},
@@ -162,13 +157,12 @@ class TestReconcilerReconnect:
             {"orderId": "ex_1"},
         ]
 
-        result = await reconciler.reconcile_reconnect(runner)
+        result = reconciler.reconcile_reconnect(runner)
 
         assert result.orders_fetched == 1
         assert result.untracked_orders_on_exchange == 0
 
-    @pytest.mark.asyncio
-    async def test_reconcile_reconnect_missing_on_exchange(self, reconciler, runner, mock_rest_client):
+    def test_reconcile_reconnect_missing_on_exchange(self, reconciler, runner, mock_rest_client):
         """Test reconnect when order is in memory but not on exchange."""
         runner.inject_open_orders([
             {"orderId": "ex_1", "price": "49000", "qty": "0.001", "side": "Buy"},
@@ -176,20 +170,19 @@ class TestReconcilerReconnect:
 
         mock_rest_client.get_open_orders.return_value = []
 
-        result = await reconciler.reconcile_reconnect(runner)
+        result = reconciler.reconcile_reconnect(runner)
 
         assert result.orders_fetched == 0
         # Tracked by orderId
         assert runner._tracked_orders["ex_1"].status == "cancelled"
 
-    @pytest.mark.asyncio
-    async def test_reconcile_reconnect_missing_in_memory(self, reconciler, runner, mock_rest_client):
+    def test_reconcile_reconnect_missing_in_memory(self, reconciler, runner, mock_rest_client):
         """Test reconnect when order is on exchange but not in memory."""
         mock_rest_client.get_open_orders.return_value = [
             {"orderId": "ex_new", "price": "50000", "qty": "0.001", "side": "Sell"},
         ]
 
-        result = await reconciler.reconcile_reconnect(runner)
+        result = reconciler.reconcile_reconnect(runner)
 
         assert result.orders_fetched == 1
         assert result.untracked_orders_on_exchange == 1

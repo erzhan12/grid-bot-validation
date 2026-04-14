@@ -1248,14 +1248,12 @@ class TestOrchestratorOrderSyncLoop:
 
         # Mock reconciler
         reconciler = orchestrator._reconcilers["test_account"]
-        reconciler.reconcile_reconnect = AsyncMock()
-
-        # Mock ReconciliationResult
-
-        reconciler.reconcile_reconnect.return_value = ReconciliationResult(
-            orders_fetched=5,
-            orders_injected=0,
-            untracked_orders_on_exchange=0,
+        reconciler.reconcile_reconnect = Mock(
+            return_value=ReconciliationResult(
+                orders_fetched=5,
+                orders_injected=0,
+                untracked_orders_on_exchange=0,
+            )
         )
 
         # Run one iteration then stop
@@ -1293,7 +1291,7 @@ class TestOrchestratorOrderSyncLoop:
 
         # Mock reconciler - should not be called
         reconciler = orchestrator._reconcilers["test_account"]
-        reconciler.reconcile_reconnect = AsyncMock()
+        reconciler.reconcile_reconnect = Mock()
 
         # Run the loop
         await orchestrator._order_sync_loop()
@@ -1318,7 +1316,7 @@ class TestOrchestratorOrderSyncLoop:
 
         # Make reconciler raise error
         reconciler = orchestrator._reconcilers["test_account"]
-        reconciler.reconcile_reconnect = AsyncMock(side_effect=Exception("API error"))
+        reconciler.reconcile_reconnect = Mock(side_effect=Exception("API error"))
 
         async def stop_after_first(seconds):
             orchestrator._running = False
@@ -1345,11 +1343,12 @@ class TestOrchestratorOrderSyncLoop:
 
         # Mock reconciler to return discrepancies
         reconciler = orchestrator._reconcilers["test_account"]
-        reconciler.reconcile_reconnect = AsyncMock()
-        reconciler.reconcile_reconnect.return_value = ReconciliationResult(
-            orders_fetched=10,
-            orders_injected=2,
-            untracked_orders_on_exchange=1,
+        reconciler.reconcile_reconnect = Mock(
+            return_value=ReconciliationResult(
+                orders_fetched=10,
+                orders_injected=2,
+                untracked_orders_on_exchange=1,
+            )
         )
 
         async def stop_after_first(seconds):

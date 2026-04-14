@@ -165,7 +165,7 @@ class Orchestrator:
             account_name = self._get_account_for_strategy(runner.strat_id)
             reconciler = self._reconcilers.get(account_name)
             if reconciler:
-                result = await reconciler.reconcile_startup(runner)
+                result = reconciler.reconcile_startup(runner)
                 logger.info(
                     f"{runner.strat_id}: Reconciliation complete - "
                     f"fetched={result.orders_fetched}, injected={result.orders_injected}, "
@@ -833,7 +833,7 @@ class Orchestrator:
 
                     for runner in runners:
                         try:
-                            result = await reconciler.reconcile_reconnect(runner)
+                            result = reconciler.reconcile_reconnect(runner)
 
                             if result.errors:
                                 logger.warning(
