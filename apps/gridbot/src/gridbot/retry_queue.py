@@ -1,9 +1,11 @@
 """Retry queue for failed intent execution.
 
 Handles failed order placement and cancellation with exponential backoff.
+The queue has no background thread — its owner calls ``process_due()``
+from a polling loop. This matches the bbu2-style single-threaded
+orchestrator (see 0017_PLAN.md).
 """
 
-import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, UTC
@@ -51,6 +53,9 @@ class RetryQueue:
     Items are retried up to max_attempts times or until max_elapsed_seconds
     has passed since the first attempt.
 
+    There is no background thread: the owner must call ``process_due()``
+    periodically (the orchestrator ticks it from its main loop).
+
     Example:
         queue = RetryQueue(
             executor_func=executor.execute_place,
@@ -61,11 +66,8 @@ class RetryQueue:
         # Add failed intent to queue
         queue.add(intent, "Rate limited")
 
-        # Process due items (call periodically)
-        await queue.process_due()
-
-        # Or run background task
-        await queue.start()
+        # Process due items (call periodically from a main loop)
+        queue.process_due()
     """
 
     def __init__(
@@ -75,7 +77,6 @@ class RetryQueue:
         max_elapsed_seconds: float = 30.0,
         initial_backoff_seconds: float = 1.0,
         backoff_multiplier: float = 2.0,
-        check_interval_seconds: float = 1.0,
         is_paused: Optional[Callable[[], bool]] = None,
     ):
         """Initialize retry queue.
@@ -86,7 +87,6 @@ class RetryQueue:
             max_elapsed_seconds: Maximum seconds since first attempt.
             initial_backoff_seconds: Initial backoff delay.
             backoff_multiplier: Multiplier for exponential backoff.
-            check_interval_seconds: How often to check for due items.
             is_paused: Optional callable returning True to skip processing (e.g. auth cooldown).
         """
         self._executor_func = executor_func
@@ -94,23 +94,14 @@ class RetryQueue:
         self._max_elapsed_seconds = max_elapsed_seconds
         self._initial_backoff = initial_backoff_seconds
         self._backoff_multiplier = backoff_multiplier
-        self._check_interval = check_interval_seconds
         self._is_paused = is_paused or (lambda: False)
 
         self._queue: list[RetryItem] = []
-        self._running = False
-        self._stopped = False
-        self._task: Optional[asyncio.Task] = None
 
     @property
     def size(self) -> int:
         """Number of items in queue."""
         return len(self._queue)
-
-    @property
-    def running(self) -> bool:
-        """Whether background task is running."""
-        return self._running
 
     def add(self, intent: PlaceLimitIntent | CancelIntent, error: str) -> None:
         """Add a failed intent to the retry queue.
@@ -157,7 +148,7 @@ class RetryQueue:
         self._queue.clear()
         return count
 
-    async def process_due(self) -> int:
+    def process_due(self) -> int:
         """Process all due items in the queue.
 
         Returns:
@@ -170,9 +161,6 @@ class RetryQueue:
         items_to_remove = []
 
         for item in self._queue:
-            if self._stopped:
-                break
-
             if not item.is_due():
                 continue
 
@@ -206,7 +194,7 @@ class RetryQueue:
             )
 
             try:
-                result = await self._execute_intent(item.intent)
+                result = self._executor_func(item.intent)
 
                 if result.success:
                     logger.info(f"Retry succeeded: {type(item.intent).__name__}")
@@ -234,46 +222,3 @@ class RetryQueue:
             self._queue.remove(item)
 
         return processed
-
-    async def _execute_intent(self, intent: PlaceLimitIntent | CancelIntent):
-        """Execute an intent, handling sync vs async executor functions."""
-        result = self._executor_func(intent)
-        # Handle both sync and async executors
-        if asyncio.iscoroutine(result):
-            result = await result
-        return result
-
-    async def start(self) -> None:
-        """Start background task that processes due items."""
-        if self._running:
-            return
-
-        self._running = True
-        self._stopped = False
-        self._task = asyncio.create_task(self._run_loop())
-        logger.info("Retry queue background task started")
-
-    async def stop(self) -> None:
-        """Stop background task."""
-        self._running = False
-        self._stopped = True
-
-        if self._task:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
-
-        logger.info("Retry queue background task stopped")
-
-    async def _run_loop(self) -> None:
-        """Background loop that processes due items."""
-        while self._running:
-            try:
-                await self.process_due()
-            except Exception as e:
-                logger.error(f"Error in retry queue loop: {e}")
-
-            await asyncio.sleep(self._check_interval)

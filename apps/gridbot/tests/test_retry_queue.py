@@ -1,9 +1,9 @@
 """Tests for gridbot retry queue module."""
 
-import asyncio
+import time
 from datetime import datetime, timedelta, UTC
 from decimal import Decimal
-from unittest.mock import Mock, AsyncMock
+from unittest.mock import Mock
 
 import pytest
 
@@ -52,6 +52,13 @@ def failure_result():
     return result
 
 
+def _force_due(queue: RetryQueue) -> None:
+    """Helper: make every item immediately due for retry."""
+    now = datetime.now(UTC)
+    for item in queue._queue:
+        item.next_retry_ts = now
+
+
 class TestRetryItem:
     """Tests for RetryItem dataclass."""
 
@@ -96,7 +103,6 @@ class TestRetryQueueBasic:
         """Test creating a queue."""
         queue = RetryQueue(executor_func=Mock())
         assert queue.size == 0
-        assert queue.running is False
 
     def test_add_item(self, place_intent):
         """Test adding an item."""
@@ -137,28 +143,24 @@ class TestRetryQueueBasic:
 class TestRetryQueueProcessing:
     """Tests for RetryQueue.process_due."""
 
-    @pytest.mark.asyncio
-    async def test_process_due_success(self, place_intent, success_result):
+    def test_process_due_success(self, place_intent, success_result):
         """Test processing succeeds and removes item."""
         executor = Mock(return_value=success_result)
         queue = RetryQueue(
             executor_func=executor,
             max_attempts=3,
-            initial_backoff_seconds=0.01,  # Fast for testing
+            initial_backoff_seconds=0.01,
         )
         queue.add(place_intent, "Initial error")
+        _force_due(queue)
 
-        # Wait for item to be due
-        await asyncio.sleep(0.02)
-
-        processed = await queue.process_due()
+        processed = queue.process_due()
 
         assert processed == 1
         assert queue.size == 0
         executor.assert_called_once()
 
-    @pytest.mark.asyncio
-    async def test_process_due_failure_retries(self, place_intent, failure_result):
+    def test_process_due_failure_retries(self, place_intent, failure_result):
         """Test processing failure increments attempt count."""
         executor = Mock(return_value=failure_result)
         queue = RetryQueue(
@@ -167,19 +169,16 @@ class TestRetryQueueProcessing:
             initial_backoff_seconds=0.01,
         )
         queue.add(place_intent, "Initial error")
+        _force_due(queue)
 
-        # Wait for item to be due
-        await asyncio.sleep(0.02)
-
-        processed = await queue.process_due()
+        processed = queue.process_due()
 
         # Item not removed, still in queue with incremented attempt
         assert processed == 0
         assert queue.size == 1
         assert queue._queue[0].attempt_count == 2  # 1 initial + 1 retry
 
-    @pytest.mark.asyncio
-    async def test_process_due_max_attempts(self, place_intent, failure_result):
+    def test_process_due_max_attempts(self, place_intent, failure_result):
         """Test item removed after max attempts."""
         executor = Mock(return_value=failure_result)
         queue = RetryQueue(
@@ -190,19 +189,18 @@ class TestRetryQueueProcessing:
         queue.add(place_intent, "Initial error")
 
         # First retry
-        await asyncio.sleep(0.02)
-        await queue.process_due()
+        _force_due(queue)
+        queue.process_due()
         assert queue.size == 1
 
         # Second retry - should be removed (max_attempts=2, we've now done 2)
-        await asyncio.sleep(0.05)
-        processed = await queue.process_due()
+        _force_due(queue)
+        processed = queue.process_due()
 
         assert processed == 1
         assert queue.size == 0
 
-    @pytest.mark.asyncio
-    async def test_process_due_max_elapsed(self, place_intent, failure_result):
+    def test_process_due_max_elapsed(self, place_intent, failure_result):
         """Test item removed after max elapsed time."""
         executor = Mock(return_value=failure_result)
         queue = RetryQueue(
@@ -214,15 +212,15 @@ class TestRetryQueueProcessing:
         queue.add(place_intent, "Initial error")
 
         # Wait for max elapsed time
-        await asyncio.sleep(0.06)
+        time.sleep(0.06)
+        _force_due(queue)
 
-        processed = await queue.process_due()
+        processed = queue.process_due()
 
         assert processed == 1
         assert queue.size == 0
 
-    @pytest.mark.asyncio
-    async def test_process_due_not_due_yet(self, place_intent, success_result):
+    def test_process_due_not_due_yet(self, place_intent, success_result):
         """Test items not due are skipped."""
         executor = Mock(return_value=success_result)
         queue = RetryQueue(
@@ -232,35 +230,17 @@ class TestRetryQueueProcessing:
         queue.add(place_intent, "Initial error")
 
         # Process immediately (item not due yet)
-        processed = await queue.process_due()
+        processed = queue.process_due()
 
         assert processed == 0
         assert queue.size == 1
         executor.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_process_due_async_executor(self, place_intent, success_result):
-        """Test processing with async executor function."""
-        executor = AsyncMock(return_value=success_result)
-        queue = RetryQueue(
-            executor_func=executor,
-            initial_backoff_seconds=0.01,
-        )
-        queue.add(place_intent, "Initial error")
-
-        await asyncio.sleep(0.02)
-        processed = await queue.process_due()
-
-        assert processed == 1
-        assert queue.size == 0
-        executor.assert_called_once()
-
 
 class TestRetryQueueCancelDispatch:
     """Tests for CancelIntent dispatch through retry queue."""
 
-    @pytest.mark.asyncio
-    async def test_process_due_cancel_intent(self, cancel_intent, success_result):
+    def test_process_due_cancel_intent(self, cancel_intent, success_result):
         """Test CancelIntent is dispatched through process_due and received by executor."""
         executor = Mock(return_value=success_result)
         queue = RetryQueue(
@@ -269,16 +249,15 @@ class TestRetryQueueCancelDispatch:
             initial_backoff_seconds=0.01,
         )
         queue.add(cancel_intent, "Cancel failed")
+        _force_due(queue)
 
-        await asyncio.sleep(0.02)
-        processed = await queue.process_due()
+        processed = queue.process_due()
 
         assert processed == 1
         assert queue.size == 0
         executor.assert_called_once_with(cancel_intent)
 
-    @pytest.mark.asyncio
-    async def test_process_due_cancel_intent_failure_retries(self, cancel_intent, failure_result):
+    def test_process_due_cancel_intent_failure_retries(self, cancel_intent, failure_result):
         """Test failed CancelIntent stays in queue for retry."""
         executor = Mock(return_value=failure_result)
         queue = RetryQueue(
@@ -287,9 +266,9 @@ class TestRetryQueueCancelDispatch:
             initial_backoff_seconds=0.01,
         )
         queue.add(cancel_intent, "Cancel failed")
+        _force_due(queue)
 
-        await asyncio.sleep(0.02)
-        processed = await queue.process_due()
+        processed = queue.process_due()
 
         assert processed == 0
         assert queue.size == 1
@@ -297,65 +276,10 @@ class TestRetryQueueCancelDispatch:
         executor.assert_called_once_with(cancel_intent)
 
 
-class TestRetryQueueBackgroundTask:
-    """Tests for RetryQueue background task."""
-
-    @pytest.mark.asyncio
-    async def test_start_stop(self):
-        """Test starting and stopping background task."""
-        queue = RetryQueue(
-            executor_func=Mock(),
-            check_interval_seconds=0.01,
-        )
-
-        await queue.start()
-        assert queue.running is True
-
-        await queue.stop()
-        assert queue.running is False
-
-    @pytest.mark.asyncio
-    async def test_background_processing(self, place_intent, success_result):
-        """Test background task processes items."""
-        executor = Mock(return_value=success_result)
-        queue = RetryQueue(
-            executor_func=executor,
-            initial_backoff_seconds=0.01,
-            check_interval_seconds=0.01,
-        )
-
-        queue.add(place_intent, "Initial error")
-        await queue.start()
-
-        # Wait for background processing
-        await asyncio.sleep(0.05)
-
-        await queue.stop()
-
-        assert queue.size == 0
-        executor.assert_called()
-
-    @pytest.mark.asyncio
-    async def test_double_start(self):
-        """Test starting twice is idempotent."""
-        queue = RetryQueue(
-            executor_func=Mock(),
-            check_interval_seconds=0.01,
-        )
-
-        await queue.start()
-        await queue.start()  # Should be no-op
-
-        assert queue.running is True
-
-        await queue.stop()
-
-
 class TestRetryQueueBackoff:
     """Tests for exponential backoff."""
 
-    @pytest.mark.asyncio
-    async def test_exponential_backoff(self, place_intent, failure_result):
+    def test_exponential_backoff(self, place_intent, failure_result):
         """Test backoff increases exponentially."""
         executor = Mock(return_value=failure_result)
         queue = RetryQueue(
@@ -367,9 +291,9 @@ class TestRetryQueueBackoff:
         queue.add(place_intent, "Initial error")
 
         # Force item to be due
-        queue._queue[0].next_retry_ts = datetime.now(UTC)
+        _force_due(queue)
 
-        await queue.process_due()
+        queue.process_due()
 
         # Check backoff: initial(1.0) * multiplier^attempt = 1.0 * 2^1 = 2.0
         item = queue._queue[0]
@@ -381,8 +305,7 @@ class TestRetryQueueBackoff:
 class TestRetryQueuePaused:
     """Tests for is_paused behavior."""
 
-    @pytest.mark.asyncio
-    async def test_paused_skips_processing(self, place_intent, success_result):
+    def test_paused_skips_processing(self, place_intent, success_result):
         """Test process_due skips all items when paused."""
         executor = Mock(return_value=success_result)
         queue = RetryQueue(
@@ -391,16 +314,15 @@ class TestRetryQueuePaused:
             is_paused=lambda: True,
         )
         queue.add(place_intent, "error")
-        await asyncio.sleep(0.02)
+        _force_due(queue)
 
-        processed = await queue.process_due()
+        processed = queue.process_due()
 
         assert processed == 0
         assert queue.size == 1  # item still in queue
         executor.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_paused_mid_batch_stops_processing(self, place_intent, failure_result):
+    def test_paused_mid_batch_stops_processing(self, place_intent, failure_result):
         """Test process_due stops mid-batch when pause activates."""
         call_count = 0
         paused = False
@@ -422,19 +344,14 @@ class TestRetryQueuePaused:
         # Add 3 items
         for _ in range(3):
             queue.add(place_intent, "error")
-        await asyncio.sleep(0.02)
+        _force_due(queue)
 
-        # Force all items due
-        for item in queue._queue:
-            item.next_retry_ts = datetime.now(UTC)
-
-        await queue.process_due()
+        queue.process_due()
 
         # Should have tried 2 items (second one triggers pause, third skipped)
         assert call_count == 2
 
-    @pytest.mark.asyncio
-    async def test_unpaused_processes_normally(self, place_intent, success_result):
+    def test_unpaused_processes_normally(self, place_intent, success_result):
         """Test process_due works when not paused."""
         executor = Mock(return_value=success_result)
         queue = RetryQueue(
@@ -443,35 +360,9 @@ class TestRetryQueuePaused:
             is_paused=lambda: False,
         )
         queue.add(place_intent, "error")
-        await asyncio.sleep(0.02)
+        _force_due(queue)
 
-        processed = await queue.process_due()
+        processed = queue.process_due()
 
         assert processed == 1
         assert queue.size == 0
-
-
-class TestRetryQueueStopStartCycle:
-    """Tests for stop/start cycle (P2 fix)."""
-
-    @pytest.mark.asyncio
-    async def test_start_stop_start_processes_items(self, place_intent, success_result):
-        """Test retry queue works after stop -> start cycle."""
-        executor = Mock(return_value=success_result)
-        queue = RetryQueue(
-            executor_func=executor,
-            initial_backoff_seconds=0.01,
-            check_interval_seconds=0.01,
-        )
-
-        await queue.start()
-        await queue.stop()
-        await queue.start()
-
-        queue.add(place_intent, "error")
-        await asyncio.sleep(0.05)
-
-        # Item should have been processed by background loop
-        assert queue.size == 0
-
-        await queue.stop()

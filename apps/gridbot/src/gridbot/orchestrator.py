@@ -192,9 +192,8 @@ class Orchestrator:
         self._health_check_task = asyncio.create_task(self._health_check_loop())
         self._order_sync_task = asyncio.create_task(self._order_sync_loop())
 
-        # Start retry queues
-        for queue in self._retry_queues.values():
-            await queue.start()
+        # Retry queues have no background task — orchestrator ticks them from
+        # the main polling loop (see 0017_PLAN.md Phase 3d).
 
         logger.info(f"Orchestrator started with {len(self._runners)} strategies")
 
@@ -213,9 +212,7 @@ class Orchestrator:
         for ws in self._private_ws.values():
             ws.disconnect()
 
-        # Stop retry queues (before cancelling tasks so they exit cleanly)
-        for queue in self._retry_queues.values():
-            await queue.stop()
+        # Retry queues have no background task to stop (see 0017_PLAN.md).
 
         # Stop background tasks
         for task in (self._position_check_task, self._health_check_task, self._order_sync_task):
