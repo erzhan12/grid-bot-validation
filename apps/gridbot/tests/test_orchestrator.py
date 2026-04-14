@@ -408,11 +408,13 @@ class TestOrchestratorGuardClauses:
         orchestrator.start()
         assert len(orchestrator._runners) == 0
 
-    def test_stop_not_running_returns_early(self, gridbot_config):
-        """stop() returns immediately when not running."""
+    def test_stop_not_started_returns_early(self, gridbot_config):
+        """stop() is a no-op when start() was never called."""
         orchestrator = Orchestrator(gridbot_config)
+        assert not orchestrator._started
         assert not orchestrator._running
-        orchestrator.stop()
+        orchestrator.stop()  # must not raise
+        assert not orchestrator._started
         assert not orchestrator._running
 
     def test_request_stop_clears_running_flag(self, gridbot_config):
@@ -421,6 +423,73 @@ class TestOrchestratorGuardClauses:
         orchestrator._running = True
         orchestrator.request_stop()
         assert orchestrator._running is False
+
+    def test_request_stop_is_idempotent(self, gridbot_config):
+        """Calling request_stop() twice is safe (signal handler may fire twice)."""
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._running = True
+        orchestrator.request_stop()
+        orchestrator.request_stop()  # must not raise
+        assert orchestrator._running is False
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_stop_after_request_stop_still_cleans_up(
+        self, mock_private_ws, mock_public_ws, mock_rest_client, gridbot_config
+    ):
+        """Bug regression: stop() after request_stop() must still disconnect WS.
+
+        Flow: signal handler fires request_stop() (clearing _running),
+        run() exits, then the finally block in main.py calls stop().
+        stop() must not skip cleanup just because _running is already
+        False — gate is on _started, not _running.
+        """
+        mock_public_ws.return_value.connect = Mock()
+        mock_public_ws.return_value.disconnect = Mock()
+        mock_private_ws.return_value.connect = Mock()
+        mock_private_ws.return_value.disconnect = Mock()
+        mock_rest_client.return_value.get_open_orders = Mock(return_value=[])
+
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator.start()
+        assert orchestrator._started is True
+        assert orchestrator._running is True
+
+        # Simulate signal-handler path: request_stop() runs first.
+        orchestrator.request_stop()
+        assert orchestrator._running is False
+        assert orchestrator._started is True  # still started, loop just exited
+
+        # Now main.py's finally block calls stop(). It MUST still
+        # disconnect the WebSockets and clear _started.
+        orchestrator.stop()
+        mock_public_ws.return_value.disconnect.assert_called()
+        mock_private_ws.return_value.disconnect.assert_called()
+        assert orchestrator._started is False
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_stop_is_idempotent(
+        self, mock_private_ws, mock_public_ws, mock_rest_client, gridbot_config
+    ):
+        """Calling stop() twice must not double-disconnect or raise."""
+        mock_public_ws.return_value.connect = Mock()
+        mock_public_ws.return_value.disconnect = Mock()
+        mock_private_ws.return_value.connect = Mock()
+        mock_private_ws.return_value.disconnect = Mock()
+        mock_rest_client.return_value.get_open_orders = Mock(return_value=[])
+
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator.start()
+        orchestrator.stop()
+        mock_public_ws.return_value.disconnect.reset_mock()
+        mock_private_ws.return_value.disconnect.reset_mock()
+
+        orchestrator.stop()  # second call is a no-op
+        mock_public_ws.return_value.disconnect.assert_not_called()
+        mock_private_ws.return_value.disconnect.assert_not_called()
 
 
 class TestOrchestratorPositionWsCache:

@@ -39,6 +39,7 @@ from gridbot.retry_queue import RetryQueue
 _HEALTH_CHECK_INTERVAL = 10  # seconds
 _CHECK_INTERVAL = 0.1  # 100 ms main loop tick (bbu2 value)
 _RETRY_TICK_INTERVAL = 1.0  # seconds between retry-queue drains
+_POSITION_FETCH_SLOW_THRESHOLD = 2.0  # log a warning if REST position fetch takes longer
 
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,14 @@ class Orchestrator:
         self._account_to_runners: dict[str, list[StrategyRunner]] = {}  # account_name -> runners
 
         # State
+        # `_started`: set once start() completes successfully; cleared by
+        # stop(). Guards stop() against "never started" and against double
+        # stop. Independent of `_running` because the main loop may have
+        # already exited (via request_stop()) before stop() is called from
+        # the finally block in main.py.
+        # `_running`: main-loop gate. Flipped by request_stop() from a
+        # signal handler or by stop() at teardown.
+        self._started = False
         self._running = False
 
         # WebSocket position data cache: account_name -> symbol -> side -> position_data
@@ -115,7 +124,10 @@ class Orchestrator:
         self._position_ws_data: dict[str, dict[str, dict[str, dict]]] = {}
 
         # Wallet balance cache: account_name -> (balance, timestamp)
-        # No lock needed: single-thread polling loop is the only reader/writer.
+        # IMPORTANT: Only accessed from main thread, never from WS callbacks.
+        # The main polling loop is the single reader/writer, so no lock is
+        # required. Do NOT touch this from _on_ticker / _on_order /
+        # _on_execution / _on_position — those run in pybit WS threads.
         self._wallet_cache: dict[str, tuple[float, datetime]] = {}
 
         # WS → main-thread buffers. dict/deque mutations are atomic under CPython GIL.
@@ -210,6 +222,7 @@ class Orchestrator:
         self._next_retry_tick = now + _RETRY_TICK_INTERVAL
 
         self._running = True
+        self._started = True
         logger.info(f"Orchestrator started with {len(self._runners)} strategies")
 
     def run(self) -> None:
@@ -325,11 +338,26 @@ class Orchestrator:
         self._running = False
 
     def stop(self) -> None:
-        """Stop the orchestrator gracefully (non-blocking)."""
-        if not self._running:
+        """Stop the orchestrator gracefully (non-blocking).
+
+        Idempotent and safe to call whether or not the main loop is
+        still running. Gated on `_started` (not `_running`) because
+        the signal-handler path calls request_stop() first — which
+        clears _running — and only then reaches this method via the
+        `finally` block in main.py. If we gated on _running we would
+        skip WS disconnect and DB run-record cleanup on every normal
+        shutdown.
+        """
+        if not self._started:
+            # Never started, or already stopped. Double-stop and
+            # stop-before-start are both no-ops.
             return
 
         logger.info("Stopping orchestrator")
+        # Clear _started first so re-entry is a no-op, then flip
+        # _running to be extra-safe for any concurrent run() loop that
+        # may still be alive (request_stop() usually gets here first).
+        self._started = False
         self._running = False
 
         # Disconnect WebSockets first to stop new events from flowing in
@@ -523,11 +551,21 @@ class Orchestrator:
         self._notifier.alert(msg, error_key=f"auth_cooldown_{strat_id}")
 
     def _on_position(self, account_name: str, message: dict) -> None:
-        """Handle position WebSocket message.
+        """Handle position WebSocket message (runs in pybit WS thread).
 
-        Stores position data from WebSocket for real-time updates.
-        Following original bbu2 pattern: WebSocket is primary source,
-        HTTP REST is fallback only.
+        Stores position data into `_position_ws_data` as the primary,
+        real-time source. `_fetch_and_update_positions` on the main
+        thread later reads this cache (with REST fallback when a slot
+        is still None).
+
+        Thread-safety: every mutation here is a single `dict[k] = v`
+        (setdefault plus an explicit assignment), which is atomic under
+        the CPython GIL. No lock is needed. Races with the main-thread
+        reader are benign — worst case the reader sees a partially
+        populated `_position_ws_data[account][symbol]` for one side
+        before the other lands, and falls back to REST for the missing
+        side, which is exactly the same code path taken on a real WS
+        gap. Following original bbu2 pattern: WS primary, REST fallback.
 
         Bybit position message format:
         {
@@ -548,7 +586,8 @@ class Orchestrator:
         }
         """
         try:
-            # Initialize account cache if needed
+            # Initialize account cache if needed. setdefault is a single
+            # bytecode op and is GIL-atomic.
             if account_name not in self._position_ws_data:
                 self._position_ws_data[account_name] = {}
 
@@ -568,7 +607,7 @@ class Orchestrator:
                 if symbol not in self._position_ws_data[account_name]:
                     self._position_ws_data[account_name][symbol] = {}
 
-                # Store position data by side
+                # Store position data by side — atomic dict-set under GIL.
                 self._position_ws_data[account_name][symbol][side] = pos
 
                 logger.debug(
@@ -583,7 +622,16 @@ class Orchestrator:
         """Handle order WebSocket message (runs in pybit WS thread).
 
         Appends each event to the target runner's pending deque. The
-        main-loop tick drains the deque in FIFO order.
+        main-loop tick drains the deque in FIFO order via popleft().
+
+        Thread-safety: `collections.deque.append` is atomic under the
+        CPython GIL (single C-level operation), as is `popleft` on the
+        main thread. No lock is needed. Races are benign: worst case
+        an event queues after the main loop has already drained but
+        before it sleeps, and the event is picked up on the next 100 ms
+        tick — an acceptable delay. The `_pending_orders.get(...)` read
+        is also GIL-atomic; the deque object is created up-front in
+        start() and never replaced, so `is not None` is race-free.
         """
         try:
             normalizer = self._normalizers[account_name]
@@ -605,7 +653,12 @@ class Orchestrator:
         """Handle execution WebSocket message (runs in pybit WS thread).
 
         Appends each event to the target runner's pending deque. The
-        main-loop tick drains the deque in FIFO order.
+        main-loop tick drains the deque in FIFO order via popleft().
+
+        Thread-safety: identical guarantees to `_on_order` —
+        `deque.append` is GIL-atomic, the deque object is created
+        up-front in start() and never replaced, and races with the
+        main-thread drainer cost at most one 100 ms tick of delay.
         """
         try:
             normalizer = self._normalizers[account_name]
@@ -741,6 +794,11 @@ class Orchestrator:
             startup: If True, log warnings with startup context on failure.
         """
         for account_name, runners in list(self._account_to_runners.items()):
+            # Instrument the whole per-account REST section so we can spot
+            # cases where a blocking pybit call stalls the main polling loop.
+            # The 2s threshold is well under the 10s pybit timeout but far
+            # enough above normal (~100-300ms) to only fire on real stalls.
+            start = time.monotonic()
             try:
                 rest_client = self._rest_clients[account_name]
 
@@ -814,6 +872,14 @@ class Orchestrator:
                     self._notifier.alert_exception(
                         "_fetch_and_update_positions", e,
                         error_key=f"position_fetch_{account_name}",
+                    )
+            finally:
+                elapsed = time.monotonic() - start
+                if elapsed > _POSITION_FETCH_SLOW_THRESHOLD:
+                    logger.warning(
+                        "Position fetch for %s took %.1fs (threshold=%.1fs) — "
+                        "blocking REST stalled the main polling loop",
+                        account_name, elapsed, _POSITION_FETCH_SLOW_THRESHOLD,
                     )
 
     def _health_check_once(self) -> None:
