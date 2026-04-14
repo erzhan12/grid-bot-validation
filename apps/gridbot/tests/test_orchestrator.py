@@ -915,6 +915,114 @@ class TestOrchestratorPositionCheck:
         # Should not raise
         orchestrator._fetch_and_update_positions()
 
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_position_check_total_budget_stops_extra_accounts(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Once _POSITION_FETCH_TOTAL_BUDGET is spent, subsequent accounts are deferred."""
+        # Two accounts share the test config; the second must be skipped
+        # once the first has burned the whole budget.
+        second_account = AccountConfig(
+            name="slow_account",
+            api_key="k2",
+            api_secret="s2",
+            testnet=True,
+        )
+
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._init_account(account_config)
+        orchestrator._init_account(second_account)
+
+        # Give each account its own runner so the loop iterates twice.
+        runner_a = Mock(strat_id="a", symbol="BTCUSDT")
+        runner_a.engine.last_close = 42000.0
+        runner_b = Mock(strat_id="b", symbol="BTCUSDT")
+        runner_b.engine.last_close = 42000.0
+        orchestrator._account_to_runners = {
+            "test_account": [runner_a],
+            "slow_account": [runner_b],
+        }
+
+        # Pre-populate WS cache so only wallet_balance hits REST — keeps
+        # the test path narrow and makes the budget the only variable.
+        long_pos = {"symbol": "BTCUSDT", "side": "Buy", "size": "0"}
+        short_pos = {"symbol": "BTCUSDT", "side": "Sell", "size": "0"}
+        orchestrator._position_ws_data = {
+            "test_account": {"BTCUSDT": {"Buy": long_pos, "Sell": short_pos}},
+            "slow_account": {"BTCUSDT": {"Buy": long_pos, "Sell": short_pos}},
+        }
+
+        for name in ("test_account", "slow_account"):
+            rc = orchestrator._rest_clients[name]
+            rc.get_wallet_balance.return_value = {
+                "list": [{"coin": [{"coin": "USDT", "walletBalance": "1000"}]}]
+            }
+
+        # Fake monotonic: the first account burns 6s (over the 5s budget)
+        # between its loop entry and the post-fetch wait. Sequence:
+        #   loop_start         -> 0.0
+        #   1st start/gate     -> 0.0
+        #   1st finally        -> 6.0   (slow fetch)
+        #   2nd start/gate     -> 6.0   (budget gate trips, break)
+        fake_times = iter([0.0, 0.0, 6.0, 6.0, 6.0, 6.0])
+        with patch("gridbot.orchestrator.time.monotonic", side_effect=lambda: next(fake_times)):
+            orchestrator._fetch_and_update_positions()
+
+        # First account was served; second was deferred by the budget gate.
+        runner_a.on_position_update.assert_called_once()
+        runner_b.on_position_update.assert_not_called()
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_position_check_total_budget_ignored_on_startup(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Startup fetch must run every account even if budget would trip."""
+        second_account = AccountConfig(
+            name="slow_account", api_key="k2", api_secret="s2", testnet=True,
+        )
+
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._init_account(account_config)
+        orchestrator._init_account(second_account)
+
+        runner_a = Mock(strat_id="a", symbol="BTCUSDT")
+        runner_a.engine.last_close = 42000.0
+        runner_b = Mock(strat_id="b", symbol="BTCUSDT")
+        runner_b.engine.last_close = 42000.0
+        orchestrator._account_to_runners = {
+            "test_account": [runner_a],
+            "slow_account": [runner_b],
+        }
+
+        long_pos = {"symbol": "BTCUSDT", "side": "Buy", "size": "0"}
+        short_pos = {"symbol": "BTCUSDT", "side": "Sell", "size": "0"}
+        orchestrator._position_ws_data = {
+            "test_account": {"BTCUSDT": {"Buy": long_pos, "Sell": short_pos}},
+            "slow_account": {"BTCUSDT": {"Buy": long_pos, "Sell": short_pos}},
+        }
+
+        for name in ("test_account", "slow_account"):
+            rc = orchestrator._rest_clients[name]
+            rc.get_wallet_balance.return_value = {
+                "list": [{"coin": [{"coin": "USDT", "walletBalance": "1000"}]}]
+            }
+
+        # Even with cumulative time well past the budget, startup=True
+        # must not short-circuit — runner state would otherwise be
+        # partially initialized.
+        fake_times = iter([0.0, 0.0, 10.0, 10.0, 20.0, 20.0])
+        with patch("gridbot.orchestrator.time.monotonic", side_effect=lambda: next(fake_times)):
+            orchestrator._fetch_and_update_positions(startup=True)
+
+        runner_a.on_position_update.assert_called_once()
+        runner_b.on_position_update.assert_called_once()
+
 
 class TestOrchestratorDbRecords:
     """Tests for database Run record creation and update."""

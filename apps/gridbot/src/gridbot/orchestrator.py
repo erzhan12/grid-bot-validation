@@ -41,6 +41,7 @@ _CHECK_INTERVAL = 0.1  # 100 ms main loop tick (bbu2 value)
 _RETRY_TICK_INTERVAL = 1.0  # seconds between retry-queue drains
 _POSITION_FETCH_SLOW_THRESHOLD = 2.0  # log a warning if REST position fetch takes longer
 _POSITION_FETCH_MIN_INTERVAL = 1.0  # per-account floor between REST fetches (defense-in-depth)
+_POSITION_FETCH_TOTAL_BUDGET = 5.0  # total wall-clock ceiling for one _fetch_and_update_positions call
 
 
 logger = logging.getLogger(__name__)
@@ -828,17 +829,42 @@ class Orchestrator:
         2. Fall back to REST API when WebSocket data is not available
         3. Periodically sync via REST to ensure data freshness
 
+        Wall-clock budget: the whole call is capped at
+        ``_POSITION_FETCH_TOTAL_BUDGET`` seconds. Before starting the
+        REST section for each account, we check remaining budget and
+        break out of the loop if spent. This prevents a sequence of
+        slow accounts (~2s each x N) from pinning the main polling
+        loop well beyond any single pybit timeout. Budget is NOT
+        enforced during startup — the first pass needs to initialize
+        runner state and a partial result would leave some runners
+        with no multipliers.
+
         Args:
-            startup: If True, log warnings with startup context on failure.
+            startup: If True, log warnings with startup context on
+                failure and skip budget enforcement.
         """
+        loop_start = time.monotonic()
         for account_name, runners in list(self._account_to_runners.items()):
+            start = time.monotonic()
+            # Total-budget gate: stop scheduling new REST sections once
+            # the cumulative wall-clock ceiling is reached. Remaining
+            # accounts will be picked up on the next periodic tick.
+            # Skipped on startup so initial state always gets populated.
+            if not startup:
+                elapsed_total = start - loop_start
+                if elapsed_total >= _POSITION_FETCH_TOTAL_BUDGET:
+                    logger.warning(
+                        "Position fetch total budget exceeded: %.1fs >= %.1fs, "
+                        "deferring remaining accounts to next tick (skipped: %s)",
+                        elapsed_total, _POSITION_FETCH_TOTAL_BUDGET, account_name,
+                    )
+                    break
             # Short-circuit: per-account minimum interval between blocking
             # REST fetches. _next_position_check already spaces ticks by
             # the configured interval, but if anything bypasses the
             # scheduler (manual call, startup race), this floor prevents
             # two back-to-back pybit calls from pinning the main loop.
             # Skipped during startup so the initial fetch always runs.
-            start = time.monotonic()
             if not startup:
                 last = self._last_position_fetch.get(account_name)
                 if last is not None and (start - last) < _POSITION_FETCH_MIN_INTERVAL:
