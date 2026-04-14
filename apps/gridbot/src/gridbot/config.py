@@ -109,12 +109,6 @@ class GridbotConfig(BaseModel):
         description="Minutes to wait between auth error retry cycles (per strategy)",
     )
 
-    # Event saver
-    enable_event_saver: bool = Field(
-        default=False,
-        description="Start embedded EventSaver for live data capture",
-    )
-
     # Notifications
     notification: Optional[NotificationConfig] = None
 

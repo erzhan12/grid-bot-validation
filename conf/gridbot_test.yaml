@@ -17,5 +17,4 @@ strategies:
 
 database_url: "${DATABASE_URL}"
 
-enable_event_saver: true
 auth_cooldown_minutes: 30
