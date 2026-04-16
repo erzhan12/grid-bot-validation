@@ -978,11 +978,13 @@ class TestOrchestratorPositionCheck:
     @patch("gridbot.orchestrator.BybitRestClient")
     @patch("gridbot.orchestrator.PublicWebSocketClient")
     @patch("gridbot.orchestrator.PrivateWebSocketClient")
-    def test_position_check_total_budget_ignored_on_startup(
+    def test_position_check_startup_uses_larger_budget(
         self, mock_private_ws, mock_public_ws, mock_rest_client,
         gridbot_config, account_config, strategy_config,
     ):
-        """Startup fetch must run every account even if budget would trip."""
+        """Startup pass uses the larger _STARTUP_POSITION_FETCH_BUDGET so
+        a cumulative spend that would trip the steady-state budget
+        still lets every account initialize."""
         second_account = AccountConfig(
             name="slow_account", api_key="k2", api_secret="s2", testnet=True,
         )
@@ -1013,15 +1015,62 @@ class TestOrchestratorPositionCheck:
                 "list": [{"coin": [{"coin": "USDT", "walletBalance": "1000"}]}]
             }
 
-        # Even with cumulative time well past the budget, startup=True
-        # must not short-circuit — runner state would otherwise be
-        # partially initialized.
+        # Cumulative 20s exceeds the 5s steady-state budget but sits well
+        # under the 30s startup budget — both runners still get initialized.
         fake_times = iter([0.0, 0.0, 10.0, 10.0, 20.0, 20.0])
         with patch("gridbot.orchestrator.time.monotonic", side_effect=lambda: next(fake_times)):
             orchestrator._fetch_and_update_positions(startup=True)
 
         runner_a.on_position_update.assert_called_once()
         runner_b.on_position_update.assert_called_once()
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_position_check_startup_budget_still_bounded(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Startup is bounded: once _STARTUP_POSITION_FETCH_BUDGET is spent,
+        remaining accounts are deferred to the next tick."""
+        second_account = AccountConfig(
+            name="slow_account", api_key="k2", api_secret="s2", testnet=True,
+        )
+
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._init_account(account_config)
+        orchestrator._init_account(second_account)
+
+        runner_a = Mock(strat_id="a", symbol="BTCUSDT")
+        runner_a.engine.last_close = 42000.0
+        runner_b = Mock(strat_id="b", symbol="BTCUSDT")
+        runner_b.engine.last_close = 42000.0
+        orchestrator._account_to_runners = {
+            "test_account": [runner_a],
+            "slow_account": [runner_b],
+        }
+
+        long_pos = {"symbol": "BTCUSDT", "side": "Buy", "size": "0"}
+        short_pos = {"symbol": "BTCUSDT", "side": "Sell", "size": "0"}
+        orchestrator._position_ws_data = {
+            "test_account": {"BTCUSDT": {"Buy": long_pos, "Sell": short_pos}},
+            "slow_account": {"BTCUSDT": {"Buy": long_pos, "Sell": short_pos}},
+        }
+
+        for name in ("test_account", "slow_account"):
+            rc = orchestrator._rest_clients[name]
+            rc.get_wallet_balance.return_value = {
+                "list": [{"coin": [{"coin": "USDT", "walletBalance": "1000"}]}]
+            }
+
+        # Cumulative 31s exceeds the 30s startup budget — second account
+        # must be deferred to the next tick.
+        fake_times = iter([0.0, 0.0, 31.0, 31.0, 31.0, 31.0])
+        with patch("gridbot.orchestrator.time.monotonic", side_effect=lambda: next(fake_times)):
+            orchestrator._fetch_and_update_positions(startup=True)
+
+        runner_a.on_position_update.assert_called_once()
+        runner_b.on_position_update.assert_not_called()
 
 
 class TestOrchestratorDbRecords:

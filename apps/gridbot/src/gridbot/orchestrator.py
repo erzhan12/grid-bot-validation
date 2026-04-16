@@ -9,6 +9,7 @@ The orchestrator is the main entry point for the gridbot. It:
 """
 
 import logging
+import threading
 import time
 from collections import deque
 from datetime import datetime, timedelta, UTC
@@ -42,6 +43,7 @@ _RETRY_TICK_INTERVAL = 1.0  # seconds between retry-queue drains
 _POSITION_FETCH_SLOW_THRESHOLD = 2.0  # log a warning if REST position fetch takes longer
 _POSITION_FETCH_MIN_INTERVAL = 1.0  # per-account floor between REST fetches (defense-in-depth)
 _POSITION_FETCH_TOTAL_BUDGET = 5.0  # total wall-clock ceiling for one _fetch_and_update_positions call
+_STARTUP_POSITION_FETCH_BUDGET = 30.0  # higher ceiling for the startup pass (covers ~3 accounts hitting full pybit timeout)
 
 
 logger = logging.getLogger(__name__)
@@ -556,7 +558,25 @@ class Orchestrator:
 
         Works regardless of whether the failure came from the ticker path
         or the retry queue path.
+
+        Thread-safety: this callback is main-thread only. It mutates
+        ``_auth_cooldown_cycles`` (read-then-write — NOT atomic) and
+        ``_auth_cooldown_until``, and calls ``retry_queue.clear()`` which
+        runs in parallel with ``process_due()`` only if the main-thread
+        assumption holds. All current callers satisfy this: executor
+        entry points (`execute_place`/`execute_cancel`/`execute_amend`)
+        are invoked from `StrategyRunner` (main-thread ticker cycle) and
+        `RetryQueue.process_due()` (main-thread retry-drain tick). If a
+        future change wires this callback to a WebSocket handler or any
+        other thread, the cycle-counter update and the retry-queue clear
+        must be serialized with a lock (and with `process_due`).
         """
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError(
+                "_on_auth_cooldown_entered must run on the main thread; "
+                "see docstring for the locking required before relaxing "
+                f"this. Called from: {threading.current_thread().name}"
+            )
         cycle = self._auth_cooldown_cycles.get(strat_id, 0) + 1
         self._auth_cooldown_cycles[strat_id] = cycle
 
@@ -829,36 +849,40 @@ class Orchestrator:
         2. Fall back to REST API when WebSocket data is not available
         3. Periodically sync via REST to ensure data freshness
 
-        Wall-clock budget: the whole call is capped at
-        ``_POSITION_FETCH_TOTAL_BUDGET`` seconds. Before starting the
-        REST section for each account, we check remaining budget and
-        break out of the loop if spent. This prevents a sequence of
-        slow accounts (~2s each x N) from pinning the main polling
-        loop well beyond any single pybit timeout. Budget is NOT
-        enforced during startup — the first pass needs to initialize
-        runner state and a partial result would leave some runners
-        with no multipliers.
+        Wall-clock budget: the whole call is capped by one of two
+        ceilings — ``_POSITION_FETCH_TOTAL_BUDGET`` for steady-state
+        ticks and the larger ``_STARTUP_POSITION_FETCH_BUDGET`` for
+        the startup pass. Before starting the REST section for each
+        account we check remaining budget and break out of the loop
+        if spent. This prevents a sequence of slow accounts (~2s each
+        x N) from pinning the main polling loop well beyond any
+        single pybit timeout. The startup pass uses a higher ceiling
+        so the first pass almost always finishes and initializes
+        every runner's multipliers, but is still bounded so a
+        pathological pybit stall cannot block startup indefinitely.
 
         Args:
             startup: If True, log warnings with startup context on
-                failure and skip budget enforcement.
+                failure and apply the larger startup budget.
         """
         loop_start = time.monotonic()
+        budget = _STARTUP_POSITION_FETCH_BUDGET if startup else _POSITION_FETCH_TOTAL_BUDGET
         for account_name, runners in list(self._account_to_runners.items()):
             start = time.monotonic()
             # Total-budget gate: stop scheduling new REST sections once
             # the cumulative wall-clock ceiling is reached. Remaining
             # accounts will be picked up on the next periodic tick.
-            # Skipped on startup so initial state always gets populated.
-            if not startup:
-                elapsed_total = start - loop_start
-                if elapsed_total >= _POSITION_FETCH_TOTAL_BUDGET:
-                    logger.warning(
-                        "Position fetch total budget exceeded: %.1fs >= %.1fs, "
-                        "deferring remaining accounts to next tick (skipped: %s)",
-                        elapsed_total, _POSITION_FETCH_TOTAL_BUDGET, account_name,
-                    )
-                    break
+            # Startup uses a larger budget (see _STARTUP_POSITION_FETCH_BUDGET)
+            # so the first pass almost always completes, but is still bounded.
+            elapsed_total = start - loop_start
+            if elapsed_total >= budget:
+                logger.warning(
+                    "Position fetch total budget exceeded (%s): %.1fs >= %.1fs, "
+                    "deferring remaining accounts to next tick (skipped: %s)",
+                    "startup" if startup else "steady-state",
+                    elapsed_total, budget, account_name,
+                )
+                break
             # Short-circuit: per-account minimum interval between blocking
             # REST fetches. _next_position_check already spaces ticks by
             # the configured interval, but if anything bypasses the

@@ -879,6 +879,12 @@ class StrategyRunner:
         (long first, then short). This prevents an unrelated fill on one
         side from clearing an error detected on the other side.
 
+        Owns the lifecycle of ``_same_order_error``: resets the flag
+        once before evaluation, then lets ``_check_same_orders_side``
+        set it to True on detection. The error auto-clears when new
+        fills push the problematic pair out of the buffer, because
+        each execution re-enters here and starts from a clean reset.
+
         Args:
             event: Execution event to check.
         """
@@ -911,9 +917,12 @@ class StrategyRunner:
         }
         buffer.appendleft(exec_record)
 
-        # Check BOTH buffers (matches bbu2: check long first, short second)
-        # _check_same_orders_side resets the flag before evaluating, so we
-        # must check both to avoid one side clearing the other's error.
+        # Reset the flag once, then check both buffers (long first, short
+        # second, matching bbu2). The side-check is set-on-error only; we
+        # own the reset here so an unrelated fill on short can't clear an
+        # error detected on long. Early-return after long keeps the work
+        # bounded when a duplicate was already found.
+        self._same_order_error = False
         self._check_same_orders_side(self._recent_executions_long)
         if self._same_order_error:
             return
@@ -922,20 +931,18 @@ class StrategyRunner:
     def _check_same_orders_side(self, executions: deque) -> None:
         """Check execution buffer for same-price duplicates.
 
-        Re-evaluates on every call (bbu2-style): resets error flag first,
-        then checks. Error auto-clears when new fills push the problematic
-        pair out of the buffer.
-
         Compares consecutive executions. If same price and side but different
         order_id, this indicates a duplicate order was placed at the same
         price level - a grid bug.
 
+        Set-on-error only: this method sets ``_same_order_error`` to
+        True on detection and never clears it. The caller
+        (``_check_same_orders``) is responsible for resetting the flag
+        once before invoking this across both buffers.
+
         Args:
             executions: Deque of recent execution records for one direction.
         """
-        # Reset before re-evaluation (matches bbu2 _check_same_orders_side line 159)
-        self._same_order_error = False
-
         if len(executions) < 2:
             return
 
