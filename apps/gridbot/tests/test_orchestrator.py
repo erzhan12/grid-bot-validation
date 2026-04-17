@@ -1,5 +1,7 @@
 """Tests for gridbot orchestrator module."""
 
+import threading
+import time
 from decimal import Decimal
 from unittest.mock import Mock, MagicMock, patch
 
@@ -2041,3 +2043,38 @@ class TestOrchestratorRunBackoff:
         assert all(s <= _MAX_TICK_BACKOFF for s in recorded)
         # Progression: 1, 2, 4, 8, 16, 32, 64, 128, 180 (cap), 180
         assert recorded == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 180.0, 180.0]
+
+
+class TestOrchestratorRunRequestStop:
+    """End-to-end threading contract: run() exits promptly when request_stop()
+    is called from another thread."""
+
+    def test_run_exits_on_request_stop_from_another_thread(self, gridbot_config):
+        orchestrator = Orchestrator(gridbot_config, notifier=Mock(spec=Notifier))
+
+        tick_count = {"n": 0}
+
+        def counting_tick():
+            tick_count["n"] += 1
+
+        orchestrator._tick = Mock(side_effect=counting_tick)
+        orchestrator._running = True
+
+        thread = threading.Thread(target=orchestrator.run, name="run-loop")
+        thread.start()
+
+        # Give the loop time to run a few ticks (_CHECK_INTERVAL=0.1s).
+        deadline = time.monotonic() + 1.0
+        while tick_count["n"] < 3 and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        assert tick_count["n"] >= 3, "run() didn't tick — loop never started"
+
+        # Cross-thread stop signal.
+        orchestrator.request_stop()
+
+        # Worst case: one tick already in-flight + one _CHECK_INTERVAL sleep.
+        # 2s leaves plenty of margin on any CI.
+        thread.join(timeout=2.0)
+        assert not thread.is_alive(), "run() did not exit within 2s of request_stop()"
+        assert orchestrator._running is False
