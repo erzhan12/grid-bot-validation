@@ -1856,3 +1856,78 @@ class TestFetchInstrumentInfo:
 
         info = orchestrator._fetch_instrument_info("BTCUSDT", "test_account")
         assert info is None
+
+
+class TestOrchestratorRunBackoff:
+    """run() exponential backoff on consecutive _tick() failures."""
+
+    @staticmethod
+    def _make_orchestrator(gridbot_config):
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        orchestrator._running = True
+        return orchestrator
+
+    @staticmethod
+    def _install_sleep_stub(orchestrator, stop_after):
+        """Patch time.sleep to record args and stop the loop after N calls."""
+        recorded: list[float] = []
+
+        def fake_sleep(seconds):
+            recorded.append(seconds)
+            if len(recorded) >= stop_after:
+                orchestrator._running = False
+
+        return recorded, fake_sleep
+
+    def test_success_sleeps_check_interval(self, gridbot_config):
+        from gridbot.orchestrator import _CHECK_INTERVAL
+
+        orchestrator = self._make_orchestrator(gridbot_config)
+        orchestrator._tick = Mock(return_value=None)
+        recorded, fake_sleep = self._install_sleep_stub(orchestrator, stop_after=1)
+
+        with patch("gridbot.orchestrator.time.sleep", side_effect=fake_sleep):
+            orchestrator.run()
+
+        assert recorded == [_CHECK_INTERVAL]
+
+    def test_escalates_1_2_4_on_repeated_failures(self, gridbot_config):
+        orchestrator = self._make_orchestrator(gridbot_config)
+        orchestrator._tick = Mock(side_effect=RuntimeError("boom"))
+        recorded, fake_sleep = self._install_sleep_stub(orchestrator, stop_after=3)
+
+        with patch("gridbot.orchestrator.time.sleep", side_effect=fake_sleep):
+            orchestrator.run()
+
+        assert recorded == [1.0, 2.0, 4.0]
+        assert orchestrator._notifier.alert_exception.call_count == 3
+
+    def test_resets_to_check_interval_after_success(self, gridbot_config):
+        from gridbot.orchestrator import _CHECK_INTERVAL
+
+        orchestrator = self._make_orchestrator(gridbot_config)
+        orchestrator._tick = Mock(
+            side_effect=[RuntimeError("a"), RuntimeError("b"), None]
+        )
+        recorded, fake_sleep = self._install_sleep_stub(orchestrator, stop_after=3)
+
+        with patch("gridbot.orchestrator.time.sleep", side_effect=fake_sleep):
+            orchestrator.run()
+
+        assert recorded == [1.0, 2.0, _CHECK_INTERVAL]
+
+    def test_caps_at_max_tick_backoff(self, gridbot_config):
+        from gridbot.orchestrator import _MAX_TICK_BACKOFF
+
+        orchestrator = self._make_orchestrator(gridbot_config)
+        orchestrator._tick = Mock(side_effect=RuntimeError("down"))
+        recorded, fake_sleep = self._install_sleep_stub(orchestrator, stop_after=10)
+
+        with patch("gridbot.orchestrator.time.sleep", side_effect=fake_sleep):
+            orchestrator.run()
+
+        assert len(recorded) == 10
+        assert all(s <= _MAX_TICK_BACKOFF for s in recorded)
+        # Progression: 1, 2, 4, 8, 16, 32, 64, 128, 180 (cap), 180
+        assert recorded == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 180.0, 180.0]

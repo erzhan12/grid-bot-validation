@@ -44,6 +44,7 @@ _POSITION_FETCH_SLOW_THRESHOLD = 2.0  # log a warning if REST position fetch tak
 _POSITION_FETCH_MIN_INTERVAL = 1.0  # per-account floor between REST fetches (defense-in-depth)
 _POSITION_FETCH_TOTAL_BUDGET = 5.0  # total wall-clock ceiling for one _fetch_and_update_positions call
 _STARTUP_POSITION_FETCH_BUDGET = 30.0  # higher ceiling for the startup pass (covers ~3 accounts hitting full pybit timeout)
+_MAX_TICK_BACKOFF = 180.0  # cap (s) on main-loop backoff after consecutive _tick() failures
 
 
 logger = logging.getLogger(__name__)
@@ -240,15 +241,30 @@ class Orchestrator:
         logger.info(f"Orchestrator started with {len(self._runners)} strategies")
 
     def run(self) -> None:
-        """Main polling loop. Blocks until request_stop() / stop()."""
+        """Main polling loop. Blocks until request_stop() / stop().
+
+        On a successful _tick() we sleep the normal _CHECK_INTERVAL (100 ms).
+        On a failure we escalate sleep exponentially (1 s → 2 s → 4 s → …) up
+        to _MAX_TICK_BACKOFF, then hold at the cap until a tick succeeds. The
+        bot never stops — sustained failures keep retrying at the capped
+        interval, because the root cause may be exchange-side and self-heal.
+        """
         logger.info("Orchestrator main loop started")
+        consecutive_failures = 0
         while self._running:
             try:
                 self._tick()
+                consecutive_failures = 0
+                sleep_for = _CHECK_INTERVAL
             except Exception as e:
-                logger.error("Main loop tick error: %s", e, exc_info=True)
+                consecutive_failures += 1
+                sleep_for = min(2 ** (consecutive_failures - 1), _MAX_TICK_BACKOFF)
+                logger.error(
+                    "Main loop tick error (#%d consecutive, sleeping %.1fs): %s",
+                    consecutive_failures, sleep_for, e, exc_info=True,
+                )
                 self._notifier.alert_exception("main_loop", e, error_key="main_loop")
-            time.sleep(_CHECK_INTERVAL)
+            time.sleep(sleep_for)
         logger.info("Orchestrator main loop exited")
 
     def _tick(self) -> None:
