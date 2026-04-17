@@ -320,6 +320,10 @@ class Orchestrator:
 
         # 3. Process latest ticker per symbol (coalesced — WS callback
         #    overwrites older events, so only the freshest is processed).
+        #    Identity check (`is`) relies on normalize_ticker() returning a
+        #    fresh TickerEvent per message; if that ever changes (e.g.
+        #    pooling/caching), switch to a monotonic seq counter written
+        #    in _on_ticker.
         for symbol, runners in self._symbol_to_runners.items():
             event = self._latest_ticker.get(symbol)
             if event is None or event is self._last_processed_ticker.get(symbol):
@@ -560,6 +564,9 @@ class Orchestrator:
         """
         try:
             normalizer = self._normalizers[account_name]
+            # Contract: normalize_ticker must return a fresh object per
+            # call — the orchestrator's coalescing loop uses `is` to
+            # detect unprocessed events.
             event = normalizer.normalize_ticker(message)
             if event is None:
                 return
