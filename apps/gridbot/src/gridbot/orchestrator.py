@@ -132,6 +132,8 @@ class Orchestrator:
         # The main polling loop is the single reader/writer, so no lock is
         # required. Do NOT touch this from _on_ticker / _on_order /
         # _on_execution / _on_position — those run in pybit WS threads.
+        # No runtime enforcement by design — this is a field, not an entry
+        # point; invariant held by review.
         self._wallet_cache: dict[str, tuple[float, datetime]] = {}
 
         # WS → main-thread buffers. dict/deque mutations are atomic under CPython GIL.
