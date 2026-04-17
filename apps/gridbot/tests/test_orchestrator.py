@@ -1072,6 +1072,116 @@ class TestOrchestratorPositionCheck:
         runner_a.on_position_update.assert_called_once()
         runner_b.on_position_update.assert_not_called()
 
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_position_check_floor_skips_rapid_repeat(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Steady-state: if the account was fetched < _POSITION_FETCH_MIN_INTERVAL
+        ago, the next call is short-circuited (no wallet/position fetch)."""
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+
+        mock_runner = Mock(strat_id="btcusdt_test", symbol="BTCUSDT")
+        mock_runner.engine.last_close = 42000.0
+        orchestrator._account_to_runners["test_account"] = [mock_runner]
+
+        # Mark the account as just-fetched: loop_start=0.0, last=0.2
+        # → delta 0.2s < floor 1.0s → must be skipped.
+        orchestrator._last_position_fetch["test_account"] = 0.2
+
+        fake_times = iter([0.0, 0.0])  # loop_start + per-account start
+        with patch("gridbot.orchestrator.time.monotonic", side_effect=lambda: next(fake_times)):
+            orchestrator._fetch_and_update_positions()
+
+        rest_client = orchestrator._rest_clients["test_account"]
+        rest_client.get_wallet_balance.assert_not_called()
+        rest_client.get_positions.assert_not_called()
+        mock_runner.on_position_update.assert_not_called()
+        # Timestamp is NOT overwritten when the call is skipped.
+        assert orchestrator._last_position_fetch["test_account"] == 0.2
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_position_check_floor_bypassed_on_startup(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Startup pass ignores the floor so the initial fetch always runs,
+        even if _last_position_fetch was somehow set < floor seconds ago."""
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+
+        mock_runner = Mock(strat_id="btcusdt_test", symbol="BTCUSDT")
+        mock_runner.engine.last_close = 42000.0
+        mock_runner.on_position_update = Mock()
+        orchestrator._account_to_runners["test_account"] = [mock_runner]
+
+        long_pos = {"symbol": "BTCUSDT", "side": "Buy", "size": "0"}
+        short_pos = {"symbol": "BTCUSDT", "side": "Sell", "size": "0"}
+        orchestrator._position_ws_data = {
+            "test_account": {"BTCUSDT": {"Buy": long_pos, "Sell": short_pos}}
+        }
+        orchestrator._last_position_fetch["test_account"] = 0.2  # would skip in steady-state
+
+        rest_client = orchestrator._rest_clients["test_account"]
+        rest_client.get_wallet_balance.return_value = {
+            "list": [{"coin": [{"coin": "USDT", "walletBalance": "1000"}]}]
+        }
+
+        orchestrator._fetch_and_update_positions(startup=True)
+
+        # Floor is bypassed: the fetch proceeded and the runner got an update.
+        mock_runner.on_position_update.assert_called_once()
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_position_check_floor_records_last_fetch(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """After a successful steady-state fetch, _last_position_fetch is
+        updated with the per-account start timestamp so the next call is
+        gated by the floor."""
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+
+        mock_runner = Mock(strat_id="btcusdt_test", symbol="BTCUSDT")
+        mock_runner.engine.last_close = 42000.0
+        mock_runner.on_position_update = Mock()
+        orchestrator._account_to_runners["test_account"] = [mock_runner]
+
+        long_pos = {"symbol": "BTCUSDT", "side": "Buy", "size": "0"}
+        short_pos = {"symbol": "BTCUSDT", "side": "Sell", "size": "0"}
+        orchestrator._position_ws_data = {
+            "test_account": {"BTCUSDT": {"Buy": long_pos, "Sell": short_pos}}
+        }
+
+        rest_client = orchestrator._rest_clients["test_account"]
+        rest_client.get_wallet_balance.return_value = {
+            "list": [{"coin": [{"coin": "USDT", "walletBalance": "1000"}]}]
+        }
+
+        assert "test_account" not in orchestrator._last_position_fetch
+
+        # loop_start=100.0, per-account start=100.0, finally=100.1
+        fake_times = iter([100.0, 100.0, 100.1])
+        with patch("gridbot.orchestrator.time.monotonic", side_effect=lambda: next(fake_times)):
+            orchestrator._fetch_and_update_positions()
+
+        mock_runner.on_position_update.assert_called_once()
+        assert orchestrator._last_position_fetch["test_account"] == 100.0
+
 
 class TestOrchestratorDbRecords:
     """Tests for database Run record creation and update."""
