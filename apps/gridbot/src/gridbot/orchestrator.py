@@ -570,6 +570,13 @@ class Orchestrator:
         future change wires this callback to a WebSocket handler or any
         other thread, the cycle-counter update and the retry-queue clear
         must be serialized with a lock (and with `process_due`).
+
+        Design note: fail-loud thread guard is deliberate — not a missing
+        lock. Adding one here would signal "safe from any thread" and
+        invite callers that deadlock against `process_due` or push us
+        into a drain-pattern that delays cooldown activation. Enforcing
+        the invariant at runtime keeps the design simple and makes any
+        violation impossible to miss.
         """
         if threading.current_thread() is not threading.main_thread():
             raise RuntimeError(
