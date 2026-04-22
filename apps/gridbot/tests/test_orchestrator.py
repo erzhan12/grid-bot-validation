@@ -2078,3 +2078,40 @@ class TestOrchestratorRunRequestStop:
         thread.join(timeout=2.0)
         assert not thread.is_alive(), "run() did not exit within 2s of request_stop()"
         assert orchestrator._running is False
+
+
+class TestRequestImmediateOrderSync:
+    """Fast-track path for WS-reported untracked (manual) orders."""
+
+    def test_zeros_next_sync(self, gridbot_config):
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._next_order_sync = 999.0
+
+        orchestrator._request_immediate_order_sync("btcusdt_test")
+
+        assert orchestrator._next_order_sync == 0.0
+
+    def test_debounces_repeat_calls(self, gridbot_config):
+        from gridbot.orchestrator import _UNKNOWN_ORDER_DEBOUNCE_SEC
+
+        orchestrator = Orchestrator(gridbot_config)
+
+        fake_now = [1000.0]
+
+        def fake_monotonic():
+            return fake_now[0]
+
+        with patch("gridbot.orchestrator.time.monotonic", side_effect=fake_monotonic):
+            orchestrator._request_immediate_order_sync("btcusdt_test")
+            assert orchestrator._next_order_sync == 0.0
+
+            # Second call inside the debounce window must be a no-op.
+            orchestrator._next_order_sync = 999.0
+            fake_now[0] += _UNKNOWN_ORDER_DEBOUNCE_SEC / 2
+            orchestrator._request_immediate_order_sync("btcusdt_test")
+            assert orchestrator._next_order_sync == 999.0
+
+            # After the window expires, it fires again.
+            fake_now[0] += _UNKNOWN_ORDER_DEBOUNCE_SEC
+            orchestrator._request_immediate_order_sync("btcusdt_test")
+            assert orchestrator._next_order_sync == 0.0

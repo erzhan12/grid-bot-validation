@@ -45,6 +45,7 @@ _POSITION_FETCH_MIN_INTERVAL = 1.0  # per-account floor between REST fetches (de
 _POSITION_FETCH_TOTAL_BUDGET = 5.0  # total wall-clock ceiling for one _fetch_and_update_positions call
 _STARTUP_POSITION_FETCH_BUDGET = 30.0  # higher ceiling for the startup pass (covers ~3 accounts hitting full pybit timeout)
 _MAX_TICK_BACKOFF = 180.0  # cap (s) on main-loop backoff after consecutive _tick() failures
+_UNKNOWN_ORDER_DEBOUNCE_SEC = 2.0  # min interval between WS-triggered fast-track order syncs
 
 
 logger = logging.getLogger(__name__)
@@ -150,6 +151,10 @@ class Orchestrator:
         self._next_health_check: float = 0.0
         self._next_order_sync: float = 0.0
         self._next_retry_tick: float = 0.0
+
+        # Debounce window for WS-triggered fast-track order syncs. Bursts of
+        # untracked-order WS events coalesce into a single reconciliation sweep.
+        self._unknown_order_debounce_until: float = 0.0
 
         # Per-account floor for blocking REST position fetches. Defense-
         # in-depth against scheduler glitches or manual re-entry that
@@ -517,6 +522,7 @@ class Orchestrator:
             instrument_info=instrument_info,
             anchor_store=self._anchor_store,
             on_intent_failed=lambda intent, error: retry_queue.add(intent, error),
+            on_unknown_order=self._request_immediate_order_sync,
             notifier=self._notifier,
         )
         self._runners[strat_id] = runner
@@ -1083,6 +1089,27 @@ class Orchestrator:
             self._notifier.alert_exception(
                 "_health_check_once", e, error_key="health_check_loop",
             )
+
+    def _request_immediate_order_sync(self, strat_id: str) -> None:
+        """Fast-track the next order-sync sweep.
+
+        Invoked by `StrategyRunner.on_order_update` when a `New`-status WS
+        event arrives for an order ID we don't track (i.e., a manual order
+        placed mid-run). Zeroing `_next_order_sync` makes the main polling
+        loop run `_order_sync_once` on its next iteration (~100 ms), which
+        adopts the unknown order via `Reconciler.reconcile_reconnect` so the
+        next tick can cancel it if it's off-grid.
+
+        Debounced so a burst of manual orders coalesces into one sweep.
+        """
+        now = time.monotonic()
+        if now < self._unknown_order_debounce_until:
+            return
+        self._unknown_order_debounce_until = now + _UNKNOWN_ORDER_DEBOUNCE_SEC
+        self._next_order_sync = 0.0
+        logger.info(
+            "%s: Untracked order seen — fast-tracking order sync", strat_id,
+        )
 
     def _order_sync_once(self) -> None:
         """Single-shot order reconciliation sweep.

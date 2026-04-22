@@ -658,6 +658,87 @@ class TestFindTrackedOrder:
         assert runner._tracked_orders["exch_1"].status == "cancelled"
 
 
+class TestUnknownOrderCallback:
+    """Tests for the on_unknown_order callback (mid-run manual order detection)."""
+
+    def _make_event(self, status: str, order_id: str = "manual_1"):
+        return OrderUpdateEvent(
+            event_type=EventType.ORDER_UPDATE,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            order_id=order_id,
+            order_link_id="",
+            status=status,
+            side="Buy",
+            price=Decimal("49000"),
+            qty=Decimal("0.001"),
+            leaves_qty=Decimal("0.001"),
+        )
+
+    def test_untracked_new_triggers_callback(self, strategy_config, mock_executor):
+        callback = Mock()
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            on_unknown_order=callback,
+        )
+
+        runner.on_order_update(self._make_event("New"))
+
+        callback.assert_called_once_with(strategy_config.strat_id)
+
+    def test_untracked_cancelled_does_not_trigger(self, strategy_config, mock_executor):
+        """Status guard: tail Cancelled events for foreign orders must not trigger sync."""
+        callback = Mock()
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            on_unknown_order=callback,
+        )
+
+        runner.on_order_update(self._make_event("Cancelled"))
+        runner.on_order_update(self._make_event("Filled"))
+
+        callback.assert_not_called()
+
+    def test_tracked_new_does_not_trigger(self, runner):
+        """Bot's own placed orders find a tracked entry → callback never fires."""
+        callback = Mock()
+        runner._on_unknown_order = callback
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000.0"),
+            qty=Decimal("0.001"), grid_level=5, direction="long",
+        )
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
+
+        event = OrderUpdateEvent(
+            event_type=EventType.ORDER_UPDATE,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            order_id="order_123",
+            order_link_id=intent.client_order_id,
+            status="New",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            leaves_qty=Decimal("0.001"),
+        )
+        runner.on_order_update(event)
+
+        callback.assert_not_called()
+
+    def test_no_callback_configured_is_safe(self, strategy_config, mock_executor):
+        """When no callback is wired, untracked-New events must not raise."""
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+        )
+        runner.on_order_update(self._make_event("New"))
+
+
 class TestStrategyRunnerFailureCallback:
     """Tests for failure callback."""
     def test_on_intent_failed_called(self, strategy_config, mock_executor):

@@ -110,6 +110,7 @@ class StrategyRunner:
         instrument_info: Optional[InstrumentInfo] = None,
         anchor_store: Optional[GridAnchorStore] = None,
         on_intent_failed: Optional[Callable[[PlaceLimitIntent | CancelIntent, str], None]] = None,
+        on_unknown_order: Optional[Callable[[str], None]] = None,
         notifier: Optional[Notifier] = None,
     ):
         """Initialize strategy runner.
@@ -120,12 +121,15 @@ class StrategyRunner:
             instrument_info: Instrument info for qty rounding (None uses no rounding).
             anchor_store: Optional anchor store for grid persistence.
             on_intent_failed: Callback when intent execution fails (for retry queue).
+            on_unknown_order: Callback when WS reports a New order we don't track
+                (for fast-tracking the next order-sync sweep).
             notifier: Alert notifier for same-order error Telegram alerts.
         """
         self._config = strategy_config
         self._executor = executor
         self._anchor_store = anchor_store
         self._on_intent_failed = on_intent_failed
+        self._on_unknown_order = on_unknown_order
         self._notifier = notifier
 
         # Qty computation
@@ -391,6 +395,12 @@ class StrategyRunner:
                     f"{self.strat_id}: Received order_update for untracked order "
                     f"order_id={event.order_id} order_link_id={event.order_link_id!r}"
                 )
+                # Fast-track the next order-sync sweep so the reconciler picks
+                # up this manual/unknown order and the next tick can cancel it
+                # if it's off-grid. Only on `New` — `Cancelled`/`Filled` tail
+                # events for orders we never tracked are harmless.
+                if event.status == "New" and self._on_unknown_order is not None:
+                    self._on_unknown_order(self.strat_id)
 
             # Pass to engine (update state regardless of error)
             intents = self._engine.on_event(event)
