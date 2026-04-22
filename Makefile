@@ -1,4 +1,4 @@
-.PHONY: test test-integration lint
+.PHONY: test test-integration lint clear-log
 
 # Run tests per-directory to avoid conftest ImportPathMismatchError when
 # multiple tests/conftest.py exist. Coverage is appended and reported at the end.
@@ -25,4 +25,8 @@ test-integration:
 # Run ruff linter
 lint:
 	uv run ruff check .
+
+# Truncate /tmp/gridbot.log before a fresh run
+clear-log:
+	: > /tmp/gridbot.log
 
