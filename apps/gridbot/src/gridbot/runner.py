@@ -587,24 +587,39 @@ class StrategyRunner:
         intents: list[PlaceLimitIntent | CancelIntent],
         limits: dict[str, list[dict]],
     ) -> None:
-        """Execute a list of intents."""
+        """Execute a list of intents.
+
+        Cancels run before places so margin and the per-symbol active-order
+        slots held by stale orders are freed before new placements try to
+        consume them. Within each group the engine's nearest-to-farthest
+        ordering is preserved.
+        """
         if self._executor.auth_cooldown:
             logger.debug(f"{self.strat_id}: Auth cooldown active, skipping {len(intents)} intents")
             return
 
-        for intent in intents:
+        cancels = [i for i in intents if isinstance(i, CancelIntent)]
+        places = [i for i in intents if isinstance(i, PlaceLimitIntent)]
+
+        for intent in cancels:
             if self._executor.auth_cooldown:
                 logger.debug(f"{self.strat_id}: Auth cooldown activated mid-batch, skipping remaining intents")
-                break
-            if isinstance(intent, PlaceLimitIntent):
-                self._execute_place_intent(intent, limits)
-                # Refresh limits after each placement so _is_good_to_place
-                # sees newly placed orders. Without this, multiple reduce-only
-                # intents in the same batch can over-cover the position because
-                # they all check against the same stale snapshot.
-                limits = self.get_limit_orders()
-            elif isinstance(intent, CancelIntent):
-                self._execute_cancel_intent(intent)
+                return
+            self._execute_cancel_intent(intent)
+
+        if cancels:
+            limits = self.get_limit_orders()
+
+        for intent in places:
+            if self._executor.auth_cooldown:
+                logger.debug(f"{self.strat_id}: Auth cooldown activated mid-batch, skipping remaining intents")
+                return
+            self._execute_place_intent(intent, limits)
+            # Refresh limits after each placement so _is_good_to_place
+            # sees newly placed orders. Without this, multiple reduce-only
+            # intents in the same batch can over-cover the position because
+            # they all check against the same stale snapshot.
+            limits = self.get_limit_orders()
 
     @staticmethod
     def _derive_direction_from_order(side: str, reduce_only: bool) -> Optional[DirectionType]:

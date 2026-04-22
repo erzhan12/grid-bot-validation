@@ -1834,6 +1834,54 @@ class TestRunnerAuthCooldown:
         # the rest skipped because cooldown activated
         assert call_count == 1
 
+    def test_cancels_run_before_places(self, strategy_config):
+        """Cancels in a mixed batch must dispatch before any place, so margin
+        and active-order slots held by stale orders are freed before new
+        placements try to consume them."""
+        executor = Mock(spec=IntentExecutor)
+        executor.shadow_mode = False
+        executor.auth_cooldown = False
+
+        call_order: list[str] = []
+
+        def record_place(intent):
+            call_order.append(f"place@{intent.price}")
+            return OrderResult(success=True, order_id=f"oid_{intent.price}")
+
+        def record_cancel(intent):
+            call_order.append(f"cancel@{intent.order_id}")
+            return CancelResult(success=True)
+
+        executor.execute_place = record_place
+        executor.execute_cancel = record_cancel
+
+        runner = StrategyRunner(strategy_config=strategy_config, executor=executor)
+        runner._wallet_balance = Decimal("10000")
+
+        # Engine-style interleaved order: place, cancel, place, cancel
+        intents = [
+            PlaceLimitIntent.create(
+                symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+                qty=Decimal("0.001"), grid_level=0, direction="long",
+            ),
+            CancelIntent(symbol="BTCUSDT", order_id="stale_1", reason="outside_grid"),
+            PlaceLimitIntent.create(
+                symbol="BTCUSDT", side="Buy", price=Decimal("49900"),
+                qty=Decimal("0.001"), grid_level=1, direction="long",
+            ),
+            CancelIntent(symbol="BTCUSDT", order_id="stale_2", reason="side_mismatch"),
+        ]
+
+        runner._execute_intents(intents, EMPTY_LIMITS)
+
+        # All cancels must precede all places, regardless of input ordering.
+        cancel_indices = [i for i, c in enumerate(call_order) if c.startswith("cancel@")]
+        place_indices = [i for i, c in enumerate(call_order) if c.startswith("place@")]
+        assert cancel_indices and place_indices
+        assert max(cancel_indices) < min(place_indices), (
+            f"cancels must run before places, got: {call_order}"
+        )
+
 
 class TestIsGoodToPlace:
     """Tests for _is_good_to_place reduce-only order validation.
