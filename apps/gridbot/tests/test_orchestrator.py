@@ -811,6 +811,129 @@ class TestOrchestratorTick:
         notifier.alert_exception.assert_called_once()
 
 
+class TestOrchestratorTickPeriodicCheckIsolation:
+    """Each periodic REST check is isolated so one failure doesn't wedge
+    WS-event drain via the outer backoff path."""
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_failing_position_check_does_not_escape_tick(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """_tick() swallows _fetch_and_update_positions errors and advances its timer."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+
+        orchestrator._fetch_and_update_positions = Mock(side_effect=RuntimeError("boom"))
+        orchestrator._next_position_check = 0.0  # due now
+
+        before = orchestrator._next_position_check
+        orchestrator._tick()  # must not raise
+
+        assert orchestrator._next_position_check > before, (
+            "_next_position_check must advance even when the check raises"
+        )
+        notifier.alert_exception.assert_any_call(
+            "_fetch_and_update_positions",
+            orchestrator._fetch_and_update_positions.side_effect,
+            error_key="periodic_fetch_positions",
+        )
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_failing_health_check_does_not_starve_ws_drain(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """A raising _health_check_once does not prevent ticker dispatch."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+
+        mock_runner = Mock()
+        mock_runner.strat_id = "btcusdt_test"
+        mock_runner.symbol = "BTCUSDT"
+        orchestrator._runners = {"btcusdt_test": mock_runner}
+        orchestrator._symbol_to_runners = {"BTCUSDT": [mock_runner]}
+
+        orchestrator._health_check_once = Mock(side_effect=RuntimeError("boom"))
+        orchestrator._next_health_check = 0.0  # due now
+
+        ticker_event = Mock()
+        orchestrator._latest_ticker["BTCUSDT"] = ticker_event
+
+        orchestrator._tick()
+
+        mock_runner.on_ticker.assert_called_once_with(ticker_event)
+        notifier.alert_exception.assert_any_call(
+            "_health_check_once",
+            orchestrator._health_check_once.side_effect,
+            error_key="periodic_health_check",
+        )
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_failing_order_sync_alerts_with_stable_key(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Repeated _order_sync_once failures alert with the same throttle key."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+
+        orchestrator._order_sync_once = Mock(side_effect=RuntimeError("boom"))
+
+        # Ensure order sync is enabled and due.
+        orchestrator._config.order_sync_interval = 0.01
+        orchestrator._next_order_sync = 0.0
+        orchestrator._tick()
+        orchestrator._next_order_sync = 0.0
+        orchestrator._tick()
+
+        order_sync_calls = [
+            c for c in notifier.alert_exception.call_args_list
+            if c.kwargs.get("error_key") == "periodic_order_sync"
+        ]
+        assert len(order_sync_calls) == 2
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_persistently_failing_check_retries_at_interval_not_every_tick(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """A failing periodic check advances its timestamp so it doesn't fire every tick."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+
+        orchestrator._fetch_and_update_positions = Mock(side_effect=RuntimeError("boom"))
+
+        # First tick: due now, should fire once and advance.
+        orchestrator._next_position_check = 0.0
+        orchestrator._tick()
+        assert orchestrator._fetch_and_update_positions.call_count == 1
+
+        # Second tick immediately after: not yet due (timestamp advanced), must not fire.
+        orchestrator._tick()
+        assert orchestrator._fetch_and_update_positions.call_count == 1
+
+
 class TestOrchestratorPositionCheck:
     """Tests for _fetch_and_update_positions (single-shot, called from _tick)."""
 
@@ -2041,8 +2164,8 @@ class TestOrchestratorRunBackoff:
 
         assert len(recorded) == 10
         assert all(s <= _MAX_TICK_BACKOFF for s in recorded)
-        # Progression: 1, 2, 4, 8, 16, 32, 64, 128, 180 (cap), 180
-        assert recorded == [1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 180.0, 180.0]
+        # Progression: 1, 2, 4, 8, 16, 30 (cap hit at n=6 since 32 > 30), then 30s thereafter
+        assert recorded == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0, 30.0, 30.0]
 
 
 class TestOrchestratorRunRequestStop:

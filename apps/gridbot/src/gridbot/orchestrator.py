@@ -44,7 +44,7 @@ _POSITION_FETCH_SLOW_THRESHOLD = 2.0  # log a warning if REST position fetch tak
 _POSITION_FETCH_MIN_INTERVAL = 1.0  # per-account floor between REST fetches (defense-in-depth)
 _POSITION_FETCH_TOTAL_BUDGET = 5.0  # total wall-clock ceiling for one _fetch_and_update_positions call
 _STARTUP_POSITION_FETCH_BUDGET = 30.0  # higher ceiling for the startup pass (covers ~3 accounts hitting full pybit timeout)
-_MAX_TICK_BACKOFF = 180.0  # cap (s) on main-loop backoff after consecutive _tick() failures
+_MAX_TICK_BACKOFF = 30.0  # cap (s) on main-loop backoff after consecutive _tick() failures
 _UNKNOWN_ORDER_DEBOUNCE_SEC = 2.0  # min interval between WS-triggered fast-track order syncs
 
 
@@ -253,6 +253,12 @@ class Orchestrator:
         to _MAX_TICK_BACKOFF, then hold at the cap until a tick succeeds. The
         bot never stops — sustained failures keep retrying at the capped
         interval, because the root cause may be exchange-side and self-heal.
+
+        Routine per-event runner errors (on_execution / on_order_update /
+        on_ticker) and periodic REST-check failures (_fetch_and_update_positions
+        / _health_check_once / _order_sync_once / retry-queue tick) are caught
+        and alerted inside _tick() and do NOT feed this backoff. Only genuinely
+        unexpected exceptions that escape _tick() escalate sleep here.
         """
         logger.info("Orchestrator main loop started")
         consecutive_failures = 0
@@ -348,19 +354,53 @@ class Orchestrator:
                     )
 
         # 4. Periodic checks via timestamp gating (bbu2 check_job pattern).
+        #    Each check is wrapped so that one flaky REST call cannot wedge
+        #    WS-event drain (sections 1-3 above) via the outer backoff path.
+        #    The _next_* timestamp is advanced BEFORE the call so a
+        #    persistently failing check does not retry every tick.
         now = time.monotonic()
         if now >= self._next_position_check:
-            self._fetch_and_update_positions()
             self._next_position_check = now + self._config.position_check_interval
+            try:
+                self._fetch_and_update_positions()
+            except Exception as e:
+                logger.error(
+                    "Periodic check failed (_fetch_and_update_positions): %s",
+                    e, exc_info=True,
+                )
+                self._notifier.alert_exception(
+                    "_fetch_and_update_positions", e,
+                    error_key="periodic_fetch_positions",
+                )
         if now >= self._next_health_check:
-            self._health_check_once()
             self._next_health_check = now + _HEALTH_CHECK_INTERVAL
+            try:
+                self._health_check_once()
+            except Exception as e:
+                logger.error(
+                    "Periodic check failed (_health_check_once): %s",
+                    e, exc_info=True,
+                )
+                self._notifier.alert_exception(
+                    "_health_check_once", e,
+                    error_key="periodic_health_check",
+                )
         if (
             self._config.order_sync_interval > 0
             and now >= self._next_order_sync
         ):
-            self._order_sync_once()
             self._next_order_sync = now + self._config.order_sync_interval
+            try:
+                self._order_sync_once()
+            except Exception as e:
+                logger.error(
+                    "Periodic check failed (_order_sync_once): %s",
+                    e, exc_info=True,
+                )
+                self._notifier.alert_exception(
+                    "_order_sync_once", e,
+                    error_key="periodic_order_sync",
+                )
         if now >= self._next_retry_tick:
             for rq in self._retry_queues.values():
                 try:
@@ -803,8 +843,10 @@ class Orchestrator:
         Returns:
             Wallet balance in USDT.
         """
-        assert threading.current_thread() is threading.main_thread(), \
-            "_get_wallet_balance touches _wallet_cache; must run on main thread"
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError(
+                "_get_wallet_balance touches _wallet_cache; must run on main thread"
+            )
         # Check if caching is disabled
         if self._config.wallet_cache_interval <= 0:
             return self._fetch_wallet_balance(account_name)
