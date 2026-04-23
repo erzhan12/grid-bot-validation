@@ -71,13 +71,14 @@ class BybitRestClient:
     api_key: str
     api_secret: str
     testnet: bool = True
-    timeout: int = 10
+    timeout: float = 10.0
     """Per-request timeout in seconds passed to pybit's ``HTTP`` session.
 
     pybit applies this via ``requests.Session.send(..., timeout=self.timeout)``
     so every REST call is bounded for both connect and read. Combined with
     pybit's ``force_retry=False`` default, network errors raise immediately
-    instead of blocking the caller.
+    instead of blocking the caller. ``requests`` accepts ``float`` timeouts
+    natively, so sub-second precision (e.g. 10.5) is preserved end-to-end.
     """
     rate_limit_config: RateLimitConfig = field(default_factory=lambda: RateLimitConfig(query_rate=10))
 

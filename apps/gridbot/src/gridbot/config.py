@@ -88,7 +88,12 @@ class GridbotConfig(BaseModel):
     # Timing
     position_check_interval: float = Field(
         default=63.0,
-        description="Seconds between position checks",
+        description=(
+            "Minimum seconds between blocking REST position fetches of the "
+            "same account (floor). The steady-state rotation scheduler uses "
+            "max(position_check_interval, N_accounts * _POSITION_TICK_BASE) "
+            "as the actual per-account floor, so this is a lower bound."
+        ),
     )
     order_sync_interval: float = Field(
         default=61.0,

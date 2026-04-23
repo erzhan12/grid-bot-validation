@@ -41,14 +41,22 @@ _HEALTH_CHECK_INTERVAL = 10  # seconds
 _CHECK_INTERVAL = 0.1  # 100 ms main loop tick (bbu2 value)
 _RETRY_TICK_INTERVAL = 1.0  # seconds between retry-queue drains
 _POSITION_FETCH_SLOW_THRESHOLD = 2.0  # log a warning if REST position fetch takes longer
-_POSITION_FETCH_MIN_INTERVAL = 1.0  # per-account floor between REST fetches (defense-in-depth)
-_POSITION_FETCH_TOTAL_BUDGET = 5.0  # total wall-clock ceiling for one _fetch_and_update_positions call
-_STARTUP_POSITION_FETCH_BUDGET = 30.0  # higher ceiling for the startup pass (covers ~3 accounts hitting full pybit timeout)
+_POSITION_TICK_BASE = 15.0  # base cadence for the steady-state position-fetch rotation tick (seconds)
+_POSITION_STARTUP_HARD_CAP = 60.0  # hard ceiling on the startup batch; exceeding aborts startup
 _MAX_TICK_BACKOFF = 30.0  # cap (s) on main-loop backoff after consecutive _tick() failures
 _UNKNOWN_ORDER_DEBOUNCE_SEC = 2.0  # min interval between WS-triggered fast-track order syncs
 
 
 logger = logging.getLogger(__name__)
+
+
+class StartupTimeoutError(RuntimeError):
+    """Raised when the startup position-fetch batch exceeds the hard cap.
+
+    main.py catches startup exceptions and returns exit code 1, so this
+    aborts the bot cleanly instead of silently continuing with partially
+    initialized accounts.
+    """
 
 
 class Orchestrator:
@@ -156,13 +164,16 @@ class Orchestrator:
         # untracked-order WS events coalesce into a single reconciliation sweep.
         self._unknown_order_debounce_until: float = 0.0
 
-        # Per-account floor for blocking REST position fetches. Defense-
-        # in-depth against scheduler glitches or manual re-entry that
-        # could fire two back-to-back fetches and pin the main polling
-        # loop. `_next_position_check` already spaces real ticks by the
-        # configured interval; this floor only matters if something
-        # bypasses that. Keyed by account_name; value is `time.monotonic`.
+        # Per-account timestamp of the last completed REST position fetch
+        # (time.monotonic). Steady-state rotation uses this to enforce a
+        # per-account minimum interval of
+        # max(config.position_check_interval, N * _POSITION_TICK_BASE).
         self._last_position_fetch: dict[str, float] = {}
+
+        # Rotation index for steady-state one-account-per-tick position
+        # fetching. After each successful fetch the index advances mod N,
+        # guaranteeing every account eventually gets its turn.
+        self._position_fetch_rotation_index: int = 0
 
         # Auth cooldown tracking
         self._auth_cooldown_until: dict[str, datetime] = {}  # strat_id -> expiry
@@ -236,7 +247,7 @@ class Orchestrator:
         # Prime periodic-tick schedulers so the first main loop iteration
         # does not immediately re-run expensive checks.
         now = time.monotonic()
-        self._next_position_check = now + self._config.position_check_interval
+        self._next_position_check = now + _POSITION_TICK_BASE
         self._next_health_check = now + _HEALTH_CHECK_INTERVAL
         self._next_order_sync = now  # order sync runs immediately on first tick
         self._next_retry_tick = now + _RETRY_TICK_INTERVAL
@@ -360,7 +371,7 @@ class Orchestrator:
         #    persistently failing check does not retry every tick.
         now = time.monotonic()
         if now >= self._next_position_check:
-            self._next_position_check = now + self._config.position_check_interval
+            self._next_position_check = now + _POSITION_TICK_BASE
             try:
                 self._fetch_and_update_positions()
             except Exception as e:
@@ -483,7 +494,7 @@ class Orchestrator:
             api_key=account_config.api_key,
             api_secret=account_config.api_secret,
             testnet=account_config.testnet,
-            timeout=int(self._config.rest_fetch_timeout),
+            timeout=self._config.rest_fetch_timeout,
         )
 
         # Create executor
@@ -924,149 +935,163 @@ class Orchestrator:
             return None
 
     def _fetch_and_update_positions(self, *, startup: bool = False) -> None:
-        """Fetch positions and wallet balance, then update all runners.
+        """Fetch positions and wallet balance, then update runners.
 
-        Following original bbu2 pattern:
-        1. Use WebSocket position data as primary source (real-time)
-        2. Fall back to REST API when WebSocket data is not available
-        3. Periodically sync via REST to ensure data freshness
+        Two modes:
+        - startup=True: batch pass through every account, bounded by a
+          hard wall-clock cap (_POSITION_STARTUP_HARD_CAP). Exceeding
+          the cap raises StartupTimeoutError to abort the bot.
+        - startup=False: one account per call, round-robin. The picked
+          account must satisfy the per-account floor:
+              floor = max(config.position_check_interval, N * _POSITION_TICK_BASE)
+          If no eligible account exists this tick, nothing happens.
 
-        Wall-clock budget: the whole call is capped by one of two
-        ceilings — ``_POSITION_FETCH_TOTAL_BUDGET`` for steady-state
-        ticks and the larger ``_STARTUP_POSITION_FETCH_BUDGET`` for
-        the startup pass. Before starting the REST section for each
-        account we check remaining budget and break out of the loop
-        if spent. This prevents a sequence of slow accounts (~2s each
-        x N) from pinning the main polling loop well beyond any
-        single pybit timeout. The startup pass uses a higher ceiling
-        so the first pass almost always finishes and initializes
-        every runner's multipliers, but is still bounded so a
-        pathological pybit stall cannot block startup indefinitely.
-
-        Args:
-            startup: If True, log warnings with startup context on
-                failure and apply the larger startup budget.
+        Per-account body (WS-first with REST fallback, per-runner
+        on_position_update, slow-REST warning) is shared between the
+        two modes via `_fetch_one_account`.
         """
+        if startup:
+            self._fetch_positions_startup_batch()
+        else:
+            self._fetch_positions_rotation_tick()
+
+    def _fetch_positions_startup_batch(self) -> None:
+        """Startup: fetch every account serially, aborting on hard cap."""
+        accounts = list(self._account_to_runners.items())
+        total = len(accounts)
         loop_start = time.monotonic()
-        budget = _STARTUP_POSITION_FETCH_BUDGET if startup else _POSITION_FETCH_TOTAL_BUDGET
-        for account_name, runners in list(self._account_to_runners.items()):
-            start = time.monotonic()
-            # Total-budget gate: stop scheduling new REST sections once
-            # the cumulative wall-clock ceiling is reached. Remaining
-            # accounts will be picked up on the next periodic tick.
-            # Startup uses a larger budget (see _STARTUP_POSITION_FETCH_BUDGET)
-            # so the first pass almost always completes, but is still bounded.
-            elapsed_total = start - loop_start
-            if elapsed_total >= budget:
-                logger.warning(
-                    "Position fetch total budget exceeded (%s): %.1fs >= %.1fs, "
-                    "deferring remaining accounts to next tick (skipped: %s)",
-                    "startup" if startup else "steady-state",
-                    elapsed_total, budget, account_name,
+        done = 0
+        for account_name, runners in accounts:
+            elapsed_total = time.monotonic() - loop_start
+            if elapsed_total >= _POSITION_STARTUP_HARD_CAP:
+                raise StartupTimeoutError(
+                    f"Startup position fetch exceeded "
+                    f"{_POSITION_STARTUP_HARD_CAP:.0f}s "
+                    f"({elapsed_total:.1f}s elapsed); initialized "
+                    f"{done}/{total} accounts. Aborting startup — "
+                    f"check REST connectivity and pybit timeouts."
                 )
-                break
-            # Short-circuit: per-account minimum interval between blocking
-            # REST fetches. _next_position_check already spaces ticks by
-            # the configured interval, but if anything bypasses the
-            # scheduler (manual call, startup race), this floor prevents
-            # two back-to-back pybit calls from pinning the main loop.
-            # Skipped during startup so the initial fetch always runs.
-            if not startup:
-                last = self._last_position_fetch.get(account_name)
-                if last is not None and (start - last) < _POSITION_FETCH_MIN_INTERVAL:
-                    logger.debug(
-                        "Skipping position fetch for %s: last fetch was %.2fs ago "
-                        "(floor=%.1fs)",
-                        account_name, start - last, _POSITION_FETCH_MIN_INTERVAL,
-                    )
-                    continue
-            self._last_position_fetch[account_name] = start
-            # Instrument the whole per-account REST section so we can spot
-            # cases where a blocking pybit call stalls the main polling loop.
-            # The 2s threshold is well under the 10s pybit timeout but far
-            # enough above normal (~100-300ms) to only fire on real stalls.
             try:
-                rest_client = self._rest_clients[account_name]
-
-                # Fetch wallet balance (cached to reduce API calls).
-                # pybit's HTTP(timeout=...) caps the request; no extra wrapper.
-                wallet_balance = self._get_wallet_balance(account_name)
-
-                # Check if we need to fall back to REST for positions
-                # (REST sync ensures freshness even when WS data exists)
-                rest_positions = None
-
-                # Update each runner
-                for runner in runners:
-                    symbol = runner.symbol
-
-                    # Try WebSocket data first (real-time)
-                    long_pos = self._get_position_from_ws(account_name, symbol, "Buy")
-                    short_pos = self._get_position_from_ws(account_name, symbol, "Sell")
-
-                    # Fall back to REST if WebSocket data not available
-                    if long_pos is None or short_pos is None:
-                        # Lazy fetch REST positions (once per account)
-                        if rest_positions is None:
-                            rest_positions = rest_client.get_positions()
-                            logger.debug(
-                                f"Fetched positions from REST for {account_name} "
-                                f"(WS data incomplete)"
-                            )
-
-                        # Find positions from REST response
-                        for pos in rest_positions:
-                            if pos.get("symbol") != symbol:
-                                continue
-                            side = pos.get("side", "")
-                            if side == "Buy" and long_pos is None:
-                                long_pos = pos
-                            elif side == "Sell" and short_pos is None:
-                                short_pos = pos
-
-                    # Get last close from engine
-                    last_close = runner.engine.last_close or 0.0
-
-                    try:
-                        runner.on_position_update(
-                            long_position=long_pos,
-                            short_position=short_pos,
-                            wallet_balance=wallet_balance,
-                            last_close=last_close,
-                        )
-                    except Exception as e:
-                        logger.error(
-                            "Position update failed for runner %s: %s",
-                            runner.strat_id, e, exc_info=True,
-                        )
-                        self._notifier.alert_exception(
-                            f"runner.on_position_update({runner.strat_id})",
-                            e,
-                            error_key=f"position_update_{account_name}_{runner.strat_id}",
-                        )
-                        # Continue to next runner instead of raising
-
+                self._fetch_one_account(account_name, runners)
             except Exception as e:
-                if startup:
-                    logger.warning(
-                        "Failed to fetch initial positions for %s during startup: %s. "
-                        "Runners may not have multipliers until next periodic check.",
-                        account_name, e,
+                # Per-account exception during startup is logged as
+                # warning and the batch continues. The only startup
+                # abort signal is the hard cap above.
+                logger.warning(
+                    "Failed to fetch initial positions for %s during startup: %s. "
+                    "Runners may not have multipliers until next periodic check.",
+                    account_name, e,
+                )
+            else:
+                done += 1
+            self._last_position_fetch[account_name] = time.monotonic()
+        # Rotation begins after startup; start from index 0.
+        self._position_fetch_rotation_index = 0
+
+    def _fetch_positions_rotation_tick(self) -> None:
+        """Steady-state: fetch ONE eligible account per call, round-robin."""
+        accounts = list(self._account_to_runners.items())
+        n = len(accounts)
+        if n == 0:
+            return
+        per_account_floor = max(
+            float(self._config.position_check_interval),
+            n * _POSITION_TICK_BASE,
+        )
+        now = time.monotonic()
+        start_idx = self._position_fetch_rotation_index % n
+        for offset in range(n):
+            idx = (start_idx + offset) % n
+            account_name, runners = accounts[idx]
+            last = self._last_position_fetch.get(account_name, 0.0)
+            if (now - last) < per_account_floor:
+                continue
+            try:
+                self._fetch_one_account(account_name, runners)
+            except Exception as e:
+                logger.error("Position check error for %s: %s", account_name, e)
+                self._notifier.alert_exception(
+                    "_fetch_and_update_positions", e,
+                    error_key=f"position_fetch_{account_name}",
+                )
+            self._last_position_fetch[account_name] = time.monotonic()
+            self._position_fetch_rotation_index = (idx + 1) % n
+            return
+        # Nobody eligible — all accounts fetched within the floor window.
+        # Silent no-op; the next tick will retry.
+
+    def _fetch_one_account(self, account_name: str, runners: list) -> None:
+        """Fetch wallet + positions for one account, update each runner.
+
+        WS data is primary; REST is fallback when WS is missing. Per-runner
+        on_position_update exceptions are caught and alerted but do not
+        abort the per-account pass. REST or wallet-fetch exceptions
+        propagate to the caller (startup / rotation-tick) which decides
+        how to handle them.
+        """
+        start = time.monotonic()
+        try:
+            rest_client = self._rest_clients[account_name]
+
+            # Fetch wallet balance (cached to reduce API calls).
+            # pybit's HTTP(timeout=...) caps the request; no extra wrapper.
+            wallet_balance = self._get_wallet_balance(account_name)
+
+            # Lazy REST positions (fetched on demand if WS data is missing).
+            rest_positions = None
+
+            for runner in runners:
+                symbol = runner.symbol
+
+                # Try WebSocket data first (real-time)
+                long_pos = self._get_position_from_ws(account_name, symbol, "Buy")
+                short_pos = self._get_position_from_ws(account_name, symbol, "Sell")
+
+                # Fall back to REST if WebSocket data not available
+                if long_pos is None or short_pos is None:
+                    if rest_positions is None:
+                        rest_positions = rest_client.get_positions()
+                        logger.debug(
+                            f"Fetched positions from REST for {account_name} "
+                            f"(WS data incomplete)"
+                        )
+                    for pos in rest_positions:
+                        if pos.get("symbol") != symbol:
+                            continue
+                        side = pos.get("side", "")
+                        if side == "Buy" and long_pos is None:
+                            long_pos = pos
+                        elif side == "Sell" and short_pos is None:
+                            short_pos = pos
+
+                last_close = runner.engine.last_close or 0.0
+
+                try:
+                    runner.on_position_update(
+                        long_position=long_pos,
+                        short_position=short_pos,
+                        wallet_balance=wallet_balance,
+                        last_close=last_close,
                     )
-                else:
-                    logger.error("Position check error for %s: %s", account_name, e)
+                except Exception as e:
+                    logger.error(
+                        "Position update failed for runner %s: %s",
+                        runner.strat_id, e, exc_info=True,
+                    )
                     self._notifier.alert_exception(
-                        "_fetch_and_update_positions", e,
-                        error_key=f"position_fetch_{account_name}",
+                        f"runner.on_position_update({runner.strat_id})",
+                        e,
+                        error_key=f"position_update_{account_name}_{runner.strat_id}",
                     )
-            finally:
-                elapsed = time.monotonic() - start
-                if elapsed > _POSITION_FETCH_SLOW_THRESHOLD:
-                    logger.warning(
-                        "Position fetch for %s took %.1fs (threshold=%.1fs) — "
-                        "blocking REST stalled the main polling loop",
-                        account_name, elapsed, _POSITION_FETCH_SLOW_THRESHOLD,
-                    )
+                    # Continue to next runner instead of raising
+        finally:
+            elapsed = time.monotonic() - start
+            if elapsed > _POSITION_FETCH_SLOW_THRESHOLD:
+                logger.warning(
+                    "Position fetch for %s took %.1fs (threshold=%.1fs) — "
+                    "blocking REST stalled the main polling loop",
+                    account_name, elapsed, _POSITION_FETCH_SLOW_THRESHOLD,
+                )
 
     def _health_check_once(self) -> None:
         """Single-shot WebSocket health check + auth-cooldown expiry sweep.
