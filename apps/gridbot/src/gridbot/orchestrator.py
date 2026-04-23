@@ -265,8 +265,8 @@ class Orchestrator:
                 consecutive_failures += 1
                 sleep_for = min(2 ** (consecutive_failures - 1), _MAX_TICK_BACKOFF)
                 logger.error(
-                    "Main loop tick error (#%d consecutive, sleeping %.1fs): %s",
-                    consecutive_failures, sleep_for, e, exc_info=True,
+                    "Main loop tick error (#%d consecutive, %s, sleeping %.1fs): %s",
+                    consecutive_failures, type(e).__name__, sleep_for, e, exc_info=True,
                 )
                 self._notifier.alert_exception("main_loop", e, error_key="main_loop")
             time.sleep(sleep_for)
@@ -803,6 +803,8 @@ class Orchestrator:
         Returns:
             Wallet balance in USDT.
         """
+        assert threading.current_thread() is threading.main_thread(), \
+            "_get_wallet_balance touches _wallet_cache; must run on main thread"
         # Check if caching is disabled
         if self._config.wallet_cache_interval <= 0:
             return self._fetch_wallet_balance(account_name)
