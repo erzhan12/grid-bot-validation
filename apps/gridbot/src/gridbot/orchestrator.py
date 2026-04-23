@@ -138,19 +138,33 @@ class Orchestrator:
         self._position_ws_data: dict[str, dict[str, dict[str, dict]]] = {}
 
         # Wallet balance cache: account_name -> (balance, timestamp)
-        # IMPORTANT: Only accessed from main thread, never from WS callbacks.
-        # The main polling loop is the single reader/writer, so no lock is
-        # required. Do NOT touch this from _on_ticker / _on_order /
-        # _on_execution / _on_position — those run in pybit WS threads.
-        # No runtime enforcement by design — this is a field, not an entry
-        # point; invariant held by review.
+        #
+        # Thread safety: accessed ONLY from the main polling loop, via
+        # _get_wallet_balance / _fetch_wallet_balance. _get_wallet_balance
+        # raises RuntimeError if called from any non-main thread. The main
+        # loop is the sole reader/writer, so no lock is required.
+        #
+        # Do NOT touch this from WS callbacks (_on_ticker, _on_position,
+        # _on_order, _on_execution) — they run in pybit threads and would
+        # trip the guard.
         self._wallet_cache: dict[str, tuple[float, datetime]] = {}
 
-        # WS → main-thread buffers. dict/deque mutations are atomic under CPython GIL.
-        # Ticker: latest-wins cache, symbol -> event.
+        # WS → main-thread buffers.
+        #
+        # Memory model: CPython's GIL serialises bytecode execution, so a
+        # dict/deque mutation in one thread and a read in another never
+        # tear — the reader sees either the prior value or the newer write,
+        # never a partially-updated state. Under CPython this is sufficient
+        # without explicit locks or memory barriers. Caveat: free-threaded
+        # CPython (PEP 703 / 3.13t) removes the GIL; if we ever migrate to
+        # a GIL-less interpreter, these buffers need explicit synchronisation
+        # (lock or lock-free atomic).
+        #
+        # Ticker: latest-wins cache. Older events coalesce away — only the
+        # freshest value per symbol ever matters.
         self._latest_ticker: dict[str, TickerEvent] = {}
         self._last_processed_ticker: dict[str, TickerEvent] = {}
-        # Per-runner pending execution/order events (deques are atomic under GIL).
+        # Per-runner pending execution/order events.
         self._pending_executions: dict[str, deque] = {}
         self._pending_orders: dict[str, deque] = {}
 
@@ -627,10 +641,10 @@ class Orchestrator:
             event = normalizer.normalize_ticker(message)
             if event is None:
                 return
-            # dict[k] = v is atomic under CPython GIL. Races with the main
-            # loop are benign: worst case we overwrite a value that hasn't
-            # been read yet, but the reader will pick up the newer one on
-            # the next iteration.
+            # See _latest_ticker field declaration for the GIL memory-model
+            # rationale. Races with the main loop are benign: worst case we
+            # overwrite a value that hasn't been read yet; the reader picks
+            # up the newer one on the next iteration.
             self._latest_ticker[symbol] = event
         except Exception as e:
             self._notifier.alert_exception("_on_ticker", e, error_key="ws_on_ticker")
