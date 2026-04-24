@@ -278,7 +278,7 @@ class TestOrchestratorLifecycle:
         orchestrator = Orchestrator(gridbot_config)
 
         with patch.object(
-            orchestrator, "_fetch_and_update_positions"
+            orchestrator._position_fetcher, "fetch_and_update"
         ) as mock_fetch:
             orchestrator.start()
             mock_fetch.assert_called_once_with(startup=True)
@@ -308,7 +308,7 @@ class TestOrchestratorLifecycle:
         orchestrator._build_routing_maps()
 
         # Mock wallet balance to raise (startup warns and continues)
-        orchestrator._get_wallet_balance = Mock(
+        orchestrator._position_fetcher.get_wallet_balance = Mock(
             side_effect=TimeoutError("REST hung")
         )
 
@@ -498,7 +498,7 @@ class TestOrchestratorPositionWsCache:
     """Tests for WebSocket position data caching."""
 
     def test_on_position_stores_linear_data(self, gridbot_config):
-        """_on_position stores linear position data in cache."""
+        """on_position_message stores linear position data in cache."""
         orchestrator = Orchestrator(gridbot_config)
         message = {
             "data": [
@@ -511,14 +511,14 @@ class TestOrchestratorPositionWsCache:
                 }
             ]
         }
-        orchestrator._on_position("test_account", message)
+        orchestrator._position_fetcher.on_position_message("test_account", message)
 
-        cached = orchestrator._position_ws_data["test_account"]["BTCUSDT"]["Buy"]
+        cached = orchestrator._position_fetcher._position_ws_data["test_account"]["BTCUSDT"]["Buy"]
         assert cached["size"] == "0.1"
         assert cached["avgPrice"] == "42500.00"
 
     def test_on_position_stores_both_sides(self, gridbot_config):
-        """_on_position stores both Buy and Sell positions."""
+        """on_position_message stores both Buy and Sell positions."""
         orchestrator = Orchestrator(gridbot_config)
         message = {
             "data": [
@@ -526,24 +526,24 @@ class TestOrchestratorPositionWsCache:
                 {"category": "linear", "symbol": "BTCUSDT", "side": "Sell", "size": "0.05"},
             ]
         }
-        orchestrator._on_position("test_account", message)
+        orchestrator._position_fetcher.on_position_message("test_account", message)
 
-        assert orchestrator._position_ws_data["test_account"]["BTCUSDT"]["Buy"]["size"] == "0.1"
-        assert orchestrator._position_ws_data["test_account"]["BTCUSDT"]["Sell"]["size"] == "0.05"
+        assert orchestrator._position_fetcher._position_ws_data["test_account"]["BTCUSDT"]["Buy"]["size"] == "0.1"
+        assert orchestrator._position_fetcher._position_ws_data["test_account"]["BTCUSDT"]["Sell"]["size"] == "0.05"
 
     def test_on_position_filters_non_linear(self, gridbot_config):
-        """_on_position ignores non-linear positions."""
+        """on_position_message ignores non-linear positions."""
         orchestrator = Orchestrator(gridbot_config)
         message = {
             "data": [
                 {"category": "spot", "symbol": "BTCUSDT", "side": "Buy", "size": "1.0"},
             ]
         }
-        orchestrator._on_position("test_account", message)
-        assert len(orchestrator._position_ws_data.get("test_account", {})) == 0
+        orchestrator._position_fetcher.on_position_message("test_account", message)
+        assert len(orchestrator._position_fetcher._position_ws_data.get("test_account", {})) == 0
 
     def test_on_position_skips_empty_symbol_or_side(self, gridbot_config):
-        """_on_position skips entries with empty symbol or side."""
+        """on_position_message skips entries with empty symbol or side."""
         orchestrator = Orchestrator(gridbot_config)
         message = {
             "data": [
@@ -551,35 +551,35 @@ class TestOrchestratorPositionWsCache:
                 {"category": "linear", "symbol": "BTCUSDT", "side": "", "size": "0.1"},
             ]
         }
-        orchestrator._on_position("test_account", message)
-        account_data = orchestrator._position_ws_data.get("test_account", {})
+        orchestrator._position_fetcher.on_position_message("test_account", message)
+        account_data = orchestrator._position_fetcher._position_ws_data.get("test_account", {})
         assert len(account_data.get("BTCUSDT", {})) == 0
 
     def test_on_position_handles_empty_data(self, gridbot_config):
-        """_on_position handles empty or missing data gracefully."""
+        """on_position_message handles empty or missing data gracefully."""
         orchestrator = Orchestrator(gridbot_config)
-        orchestrator._on_position("test_account", {"data": []})
-        orchestrator._on_position("test_account", {})
+        orchestrator._position_fetcher.on_position_message("test_account", {"data": []})
+        orchestrator._position_fetcher.on_position_message("test_account", {})
 
     def test_get_position_from_ws_returns_cached_data(self, gridbot_config):
-        """_get_position_from_ws returns data when available."""
+        """get_position_from_ws returns data when available."""
         orchestrator = Orchestrator(gridbot_config)
         pos = {"symbol": "BTCUSDT", "side": "Buy", "size": "0.1"}
-        orchestrator._position_ws_data = {"acct": {"BTCUSDT": {"Buy": pos}}}
+        orchestrator._position_fetcher._position_ws_data = {"acct": {"BTCUSDT": {"Buy": pos}}}
 
-        result = orchestrator._get_position_from_ws("acct", "BTCUSDT", "Buy")
+        result = orchestrator._position_fetcher.get_position_from_ws("acct", "BTCUSDT", "Buy")
         assert result == pos
 
     def test_get_position_from_ws_returns_none_when_missing(self, gridbot_config):
-        """_get_position_from_ws returns None for missing data."""
+        """get_position_from_ws returns None for missing data."""
         orchestrator = Orchestrator(gridbot_config)
-        assert orchestrator._get_position_from_ws("missing", "BTCUSDT", "Buy") is None
+        assert orchestrator._position_fetcher.get_position_from_ws("missing", "BTCUSDT", "Buy") is None
 
-        orchestrator._position_ws_data = {"acct": {}}
-        assert orchestrator._get_position_from_ws("acct", "BTCUSDT", "Buy") is None
+        orchestrator._position_fetcher._position_ws_data = {"acct": {}}
+        assert orchestrator._position_fetcher.get_position_from_ws("acct", "BTCUSDT", "Buy") is None
 
-        orchestrator._position_ws_data = {"acct": {"BTCUSDT": {}}}
-        assert orchestrator._get_position_from_ws("acct", "BTCUSDT", "Buy") is None
+        orchestrator._position_fetcher._position_ws_data = {"acct": {"BTCUSDT": {}}}
+        assert orchestrator._position_fetcher.get_position_from_ws("acct", "BTCUSDT", "Buy") is None
 
 
 class TestOrchestratorEventHandlers:
@@ -829,7 +829,7 @@ class TestOrchestratorTickPeriodicCheckIsolation:
         orchestrator._init_strategy(strategy_config)
         orchestrator._build_routing_maps()
 
-        orchestrator._fetch_and_update_positions = Mock(side_effect=RuntimeError("boom"))
+        orchestrator._position_fetcher.fetch_and_update = Mock(side_effect=RuntimeError("boom"))
         orchestrator._next_position_check = 0.0  # due now
 
         before = orchestrator._next_position_check
@@ -840,7 +840,7 @@ class TestOrchestratorTickPeriodicCheckIsolation:
         )
         notifier.alert_exception.assert_any_call(
             "_fetch_and_update_positions",
-            orchestrator._fetch_and_update_positions.side_effect,
+            orchestrator._position_fetcher.fetch_and_update.side_effect,
             error_key="periodic_fetch_positions",
         )
 
@@ -922,16 +922,16 @@ class TestOrchestratorTickPeriodicCheckIsolation:
         orchestrator._init_strategy(strategy_config)
         orchestrator._build_routing_maps()
 
-        orchestrator._fetch_and_update_positions = Mock(side_effect=RuntimeError("boom"))
+        orchestrator._position_fetcher.fetch_and_update = Mock(side_effect=RuntimeError("boom"))
 
         # First tick: due now, should fire once and advance.
         orchestrator._next_position_check = 0.0
         orchestrator._tick()
-        assert orchestrator._fetch_and_update_positions.call_count == 1
+        assert orchestrator._position_fetcher.fetch_and_update.call_count == 1
 
         # Second tick immediately after: not yet due (timestamp advanced), must not fire.
         orchestrator._tick()
-        assert orchestrator._fetch_and_update_positions.call_count == 1
+        assert orchestrator._position_fetcher.fetch_and_update.call_count == 1
 
 
 class TestOrchestratorPositionCheck:
@@ -961,7 +961,7 @@ class TestOrchestratorPositionCheck:
         # Pre-populate WS position cache
         long_pos = {"symbol": "BTCUSDT", "side": "Buy", "size": "0.1"}
         short_pos = {"symbol": "BTCUSDT", "side": "Sell", "size": "0.05"}
-        orchestrator._position_ws_data = {
+        orchestrator._position_fetcher._position_ws_data = {
             "test_account": {"BTCUSDT": {"Buy": long_pos, "Sell": short_pos}}
         }
 
@@ -970,7 +970,7 @@ class TestOrchestratorPositionCheck:
             "list": [{"coin": [{"coin": "USDT", "walletBalance": "10000"}]}]
         }
 
-        orchestrator._fetch_and_update_positions()
+        orchestrator._position_fetcher.fetch_and_update()
 
         mock_runner.on_position_update.assert_called_once_with(
             long_position=long_pos,
@@ -1000,7 +1000,7 @@ class TestOrchestratorPositionCheck:
         mock_runner.on_position_update = Mock()
         orchestrator._account_to_runners["test_account"] = [mock_runner]
 
-        orchestrator._position_ws_data = {}
+        orchestrator._position_fetcher._position_ws_data = {}
 
         rest_client = orchestrator._rest_clients["test_account"]
         rest_client.get_wallet_balance.return_value = {
@@ -1011,7 +1011,7 @@ class TestOrchestratorPositionCheck:
         other_pos = {"symbol": "ETHUSDT", "side": "Buy", "size": "1.0"}
         rest_client.get_positions.return_value = [other_pos, long_pos_rest, short_pos_rest]
 
-        orchestrator._fetch_and_update_positions()
+        orchestrator._position_fetcher.fetch_and_update()
 
         rest_client.get_positions.assert_called_once()
         mock_runner.on_position_update.assert_called_once_with(
@@ -1038,7 +1038,7 @@ class TestOrchestratorPositionCheck:
         rest_client.get_wallet_balance.side_effect = Exception("API error")
 
         # Should not raise
-        orchestrator._fetch_and_update_positions()
+        orchestrator._position_fetcher.fetch_and_update()
 
 
 class TestOrchestratorPositionCheckStartupBatch:
@@ -1047,10 +1047,16 @@ class TestOrchestratorPositionCheckStartupBatch:
     def _make_orch_with_accounts(
         self, gridbot_config, mock_rest_factory, n: int,
     ):
-        """Build an orchestrator with N accounts, each with one mock runner."""
+        """Build an orchestrator with N accounts, each with one mock runner.
+
+        Mutates `_account_to_runners` / `_rest_clients` in place (via
+        `.clear()` + key assignment) so the PositionFetcher that was
+        constructed in Orchestrator.__init__ keeps seeing the same
+        dict objects it was handed.
+        """
         orchestrator = Orchestrator(gridbot_config, notifier=Mock(spec=Notifier))
-        orchestrator._account_to_runners = {}
-        orchestrator._rest_clients = {}
+        orchestrator._account_to_runners.clear()
+        orchestrator._rest_clients.clear()
         runners = {}
         for i in range(n):
             name = f"acct_{i}"
@@ -1069,15 +1075,16 @@ class TestOrchestratorPositionCheckStartupBatch:
         self, mock_private_ws, mock_public_ws, mock_rest_client, gridbot_config,
     ):
         orchestrator, runners = self._make_orch_with_accounts(gridbot_config, mock_rest_client, 4)
-        orchestrator._fetch_one_account = Mock()
+        fetcher = orchestrator._position_fetcher
+        fetcher._fetch_one_account = Mock()
 
-        orchestrator._fetch_positions_startup_batch()
+        fetcher._fetch_positions_startup_batch()
 
-        assert orchestrator._fetch_one_account.call_count == 4
+        assert fetcher._fetch_one_account.call_count == 4
         # All 4 accounts recorded a last-fetch timestamp.
-        assert set(orchestrator._last_position_fetch.keys()) == set(runners.keys())
+        assert set(fetcher._last_position_fetch.keys()) == set(runners.keys())
         # Rotation index reset to 0 for subsequent steady-state.
-        assert orchestrator._position_fetch_rotation_index == 0
+        assert fetcher._position_fetch_rotation_index == 0
 
     @patch("gridbot.orchestrator.BybitRestClient")
     @patch("gridbot.orchestrator.PublicWebSocketClient")
@@ -1085,19 +1092,20 @@ class TestOrchestratorPositionCheckStartupBatch:
     def test_startup_raises_on_hard_cap_exceeded(
         self, mock_private_ws, mock_public_ws, mock_rest_client, gridbot_config,
     ):
-        from gridbot.orchestrator import StartupTimeoutError, _POSITION_STARTUP_HARD_CAP
+        from gridbot.position_fetcher import StartupTimeoutError, _POSITION_STARTUP_HARD_CAP
         orchestrator, runners = self._make_orch_with_accounts(gridbot_config, mock_rest_client, 3)
-        orchestrator._fetch_one_account = Mock()
+        fetcher = orchestrator._position_fetcher
+        fetcher._fetch_one_account = Mock()
 
         # Fake monotonic: 0, 0, cap+1 → first account fetched, second tripped.
         fake_times = iter([0.0, 0.0, _POSITION_STARTUP_HARD_CAP + 1.0,
                            _POSITION_STARTUP_HARD_CAP + 1.0, _POSITION_STARTUP_HARD_CAP + 1.0])
-        with patch("gridbot.orchestrator.time.monotonic", side_effect=lambda: next(fake_times)):
+        with patch("gridbot.position_fetcher.time.monotonic", side_effect=lambda: next(fake_times)):
             with pytest.raises(StartupTimeoutError) as exc_info:
-                orchestrator._fetch_positions_startup_batch()
+                fetcher._fetch_positions_startup_batch()
 
         assert "1/3 accounts" in str(exc_info.value)
-        assert orchestrator._fetch_one_account.call_count == 1
+        assert fetcher._fetch_one_account.call_count == 1
 
     @patch("gridbot.orchestrator.BybitRestClient")
     @patch("gridbot.orchestrator.PublicWebSocketClient")
@@ -1106,6 +1114,7 @@ class TestOrchestratorPositionCheckStartupBatch:
         self, mock_private_ws, mock_public_ws, mock_rest_client, gridbot_config,
     ):
         orchestrator, runners = self._make_orch_with_accounts(gridbot_config, mock_rest_client, 3)
+        fetcher = orchestrator._position_fetcher
 
         calls: list[str] = []
 
@@ -1114,8 +1123,8 @@ class TestOrchestratorPositionCheckStartupBatch:
             if account_name == "acct_1":
                 raise RuntimeError("boom")
 
-        orchestrator._fetch_one_account = fake_fetch_one
-        orchestrator._fetch_positions_startup_batch()
+        fetcher._fetch_one_account = fake_fetch_one
+        fetcher._fetch_positions_startup_batch()
 
         # All three attempted despite acct_1 raising.
         assert calls == ["acct_0", "acct_1", "acct_2"]
@@ -1126,8 +1135,8 @@ class TestOrchestratorPositionCheckRotation:
 
     def _make_orch_with_accounts(self, gridbot_config, n: int):
         orchestrator = Orchestrator(gridbot_config, notifier=Mock(spec=Notifier))
-        orchestrator._account_to_runners = {}
-        orchestrator._rest_clients = {}
+        orchestrator._account_to_runners.clear()
+        orchestrator._rest_clients.clear()
         for i in range(n):
             name = f"acct_{i}"
             runner = Mock(strat_id=f"s_{i}", symbol="BTCUSDT")
@@ -1143,22 +1152,23 @@ class TestOrchestratorPositionCheckRotation:
         self, mock_private_ws, mock_public_ws, mock_rest_client, gridbot_config,
     ):
         orchestrator = self._make_orch_with_accounts(gridbot_config, 4)
-        orchestrator._fetch_one_account = Mock()
+        fetcher = orchestrator._position_fetcher
+        fetcher._fetch_one_account = Mock()
 
         # All floors already satisfied: pretend each account was last fetched
         # a long time ago so every one is eligible.
         for name in orchestrator._account_to_runners:
-            orchestrator._last_position_fetch[name] = 0.0
+            fetcher._last_position_fetch[name] = 0.0
 
         calls: list[str] = []
-        orchestrator._fetch_one_account.side_effect = lambda n, r: calls.append(n)
+        fetcher._fetch_one_account.side_effect = lambda n, r: calls.append(n)
 
-        with patch("gridbot.orchestrator.time.monotonic", return_value=10_000.0):
+        with patch("gridbot.position_fetcher.time.monotonic", return_value=10_000.0):
             for _ in range(4):
-                orchestrator._fetch_positions_rotation_tick()
+                fetcher._fetch_positions_rotation_tick()
 
         assert calls == ["acct_0", "acct_1", "acct_2", "acct_3"]
-        assert orchestrator._position_fetch_rotation_index == 0  # wrapped
+        assert fetcher._position_fetch_rotation_index == 0  # wrapped
 
     @patch("gridbot.orchestrator.BybitRestClient")
     @patch("gridbot.orchestrator.PublicWebSocketClient")
@@ -1168,16 +1178,17 @@ class TestOrchestratorPositionCheckRotation:
     ):
         """After N ticks every account must have been fetched at least once."""
         orchestrator = self._make_orch_with_accounts(gridbot_config, 5)
-        orchestrator._fetch_one_account = Mock()
+        fetcher = orchestrator._position_fetcher
+        fetcher._fetch_one_account = Mock()
         for name in orchestrator._account_to_runners:
-            orchestrator._last_position_fetch[name] = 0.0
+            fetcher._last_position_fetch[name] = 0.0
 
         visited: list[str] = []
-        orchestrator._fetch_one_account.side_effect = lambda n, r: visited.append(n)
+        fetcher._fetch_one_account.side_effect = lambda n, r: visited.append(n)
 
-        with patch("gridbot.orchestrator.time.monotonic", return_value=10_000.0):
+        with patch("gridbot.position_fetcher.time.monotonic", return_value=10_000.0):
             for _ in range(5):
-                orchestrator._fetch_positions_rotation_tick()
+                fetcher._fetch_positions_rotation_tick()
 
         assert set(visited) == set(orchestrator._account_to_runners.keys())
 
@@ -1189,23 +1200,24 @@ class TestOrchestratorPositionCheckRotation:
     ):
         """Account just fetched must be skipped; rotation advances to next eligible."""
         orchestrator = self._make_orch_with_accounts(gridbot_config, 3)
-        orchestrator._fetch_one_account = Mock()
+        fetcher = orchestrator._position_fetcher
+        fetcher._fetch_one_account = Mock()
 
         # acct_0 recently fetched; acct_1 and acct_2 very old.
-        orchestrator._last_position_fetch["acct_0"] = 9_999.5  # ~0.5s ago
-        orchestrator._last_position_fetch["acct_1"] = 0.0
-        orchestrator._last_position_fetch["acct_2"] = 0.0
-        orchestrator._position_fetch_rotation_index = 0
+        fetcher._last_position_fetch["acct_0"] = 9_999.5  # ~0.5s ago
+        fetcher._last_position_fetch["acct_1"] = 0.0
+        fetcher._last_position_fetch["acct_2"] = 0.0
+        fetcher._position_fetch_rotation_index = 0
 
         calls: list[str] = []
-        orchestrator._fetch_one_account.side_effect = lambda n, r: calls.append(n)
+        fetcher._fetch_one_account.side_effect = lambda n, r: calls.append(n)
 
-        with patch("gridbot.orchestrator.time.monotonic", return_value=10_000.0):
-            orchestrator._fetch_positions_rotation_tick()
+        with patch("gridbot.position_fetcher.time.monotonic", return_value=10_000.0):
+            fetcher._fetch_positions_rotation_tick()
 
         # acct_0 was skipped (still within floor), acct_1 was the first eligible.
         assert calls == ["acct_1"]
-        assert orchestrator._position_fetch_rotation_index == 2  # next after acct_1
+        assert fetcher._position_fetch_rotation_index == 2  # next after acct_1
 
     @patch("gridbot.orchestrator.BybitRestClient")
     @patch("gridbot.orchestrator.PublicWebSocketClient")
@@ -1216,27 +1228,28 @@ class TestOrchestratorPositionCheckRotation:
         """Floor = max(config.position_check_interval, N * _POSITION_TICK_BASE).
         With N=10 and _POSITION_TICK_BASE=15s, floor must be 150s (not 63s).
         """
-        from gridbot.orchestrator import _POSITION_TICK_BASE
+        from gridbot.position_fetcher import _POSITION_TICK_BASE
         orchestrator = self._make_orch_with_accounts(gridbot_config, 10)
-        orchestrator._fetch_one_account = Mock()
+        fetcher = orchestrator._position_fetcher
+        fetcher._fetch_one_account = Mock()
 
         # All accounts fetched 100s ago: less than 10 * 15 = 150s floor,
         # so the rotation tick must find nobody eligible and do nothing.
         for name in orchestrator._account_to_runners:
-            orchestrator._last_position_fetch[name] = 9_900.0  # 100s before now
+            fetcher._last_position_fetch[name] = 9_900.0  # 100s before now
 
-        with patch("gridbot.orchestrator.time.monotonic", return_value=10_000.0):
-            orchestrator._fetch_positions_rotation_tick()
+        with patch("gridbot.position_fetcher.time.monotonic", return_value=10_000.0):
+            fetcher._fetch_positions_rotation_tick()
 
-        orchestrator._fetch_one_account.assert_not_called()
+        fetcher._fetch_one_account.assert_not_called()
 
         # Now bump clock to >150s ago → eligible again.
         for name in orchestrator._account_to_runners:
-            orchestrator._last_position_fetch[name] = 9_800.0  # 200s before now
-        with patch("gridbot.orchestrator.time.monotonic", return_value=10_000.0):
-            orchestrator._fetch_positions_rotation_tick()
+            fetcher._last_position_fetch[name] = 9_800.0  # 200s before now
+        with patch("gridbot.position_fetcher.time.monotonic", return_value=10_000.0):
+            fetcher._fetch_positions_rotation_tick()
 
-        assert orchestrator._fetch_one_account.call_count == 1
+        assert fetcher._fetch_one_account.call_count == 1
         # Confirm floor value for clarity.
         assert max(float(orchestrator._config.position_check_interval),
                    10 * _POSITION_TICK_BASE) == 150.0
@@ -1248,17 +1261,18 @@ class TestOrchestratorPositionCheckRotation:
         self, mock_private_ws, mock_public_ws, mock_rest_client, gridbot_config,
     ):
         orchestrator = self._make_orch_with_accounts(gridbot_config, 2)
-        orchestrator._fetch_one_account = Mock()
+        fetcher = orchestrator._position_fetcher
+        fetcher._fetch_one_account = Mock()
 
         # Both accounts just fetched; nobody eligible.
         now = 10_000.0
         for name in orchestrator._account_to_runners:
-            orchestrator._last_position_fetch[name] = now - 0.1
+            fetcher._last_position_fetch[name] = now - 0.1
 
-        with patch("gridbot.orchestrator.time.monotonic", return_value=now):
-            orchestrator._fetch_positions_rotation_tick()
+        with patch("gridbot.position_fetcher.time.monotonic", return_value=now):
+            fetcher._fetch_positions_rotation_tick()
 
-        orchestrator._fetch_one_account.assert_not_called()
+        fetcher._fetch_one_account.assert_not_called()
 
     @patch("gridbot.orchestrator.BybitRestClient")
     @patch("gridbot.orchestrator.PublicWebSocketClient")
@@ -1275,7 +1289,7 @@ class TestOrchestratorPositionCheckRotation:
         orchestrator._init_strategy(strategy_config)
         orchestrator._build_routing_maps()
 
-        orchestrator._fetch_and_update_positions = Mock()
+        orchestrator._position_fetcher.fetch_and_update = Mock()
         orchestrator._next_position_check = 0.0  # due immediately
 
         with patch("gridbot.orchestrator.time.monotonic", return_value=1_000.0):
@@ -1511,11 +1525,11 @@ class TestOrchestratorExceptionHandling:
         assert "on_execution" in notifier.alert_exception.call_args[0][0]
 
     def test_on_position_exception_does_not_crash(self, gridbot_config):
-        """_on_position catches broad exceptions and notifies."""
+        """on_position_message catches broad exceptions and notifies."""
         notifier = Mock(spec=Notifier)
         orchestrator = Orchestrator(gridbot_config, notifier=notifier)
 
-        orchestrator._on_position("test_account", {"data": 12345})
+        orchestrator._position_fetcher.on_position_message("test_account", {"data": 12345})
 
         notifier.alert_exception.assert_called_once()
         assert "on_position" in notifier.alert_exception.call_args[0][0]
@@ -1890,12 +1904,12 @@ class TestOrchestratorWalletCache:
             "list": [{"coin": [{"coin": "USDT", "walletBalance": "5000"}]}]
         }
 
-        balance = orchestrator._get_wallet_balance("test_account")
+        balance = orchestrator._position_fetcher.get_wallet_balance("test_account")
         assert balance == 5000.0
         rest_client.get_wallet_balance.assert_called_once()
 
-        assert "test_account" in orchestrator._wallet_cache
-        cached_balance, _ = orchestrator._wallet_cache["test_account"]
+        assert "test_account" in orchestrator._position_fetcher._wallet_cache
+        cached_balance, _ = orchestrator._position_fetcher._wallet_cache["test_account"]
         assert cached_balance == 5000.0
 
     @patch("gridbot.orchestrator.BybitRestClient")
@@ -1911,14 +1925,14 @@ class TestOrchestratorWalletCache:
         orchestrator = Orchestrator(gridbot_config)
         orchestrator._init_account(account_config)
 
-        orchestrator._wallet_cache["test_account"] = (10000.0, datetime.now(UTC))
+        orchestrator._position_fetcher._wallet_cache["test_account"] = (10000.0, datetime.now(UTC))
 
         rest_client = orchestrator._rest_clients["test_account"]
         rest_client.get_wallet_balance.return_value = {
             "list": [{"coin": [{"coin": "USDT", "walletBalance": "9999"}]}]
         }
 
-        balance = orchestrator._get_wallet_balance("test_account")
+        balance = orchestrator._position_fetcher.get_wallet_balance("test_account")
         assert balance == 10000.0
         rest_client.get_wallet_balance.assert_not_called()
 
@@ -1936,18 +1950,18 @@ class TestOrchestratorWalletCache:
         orchestrator._init_account(account_config)
 
         old_timestamp = datetime.now(UTC) - timedelta(seconds=400)
-        orchestrator._wallet_cache["test_account"] = (5000.0, old_timestamp)
+        orchestrator._position_fetcher._wallet_cache["test_account"] = (5000.0, old_timestamp)
 
         rest_client = orchestrator._rest_clients["test_account"]
         rest_client.get_wallet_balance.return_value = {
             "list": [{"coin": [{"coin": "USDT", "walletBalance": "7500"}]}]
         }
 
-        balance = orchestrator._get_wallet_balance("test_account")
+        balance = orchestrator._position_fetcher.get_wallet_balance("test_account")
         assert balance == 7500.0
         rest_client.get_wallet_balance.assert_called_once()
 
-        cached_balance, _ = orchestrator._wallet_cache["test_account"]
+        cached_balance, _ = orchestrator._position_fetcher._wallet_cache["test_account"]
         assert cached_balance == 7500.0
 
     @patch("gridbot.orchestrator.BybitRestClient")
@@ -1968,19 +1982,19 @@ class TestOrchestratorWalletCache:
         orchestrator = Orchestrator(config)
         orchestrator._init_account(account_config)
 
-        orchestrator._wallet_cache["test_account"] = (5000.0, datetime.now(UTC))
+        orchestrator._position_fetcher._wallet_cache["test_account"] = (5000.0, datetime.now(UTC))
 
         rest_client = orchestrator._rest_clients["test_account"]
         rest_client.get_wallet_balance.return_value = {
             "list": [{"coin": [{"coin": "USDT", "walletBalance": "8000"}]}]
         }
 
-        balance = orchestrator._get_wallet_balance("test_account")
+        balance = orchestrator._position_fetcher.get_wallet_balance("test_account")
         assert balance == 8000.0
         rest_client.get_wallet_balance.assert_called_once()
 
         rest_client.get_wallet_balance.reset_mock()
-        balance = orchestrator._get_wallet_balance("test_account")
+        balance = orchestrator._position_fetcher.get_wallet_balance("test_account")
         assert balance == 8000.0
         rest_client.get_wallet_balance.assert_called_once()
 
@@ -1999,9 +2013,9 @@ class TestOrchestratorWalletCache:
         rest_client.get_wallet_balance.side_effect = ConnectionError("timeout")
 
         with pytest.raises(ConnectionError, match="timeout"):
-            orchestrator._get_wallet_balance("test_account")
+            orchestrator._position_fetcher.get_wallet_balance("test_account")
 
-        assert "test_account" not in orchestrator._wallet_cache
+        assert "test_account" not in orchestrator._position_fetcher._wallet_cache
 
 
 class TestOrchestratorAuthCooldown:
