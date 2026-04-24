@@ -71,17 +71,39 @@ class BybitRestClient:
     api_key: str
     api_secret: str
     testnet: bool = True
+    timeout: float = 10.0
+    """Per-request timeout in seconds passed to pybit's ``HTTP`` session.
+
+    pybit applies this via ``requests.Session.send(..., timeout=self.timeout)``
+    so every REST call is bounded for both connect and read. Combined with
+    pybit's ``force_retry=False`` default, network errors raise immediately
+    instead of blocking the caller. ``requests`` accepts ``float`` timeouts
+    natively, so sub-second precision (e.g. 10.5) is preserved end-to-end.
+    """
     rate_limit_config: RateLimitConfig = field(default_factory=lambda: RateLimitConfig(query_rate=10))
 
     _session: Optional[HTTP] = field(default=None, init=False, repr=False)
     _rate_limiter: RateLimiter = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
-        """Initialize HTTP session and rate limiter."""
+        """Initialize HTTP session and rate limiter.
+
+        Validates ``timeout`` eagerly so misconfiguration fails fast at
+        client construction rather than silently propagating to pybit
+        (where ``timeout=0`` would disable the per-request cap and a
+        hung socket could pin the main polling loop indefinitely).
+        """
+        if self.timeout <= 0:
+            raise ValueError(
+                f"BybitRestClient timeout must be > 0, got {self.timeout!r}. "
+                "A non-positive timeout disables the per-request cap and "
+                "allows a single hung socket to block the main polling loop."
+            )
         self._session = HTTP(
             testnet=self.testnet,
             api_key=self.api_key,
             api_secret=self.api_secret,
+            timeout=self.timeout,
         )
         self._rate_limiter = RateLimiter(config=self.rate_limit_config)
 

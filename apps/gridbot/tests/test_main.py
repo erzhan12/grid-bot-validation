@@ -1,8 +1,7 @@
 """Tests for gridbot main entry point."""
 
 import logging
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 from gridbot.main import main, cli, setup_logging
 
@@ -59,136 +58,141 @@ class TestSetupLogging:
 
 
 class TestMain:
-    @pytest.mark.asyncio
-    async def test_config_not_found(self):
+    def test_config_not_found(self):
         with patch("gridbot.main.load_config", side_effect=FileNotFoundError("not found")):
-            result = await main("/nonexistent/config.yaml")
+            result = main("/nonexistent/config.yaml")
 
         assert result == 1
 
-    @pytest.mark.asyncio
-    async def test_config_invalid(self):
+    def test_config_invalid(self):
         with patch("gridbot.main.load_config", side_effect=ValueError("bad config")):
-            result = await main("/bad/config.yaml")
+            result = main("/bad/config.yaml")
 
         assert result == 1
 
-    @pytest.mark.asyncio
-    async def test_successful_startup_and_shutdown(self):
+    def test_successful_startup_and_shutdown(self):
         mock_config = MagicMock()
         mock_config.strategies = [MagicMock()]
         mock_config.database_url = None
         mock_config.notification = None
 
-        mock_orchestrator = AsyncMock()
+        mock_orchestrator = MagicMock()
 
         with patch("gridbot.main.load_config", return_value=mock_config), \
              patch("gridbot.main.Orchestrator", return_value=mock_orchestrator), \
              patch("gridbot.main.Notifier"), \
-             patch("gridbot.main.asyncio.Event") as MockEvent:
+             patch("gridbot.main.signal.signal"):
 
-            # Make shutdown_event.wait() return immediately
-            mock_event = MagicMock()
-            mock_event.wait = AsyncMock()
-            MockEvent.return_value = mock_event
-
-            result = await main("test.yaml")
+            result = main("test.yaml")
 
         assert result == 0
-        mock_orchestrator.start.assert_awaited_once()
-        mock_orchestrator.stop.assert_awaited_once()
+        mock_orchestrator.start.assert_called_once()
+        mock_orchestrator.run.assert_called_once()
+        mock_orchestrator.stop.assert_called_once()
 
-    @pytest.mark.asyncio
-    async def test_startup_error_returns_1(self):
+    def test_startup_error_returns_1(self):
         mock_config = MagicMock()
         mock_config.strategies = []
         mock_config.database_url = None
         mock_config.notification = None
 
-        mock_orchestrator = AsyncMock()
+        mock_orchestrator = MagicMock()
         mock_orchestrator.start.side_effect = Exception("startup failed")
 
         with patch("gridbot.main.load_config", return_value=mock_config), \
              patch("gridbot.main.Orchestrator", return_value=mock_orchestrator), \
-             patch("gridbot.main.Notifier"):
+             patch("gridbot.main.Notifier"), \
+             patch("gridbot.main.signal.signal"):
 
-            result = await main("test.yaml")
+            result = main("test.yaml")
 
         assert result == 1
-        mock_orchestrator.stop.assert_awaited_once()
+        mock_orchestrator.stop.assert_called_once()
 
-    @pytest.mark.asyncio
-    async def test_database_init_with_sqlite_url(self):
+    def test_database_init_with_sqlite_url(self):
         mock_config = MagicMock()
         mock_config.strategies = []
         mock_config.database_url = "sqlite:///test.db"
         mock_config.notification = None
 
-        mock_orchestrator = AsyncMock()
+        mock_orchestrator = MagicMock()
 
         with patch("gridbot.main.load_config", return_value=mock_config), \
              patch("gridbot.main.Orchestrator", return_value=mock_orchestrator), \
              patch("gridbot.main.Notifier"), \
              patch("gridbot.main.DatabaseFactory") as MockDB, \
              patch("gridbot.main.DatabaseSettings") as MockSettings, \
-             patch("gridbot.main.asyncio.Event") as MockEvent:
+             patch("gridbot.main.signal.signal"):
 
-            mock_event = MagicMock()
-            mock_event.wait = AsyncMock()
-            MockEvent.return_value = mock_event
             MockSettings.return_value = MagicMock()
 
-            result = await main("test.yaml")
+            result = main("test.yaml")
 
         assert result == 0
         MockDB.assert_called_once()
 
-    @pytest.mark.asyncio
-    async def test_database_init_failure_is_warning(self):
+    def test_database_init_failure_is_warning(self):
         mock_config = MagicMock()
         mock_config.strategies = []
         mock_config.database_url = "sqlite:///test.db"
         mock_config.notification = None
 
-        mock_orchestrator = AsyncMock()
+        mock_orchestrator = MagicMock()
 
         with patch("gridbot.main.load_config", return_value=mock_config), \
              patch("gridbot.main.Orchestrator", return_value=mock_orchestrator), \
              patch("gridbot.main.Notifier"), \
              patch("gridbot.main.DatabaseFactory", side_effect=Exception("db error")), \
              patch("gridbot.main.DatabaseSettings", return_value=MagicMock()), \
-             patch("gridbot.main.asyncio.Event") as MockEvent:
+             patch("gridbot.main.signal.signal"):
 
-            mock_event = MagicMock()
-            mock_event.wait = AsyncMock()
-            MockEvent.return_value = mock_event
-
-            result = await main("test.yaml")
+            result = main("test.yaml")
 
         # DB failure is a warning, not fatal
         assert result == 0
 
-    @pytest.mark.asyncio
-    async def test_notifier_created_with_telegram_config(self):
+    def test_notifier_created_with_telegram_config(self):
         mock_config = MagicMock()
         mock_config.strategies = []
         mock_config.database_url = None
         mock_config.notification.telegram = MagicMock()
 
-        mock_orchestrator = AsyncMock()
+        mock_orchestrator = MagicMock()
 
         with patch("gridbot.main.load_config", return_value=mock_config), \
              patch("gridbot.main.Orchestrator", return_value=mock_orchestrator), \
              patch("gridbot.main.Notifier") as MockNotifier, \
-             patch("gridbot.main.asyncio.Event") as MockEvent:
+             patch("gridbot.main.signal.signal"):
 
-            mock_event = MagicMock()
-            mock_event.wait = AsyncMock()
-            MockEvent.return_value = mock_event
-
-            await main("test.yaml")
+            main("test.yaml")
 
         MockNotifier.assert_called_once_with(mock_config.notification.telegram)
+
+    def test_signal_handler_calls_request_stop(self):
+        """Verify the installed SIGINT handler triggers orchestrator.request_stop()."""
+        mock_config = MagicMock()
+        mock_config.strategies = []
+        mock_config.database_url = None
+        mock_config.notification = None
+
+        mock_orchestrator = MagicMock()
+        captured_handlers = {}
+
+        def fake_signal(sig, handler):
+            captured_handlers[sig] = handler
+
+        with patch("gridbot.main.load_config", return_value=mock_config), \
+             patch("gridbot.main.Orchestrator", return_value=mock_orchestrator), \
+             patch("gridbot.main.Notifier"), \
+             patch("gridbot.main.signal.signal", side_effect=fake_signal):
+
+            main("test.yaml")
+
+        # Invoke the captured SIGINT handler — must call request_stop()
+        import signal as _signal
+        handler = captured_handlers[_signal.SIGINT]
+        handler(_signal.SIGINT, None)
+        mock_orchestrator.request_stop.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -196,81 +200,55 @@ class TestMain:
 # ---------------------------------------------------------------------------
 
 
-def _close_dangling_coro(mock_run):
-    """Close the unawaited coroutine created by asyncio.run(mock_main(...)).
-
-    When ``main`` is an AsyncMock patched into cli(), calling ``main(args)``
-    produces a real coroutine that ``asyncio.run`` (also mocked) never awaits.
-    Closing it explicitly silences "coroutine was never awaited" warnings.
-    """
-    coro = mock_run.call_args[0][0]
-    coro.close()
-
-
 class TestCli:
     def test_parses_config_flag(self):
-        mock_main = AsyncMock(return_value=0)
         with patch("sys.argv", ["gridbot", "--config", "myconfig.yaml"]), \
              patch("gridbot.main.setup_logging"), \
-             patch("gridbot.main.main", new=mock_main), \
-             patch("gridbot.main.asyncio.run", return_value=0) as mock_run, \
-             pytest.raises(SystemExit) as exc_info:
+             patch("gridbot.main.main", return_value=0) as mock_main, \
+             pytest_raises_system_exit() as exc_info:
 
             cli()
 
         assert exc_info.value.code == 0
-        mock_main.assert_called_once_with("myconfig.yaml", save_events=False)
-        mock_run.assert_called_once()
-        _close_dangling_coro(mock_run)
+        mock_main.assert_called_once_with("myconfig.yaml")
 
     def test_parses_debug_flag(self):
-        mock_main = AsyncMock(return_value=0)
         with patch("sys.argv", ["gridbot", "--debug"]), \
              patch("gridbot.main.setup_logging"), \
-             patch("gridbot.main.main", new=mock_main), \
-             patch("gridbot.main.asyncio.run", return_value=0) as mock_run, \
-             pytest.raises(SystemExit):
+             patch("gridbot.main.main", return_value=0), \
+             pytest_raises_system_exit():
 
             cli()
 
         assert logging.getLogger("gridbot").level == logging.DEBUG
-        _close_dangling_coro(mock_run)
 
     def test_keyboard_interrupt_returns_130(self):
-        mock_main = AsyncMock(return_value=0)
         with patch("sys.argv", ["gridbot"]), \
              patch("gridbot.main.setup_logging"), \
-             patch("gridbot.main.main", new=mock_main), \
-             patch("gridbot.main.asyncio.run", side_effect=KeyboardInterrupt) as mock_run, \
-             pytest.raises(SystemExit) as exc_info:
+             patch("gridbot.main.main", side_effect=KeyboardInterrupt), \
+             pytest_raises_system_exit() as exc_info:
 
             cli()
 
         assert exc_info.value.code == 130
-        _close_dangling_coro(mock_run)
 
     def test_default_config_is_none(self):
-        mock_main = AsyncMock(return_value=0)
         with patch("sys.argv", ["gridbot"]), \
              patch("gridbot.main.setup_logging"), \
-             patch("gridbot.main.main", new=mock_main), \
-             patch("gridbot.main.asyncio.run", return_value=0) as mock_run, \
-             pytest.raises(SystemExit):
+             patch("gridbot.main.main", return_value=0) as mock_main, \
+             pytest_raises_system_exit():
 
             cli()
 
-        mock_main.assert_called_once_with(None, save_events=False)
-        _close_dangling_coro(mock_run)
+        mock_main.assert_called_once_with(None)
 
-    def test_parses_save_events_flag(self):
-        mock_main = AsyncMock(return_value=0)
-        with patch("sys.argv", ["gridbot", "--save-events"]), \
-             patch("gridbot.main.setup_logging"), \
-             patch("gridbot.main.main", new=mock_main), \
-             patch("gridbot.main.asyncio.run", return_value=0) as mock_run, \
-             pytest.raises(SystemExit):
 
-            cli()
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
 
-        mock_main.assert_called_once_with(None, save_events=True)
-        _close_dangling_coro(mock_run)
+
+def pytest_raises_system_exit():
+    """Shim so the with-chain above stays readable. Returns a pytest.raises(SystemExit)."""
+    import pytest
+    return pytest.raises(SystemExit)

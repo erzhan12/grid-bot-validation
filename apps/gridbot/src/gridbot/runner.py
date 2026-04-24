@@ -99,8 +99,8 @@ class StrategyRunner:
         )
 
         # Process events
-        await runner.on_ticker(ticker_event)
-        await runner.on_execution(execution_event)
+        runner.on_ticker(ticker_event)
+        runner.on_execution(execution_event)
     """
 
     def __init__(
@@ -110,6 +110,7 @@ class StrategyRunner:
         instrument_info: Optional[InstrumentInfo] = None,
         anchor_store: Optional[GridAnchorStore] = None,
         on_intent_failed: Optional[Callable[[PlaceLimitIntent | CancelIntent, str], None]] = None,
+        on_unknown_order: Optional[Callable[[str], None]] = None,
         notifier: Optional[Notifier] = None,
     ):
         """Initialize strategy runner.
@@ -120,12 +121,15 @@ class StrategyRunner:
             instrument_info: Instrument info for qty rounding (None uses no rounding).
             anchor_store: Optional anchor store for grid persistence.
             on_intent_failed: Callback when intent execution fails (for retry queue).
+            on_unknown_order: Callback when WS reports a New order we don't track
+                (for fast-tracking the next order-sync sweep).
             notifier: Alert notifier for same-order error Telegram alerts.
         """
         self._config = strategy_config
         self._executor = executor
         self._anchor_store = anchor_store
         self._on_intent_failed = on_intent_failed
+        self._on_unknown_order = on_unknown_order
         self._notifier = notifier
 
         # Qty computation
@@ -284,7 +288,7 @@ class StrategyRunner:
 
         return {"long": long_orders, "short": short_orders}
 
-    async def on_ticker(self, event: TickerEvent) -> list[PlaceLimitIntent | CancelIntent]:
+    def on_ticker(self, event: TickerEvent) -> list[PlaceLimitIntent | CancelIntent]:
         """Process ticker event.
 
         Args:
@@ -309,7 +313,7 @@ class StrategyRunner:
                 return intents
 
             if intents:
-                await self._execute_intents(intents, limit_orders)
+                self._execute_intents(intents, limit_orders)
 
                 # Save anchor after grid changes
                 if self._anchor_store and len(self._engine.grid.grid) > 1:
@@ -320,7 +324,7 @@ class StrategyRunner:
             logger.error(f"{self.strat_id}: Error in on_ticker: {e}", exc_info=True)
             raise
 
-    async def on_execution(self, event: ExecutionEvent) -> list[PlaceLimitIntent | CancelIntent]:
+    def on_execution(self, event: ExecutionEvent) -> list[PlaceLimitIntent | CancelIntent]:
         """Process execution (fill) event.
 
         Args:
@@ -356,14 +360,14 @@ class StrategyRunner:
             # Only execute intents if no same-order error
             if intents and not self._same_order_error:
                 limit_orders = self.get_limit_orders()
-                await self._execute_intents(intents, limit_orders)
+                self._execute_intents(intents, limit_orders)
 
             return intents
         except Exception as e:
             logger.error(f"{self.strat_id}: Error in on_execution: {e}", exc_info=True)
             raise
 
-    async def on_order_update(self, event: OrderUpdateEvent) -> list[PlaceLimitIntent | CancelIntent]:
+    def on_order_update(self, event: OrderUpdateEvent) -> list[PlaceLimitIntent | CancelIntent]:
         """Process order update event.
 
         Args:
@@ -391,6 +395,12 @@ class StrategyRunner:
                     f"{self.strat_id}: Received order_update for untracked order "
                     f"order_id={event.order_id} order_link_id={event.order_link_id!r}"
                 )
+                # Fast-track the next order-sync sweep so the reconciler picks
+                # up this manual/unknown order and the next tick can cancel it
+                # if it's off-grid. Only on `New` — `Cancelled`/`Filled` tail
+                # events for orders we never tracked are harmless.
+                if event.status == "New" and self._on_unknown_order is not None:
+                    self._on_unknown_order(self.strat_id)
 
             # Pass to engine (update state regardless of error)
             intents = self._engine.on_event(event)
@@ -398,14 +408,14 @@ class StrategyRunner:
             # Only execute intents if no same-order error
             if intents and not self._same_order_error:
                 limit_orders = self.get_limit_orders()
-                await self._execute_intents(intents, limit_orders)
+                self._execute_intents(intents, limit_orders)
 
             return intents
         except Exception as e:
             logger.error(f"{self.strat_id}: Error in on_order_update: {e}", exc_info=True)
             raise
 
-    async def on_position_update(
+    def on_position_update(
         self,
         long_position: Optional[dict],
         short_position: Optional[dict],
@@ -582,29 +592,44 @@ class StrategyRunner:
             position_value=position_value,
         )
 
-    async def _execute_intents(
+    def _execute_intents(
         self,
         intents: list[PlaceLimitIntent | CancelIntent],
         limits: dict[str, list[dict]],
     ) -> None:
-        """Execute a list of intents."""
+        """Execute a list of intents.
+
+        Cancels run before places so margin and the per-symbol active-order
+        slots held by stale orders are freed before new placements try to
+        consume them. Within each group the engine's nearest-to-farthest
+        ordering is preserved.
+        """
         if self._executor.auth_cooldown:
             logger.debug(f"{self.strat_id}: Auth cooldown active, skipping {len(intents)} intents")
             return
 
-        for intent in intents:
+        cancels = [i for i in intents if isinstance(i, CancelIntent)]
+        places = [i for i in intents if isinstance(i, PlaceLimitIntent)]
+
+        for intent in cancels:
             if self._executor.auth_cooldown:
                 logger.debug(f"{self.strat_id}: Auth cooldown activated mid-batch, skipping remaining intents")
-                break
-            if isinstance(intent, PlaceLimitIntent):
-                await self._execute_place_intent(intent, limits)
-                # Refresh limits after each placement so _is_good_to_place
-                # sees newly placed orders. Without this, multiple reduce-only
-                # intents in the same batch can over-cover the position because
-                # they all check against the same stale snapshot.
-                limits = self.get_limit_orders()
-            elif isinstance(intent, CancelIntent):
-                await self._execute_cancel_intent(intent)
+                return
+            self._execute_cancel_intent(intent)
+
+        if cancels:
+            limits = self.get_limit_orders()
+
+        for intent in places:
+            if self._executor.auth_cooldown:
+                logger.debug(f"{self.strat_id}: Auth cooldown activated mid-batch, skipping remaining intents")
+                return
+            self._execute_place_intent(intent, limits)
+            # Refresh limits after each placement so _is_good_to_place
+            # sees newly placed orders. Without this, multiple reduce-only
+            # intents in the same batch can over-cover the position because
+            # they all check against the same stale snapshot.
+            limits = self.get_limit_orders()
 
     @staticmethod
     def _derive_direction_from_order(side: str, reduce_only: bool) -> Optional[DirectionType]:
@@ -685,7 +710,7 @@ class StrategyRunner:
 
         return position_size > (intent.qty + reduce_only_qty)
 
-    async def _execute_place_intent(self, intent: PlaceLimitIntent, limits: dict[str, list[dict]]) -> None:
+    def _execute_place_intent(self, intent: PlaceLimitIntent, limits: dict[str, list[dict]]) -> None:
         """Execute a place order intent."""
         # Resolve qty (engine emits qty=0, we fill it in)
         intent = self._resolve_qty(intent)
@@ -728,7 +753,7 @@ class StrategyRunner:
             if self._on_intent_failed:
                 self._on_intent_failed(intent, result.error)
 
-    async def _execute_cancel_intent(self, intent: CancelIntent) -> None:
+    def _execute_cancel_intent(self, intent: CancelIntent) -> None:
         """Execute a cancel order intent."""
         result = self._executor.execute_cancel(intent)
 
@@ -879,6 +904,12 @@ class StrategyRunner:
         (long first, then short). This prevents an unrelated fill on one
         side from clearing an error detected on the other side.
 
+        Owns the lifecycle of ``_same_order_error``: resets the flag
+        once before evaluation, then lets ``_check_same_orders_side``
+        set it to True on detection. The error auto-clears when new
+        fills push the problematic pair out of the buffer, because
+        each execution re-enters here and starts from a clean reset.
+
         Args:
             event: Execution event to check.
         """
@@ -911,9 +942,12 @@ class StrategyRunner:
         }
         buffer.appendleft(exec_record)
 
-        # Check BOTH buffers (matches bbu2: check long first, short second)
-        # _check_same_orders_side resets the flag before evaluating, so we
-        # must check both to avoid one side clearing the other's error.
+        # Reset the flag once, then check both buffers (long first, short
+        # second, matching bbu2). The side-check is set-on-error only; we
+        # own the reset here so an unrelated fill on short can't clear an
+        # error detected on long. Early-return after long keeps the work
+        # bounded when a duplicate was already found.
+        self._same_order_error = False
         self._check_same_orders_side(self._recent_executions_long)
         if self._same_order_error:
             return
@@ -922,20 +956,18 @@ class StrategyRunner:
     def _check_same_orders_side(self, executions: deque) -> None:
         """Check execution buffer for same-price duplicates.
 
-        Re-evaluates on every call (bbu2-style): resets error flag first,
-        then checks. Error auto-clears when new fills push the problematic
-        pair out of the buffer.
-
         Compares consecutive executions. If same price and side but different
         order_id, this indicates a duplicate order was placed at the same
         price level - a grid bug.
 
+        Set-on-error only: this method sets ``_same_order_error`` to
+        True on detection and never clears it. The caller
+        (``_check_same_orders``) is responsible for resetting the flag
+        once before invoking this across both buffers.
+
         Args:
             executions: Deque of recent execution records for one direction.
         """
-        # Reset before re-evaluation (matches bbu2 _check_same_orders_side line 159)
-        self._same_order_error = False
-
         if len(executions) < 2:
             return
 

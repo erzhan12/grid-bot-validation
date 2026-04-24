@@ -548,14 +548,44 @@ class TestInit:
             BybitRestClient(api_key="key1", api_secret="secret1", testnet=False)
 
             mock_http.assert_called_once_with(
-                testnet=False, api_key="key1", api_secret="secret1"
+                testnet=False, api_key="key1", api_secret="secret1", timeout=10
             )
 
     def test_default_testnet_true(self):
         with patch("bybit_adapter.rest_client.HTTP") as mock_http:
             BybitRestClient(api_key="k", api_secret="s")
 
-            mock_http.assert_called_once_with(testnet=True, api_key="k", api_secret="s")
+            mock_http.assert_called_once_with(
+                testnet=True, api_key="k", api_secret="s", timeout=10
+            )
+
+    def test_default_timeout_is_10_seconds(self):
+        """Default timeout must match pybit's built-in default of 10s."""
+        with patch("bybit_adapter.rest_client.HTTP") as mock_http:
+            BybitRestClient(api_key="k", api_secret="s")
+
+            _, kwargs = mock_http.call_args
+            assert kwargs["timeout"] == 10
+
+    def test_custom_timeout_threaded_through_to_HTTP(self):
+        """Custom timeout passed on the dataclass must reach pybit.HTTP()."""
+        with patch("bybit_adapter.rest_client.HTTP") as mock_http:
+            BybitRestClient(api_key="k", api_secret="s", timeout=25)
+
+            _, kwargs = mock_http.call_args
+            assert kwargs["timeout"] == 25
+
+    def test_zero_timeout_raises_value_error(self):
+        """timeout=0 disables the per-request cap and must be rejected."""
+        with patch("bybit_adapter.rest_client.HTTP"):
+            with pytest.raises(ValueError, match="timeout must be > 0"):
+                BybitRestClient(api_key="k", api_secret="s", timeout=0)
+
+    def test_negative_timeout_raises_value_error(self):
+        """Negative timeout is nonsense and must fail fast."""
+        with patch("bybit_adapter.rest_client.HTTP"):
+            with pytest.raises(ValueError, match="timeout must be > 0"):
+                BybitRestClient(api_key="k", api_secret="s", timeout=-5)
 
 
 # ---------------------------------------------------------------------------

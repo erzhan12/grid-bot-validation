@@ -21,8 +21,9 @@ _DEFAULT_THROTTLE_SECONDS = 60
 class Notifier:
     """Sends alerts via Telegram with throttling.
 
-    Thread-safe: can be called from WebSocket threads and asyncio tasks.
-    Sends Telegram messages in a background thread to avoid blocking.
+    Thread-safe: can be called from WebSocket (pybit) threads and the
+    main polling loop. Sends Telegram messages in a background thread
+    to avoid blocking.
 
     If no Telegram config is provided, acts as a no-op (log-only).
     """

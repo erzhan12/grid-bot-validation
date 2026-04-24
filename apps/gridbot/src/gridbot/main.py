@@ -6,7 +6,6 @@ Usage:
 """
 
 import argparse
-import asyncio
 import logging
 import os
 import signal
@@ -73,12 +72,11 @@ def setup_logging(json_file: Optional[str] = None) -> None:
 logger = logging.getLogger(__name__)
 
 
-async def main(config_path: Optional[str] = None, save_events: bool = False) -> int:
-    """Main async entry point.
+def main(config_path: Optional[str] = None) -> int:
+    """Main entry point.
 
     Args:
         config_path: Path to configuration file.
-        save_events: Override enable_event_saver flag from CLI.
 
     Returns:
         Exit code (0 for success, non-zero for failure).
@@ -86,8 +84,6 @@ async def main(config_path: Optional[str] = None, save_events: bool = False) -> 
     # Load configuration
     try:
         config = load_config(config_path)
-        if save_events:
-            config.enable_event_saver = True
         logger.info(f"Loaded configuration with {len(config.strategies)} strategies")
     except FileNotFoundError as e:
         logger.error(f"Configuration file not found: {e}")
@@ -124,40 +120,47 @@ async def main(config_path: Optional[str] = None, save_events: bool = False) -> 
     # Create orchestrator
     orchestrator = Orchestrator(config, db, notifier=notifier)
 
-    # Set up signal handlers.  First Ctrl+C requests graceful shutdown;
-    # second Ctrl+C force-exits (needed because synchronous REST calls
-    # block the event loop and prevent the shutdown event from being processed).
-    shutdown_event = asyncio.Event()
+    # Set up signal handlers. First Ctrl+C requests graceful shutdown;
+    # second Ctrl+C force-exits (in case graceful shutdown itself is
+    # hung — e.g. a blocking REST call inside orchestrator.stop() or a
+    # WS disconnect waiting on an unresponsive socket).
     _shutdown_requested = False
 
     def signal_handler(sig, frame):
         nonlocal _shutdown_requested
         if _shutdown_requested:
             logger.warning("Second interrupt received, forcing exit")
+            # os._exit (not sys.exit) is intentional. The second Ctrl+C
+            # is the escape hatch for a hung graceful-shutdown path:
+            # orchestrator.stop() runs in the main() finally block and
+            # may itself be blocked (e.g. pybit REST call or WS teardown).
+            # sys.exit raises SystemExit, which unwinds through finally
+            # blocks — i.e. back into the same stuck cleanup code, or
+            # worse, gets swallowed by a broad except inside stop(). The
+            # _exit(2) syscall terminates the process immediately with
+            # no Python cleanup, which is exactly what "force quit"
+            # requires. Do not "fix" this to sys.exit without first
+            # solving the hung-cleanup problem at its root.
             os._exit(130)
         _shutdown_requested = True
         logger.info(f"Received signal {sig}, initiating shutdown (press Ctrl+C again to force)")
-        shutdown_event.set()
+        orchestrator.request_stop()
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Start orchestrator
+    # Start orchestrator and block on the main loop
     try:
-        await orchestrator.start()
+        orchestrator.start()
         logger.info("Gridbot started successfully")
-
-        # Wait for shutdown signal
-        await shutdown_event.wait()
-
+        orchestrator.run()  # blocks until request_stop() is called
     except Exception as e:
         logger.error(f"Error during startup: {e}")
         return 1
-
     finally:
         # Stop orchestrator
         logger.info("Shutting down gridbot")
-        await orchestrator.stop()
+        orchestrator.stop()
 
     logger.info("Gridbot stopped")
     return 0
@@ -187,11 +190,6 @@ def cli() -> None:
         action="store_true",
         help="Enable debug logging",
     )
-    parser.add_argument(
-        "--save-events",
-        action="store_true",
-        help="Start embedded EventSaver for live data capture",
-    )
 
     args = parser.parse_args()
 
@@ -203,12 +201,9 @@ def cli() -> None:
         logging.getLogger("gridbot").setLevel(logging.DEBUG)
         logging.getLogger("gridcore").setLevel(logging.DEBUG)
 
-    # Override config flag from CLI
-    save_events = args.save_events
-
     # Run main
     try:
-        exit_code = asyncio.run(main(args.config, save_events=save_events))
+        exit_code = main(args.config)
         sys.exit(exit_code)
     except KeyboardInterrupt:
         logger.info("Interrupted")
