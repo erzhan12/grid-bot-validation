@@ -16,6 +16,7 @@ from dataclasses import replace
 from decimal import Decimal
 
 from gridcore import DirectionType
+from gridcore.instrument_info import InstrumentInfo
 
 from backtest.config import BacktestConfig, BacktestStrategyConfig, WindDownMode
 from backtest.engine import BacktestEngine
@@ -141,12 +142,20 @@ def _run_path_b(events):
         direction=DirectionType.SHORT,
         commission_rate=strategy_config.commission_rate,
     )
+    instrument_info = InstrumentInfo(
+        symbol=SYMBOL,
+        qty_step=QTY_STEP,
+        tick_size=Decimal(TICK_SIZE),
+        min_qty=QTY_STEP,
+        max_qty=Decimal("100"),
+    )
     runner = BacktestRunner(
         strategy_config=strategy_config,
         executor=executor,
         session=session,
         long_tracker=long_tracker,
         short_tracker=short_tracker,
+        instrument_info=instrument_info,
     )
 
     # Feed events through the two-phase processing loop

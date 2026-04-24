@@ -314,6 +314,7 @@ class ReplayEngine:
             session=session,
             long_tracker=long_tracker,
             short_tracker=short_tracker,
+            instrument_info=instrument_info,
         )
 
     def _create_qty_calculator(self, config, instrument_info):
