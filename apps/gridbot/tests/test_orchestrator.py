@@ -1632,6 +1632,139 @@ class TestOrchestratorHealthCheckOnce:
         assert notifier.alert.call_count >= 1
         assert notifier.alert_exception.call_count >= 1
 
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_health_check_warns_on_slow_reconnect(
+        self, mock_private_ws_cls, mock_public_ws_cls, mock_rest_client,
+        gridbot_config, account_config, strategy_config, caplog,
+    ):
+        """A reconnect exceeding the threshold emits a WARNING."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+
+        # Public branch enters reconnect and consumes both time.monotonic calls
+        pub_ws = orchestrator._public_ws["test_account"]
+        pub_ws.is_connected.return_value = False
+        pub_ws.connect = Mock()
+        pub_ws.disconnect = Mock()
+
+        # Private branch skipped so the iterator is not drained further
+        priv_ws = orchestrator._private_ws["test_account"]
+        priv_ws.is_connected.return_value = True
+
+        # Cooldown sweep at top of _health_check_once is a no-op
+        orchestrator._auth_cooldown_until = {}
+
+        with patch(
+            "gridbot.orchestrator.time.monotonic",
+            side_effect=iter([0.0, 6.0]),
+        ):
+            with caplog.at_level("WARNING", logger="gridbot.orchestrator"):
+                orchestrator._health_check_once()
+
+        matching = [
+            r for r in caplog.records
+            if r.levelname == "WARNING"
+            and "Public WS reconnect" in r.getMessage()
+            and "took" in r.getMessage()
+            and "blocking main polling loop" in r.getMessage()
+        ]
+        assert len(matching) == 1, (
+            f"Expected one slow-reconnect WARNING, got {len(matching)}: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_health_check_warns_on_slow_private_reconnect(
+        self, mock_private_ws_cls, mock_public_ws_cls, mock_rest_client,
+        gridbot_config, account_config, strategy_config, caplog,
+    ):
+        """Private-branch slow reconnect emits its own distinct WARNING."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+
+        # Public branch skipped so the monotonic iterator is only consumed
+        # by the private branch (start + finally = exactly 2 calls).
+        pub_ws = orchestrator._public_ws["test_account"]
+        pub_ws.is_connected.return_value = True
+
+        priv_ws = orchestrator._private_ws["test_account"]
+        priv_ws.is_connected.return_value = False
+        priv_ws.connect = Mock()
+        priv_ws.disconnect = Mock()
+
+        orchestrator._auth_cooldown_until = {}
+
+        with patch(
+            "gridbot.orchestrator.time.monotonic",
+            side_effect=iter([0.0, 6.0]),
+        ):
+            with caplog.at_level("WARNING", logger="gridbot.orchestrator"):
+                orchestrator._health_check_once()
+
+        matching = [
+            r for r in caplog.records
+            if r.levelname == "WARNING"
+            and "Private WS reconnect" in r.getMessage()
+            and "took" in r.getMessage()
+            and "blocking main polling loop" in r.getMessage()
+        ]
+        assert len(matching) == 1, (
+            f"Expected one slow-reconnect WARNING, got {len(matching)}: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_health_check_no_warn_on_fast_reconnect(
+        self, mock_private_ws_cls, mock_public_ws_cls, mock_rest_client,
+        gridbot_config, account_config, strategy_config, caplog,
+    ):
+        """A reconnect under the threshold must NOT emit the warning."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+
+        pub_ws = orchestrator._public_ws["test_account"]
+        pub_ws.is_connected.return_value = False
+        pub_ws.connect = Mock()
+        pub_ws.disconnect = Mock()
+
+        priv_ws = orchestrator._private_ws["test_account"]
+        priv_ws.is_connected.return_value = True
+
+        orchestrator._auth_cooldown_until = {}
+
+        with patch(
+            "gridbot.orchestrator.time.monotonic",
+            side_effect=iter([0.0, 0.5]),
+        ):
+            with caplog.at_level("WARNING", logger="gridbot.orchestrator"):
+                orchestrator._health_check_once()
+
+        matching = [
+            r for r in caplog.records
+            if r.levelname == "WARNING"
+            and "WS reconnect" in r.getMessage()
+            and "blocking main polling loop" in r.getMessage()
+        ]
+        assert matching == [], (
+            f"Unexpected slow-reconnect WARNING on fast path: "
+            f"{[r.getMessage() for r in matching]}"
+        )
+
 
 class TestOrchestratorOrderSyncOnce:
     """Tests for _order_sync_once (single-shot, called from _tick)."""

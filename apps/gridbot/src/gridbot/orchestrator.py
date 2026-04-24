@@ -41,6 +41,7 @@ _HEALTH_CHECK_INTERVAL = 10  # seconds
 _CHECK_INTERVAL = 0.1  # 100 ms main loop tick (bbu2 value)
 _RETRY_TICK_INTERVAL = 1.0  # seconds between retry-queue drains
 _POSITION_FETCH_SLOW_THRESHOLD = 2.0  # log a warning if REST position fetch takes longer
+_WS_RECONNECT_SLOW_THRESHOLD = 5.0  # log a warning if a single WS disconnect+connect takes longer
 _POSITION_TICK_BASE = 15.0  # base cadence for the steady-state position-fetch rotation tick (seconds)
 _POSITION_STARTUP_HARD_CAP = 60.0  # hard ceiling on the startup batch; exceeding aborts startup
 _MAX_TICK_BACKOFF = 30.0  # cap (s) on main-loop backoff after consecutive _tick() failures
@@ -1142,6 +1143,7 @@ class Orchestrator:
                         f"Public WS disconnected for {account_name}, reconnecting",
                         error_key=f"ws_pub_disconnect_{account_name}",
                     )
+                    reconnect_start = time.monotonic()
                     try:
                         pub_ws.disconnect()
                         pub_ws.connect()  # re-subscribes automatically via callbacks
@@ -1151,6 +1153,14 @@ class Orchestrator:
                             f"Public WS reconnect {account_name}", e,
                             error_key=f"ws_pub_reconnect_{account_name}",
                         )
+                    finally:
+                        elapsed = time.monotonic() - reconnect_start
+                        if elapsed > _WS_RECONNECT_SLOW_THRESHOLD:
+                            logger.warning(
+                                "Public WS reconnect for %s took %.1fs "
+                                "(threshold=%.1fs) — blocking main polling loop",
+                                account_name, elapsed, _WS_RECONNECT_SLOW_THRESHOLD,
+                            )
 
                 # Check private WS
                 priv_ws = self._private_ws.get(account_name)
@@ -1159,6 +1169,7 @@ class Orchestrator:
                         f"Private WS disconnected for {account_name}, reconnecting",
                         error_key=f"ws_priv_disconnect_{account_name}",
                     )
+                    reconnect_start = time.monotonic()
                     try:
                         priv_ws.disconnect()
                         priv_ws.connect()  # re-subscribes automatically via callbacks
@@ -1168,6 +1179,14 @@ class Orchestrator:
                             f"Private WS reconnect {account_name}", e,
                             error_key=f"ws_priv_reconnect_{account_name}",
                         )
+                    finally:
+                        elapsed = time.monotonic() - reconnect_start
+                        if elapsed > _WS_RECONNECT_SLOW_THRESHOLD:
+                            logger.warning(
+                                "Private WS reconnect for %s took %.1fs "
+                                "(threshold=%.1fs) — blocking main polling loop",
+                                account_name, elapsed, _WS_RECONNECT_SLOW_THRESHOLD,
+                            )
         except Exception as e:
             self._notifier.alert_exception(
                 "_health_check_once", e, error_key="health_check_loop",
