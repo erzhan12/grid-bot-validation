@@ -24,8 +24,6 @@ from gridcore import (
     GridAnchorStore,
     InstrumentInfo,
     TickerEvent,
-    ExecutionEvent,
-    OrderUpdateEvent,
 )
 from gridcore.intents import CancelIntent
 
