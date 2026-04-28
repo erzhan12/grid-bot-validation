@@ -68,7 +68,7 @@ class AuthCooldownManager:
         """
         if threading.current_thread() is not threading.main_thread():
             raise RuntimeError(
-                "_on_auth_cooldown_entered must run on the main thread; "
+                "AuthCooldownManager.enter() must run on the main thread; "
                 "see docstring for the locking required before relaxing "
                 f"this. Called from: {threading.current_thread().name}"
             )

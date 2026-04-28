@@ -107,7 +107,7 @@ class TestEnter:
         # Documented prefix — guards against accidental message drift that
         # would otherwise slip through looser substring checks.
         assert str(captured[0]).startswith(
-            "_on_auth_cooldown_entered must run on the main thread"
+            "AuthCooldownManager.enter() must run on the main thread"
         )
         assert "worker-42" in str(captured[0])
         assert "s1" not in manager._auth_cooldown_until
