@@ -227,6 +227,56 @@ class TestAtomicWrite:
         assert Path(file_path).read_text() == original_content
         assert os.path.exists(file_path)
 
+    def test_failed_save_cleans_up_tmp_file(self, tmp_path):
+        """A write that fails at os.replace must remove its .tmp file before
+        propagating — otherwise stale tmp files accumulate (especially on
+        disk-full / permission errors that prevent the next save from
+        succeeding either)."""
+        file_path = str(tmp_path / "grid_state.json")
+        tmp_file = file_path + ".tmp"
+        store = GridStateStore(file_path)
+
+        with patch("os.replace", side_effect=OSError("simulated failure")):
+            with pytest.raises(OSError):
+                store._sync_write_to_disk(
+                    "strat1",
+                    {"grid": _sample_grid(), "grid_step": 0.2, "grid_count": 20},
+                )
+
+        assert not os.path.exists(tmp_file), (
+            "Failed atomic write left a stale .tmp file behind"
+        )
+
+    def test_failed_delete_cleans_up_tmp_file(self, tmp_path):
+        """delete()'s atomic write must also clean up its tmp file on failure
+        (delete uses the same _atomic_write helper)."""
+        file_path = str(tmp_path / "grid_state.json")
+        tmp_file = file_path + ".tmp"
+        store = GridStateStore(file_path)
+        store.save("strat1", _sample_grid(), 0.2, 20)
+        store.flush()
+
+        with patch("os.replace", side_effect=OSError("simulated failure")):
+            # delete catches OSError and returns False; the tmp cleanup must
+            # still run before the catch swallows the error.
+            assert store.delete("strat1") is False
+
+        assert not os.path.exists(tmp_file), (
+            "Failed delete left a stale .tmp file behind"
+        )
+
+    def test_successful_write_leaves_no_tmp(self, tmp_path):
+        """Sanity check: after a successful save the .tmp file does not exist
+        (os.replace moved it to the final destination)."""
+        file_path = str(tmp_path / "grid_state.json")
+        tmp_file = file_path + ".tmp"
+        store = GridStateStore(file_path)
+        store.save("strat1", _sample_grid(), 0.2, 20)
+        store.flush()
+
+        assert os.path.exists(file_path)
+        assert not os.path.exists(tmp_file)
+
 
 class TestDedupe:
     def test_identical_payload_skips_thread_spawn(self, tmp_path):
@@ -445,3 +495,56 @@ class TestDelete:
     def test_delete_missing_file_returns_false(self, tmp_path):
         store = GridStateStore(str(tmp_path / "missing.json"))
         assert store.delete("strat1") is False
+
+    def test_delete_does_not_silently_drop_concurrent_save(self, tmp_path):
+        """Regression: with cleanup happening AFTER the file write, a
+        concurrent save() with the same payload would dedupe-hit on the
+        stale _last_fingerprint and be silently lost. Force the race via
+        os.replace blocked on a threading.Event, fire save() in that window,
+        then resume delete() and verify the save still landed on disk."""
+        import time
+
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
+        grid = _sample_grid()
+
+        # Seed the store so the entry exists and _last_fingerprint is set.
+        store.save("strat1", grid, 0.2, 20)
+        store.flush()
+
+        proceed = threading.Event()
+        original_replace = os.replace
+
+        def slow_replace(src, dst):
+            proceed.wait(timeout=2.0)
+            return original_replace(src, dst)
+
+        def concurrent_save():
+            store.save("strat1", grid, 0.2, 20)
+
+        with patch("os.replace", side_effect=slow_replace):
+            delete_thread = threading.Thread(
+                target=lambda: store.delete("strat1"), daemon=True,
+            )
+            delete_thread.start()
+            time.sleep(0.05)  # let delete() reach os.replace and pause
+
+            save_thread = threading.Thread(target=concurrent_save, daemon=True)
+            save_thread.start()
+            time.sleep(0.05)  # let save() race in while delete is paused
+
+            proceed.set()
+            delete_thread.join(timeout=2.0)
+            save_thread.join(timeout=2.0)
+
+        store.flush()
+
+        # With the fix (cleanup BEFORE the write), the concurrent save sees
+        # a cleared fingerprint and re-persists. Without the fix it would
+        # dedupe-hit on stale _last_fingerprint and the entry would be gone.
+        loaded = store.load("strat1")
+        assert loaded is not None, (
+            "Concurrent save() during delete() was silently dropped — "
+            "delete()'s dedupe cleanup happened too late."
+        )
+        assert loaded["grid"] == grid

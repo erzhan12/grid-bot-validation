@@ -236,17 +236,31 @@ class GridStateStore:
         non-dict-root file is silently overwritten with a fresh dict."""
         all_data = self._read_all_data()
         all_data[strat_id] = payload
+        self._atomic_write(all_data)
 
+    def _atomic_write(self, all_data: dict) -> None:
+        """Write the full data dict to self.file_path atomically. On any
+        failure (json.dump, fsync, or os.replace) the half-written .tmp file
+        is removed so failed writes do not leave garbage behind. After a
+        successful os.replace the .tmp path no longer exists, so the cleanup
+        branch only runs on real failure."""
         dir_path = os.path.dirname(self.file_path)
         if dir_path and not os.path.exists(dir_path):
             os.makedirs(dir_path)
 
         tmp_path = self.file_path + '.tmp'
-        with open(tmp_path, 'w') as f:
-            json.dump(all_data, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, self.file_path)
+        try:
+            with open(tmp_path, 'w') as f:
+                json.dump(all_data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.file_path)
+        except BaseException:
+            try:
+                os.remove(tmp_path)
+            except FileNotFoundError:
+                pass
+            raise
 
     def delete(self, strat_id: str) -> bool:
         """
@@ -267,20 +281,22 @@ class GridStateStore:
             if strat_id not in all_data:
                 return False
 
+            # Clear dedupe state BEFORE the disk write. Otherwise a concurrent
+            # save() with the same payload could slip in between the file
+            # write and the cleanup, see a stale _last_fingerprint match, and
+            # silently dedupe-skip — losing the caller's save with no error.
+            # A save() racing AFTER the cleanup will set its own fingerprint
+            # and queue a writer that waits on _io_lock; once we release it,
+            # the writer persists the new payload — caller intent honored.
+            with self._cv:
+                self._last_fingerprint.pop(strat_id, None)
+                self._pending_payload.pop(strat_id, None)
+
             del all_data[strat_id]
 
-            tmp_path = self.file_path + '.tmp'
             try:
-                with open(tmp_path, 'w') as f:
-                    json.dump(all_data, f, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp_path, self.file_path)
+                self._atomic_write(all_data)
             except (IOError, OSError):
                 return False
-
-        with self._cv:
-            self._last_fingerprint.pop(strat_id, None)
-            self._pending_payload.pop(strat_id, None)
 
         return True
