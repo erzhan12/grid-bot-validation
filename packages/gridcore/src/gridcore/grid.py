@@ -12,7 +12,7 @@ Extracted from bbu2-master/greed.py with the following key transformations:
 import logging
 from decimal import Decimal
 from enum import StrEnum
-from typing import Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,8 @@ class Grid:
     the original greed.py when given the same inputs.
     """
 
-    def __init__(self, tick_size: Decimal, grid_count: int = 50, grid_step: float = 0.2, rebalance_threshold: float = 0.3):
+    def __init__(self, tick_size: Decimal, grid_count: int = 50, grid_step: float = 0.2, rebalance_threshold: float = 0.3,
+                 on_change: Optional[Callable[[list[dict]], None]] = None):
         """
         Initialize Grid calculator.
 
@@ -42,6 +43,9 @@ class Grid:
             grid_count: Number of grid levels (default 50 = 25 buy + 1 wait + 25 sell)
             grid_step: Step size in percentage (default 0.2 = 0.2% between levels)
             rebalance_threshold: Threshold for rebalancing grid when imbalanced (default 0.3 = 30%)
+            on_change: Optional callback fired after build_grid/update_grid mutates self.grid.
+                Used by callers (e.g. live runner) to persist grid state. Grid stays pure —
+                the callback is just a function reference, no I/O knowledge here.
         """
         self.grid: list[dict] = []
         self.tick_size = tick_size
@@ -49,6 +53,17 @@ class Grid:
         self.grid_step = grid_step
         self.REBALANCE_THRESHOLD = rebalance_threshold
         self._original_anchor_price: Optional[float] = None
+        self._on_change = on_change
+
+    def _notify_change(self) -> None:
+        """Invoke on_change callback. Errors are logged but never propagate —
+        persistence failures must not crash strategy logic."""
+        if self._on_change is None:
+            return
+        try:
+            self._on_change(self.grid)
+        except Exception as e:
+            logger.error("Grid on_change callback failed: %s", e, exc_info=True)
 
     def _round_price(self, price: float) -> float:
         """
@@ -124,6 +139,8 @@ class Grid:
                 f"Check tick_size={self.tick_size} and grid_step={self.grid_step}."
             )
 
+        self._notify_change()
+
     def __rebuild_grid(self, last_close: float) -> None:
         """
         Rebuild grid from scratch.
@@ -132,6 +149,75 @@ class Grid:
         """
         self.grid = []
         self.build_grid(last_close)
+
+    def restore_grid(self, grid_list: list[dict]) -> bool:
+        """
+        Restore grid state from a serialized list of {side, price} dicts.
+
+        Validates the restored structure via is_grid_correct(); on failure
+        the grid is left empty so the engine will rebuild from market price
+        on the first ticker. Does NOT fire on_change — restoration is not a
+        mutation worth persisting (we just loaded what was already on disk).
+
+        Args:
+            grid_list: Serialized grid (list of {'side': str, 'price': float}).
+
+        Returns:
+            True if the grid was restored and validated, False otherwise.
+        """
+        try:
+            restored = [
+                {'side': GridSideType(item['side']), 'price': float(item['price'])}
+                for item in grid_list
+            ]
+        except (KeyError, ValueError, TypeError) as e:
+            logger.warning("Restored grid failed parsing (%s), building fresh grid", e)
+            self.grid = []
+            return False
+
+        self.grid = restored
+
+        if not self.is_grid_correct():
+            logger.warning("Restored grid failed validation, building fresh grid")
+            self.grid = []
+            return False
+
+        # Derive _original_anchor_price from the WAIT center so anchor_price
+        # property continues to reflect a meaningful "center" value.
+        wait_indices = [i for i, g in enumerate(self.grid) if g['side'] == GridSideType.WAIT]
+        if wait_indices:
+            center = (wait_indices[0] + wait_indices[-1]) // 2
+        else:
+            center = len(self.grid) // 2
+        self._original_anchor_price = self.grid[center]['price']
+
+        return True
+
+    @property
+    def bounds(self) -> tuple[float, float]:
+        """(min_price, max_price) computed in one pass. Raises ValueError if
+        the grid is empty. Prefer this over min_grid + max_grid in hot paths
+        (e.g. per-tick drift guard) — saves one full iteration over the grid."""
+        if not self.grid:
+            raise ValueError("Cannot get bounds from empty grid")
+        lo = hi = self.grid[0]['price']
+        for step in self.grid[1:]:
+            p = step['price']
+            if p < lo:
+                lo = p
+            elif p > hi:
+                hi = p
+        return lo, hi
+
+    @property
+    def min_grid(self) -> float:
+        """Lowest grid price. Raises ValueError if grid is empty."""
+        return self.bounds[0]
+
+    @property
+    def max_grid(self) -> float:
+        """Highest grid price. Raises ValueError if grid is empty."""
+        return self.bounds[1]
 
     def update_grid(self, last_filled_price: Optional[float], last_close: Optional[float]) -> None:
         """
@@ -169,6 +255,8 @@ class Grid:
                 grid['side'] = GridSideType.BUY
 
         self.__center_grid()
+
+        self._notify_change()
 
     def __center_grid(self) -> None:
         """

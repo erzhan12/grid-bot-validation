@@ -932,6 +932,129 @@ class TestAnchorPricePersistence:
             f"Original center should be SELL after price moved below it, got {center_after_fill['side']}"
 
 
+class TestRestoredGrid:
+    """Tests for restoring grid state on engine construction."""
+
+    def _ticker(self, price: float) -> TickerEvent:
+        return TickerEvent(
+            event_type=EventType.TICKER,
+            symbol='BTCUSDT',
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            last_price=Decimal(str(price)),
+            mark_price=Decimal(str(price)),
+            bid1_price=Decimal(str(price - 1)),
+            ask1_price=Decimal(str(price + 1)),
+            funding_rate=Decimal('0.0001'),
+        )
+
+    def test_restored_grid_skips_build_on_first_ticker(self):
+        """Engine constructed with restored_grid does not call build_grid on
+        the first ticker (the saved grid is preserved verbatim)."""
+        config = GridConfig(grid_count=10, grid_step=0.2)
+        restored = [
+            {'side': 'Buy', 'price': 99000.0},
+            {'side': 'Buy', 'price': 99500.0},
+            {'side': 'Wait', 'price': 100000.0},
+            {'side': 'Sell', 'price': 100500.0},
+            {'side': 'Sell', 'price': 101000.0},
+        ]
+        engine = GridEngine(
+            symbol='BTCUSDT',
+            tick_size=Decimal('0.1'),
+            config=config,
+            strat_id='btcusdt_test',
+            restored_grid=restored,
+        )
+
+        # First ticker within the restored grid range — must not rebuild.
+        engine.on_event(self._ticker(100100.0), {'long': [], 'short': []})
+
+        prices = [g['price'] for g in engine.grid.grid]
+        assert prices == [99000.0, 99500.0, 100000.0, 100500.0, 101000.0]
+
+    def test_restored_grid_with_invalid_pattern_falls_back_to_fresh_build(self):
+        """Restored grid that fails validation leaves the engine empty so the
+        first ticker triggers a fresh build_grid at market price."""
+        config = GridConfig(grid_count=50, grid_step=0.2)
+        bad = [
+            {'side': 'Sell', 'price': 99.0},  # SELL before BUY — invalid
+            {'side': 'Buy', 'price': 99.5},
+        ]
+        engine = GridEngine(
+            symbol='BTCUSDT',
+            tick_size=Decimal('0.1'),
+            config=config,
+            strat_id='btcusdt_test',
+            restored_grid=bad,
+        )
+        assert engine.grid.grid == []
+
+        engine.on_event(self._ticker(100000.0), {'long': [], 'short': []})
+
+        # Fresh grid built at market price.
+        assert engine.grid.anchor_price == 100000.0
+
+    def test_drift_guard_rebuilds_when_price_outside_grid(self, caplog):
+        """If last_close is outside [min_grid, max_grid] for the restored grid,
+        the drift guard rebuilds at the current price on the first ticker."""
+        config = GridConfig(grid_count=10, grid_step=0.2)
+        restored = [
+            {'side': 'Buy', 'price': 99.0},
+            {'side': 'Wait', 'price': 100.0},
+            {'side': 'Sell', 'price': 101.0},
+        ]
+        engine = GridEngine(
+            symbol='BTCUSDT',
+            tick_size=Decimal('0.1'),
+            config=config,
+            strat_id='btcusdt_test',
+            restored_grid=restored,
+        )
+
+        with caplog.at_level('INFO'):
+            engine.on_event(self._ticker(150.0), {'long': [], 'short': []})
+
+        assert any('Restored grid out of range' in r.message for r in caplog.records)
+        # Rebuild centered at the current price.
+        assert engine.grid.anchor_price == 150.0
+
+    def test_drift_guard_does_not_fire_when_price_inside_grid(self):
+        config = GridConfig(grid_count=10, grid_step=0.2)
+        restored = [
+            {'side': 'Buy', 'price': 99.0},
+            {'side': 'Buy', 'price': 99.5},
+            {'side': 'Wait', 'price': 100.0},
+            {'side': 'Sell', 'price': 100.5},
+            {'side': 'Sell', 'price': 101.0},
+        ]
+        engine = GridEngine(
+            symbol='BTCUSDT',
+            tick_size=Decimal('0.1'),
+            config=config,
+            strat_id='btcusdt_test',
+            restored_grid=restored,
+        )
+        engine.on_event(self._ticker(100.5), {'long': [], 'short': []})
+
+        prices = [g['price'] for g in engine.grid.grid]
+        assert prices == [99.0, 99.5, 100.0, 100.5, 101.0]
+
+    def test_on_grid_change_callback_fires_on_build(self):
+        """on_grid_change is invoked when the engine builds a fresh grid."""
+        captured = []
+        config = GridConfig(grid_count=10, grid_step=0.2)
+        engine = GridEngine(
+            symbol='BTCUSDT',
+            tick_size=Decimal('0.1'),
+            config=config,
+            strat_id='btcusdt_test',
+            on_grid_change=lambda g: captured.append(len(g)),
+        )
+        engine.on_event(self._ticker(100.0), {'long': [], 'short': []})
+        assert captured == [11]
+
+
 class TestGridConfigValidation:
     """Tests for GridConfig validation in __post_init__."""
 

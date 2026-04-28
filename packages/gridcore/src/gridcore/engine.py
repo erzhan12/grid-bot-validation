@@ -10,7 +10,7 @@ Extracted from bbu2-master/strat.py Strat50 class with the following transformat
 
 import logging
 from decimal import Decimal
-from typing import Optional
+from typing import Callable, Optional
 
 from gridcore.config import GridConfig
 
@@ -43,7 +43,9 @@ class GridEngine:
     }
 
     def __init__(self, symbol: str, tick_size: Decimal, config: GridConfig,
-                 strat_id: str, anchor_price: Optional[float] = None):
+                 strat_id: str, anchor_price: Optional[float] = None,
+                 restored_grid: Optional[list[dict]] = None,
+                 on_grid_change: Optional[Callable[[list[dict]], None]] = None):
         """
         Initialize grid trading engine.
 
@@ -52,15 +54,25 @@ class GridEngine:
             tick_size: Minimum price increment for the symbol
             config: Grid configuration parameters
             strat_id: Strategy identifier for this engine instance
-            anchor_price: Optional anchor price to build grid from instead of market price.
-                         Used to restore grid levels after restart.
+            anchor_price: Optional starting price for build_grid on the first ticker
+                         (overrides last_close). Used by backtests to pin grid origin.
+            restored_grid: Optional serialized grid (list of {side, price}) to restore
+                         on construction. Used by the live runner to resume after restart.
+                         If validation fails the engine falls back to a fresh build on
+                         the first ticker.
+            on_grid_change: Optional callback invoked with the current grid after every
+                         build_grid / update_grid mutation. Used by the live runner to
+                         persist grid state.
         """
         self.symbol = symbol
         self.config = config
         self.tick_size = tick_size
         self.strat_id = strat_id
         self._anchor_price = anchor_price
-        self.grid = Grid(tick_size, config.grid_count, config.grid_step, config.rebalance_threshold)
+        self.grid = Grid(tick_size, config.grid_count, config.grid_step, config.rebalance_threshold,
+                         on_change=on_grid_change)
+        if restored_grid is not None:
+            self.grid.restore_grid(restored_grid)
         self.last_close: Optional[float] = None
         self.last_filled_price: Optional[float] = None
 
@@ -118,16 +130,27 @@ class GridEngine:
         # Update last close price
         self.last_close = float(event.last_price)
 
-        # Build grid if empty
-        if len(self.grid.grid) <= 1:
-            # Use anchor price if provided (for grid restoration after restart)
-            # Otherwise use current market price
+        # Build grid if empty (a restored grid skips this branch)
+        if len(self.grid.grid) == 0:
             build_price = self._anchor_price if self._anchor_price else self.last_close
             if self._anchor_price:
                 logger.info('%s: Building grid from anchor price %s', self.symbol, build_price)
             else:
                 logger.info('%s: Building grid from market price %s', self.symbol, build_price)
             self.grid.build_grid(build_price)
+        else:
+            # Drift guard: if restored (or stale) grid is far from the current
+            # price, rebuild around last_close. Mirrors update_grid's bounds
+            # check (grid.py:157) but applies on the tick path so a restored
+            # grid does not need a fill event to re-anchor. Single-pass bounds
+            # to keep the per-tick cost low.
+            min_p, max_p = self.grid.bounds
+            if not (min_p <= self.last_close <= max_p):
+                logger.info(
+                    '%s: Restored grid out of range (last_close=%s, range=[%s, %s]), rebuilding',
+                    self.symbol, self.last_close, min_p, max_p,
+                )
+                self.grid.build_grid(self.last_close)
 
         # Check and place orders for both directions
         intents.extend(self._check_and_place('long', limit_orders.get('long', [])))

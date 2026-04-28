@@ -28,7 +28,7 @@ from gridcore import (
     OrderUpdateEvent,
     PlaceLimitIntent,
     CancelIntent,
-    GridAnchorStore,
+    GridStateStore,
     DirectionType,
     calc_position_value,
     calc_margin_ratio,
@@ -108,7 +108,7 @@ class StrategyRunner:
         strategy_config: StrategyConfig,
         executor: IntentExecutor,
         instrument_info: Optional[InstrumentInfo] = None,
-        anchor_store: Optional[GridAnchorStore] = None,
+        state_store: Optional[GridStateStore] = None,
         on_intent_failed: Optional[Callable[[PlaceLimitIntent | CancelIntent, str], None]] = None,
         on_unknown_order: Optional[Callable[[str], None]] = None,
         notifier: Optional[Notifier] = None,
@@ -119,7 +119,7 @@ class StrategyRunner:
             strategy_config: Strategy configuration.
             executor: Intent executor for API calls.
             instrument_info: Instrument info for qty rounding (None uses no rounding).
-            anchor_store: Optional anchor store for grid persistence.
+            state_store: Optional grid state store for persistence.
             on_intent_failed: Callback when intent execution fails (for retry queue).
             on_unknown_order: Callback when WS reports a New order we don't track
                 (for fast-tracking the next order-sync sweep).
@@ -127,7 +127,7 @@ class StrategyRunner:
         """
         self._config = strategy_config
         self._executor = executor
-        self._anchor_store = anchor_store
+        self._state_store = state_store
         self._on_intent_failed = on_intent_failed
         self._on_unknown_order = on_unknown_order
         self._notifier = notifier
@@ -139,8 +139,8 @@ class StrategyRunner:
         )
         self._wallet_balance: Decimal = Decimal("0")
 
-        # Load anchor if available and config matches
-        anchor_price = self._load_anchor()
+        # Restore full grid if available and config matches
+        restored_grid = self._load_grid_state()
 
         # Create GridEngine
         grid_config = GridConfig(
@@ -152,7 +152,8 @@ class StrategyRunner:
             tick_size=strategy_config.tick_size,
             config=grid_config,
             strat_id=strategy_config.strat_id,
-            anchor_price=anchor_price,
+            restored_grid=restored_grid,
+            on_grid_change=self._on_grid_change,
         )
 
         # Create linked Position managers
@@ -217,46 +218,51 @@ class StrategyRunner:
         self._recent_executions_long.clear()
         self._recent_executions_short.clear()
 
-    def _load_anchor(self) -> Optional[float]:
-        """Load anchor price if config matches."""
-        if self._anchor_store is None:
+    def _load_grid_state(self) -> Optional[list[dict]]:
+        """Load saved grid if config matches.
+
+        Returns the saved `grid` list, or None if no store configured, no entry
+        for this strat_id, the entry is in the legacy anchor-only format, or
+        the saved grid_step/grid_count differ from the current config.
+        """
+        if self._state_store is None:
             return None
 
-        anchor_data = self._anchor_store.load(self._config.strat_id)
-        if anchor_data is None:
+        saved = self._state_store.load(self._config.strat_id)
+        if saved is None:
             return None
 
-        # Check if config matches
         if (
-            anchor_data.get("grid_step") == self._config.grid_step
-            and anchor_data.get("grid_count") == self._config.grid_count
+            saved.get("grid_step") == self._config.grid_step
+            and saved.get("grid_count") == self._config.grid_count
         ):
             logger.info(
-                f"{self.strat_id}: Loaded anchor price {anchor_data['anchor_price']} "
-                f"(grid_step={anchor_data['grid_step']}, grid_count={anchor_data['grid_count']})"
+                f"{self.strat_id}: Loaded saved grid ({len(saved['grid'])} levels, "
+                f"grid_step={saved['grid_step']}, grid_count={saved['grid_count']})"
             )
-            return anchor_data["anchor_price"]
+            return saved["grid"]
         else:
             logger.info(
                 f"{self.strat_id}: Config changed, will build fresh grid "
-                f"(saved: step={anchor_data.get('grid_step')}, count={anchor_data.get('grid_count')}; "
+                f"(saved: step={saved.get('grid_step')}, count={saved.get('grid_count')}; "
                 f"current: step={self._config.grid_step}, count={self._config.grid_count})"
             )
             return None
 
-    def _save_anchor(self) -> None:
-        """Save current anchor price."""
-        if self._anchor_store is None:
+    def _on_grid_change(self, grid: list[dict]) -> None:
+        """Persist grid mutations triggered from inside Grid.build_grid /
+        Grid.update_grid. Skips writes for the just-built single-WAIT case
+        and for empty grids (a restored grid that failed validation)."""
+        if self._state_store is None:
             return
-
-        anchor_price = self._engine.get_anchor_price()
-        if anchor_price is not None:
-            self._anchor_store.save(
-                strat_id=self._config.strat_id,
-                anchor_price=anchor_price,
-                grid_step=self._config.grid_step,
-                grid_count=self._config.grid_count,
-            )
+        if len(grid) <= 1:
+            return
+        self._state_store.save(
+            strat_id=self._config.strat_id,
+            grid=grid,
+            grid_step=self._config.grid_step,
+            grid_count=self._config.grid_count,
+        )
 
     def get_limit_orders(self) -> dict[str, list[dict]]:
         """Get current limit orders in format expected by GridEngine.
@@ -314,10 +320,6 @@ class StrategyRunner:
 
             if intents:
                 self._execute_intents(intents, limit_orders)
-
-                # Save anchor after grid changes
-                if self._anchor_store and len(self._engine.grid.grid) > 1:
-                    self._save_anchor()
 
             return intents
         except Exception as e:

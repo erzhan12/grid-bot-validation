@@ -1,559 +1,447 @@
 """
-Tests for GridAnchorStore persistence functionality.
+Tests for GridStateStore persistence functionality.
 """
 
 import json
-import math
 import os
-import tempfile
+import threading
+from pathlib import Path
+from unittest.mock import patch
+
 import pytest
-from unittest.mock import patch, mock_open, MagicMock
 
-from gridcore.persistence import GridAnchorStore
+from gridcore.persistence import GridStateStore
 
 
-class TestGridAnchorStore:
-    """Tests for GridAnchorStore."""
+def _sample_grid() -> list[dict]:
+    return [
+        {"side": "Buy", "price": 100.0},
+        {"side": "Buy", "price": 101.0},
+        {"side": "Wait", "price": 102.0},
+        {"side": "Sell", "price": 103.0},
+        {"side": "Sell", "price": 104.0},
+    ]
 
-    def test_save_and_load(self, tmp_path):
-        """Test basic save and load functionality."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
 
-        # Save anchor data
-        store.save(
-            strat_id="btcusdt_main",
-            anchor_price=100000.0,
-            grid_step=0.2,
-            grid_count=50
-        )
+class TestGridStateStoreRoundtrip:
+    def test_save_and_load_roundtrip(self, tmp_path):
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
+        grid = _sample_grid()
 
-        # Load and verify
-        data = store.load("btcusdt_main")
-        assert data is not None
-        assert data['anchor_price'] == 100000.0
-        assert data['grid_step'] == 0.2
-        assert data['grid_count'] == 50
+        store.save(strat_id="strat1", grid=grid, grid_step=0.2, grid_count=20)
+        store.flush()
 
-    def test_load_nonexistent_strat_id(self, tmp_path):
-        """Test loading non-existent strat_id returns None."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
+        loaded = store.load("strat1")
+        assert loaded is not None
+        assert loaded["grid"] == grid
+        assert loaded["grid_step"] == 0.2
+        assert loaded["grid_count"] == 20
 
-        # Save one strat
-        store.save("btcusdt_main", 100000.0, 0.2, 50)
+    def test_save_overwrites_existing_entry(self, tmp_path):
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
+        store.save("strat1", _sample_grid(), grid_step=0.2, grid_count=20)
 
-        # Try to load different strat
-        data = store.load("ethusdt_main")
-        assert data is None
+        new_grid = [{"side": "Wait", "price": 200.0}, {"side": "Sell", "price": 201.0}]
+        store.save("strat1", new_grid, grid_step=0.3, grid_count=10)
+        store.flush()
 
-    def test_load_nonexistent_file(self, tmp_path):
-        """Test loading from non-existent file returns None."""
-        file_path = str(tmp_path / "nonexistent.json")
-        store = GridAnchorStore(file_path)
+        loaded = store.load("strat1")
+        assert loaded["grid"] == new_grid
+        assert loaded["grid_step"] == 0.3
+        assert loaded["grid_count"] == 10
 
-        data = store.load("btcusdt_main")
-        assert data is None
+    def test_multiple_strats_share_file(self, tmp_path):
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
 
-    def test_multiple_strategies(self, tmp_path):
-        """Test saving and loading multiple strategies."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
+        grid1 = _sample_grid()
+        grid2 = [{"side": "Buy", "price": 50.0}, {"side": "Wait", "price": 51.0}]
 
-        # Save multiple strategies
-        store.save("btcusdt_main", 100000.0, 0.2, 50)
-        store.save("ethusdt_main", 3500.0, 0.3, 40)
-        store.save("solusdt_main", 150.0, 0.5, 30)
+        store.save("strat_a", grid1, grid_step=0.2, grid_count=20)
+        store.save("strat_b", grid2, grid_step=0.5, grid_count=10)
+        store.flush()
 
-        # Load and verify each
-        btc_data = store.load("btcusdt_main")
-        assert btc_data['anchor_price'] == 100000.0
-        assert btc_data['grid_step'] == 0.2
-        assert btc_data['grid_count'] == 50
+        assert store.load("strat_a")["grid"] == grid1
+        assert store.load("strat_b")["grid"] == grid2
 
-        eth_data = store.load("ethusdt_main")
-        assert eth_data['anchor_price'] == 3500.0
-        assert eth_data['grid_step'] == 0.3
-        assert eth_data['grid_count'] == 40
+    def test_load_missing_file_returns_none(self, tmp_path):
+        file_path = str(tmp_path / "missing.json")
+        store = GridStateStore(file_path)
+        assert store.load("strat1") is None
 
-        sol_data = store.load("solusdt_main")
-        assert sol_data['anchor_price'] == 150.0
-        assert sol_data['grid_step'] == 0.5
-        assert sol_data['grid_count'] == 30
+    def test_load_unknown_strat_id_returns_none(self, tmp_path):
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
+        store.save("strat1", _sample_grid(), grid_step=0.2, grid_count=20)
+        store.flush()
+        assert store.load("strat_other") is None
 
-    def test_multiple_stores_same_file(self, tmp_path):
-        """Test multiple GridAnchorStore instances accessing same file."""
-        file_path = str(tmp_path / "grid_anchor.json")
+    def test_load_empty_strat_id_raises(self, tmp_path):
+        store = GridStateStore(str(tmp_path / "grid_state.json"))
+        with pytest.raises(ValueError):
+            store.load("")
 
-        # First store saves data
-        store1 = GridAnchorStore(file_path)
-        store1.save("btcusdt_main", 100000.0, 0.2, 50)
+    def test_save_empty_strat_id_raises(self, tmp_path):
+        store = GridStateStore(str(tmp_path / "grid_state.json"))
+        with pytest.raises(ValueError):
+            store.save("", _sample_grid(), 0.2, 20)
 
-        # Second store can read it
-        store2 = GridAnchorStore(file_path)
-        data = store2.load("btcusdt_main")
-        assert data['anchor_price'] == 100000.0
 
-        # Second store updates
-        store2.save("ethusdt_main", 3500.0, 0.3, 40)
+class TestLegacyDetection:
+    def test_legacy_anchor_format_returns_none(self, tmp_path, caplog):
+        """Legacy entry (no `grid` key) is treated as no saved state."""
+        file_path = str(tmp_path / "grid_state.json")
+        legacy_data = {
+            "strat1": {
+                "anchor_price": 100.0,
+                "grid_step": 0.2,
+                "grid_count": 20,
+            }
+        }
+        Path(file_path).write_text(json.dumps(legacy_data))
 
-        # First store can see updates
-        eth_data = store1.load("ethusdt_main")
-        assert eth_data['anchor_price'] == 3500.0
+        store = GridStateStore(file_path)
+        with caplog.at_level("INFO"):
+            result = store.load("strat1")
 
-    def test_update_existing_strategy(self, tmp_path):
-        """Test updating existing strategy overwrites old data."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
+        assert result is None
+        assert any("Legacy anchor format ignored" in r.message for r in caplog.records)
 
-        # Save initial data
-        store.save("btcusdt_main", 100000.0, 0.2, 50)
+    def test_new_format_loads_normally(self, tmp_path):
+        """Entries with `grid` key load normally — does not trigger legacy path."""
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
+        store.save("strat1", _sample_grid(), grid_step=0.2, grid_count=20)
+        store.flush()
 
-        # Update with new data
-        store.save("btcusdt_main", 105000.0, 0.25, 60)
+        loaded = store.load("strat1")
+        assert loaded is not None
+        assert "grid" in loaded
 
-        # Verify updated data
-        data = store.load("btcusdt_main")
-        assert data['anchor_price'] == 105000.0
-        assert data['grid_step'] == 0.25
-        assert data['grid_count'] == 60
 
-    def test_delete_strategy(self, tmp_path):
-        """Test deleting a strategy."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
+class TestCorruption:
+    def test_corrupt_json_returns_none(self, tmp_path):
+        file_path = str(tmp_path / "grid_state.json")
+        Path(file_path).write_text("not json at all")
 
-        # Save and then delete
-        store.save("btcusdt_main", 100000.0, 0.2, 50)
-        result = store.delete("btcusdt_main")
+        store = GridStateStore(file_path)
+        assert store.load("strat1") is None
 
-        assert result is True
-        assert store.load("btcusdt_main") is None
+    def test_partial_json_returns_none(self, tmp_path):
+        file_path = str(tmp_path / "grid_state.json")
+        Path(file_path).write_text('{"strat1": {"grid":')
 
-    def test_delete_nonexistent_strategy(self, tmp_path):
-        """Test deleting non-existent strategy returns False."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
+        store = GridStateStore(file_path)
+        assert store.load("strat1") is None
 
-        # Save one strategy
-        store.save("btcusdt_main", 100000.0, 0.2, 50)
+    def test_non_dict_entry_returns_none(self, tmp_path):
+        """Hand-edited file with a non-dict entry must not crash load() —
+        regression for `'grid' not in entry` raising TypeError on int/str/list."""
+        file_path = str(tmp_path / "grid_state.json")
+        Path(file_path).write_text(json.dumps({
+            "int_entry": 1,
+            "str_entry": "garbage",
+            "list_entry": [1, 2, 3],
+        }))
 
-        # Try to delete different strategy
-        result = store.delete("ethusdt_main")
-        assert result is False
+        store = GridStateStore(file_path)
+        assert store.load("int_entry") is None
+        assert store.load("str_entry") is None
+        assert store.load("list_entry") is None
 
-    def test_delete_from_nonexistent_file(self, tmp_path):
-        """Test deleting from non-existent file returns False."""
-        file_path = str(tmp_path / "nonexistent.json")
-        store = GridAnchorStore(file_path)
+    @pytest.mark.parametrize("root_value", ["[]", '"x"', "1", "true", "null"])
+    def test_non_dict_root_does_not_crash_load(self, tmp_path, root_value):
+        """Hand-edited file with valid JSON but non-object root (e.g. `[]`)
+        must not crash load() — regression for AttributeError on
+        `all_data.get(...)` when root is a list/string/number."""
+        file_path = str(tmp_path / "grid_state.json")
+        Path(file_path).write_text(root_value)
 
-        result = store.delete("btcusdt_main")
-        assert result is False
+        store = GridStateStore(file_path)
+        assert store.load("any_strat") is None
 
-    def test_creates_directory_if_not_exists(self, tmp_path):
-        """Test that save creates parent directories if they don't exist."""
-        file_path = str(tmp_path / "nested" / "dir" / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
+    def test_save_self_heals_non_dict_root(self, tmp_path):
+        """A file whose root was hand-edited to a non-dict must be silently
+        overwritten on the next save(), not crash with TypeError. Persistence
+        layer should be self-healing without manual file cleanup."""
+        file_path = str(tmp_path / "grid_state.json")
+        Path(file_path).write_text("[]")
 
-        store.save("btcusdt_main", 100000.0, 0.2, 50)
+        store = GridStateStore(file_path)
+        grid = _sample_grid()
+        store.save("strat1", grid, 0.2, 20)
+        store.flush()
 
-        # Verify file was created
+        loaded = store.load("strat1")
+        assert loaded is not None
+        assert loaded["grid"] == grid
+
+    def test_delete_non_dict_root_returns_false(self, tmp_path):
+        """delete() on a file with non-dict root must not crash — returns
+        False (nothing to delete) since the per-strat entry can't exist."""
+        file_path = str(tmp_path / "grid_state.json")
+        Path(file_path).write_text("[]")
+
+        store = GridStateStore(file_path)
+        assert store.delete("strat1") is False
+
+    def test_save_recovers_from_corrupt_existing_file(self, tmp_path):
+        """Corrupt existing file is silently overwritten on save (matches legacy behavior)."""
+        file_path = str(tmp_path / "grid_state.json")
+        Path(file_path).write_text("garbage")
+
+        store = GridStateStore(file_path)
+        grid = _sample_grid()
+        store.save("strat1", grid, grid_step=0.2, grid_count=20)
+        store.flush()
+
+        loaded = store.load("strat1")
+        assert loaded["grid"] == grid
+
+
+class TestAtomicWrite:
+    def test_old_file_survives_failed_write(self, tmp_path):
+        """If os.replace fails after the tmp file is written, the original file
+        must remain intact (atomicity guarantee)."""
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
+
+        # First write succeeds.
+        original_grid = _sample_grid()
+        store.save("strat1", original_grid, grid_step=0.2, grid_count=20)
+        store.flush()
+        original_content = Path(file_path).read_text()
+
+        # Second write fails at os.replace step.
+        new_grid = [{"side": "Wait", "price": 999.0}]
+        with patch("os.replace", side_effect=OSError("simulated failure")):
+            with pytest.raises(OSError):
+                store._sync_write_to_disk(
+                    "strat1",
+                    {"grid": new_grid, "grid_step": 0.2, "grid_count": 20},
+                )
+
+        # Original file is untouched.
+        assert Path(file_path).read_text() == original_content
         assert os.path.exists(file_path)
-        data = store.load("btcusdt_main")
-        assert data['anchor_price'] == 100000.0
-
-    def test_handles_corrupted_json(self, tmp_path):
-        """Test that load handles corrupted JSON gracefully."""
-        file_path = str(tmp_path / "grid_anchor.json")
-
-        # Write corrupted JSON
-        with open(file_path, 'w') as f:
-            f.write("not valid json {{{")
-
-        store = GridAnchorStore(file_path)
-        data = store.load("btcusdt_main")
-        assert data is None
-
-    def test_json_format(self, tmp_path):
-        """Test that saved JSON has expected format."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
-
-        store.save("btcusdt_main", 100000.0, 0.2, 50)
-        store.save("ethusdt_main", 3500.0, 0.3, 40)
-
-        # Read raw JSON and verify structure
-        with open(file_path, 'r') as f:
-            raw_data = json.load(f)
-
-        assert "btcusdt_main" in raw_data
-        assert "ethusdt_main" in raw_data
-        assert raw_data["btcusdt_main"]["anchor_price"] == 100000.0
-        assert raw_data["ethusdt_main"]["grid_step"] == 0.3
-
-    def test_default_file_path(self):
-        """Test default file path is db/grid_anchor.json."""
-        store = GridAnchorStore()
-        assert store.file_path == 'db/grid_anchor.json'
-
-
-class TestGridAnchorStoreIOErrors:
-    """Tests for IOError handling in GridAnchorStore."""
-
-    def test_load_with_permission_error(self, tmp_path):
-        """Test load handles permission errors gracefully."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
-
-        # Save valid data first
-        store.save("btcusdt_main", 100000.0, 0.2, 50)
 
-        # Mock open to raise PermissionError
-        with patch("builtins.open", side_effect=PermissionError("Permission denied")):
-            data = store.load("btcusdt_main")
-            assert data is None
-
-    def test_save_with_permission_error(self, tmp_path):
-        """Test save handles permission errors when writing."""
-        file_path = str(tmp_path / "restricted" / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
-
-        # Mock os.makedirs to succeed but open to fail with PermissionError
-        with patch("os.makedirs"):
-            with patch("builtins.open", side_effect=PermissionError("Permission denied")):
-                # Should raise the PermissionError
-                with pytest.raises(PermissionError):
-                    store.save("btcusdt_main", 100000.0, 0.2, 50)
-
-    def test_delete_with_read_permission_error(self, tmp_path):
-        """Test delete returns False when file cannot be read due to permissions."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
-
-        # Save data first
-        store.save("btcusdt_main", 100000.0, 0.2, 50)
-
-        # Mock open to raise PermissionError on read
-        with patch("builtins.open", side_effect=PermissionError("Permission denied")):
-            result = store.delete("btcusdt_main")
-            assert result is False
-
-    def test_delete_preserves_other_strategies(self, tmp_path):
-        """Test delete only removes target strategy, preserves others."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
-
-        # Save multiple strategies
-        store.save("btcusdt_main", 100000.0, 0.2, 50)
-        store.save("ethusdt_main", 3500.0, 0.3, 40)
-        store.save("solusdt_main", 150.0, 0.5, 30)
-
-        # Delete one strategy
-        result = store.delete("ethusdt_main")
-        assert result is True
-
-        # Verify others are preserved
-        btc_data = store.load("btcusdt_main")
-        assert btc_data is not None
-        assert btc_data['anchor_price'] == 100000.0
-
-        sol_data = store.load("solusdt_main")
-        assert sol_data is not None
-        assert sol_data['anchor_price'] == 150.0
 
-        # Verify deleted strategy is gone
-        eth_data = store.load("ethusdt_main")
-        assert eth_data is None
-
-
-class TestGridAnchorStoreCorruption:
-    """Tests for handling corrupted data scenarios."""
-
-    def test_delete_with_corrupted_json(self, tmp_path):
-        """Test delete returns False when JSON is corrupted."""
-        file_path = str(tmp_path / "grid_anchor.json")
-
-        # Write corrupted JSON
-        with open(file_path, 'w') as f:
-            f.write("not valid json {{{")
-
-        store = GridAnchorStore(file_path)
-        result = store.delete("btcusdt_main")
-        assert result is False
-
-    def test_save_overwrites_corrupted_data(self, tmp_path):
-        """Test save succeeds even when existing file has corrupted JSON."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
-
-        # Save initial valid data
-        store.save("btcusdt_main", 100000.0, 0.2, 50)
-
-        # Corrupt the file
-        with open(file_path, 'w') as f:
-            f.write("corrupted json {{{")
-
-        # Save should succeed and overwrite corrupted data
-        store.save("ethusdt_main", 3500.0, 0.3, 40)
-
-        # Verify new data is saved
-        data = store.load("ethusdt_main")
-        assert data is not None
-        assert data['anchor_price'] == 3500.0
-
-        # Original data should be lost (corrupted file was overwritten with empty dict)
-        btc_data = store.load("btcusdt_main")
-        assert btc_data is None
-
-
-class TestGridAnchorStoreEdgeFilePaths:
-    """Tests for edge cases with file paths."""
-
-    def test_save_with_no_parent_directory(self, tmp_path):
-        """Test save works with file path that has no parent directory."""
-        # Change to tmp_path to test relative path
-        original_cwd = os.getcwd()
-        try:
-            os.chdir(tmp_path)
-            store = GridAnchorStore("grid_anchor.json")
-
-            store.save("btcusdt_main", 100000.0, 0.2, 50)
-
-            # Verify file was created in current directory
-            assert os.path.exists("grid_anchor.json")
-            data = store.load("btcusdt_main")
-            assert data['anchor_price'] == 100000.0
-        finally:
-            os.chdir(original_cwd)
-
-    def test_empty_file_after_deleting_last_strategy(self, tmp_path):
-        """Test that deleting the last strategy leaves an empty JSON object."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
-
-        # Save single strategy
-        store.save("btcusdt_main", 100000.0, 0.2, 50)
-
-        # Delete it
-        result = store.delete("btcusdt_main")
-        assert result is True
-
-        # File should contain empty JSON object
-        with open(file_path, 'r') as f:
-            data = json.load(f)
-        assert data == {}
-
-    def test_very_long_file_path(self, tmp_path):
-        """Test save and load work with very long file paths."""
-        # Create a deeply nested directory structure
-        long_path = tmp_path
-        for i in range(10):
-            long_path = long_path / f"nested_directory_{i}"
-
-        file_path = str(long_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
-
-        # Should create all directories and save
-        store.save("btcusdt_main", 100000.0, 0.2, 50)
-
-        assert os.path.exists(file_path)
-        data = store.load("btcusdt_main")
-        assert data['anchor_price'] == 100000.0
-
-
-class TestGridAnchorStoreEdgeValues:
-    """Tests for edge case data values."""
-
-    def test_save_with_negative_values(self, tmp_path):
-        """Test save works with negative values."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
-
-        # Negative values (may not make sense for trading but should persist)
-        store.save("test_strat", -100.0, -0.5, -10)
-
-        data = store.load("test_strat")
-        assert data['anchor_price'] == -100.0
-        assert data['grid_step'] == -0.5
-        assert data['grid_count'] == -10
-
-    def test_save_with_zero_values(self, tmp_path):
-        """Test save works with zero values."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
-
-        store.save("test_strat", 0.0, 0.0, 0)
-
-        data = store.load("test_strat")
-        assert data['anchor_price'] == 0.0
-        assert data['grid_step'] == 0.0
-        assert data['grid_count'] == 0
-
-    def test_save_with_very_large_numbers(self, tmp_path):
-        """Test save works with very large float values."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
-
-        # Very large but valid float values
-        large_price = 1e100
-        large_step = 1e50
-        large_count = 999999999
-
-        store.save("test_strat", large_price, large_step, large_count)
-
-        data = store.load("test_strat")
-        assert data['anchor_price'] == large_price 
-        assert data['grid_step'] == large_step
-        assert data['grid_count'] == large_count
-
-    def test_save_with_nan_values(self, tmp_path):
-        """Test save with NaN values (Python json allows NaN by default)."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
-
-        # Python's json.dump() allows NaN by default (writes as JavaScript literal)
-        store.save("test_strat", float('nan'), 0.2, 50)
-
-        # Verify it was saved and can be loaded
-        data = store.load("test_strat")
-        assert data is not None
-        # NaN != NaN, so use math.isnan()
-        assert math.isnan(data['anchor_price'])
-        assert data['grid_step'] == 0.2
-        assert data['grid_count'] == 50
-
-    def test_save_with_infinity_values(self, tmp_path):
-        """Test save with infinity values (Python json allows Infinity by default)."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
-
-        # Python's json.dump() allows Infinity by default (writes as JavaScript literal)
-        store.save("test_strat", float('inf'), 0.2, 50)
-
-        # Verify it was saved and can be loaded
-        data = store.load("test_strat")
-        assert data is not None
-        assert math.isinf(data['anchor_price'])
-        assert data['anchor_price'] > 0  # Positive infinity
-        assert data['grid_step'] == 0.2
-        assert data['grid_count'] == 50
-
-    def test_load_returns_correct_types(self, tmp_path):
-        """Test that loaded data has correct Python types."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
-
-        store.save("btcusdt_main", 100000.0, 0.2, 50)
-
-        data = store.load("btcusdt_main")
-        assert isinstance(data, dict)
-        assert isinstance(data['anchor_price'], (int, float))
-        assert isinstance(data['grid_step'], (int, float))
-        assert isinstance(data['grid_count'], int)
-
-
-class TestGridAnchorStoreSpecialStratIds:
-    """Tests for special characters in strat_id."""
-
-    def test_strat_id_with_spaces(self, tmp_path):
-        """Test strat_id with spaces works correctly."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
-
-        strat_id = "btc usdt main strategy"
-        store.save(strat_id, 100000.0, 0.2, 50)
-
-        data = store.load(strat_id)
-        assert data is not None
-        assert data['anchor_price'] == 100000.0
-
-    def test_strat_id_with_unicode(self, tmp_path):
-        """Test strat_id with unicode characters."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
-
-        # Unicode: emoji, Chinese, Arabic
-        strat_id = "策略_🚀_استراتيجية"
-        store.save(strat_id, 100000.0, 0.2, 50)
-
-        data = store.load(strat_id)
-        assert data is not None
-        assert data['anchor_price'] == 100000.0
-
-    def test_strat_id_with_special_chars(self, tmp_path):
-        """Test strat_id with special characters."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
-
-        strat_id = "btc@usdt#main$strategy%^&*()"
-        store.save(strat_id, 100000.0, 0.2, 50)
-
-        data = store.load(strat_id)
-        assert data is not None
-        assert data['anchor_price'] == 100000.0
-
-    def test_empty_strat_id(self, tmp_path):
-        """Test empty string as strat_id."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
-
-        strat_id = ""
-        with pytest.raises(ValueError, match="strat_id must be a non-empty string"):
-            store.save(strat_id, 100000.0, 0.2, 50)
-        with pytest.raises(ValueError, match="strat_id must be a non-empty string"):
-            store.load(strat_id)
-        with pytest.raises(ValueError, match="strat_id must be a non-empty string"):
-            store.delete(strat_id)
-
-
-class TestGridAnchorStoreMiscEdgeCases:
-    """Tests for miscellaneous edge cases."""
-
-    def test_save_creates_valid_json_format(self, tmp_path):
-        """Test that save creates properly formatted JSON with indentation."""
-        file_path = str(tmp_path / "grid_anchor.json")
-        store = GridAnchorStore(file_path)
-
-        store.save("btcusdt_main", 100000.0, 0.2, 50)
-
-        # Read raw file content
-        with open(file_path, 'r') as f:
-            content = f.read()
-
-        # Should have indentation (indent=2)
-        assert '\n' in content
-        assert '  ' in content  # 2-space indent
-
-        # Should be valid JSON
-        parsed = json.loads(content)
-        assert parsed["btcusdt_main"]["anchor_price"] == 100000.0
-
-    def test_file_path_property_accessible(self):
-        """Test that file_path attribute is accessible."""
-        store = GridAnchorStore("custom/path/grid_anchor.json")
-        assert store.file_path == "custom/path/grid_anchor.json"
-
-        # Should be able to read it
-        path = store.file_path
-        assert isinstance(path, str)
-        assert "grid_anchor.json" in path
-
-    def test_multiple_stores_same_file(self, tmp_path):
-        """Test multiple GridAnchorStore instances accessing same file."""
-        file_path = str(tmp_path / "grid_anchor.json")
-
-        # First store saves data
-        store1 = GridAnchorStore(file_path)
-        store1.save("btcusdt_main", 100000.0, 0.2, 50)
-
-        # Second store can read it
-        store2 = GridAnchorStore(file_path)
-        data = store2.load("btcusdt_main")
-        assert data['anchor_price'] == 100000.0
-
-        # Second store updates
-        store2.save("ethusdt_main", 3500.0, 0.3, 40)
-
-        # First store can see updates
-        eth_data = store1.load("ethusdt_main")
-        assert eth_data['anchor_price'] == 3500.0
+class TestDedupe:
+    def test_identical_payload_skips_thread_spawn(self, tmp_path):
+        """Two identical save() calls — the second must short-circuit before
+        even spawning a background thread (no work, no deepcopy)."""
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
+        grid = _sample_grid()
+
+        store.save("strat1", grid, grid_step=0.2, grid_count=20)
+        store.flush()
+
+        with patch("threading.Thread") as mock_thread:
+            store.save("strat1", grid, grid_step=0.2, grid_count=20)
+
+        mock_thread.assert_not_called()
+
+    def test_changed_payload_triggers_write(self, tmp_path):
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
+        grid_a = _sample_grid()
+        grid_b = list(grid_a) + [{"side": "Sell", "price": 105.0}]
+
+        store.save("strat1", grid_a, grid_step=0.2, grid_count=20)
+        store.save("strat1", grid_b, grid_step=0.2, grid_count=20)
+        store.flush()
+
+        loaded = store.load("strat1")
+        assert loaded["grid"] == grid_b
+
+    def test_dedupe_baseline_unaffected_by_in_place_mutation(self, tmp_path):
+        """The store fingerprints by structural identity at save() time. If
+        the caller later mutates the same list in place, the next save() must
+        still detect the difference and trigger a write — i.e. the fingerprint
+        must reflect the snapshot at the moment of the prior save, not a live
+        reference."""
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
+        grid = _sample_grid()
+
+        store.save("strat1", grid, grid_step=0.2, grid_count=20)
+        store.flush()
+
+        grid[0]["side"] = "Wait"  # In-place mutation by caller.
+
+        with patch("threading.Thread") as mock_thread:
+            store.save("strat1", grid, grid_step=0.2, grid_count=20)
+            assert mock_thread.call_count == 1
+
+
+class TestFlush:
+    def test_flush_waits_for_pending_writes(self, tmp_path):
+        """flush() must block until all in-flight writes have completed —
+        used by tests and graceful shutdown."""
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
+        store.save("strat1", _sample_grid(), grid_step=0.2, grid_count=20)
+        store.flush()
+        # File exists immediately after flush returns.
+        assert Path(file_path).exists()
+        loaded = store.load("strat1")
+        assert loaded is not None
+
+    def test_flush_with_no_pending_writes_is_noop(self, tmp_path):
+        store = GridStateStore(str(tmp_path / "grid_state.json"))
+        store.flush()  # Should not raise.
+
+
+class TestBackgroundWrite:
+    def test_save_does_not_block_caller(self, tmp_path):
+        """save() returns immediately; disk I/O happens in a background thread."""
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
+        store.save("strat1", _sample_grid(), grid_step=0.2, grid_count=20)
+        # If save() were blocking on fsync, this assertion would race with
+        # the actual disk write. flush() makes the test deterministic.
+        store.flush()
+        assert store.load("strat1") is not None
+
+    def test_concurrent_writes_serialized_by_lock(self, tmp_path):
+        """Two strats writing back-to-back both end up on disk (the lock
+        serializes; nothing is dropped)."""
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
+
+        store.save("a", [{"side": "Wait", "price": 1.0}, {"side": "Sell", "price": 2.0}], 0.2, 10)
+        store.save("b", [{"side": "Buy", "price": 3.0}, {"side": "Wait", "price": 4.0}], 0.2, 10)
+        store.flush()
+
+        assert store.load("a") is not None
+        assert store.load("b") is not None
+
+    def test_burst_saves_persist_latest_payload(self, tmp_path):
+        """Five rapid distinct saves for the same strat_id must end with the
+        last payload on disk — verifies the single-writer-per-strat coalescing
+        does not reorder writes (the original threading.Lock approach was not
+        FIFO and could write older payloads after newer ones)."""
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
+
+        for i in range(5):
+            grid = [{"side": "Wait", "price": 100.0 + i}, {"side": "Sell", "price": 200.0 + i}]
+            store.save("strat1", grid, 0.2, 10)
+        store.flush()
+
+        loaded = store.load("strat1")
+        # Last payload (i=4) must win.
+        assert loaded["grid"][0]["price"] == 104.0
+        assert loaded["grid"][1]["price"] == 204.0
+
+    def test_save_during_in_flight_write_is_coalesced(self, tmp_path):
+        """A save() that arrives while an earlier write is in flight must NOT
+        spawn a second writer thread — the in-flight writer drains the slot."""
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
+
+        spawn_count = 0
+        original_thread = threading.Thread
+
+        def counting_thread(*args, **kwargs):
+            nonlocal spawn_count
+            spawn_count += 1
+            return original_thread(*args, **kwargs)
+
+        with patch("threading.Thread", side_effect=counting_thread):
+            store.save("strat1", _sample_grid(), 0.2, 20)
+            grid_b = _sample_grid() + [{"side": "Sell", "price": 999.0}]
+            store.save("strat1", grid_b, 0.2, 20)
+
+        store.flush()
+        # At most 2 thread spawns (in the worst case the first finished before
+        # the second save), but importantly the disk has the latest payload.
+        assert spawn_count <= 2
+        assert store.load("strat1")["grid"] == grid_b
+
+    def test_write_failure_logged_not_raised(self, tmp_path, caplog):
+        """A disk-write failure inside the background thread is logged but
+        never propagates — persistence failures must not crash the bot."""
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
+
+        with patch.object(store, "_sync_write_to_disk", side_effect=OSError("boom")):
+            with caplog.at_level("ERROR"):
+                store.save("strat1", _sample_grid(), 0.2, 20)
+                store.flush()
+
+        assert any("Save failed for strat1" in r.message for r in caplog.records)
+
+    def test_failed_write_allows_retry_with_same_payload(self, tmp_path):
+        """After a transient write failure the same payload must persist on
+        the next save() — regression for stale-dedupe (the failed payload's
+        fingerprint stayed in _last_fingerprint and silently skipped retries
+        until the grid happened to mutate to a different fingerprint)."""
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
+        grid = _sample_grid()
+
+        # First save fails at the disk layer.
+        with patch.object(store, "_sync_write_to_disk", side_effect=OSError("transient")):
+            store.save("strat1", grid, 0.2, 20)
+            store.flush()
+        assert store.load("strat1") is None  # nothing on disk
+
+        # Retry with the SAME payload — must reach disk now that the writer
+        # rolled back the dedupe fingerprint on failure.
+        store.save("strat1", grid, 0.2, 20)
+        store.flush()
+
+        loaded = store.load("strat1")
+        assert loaded is not None
+        assert loaded["grid"] == grid
+
+    def test_failed_write_does_not_overwrite_newer_payload_dedupe(self, tmp_path):
+        """If a newer payload was enqueued between a save() and its writer's
+        failure, the rollback must NOT clear the newer payload's fingerprint
+        (it's still valid and pending)."""
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
+        grid_a = _sample_grid()
+        grid_b = list(grid_a) + [{"side": "Sell", "price": 999.0}]
+
+        # Both writes fail. After flush, neither is on disk and dedupe is
+        # cleared so a retry of either succeeds.
+        with patch.object(store, "_sync_write_to_disk", side_effect=OSError("boom")):
+            store.save("strat1", grid_a, 0.2, 20)
+            store.save("strat1", grid_b, 0.2, 20)
+            store.flush()
+
+        # Without the rollback, the second save's fingerprint would persist
+        # in _last_fingerprint even after the failure, and a retry would
+        # silently skip. Verify retry works.
+        store.save("strat1", grid_b, 0.2, 20)
+        store.flush()
+        loaded = store.load("strat1")
+        assert loaded is not None
+        assert loaded["grid"] == grid_b
+
+
+class TestDelete:
+    def test_delete_existing_strat(self, tmp_path):
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
+        store.save("strat1", _sample_grid(), 0.2, 20)
+        store.flush()
+
+        assert store.delete("strat1") is True
+        assert store.load("strat1") is None
+
+    def test_delete_unknown_strat_returns_false(self, tmp_path):
+        file_path = str(tmp_path / "grid_state.json")
+        store = GridStateStore(file_path)
+        store.save("strat1", _sample_grid(), 0.2, 20)
+        store.flush()
+        assert store.delete("strat_other") is False
+
+    def test_delete_missing_file_returns_false(self, tmp_path):
+        store = GridStateStore(str(tmp_path / "missing.json"))
+        assert store.delete("strat1") is False
