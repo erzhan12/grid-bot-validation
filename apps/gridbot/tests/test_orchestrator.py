@@ -1671,7 +1671,7 @@ class TestOrchestratorHealthCheckOnce:
         priv_ws.is_connected.return_value = True
 
         # Cooldown sweep at top of _health_check_once is a no-op
-        orchestrator._auth_cooldown_until = {}
+        orchestrator._auth_cooldown._auth_cooldown_until = {}
 
         with patch(
             "gridbot.orchestrator.time.monotonic",
@@ -1716,7 +1716,7 @@ class TestOrchestratorHealthCheckOnce:
         priv_ws.connect = Mock()
         priv_ws.disconnect = Mock()
 
-        orchestrator._auth_cooldown_until = {}
+        orchestrator._auth_cooldown._auth_cooldown_until = {}
 
         with patch(
             "gridbot.orchestrator.time.monotonic",
@@ -1759,7 +1759,7 @@ class TestOrchestratorHealthCheckOnce:
         priv_ws = orchestrator._private_ws["test_account"]
         priv_ws.is_connected.return_value = True
 
-        orchestrator._auth_cooldown_until = {}
+        orchestrator._auth_cooldown._auth_cooldown_until = {}
 
         with patch(
             "gridbot.orchestrator.time.monotonic",
@@ -2028,16 +2028,16 @@ class TestOrchestratorAuthCooldown:
         self, mock_private_ws, mock_public_ws, mock_rest_client,
         gridbot_config, account_config, strategy_config,
     ):
-        """_on_auth_cooldown_entered sets expiry timer and sends alert."""
+        """AuthCooldownManager.enter sets expiry timer and sends alert."""
         notifier = Mock(spec=Notifier)
         orchestrator = Orchestrator(gridbot_config, notifier=notifier)
         orchestrator._init_account(account_config)
         orchestrator._init_strategy(strategy_config)
 
-        orchestrator._on_auth_cooldown_entered("btcusdt_test")
+        orchestrator._auth_cooldown.enter("btcusdt_test")
 
-        assert "btcusdt_test" in orchestrator._auth_cooldown_until
-        assert orchestrator._auth_cooldown_cycles["btcusdt_test"] == 1
+        assert "btcusdt_test" in orchestrator._auth_cooldown._auth_cooldown_until
+        assert orchestrator._auth_cooldown._auth_cooldown_cycles["btcusdt_test"] == 1
         notifier.alert.assert_called_once()
         assert "cycle 1" in notifier.alert.call_args[0][0]
 
@@ -2054,13 +2054,13 @@ class TestOrchestratorAuthCooldown:
         orchestrator._init_account(account_config)
         orchestrator._init_strategy(strategy_config)
 
-        orchestrator._on_auth_cooldown_entered("btcusdt_test")
-        assert orchestrator._auth_cooldown_cycles["btcusdt_test"] == 1
+        orchestrator._auth_cooldown.enter("btcusdt_test")
+        assert orchestrator._auth_cooldown._auth_cooldown_cycles["btcusdt_test"] == 1
 
-        del orchestrator._auth_cooldown_until["btcusdt_test"]
+        del orchestrator._auth_cooldown._auth_cooldown_until["btcusdt_test"]
 
-        orchestrator._on_auth_cooldown_entered("btcusdt_test")
-        assert orchestrator._auth_cooldown_cycles["btcusdt_test"] == 2
+        orchestrator._auth_cooldown.enter("btcusdt_test")
+        assert orchestrator._auth_cooldown._auth_cooldown_cycles["btcusdt_test"] == 2
         assert "cycle 2" in notifier.alert.call_args[0][0]
 
     @patch("gridbot.orchestrator.BybitRestClient")
@@ -2082,8 +2082,8 @@ class TestOrchestratorAuthCooldown:
         executor = orchestrator._strategy_executors["btcusdt_test"]
         executor._auth_cooldown = True
         executor._auth_failure_count = 5
-        orchestrator._auth_cooldown_until["btcusdt_test"] = datetime.now(UTC) - timedelta(seconds=1)
-        orchestrator._auth_cooldown_cycles["btcusdt_test"] = 2
+        orchestrator._auth_cooldown._auth_cooldown_until["btcusdt_test"] = datetime.now(UTC) - timedelta(seconds=1)
+        orchestrator._auth_cooldown._auth_cooldown_cycles["btcusdt_test"] = 2
 
         pub_ws = orchestrator._public_ws["test_account"]
         pub_ws.is_connected.return_value = True
@@ -2094,8 +2094,8 @@ class TestOrchestratorAuthCooldown:
 
         assert executor.auth_cooldown is False
         assert executor.auth_failure_count == 0
-        assert "btcusdt_test" not in orchestrator._auth_cooldown_until
-        assert orchestrator._auth_cooldown_cycles["btcusdt_test"] == 2
+        assert "btcusdt_test" not in orchestrator._auth_cooldown._auth_cooldown_until
+        assert orchestrator._auth_cooldown._auth_cooldown_cycles["btcusdt_test"] == 2
         assert any("cooldown expired" in str(c) for c in notifier.alert.call_args_list)
 
     @patch("gridbot.orchestrator.BybitRestClient")
@@ -2118,10 +2118,10 @@ class TestOrchestratorAuthCooldown:
         orchestrator._init_strategy(strategy_config)
 
         before = datetime.now(UTC)
-        orchestrator._on_auth_cooldown_entered("btcusdt_test")
+        orchestrator._auth_cooldown.enter("btcusdt_test")
         after = datetime.now(UTC)
 
-        expiry = orchestrator._auth_cooldown_until["btcusdt_test"]
+        expiry = orchestrator._auth_cooldown._auth_cooldown_until["btcusdt_test"]
         assert expiry >= before + timedelta(minutes=10)
         assert expiry <= after + timedelta(minutes=10)
 
@@ -2147,7 +2147,7 @@ class TestOrchestratorAuthCooldown:
         retry_queue.add(intent, "auth error")
         assert retry_queue.size == 2
 
-        orchestrator._on_auth_cooldown_entered("btcusdt_test")
+        orchestrator._auth_cooldown.enter("btcusdt_test")
 
         assert retry_queue.size == 0
 
