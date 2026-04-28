@@ -9,10 +9,9 @@ The orchestrator is the main entry point for the gridbot. It:
 """
 
 import logging
-import threading
 import time
 from collections import deque
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, UTC
 from typing import Optional
 from uuid import UUID, uuid5
 
@@ -37,6 +36,7 @@ from gridbot.runner import StrategyRunner
 from gridbot.reconciler import Reconciler
 from gridbot.retry_queue import RetryQueue
 from gridbot.position_fetcher import PositionFetcher, _POSITION_TICK_BASE
+from gridbot.auth_cooldown_manager import AuthCooldownManager
 
 _HEALTH_CHECK_INTERVAL = 10  # seconds
 _CHECK_INTERVAL = 0.1  # 100 ms main loop tick (bbu2 value)
@@ -138,6 +138,18 @@ class Orchestrator:
             position_check_interval=self._config.position_check_interval,
         )
 
+        # Auth-cooldown subsystem. Constructed eagerly for the same reason
+        # as _position_fetcher — _init_strategy registers an executor
+        # callback bound to this instance, and _strategy_executors /
+        # _retry_queues are held by reference (empty now, populated in
+        # place by _init_strategy).
+        self._auth_cooldown = AuthCooldownManager(
+            strategy_executors=self._strategy_executors,
+            retry_queues=self._retry_queues,
+            notifier=self._notifier,
+            cooldown_minutes=self._config.auth_cooldown_minutes,
+        )
+
         # WS → main-thread buffers.
         #
         # Memory model: CPython's GIL serialises bytecode execution, so a
@@ -166,10 +178,6 @@ class Orchestrator:
         # Debounce window for WS-triggered fast-track order syncs. Bursts of
         # untracked-order WS events coalesce into a single reconciliation sweep.
         self._unknown_order_debounce_until: float = 0.0
-
-        # Auth cooldown tracking
-        self._auth_cooldown_until: dict[str, datetime] = {}  # strat_id -> expiry
-        self._auth_cooldown_cycles: dict[str, int] = {}  # strat_id -> cumulative cycle count
 
     @property
     def running(self) -> bool:
@@ -536,7 +544,7 @@ class Orchestrator:
         executor = IntentExecutor(
             base_executor._client,
             shadow_mode=strategy_config.shadow_mode,
-            on_cooldown_entered=lambda sid=strat_id: self._on_auth_cooldown_entered(sid),
+            on_cooldown_entered=lambda sid=strat_id: self._auth_cooldown.enter(sid),
         )
 
         # Create retry queue with dispatcher that routes by intent type
@@ -626,62 +634,6 @@ class Orchestrator:
             self._latest_ticker[symbol] = event
         except Exception as e:
             self._notifier.alert_exception("_on_ticker", e, error_key="ws_on_ticker")
-
-    def _on_auth_cooldown_entered(self, strat_id: str) -> None:
-        """Called by executor when auth cooldown activates.
-
-        Works regardless of whether the failure came from the ticker path
-        or the retry queue path.
-
-        Thread-safety: this callback is main-thread only. It mutates
-        ``_auth_cooldown_cycles`` (read-then-write — NOT atomic) and
-        ``_auth_cooldown_until``, and calls ``retry_queue.clear()`` which
-        runs in parallel with ``process_due()`` only if the main-thread
-        assumption holds. All current callers satisfy this: executor
-        entry points (`execute_place`/`execute_cancel`/`execute_amend`)
-        are invoked from `StrategyRunner` (main-thread ticker cycle) and
-        `RetryQueue.process_due()` (main-thread retry-drain tick). If a
-        future change wires this callback to a WebSocket handler or any
-        other thread, the cycle-counter update and the retry-queue clear
-        must be serialized with a lock (and with `process_due`).
-
-        Design note: fail-loud thread guard is deliberate — not a missing
-        lock. Adding one here would signal "safe from any thread" and
-        invite callers that deadlock against `process_due` or push us
-        into a drain-pattern that delays cooldown activation. Enforcing
-        the invariant at runtime keeps the design simple and makes any
-        violation impossible to miss.
-        """
-        if threading.current_thread() is not threading.main_thread():
-            raise RuntimeError(
-                "_on_auth_cooldown_entered must run on the main thread; "
-                "see docstring for the locking required before relaxing "
-                f"this. Called from: {threading.current_thread().name}"
-            )
-        cycle = self._auth_cooldown_cycles.get(strat_id, 0) + 1
-        self._auth_cooldown_cycles[strat_id] = cycle
-
-        cooldown_minutes = self._config.auth_cooldown_minutes
-        expiry = datetime.now(UTC) + timedelta(minutes=cooldown_minutes)
-        self._auth_cooldown_until[strat_id] = expiry
-
-        executor = self._strategy_executors.get(strat_id)
-        failure_count = executor.auth_failure_count if executor else "?"
-
-        # Clear retry queue — stale intents would fail with the same auth error,
-        # and fresh intents at current prices will be generated after cooldown.
-        retry_queue = self._retry_queues.get(strat_id)
-        if retry_queue:
-            cleared = retry_queue.clear()
-            if cleared:
-                logger.info(f"Cleared {cleared} items from retry queue for {strat_id}")
-
-        msg = (
-            f"Strategy {strat_id}: {failure_count} consecutive auth errors, "
-            f"entering {cooldown_minutes}-min cooldown (cycle {cycle})"
-        )
-        logger.error(msg)
-        self._notifier.alert(msg, error_key=f"auth_cooldown_{strat_id}")
 
     def _on_order(self, account_name: str, message: dict) -> None:
         """Handle order WebSocket message (runs in pybit WS thread).
@@ -785,24 +737,7 @@ class Orchestrator:
         seconds.
         """
         try:
-            # Check auth cooldown expiry
-            now = datetime.now(UTC)
-            for strat_id in list(self._auth_cooldown_until.keys()):
-                expiry = self._auth_cooldown_until[strat_id]
-                if now >= expiry:
-                    executor = self._strategy_executors.get(strat_id)
-                    cycle = self._auth_cooldown_cycles.get(strat_id, 1)
-                    if executor:
-                        executor.reset_auth_cooldown()
-                        msg = (
-                            f"Strategy {strat_id}: cooldown expired (cycle {cycle}), "
-                            f"resuming order execution"
-                        )
-                        logger.info(msg)
-                        self._notifier.alert(
-                            msg, error_key=f"auth_cooldown_resume_{strat_id}",
-                        )
-                    del self._auth_cooldown_until[strat_id]
+            self._auth_cooldown.sweep_expired(datetime.now(UTC))
 
             for account_name in list(self._public_ws.keys()):
                 # Check public WS
