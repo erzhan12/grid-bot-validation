@@ -57,7 +57,7 @@ class GridStateStore:
         # overwrites the slot — the in-flight writer (if any) will pick up the
         # newer value the next time it loops, so a burst of saves coalesces
         # into one final disk write per strat.
-        self._pending_payload: dict[str, dict] = {}
+        self._pending_payload: dict[str, tuple[tuple, dict]] = {}
         # State + condition variable for: serializing slot access, dedupe
         # bookkeeping, the active-writer set, and flush() wait/notify.
         self._cv = threading.Condition()
