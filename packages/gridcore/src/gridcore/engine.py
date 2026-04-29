@@ -72,7 +72,11 @@ class GridEngine:
         self.grid = Grid(tick_size, config.grid_count, config.grid_step, config.rebalance_threshold,
                          on_change=on_grid_change)
         if restored_grid is not None:
-            self.grid.restore_grid(restored_grid)
+            if not self.grid.restore_grid(restored_grid):
+                logger.warning(
+                    "%s (%s): Restored grid failed validation, will build fresh grid on first ticker",
+                    self.strat_id, self.symbol,
+                )
         self.last_close: Optional[float] = None
         self.last_filled_price: Optional[float] = None
 

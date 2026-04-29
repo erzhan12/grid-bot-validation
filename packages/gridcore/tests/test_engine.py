@@ -973,27 +973,58 @@ class TestRestoredGrid:
         prices = [g['price'] for g in engine.grid.grid]
         assert prices == [99000.0, 99500.0, 100000.0, 100500.0, 101000.0]
 
-    def test_restored_grid_with_invalid_pattern_falls_back_to_fresh_build(self):
+    def test_restored_grid_with_invalid_pattern_falls_back_to_fresh_build(self, caplog):
         """Restored grid that fails validation leaves the engine empty so the
-        first ticker triggers a fresh build_grid at market price."""
+        first ticker triggers a fresh build_grid at market price. The engine
+        must log a warning that includes strat_id and symbol so operators can
+        identify which strategy hit the bad-state path."""
         config = GridConfig(grid_count=50, grid_step=0.2)
         bad = [
             {'side': 'Sell', 'price': 99.0},  # SELL before BUY — invalid
             {'side': 'Buy', 'price': 99.5},
         ]
-        engine = GridEngine(
-            symbol='BTCUSDT',
-            tick_size=Decimal('0.1'),
-            config=config,
-            strat_id='btcusdt_test',
-            restored_grid=bad,
-        )
+        with caplog.at_level('WARNING'):
+            engine = GridEngine(
+                symbol='BTCUSDT',
+                tick_size=Decimal('0.1'),
+                config=config,
+                strat_id='btcusdt_test',
+                restored_grid=bad,
+            )
         assert engine.grid.grid == []
+
+        # Warning identifies strat_id AND symbol — the kernel of the original
+        # review feedback was that failures were hard to attribute under load.
+        warnings = [r.message for r in caplog.records if r.levelname == 'WARNING']
+        assert any(
+            'btcusdt_test' in m and 'BTCUSDT' in m and 'Restored grid failed' in m
+            for m in warnings
+        ), f"Expected contextual restore-failure warning, got: {warnings}"
 
         engine.on_event(self._ticker(100000.0), {'long': [], 'short': []})
 
         # Fresh grid built at market price.
         assert engine.grid.anchor_price == 100000.0
+
+    def test_restored_grid_success_does_not_warn(self, caplog):
+        """Successful restoration must NOT emit the failure warning — would
+        be alert-spam noise."""
+        config = GridConfig(grid_count=10, grid_step=0.2)
+        good = [
+            {'side': 'Buy', 'price': 99.0},
+            {'side': 'Wait', 'price': 100.0},
+            {'side': 'Sell', 'price': 101.0},
+        ]
+        with caplog.at_level('WARNING'):
+            GridEngine(
+                symbol='BTCUSDT',
+                tick_size=Decimal('0.1'),
+                config=config,
+                strat_id='btcusdt_test',
+                restored_grid=good,
+            )
+        warnings = [r.message for r in caplog.records if r.levelname == 'WARNING']
+        assert not any('Restored grid failed' in m for m in warnings)
 
     def test_drift_guard_rebuilds_when_price_outside_grid(self, caplog):
         """If last_close is outside [min_grid, max_grid] for the restored grid,

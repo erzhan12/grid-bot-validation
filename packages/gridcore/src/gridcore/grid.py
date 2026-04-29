@@ -159,6 +159,10 @@ class Grid:
         on the first ticker. Does NOT fire on_change — restoration is not a
         mutation worth persisting (we just loaded what was already on disk).
 
+        Failures are NOT logged here — the caller has the business-level
+        context (strat_id, symbol) needed to make the warning useful, so
+        logging is delegated upstream to the engine.
+
         Args:
             grid_list: Serialized grid (list of {'side': str, 'price': float}).
 
@@ -170,15 +174,13 @@ class Grid:
                 {'side': GridSideType(item['side']), 'price': float(item['price'])}
                 for item in grid_list
             ]
-        except (KeyError, ValueError, TypeError) as e:
-            logger.warning("Restored grid failed parsing (%s), building fresh grid", e)
+        except (KeyError, ValueError, TypeError):
             self.grid = []
             return False
 
         self.grid = restored
 
         if not self.is_grid_correct():
-            logger.warning("Restored grid failed validation, building fresh grid")
             self.grid = []
             return False
 
