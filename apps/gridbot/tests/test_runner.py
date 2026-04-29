@@ -2142,3 +2142,75 @@ class TestIsGoodToPlace:
         )
         runner._execute_place_intent(intent, EMPTY_LIMITS)
         mock_executor.execute_place.assert_not_called()
+
+
+class TestStateStoreWiring:
+    """Tests for the GridStateStore wiring on the runner."""
+
+    def test_no_store_means_no_save_no_restore(self, strategy_config, mock_executor):
+        """state_store=None must not crash on construction or grid mutation."""
+        runner = StrategyRunner(strategy_config=strategy_config, executor=mock_executor)
+        runner._engine.grid.build_grid(50000.0)
+        assert len(runner._engine.grid.grid) > 0
+
+    def test_load_grid_state_returns_none_when_no_store(self, strategy_config, mock_executor):
+        runner = StrategyRunner(strategy_config=strategy_config, executor=mock_executor)
+        assert runner._load_grid_state() is None
+
+    def test_load_grid_state_config_match(self, strategy_config, mock_executor):
+        """Saved grid with matching grid_step + grid_count is loaded."""
+        store = Mock()
+        store.load.return_value = {
+            "grid": [{"side": "Buy", "price": 49000.0}, {"side": "Wait", "price": 50000.0}],
+            "grid_step": strategy_config.grid_step,
+            "grid_count": strategy_config.grid_count,
+        }
+        StrategyRunner(
+            strategy_config=strategy_config, executor=mock_executor, state_store=store,
+        )
+        store.load.assert_called_once_with(strategy_config.strat_id)
+
+    def test_load_grid_state_config_mismatch_returns_none(self, strategy_config, mock_executor):
+        """Saved grid with different grid_step is discarded — engine starts empty."""
+        store = Mock()
+        store.load.return_value = {
+            "grid": [{"side": "Buy", "price": 49000.0}],
+            "grid_step": strategy_config.grid_step + 0.1,
+            "grid_count": strategy_config.grid_count,
+        }
+        runner = StrategyRunner(
+            strategy_config=strategy_config, executor=mock_executor, state_store=store,
+        )
+        assert runner._engine.grid.grid == []
+
+    def test_on_grid_change_persists_full_grid(self, strategy_config, mock_executor):
+        """Grid mutations flow through the on_change callback into store.save."""
+        store = Mock()
+        store.load.return_value = None
+        runner = StrategyRunner(
+            strategy_config=strategy_config, executor=mock_executor, state_store=store,
+        )
+        runner._engine.grid.build_grid(50000.0)
+
+        store.save.assert_called_once()
+        call = store.save.call_args
+        assert call.kwargs["strat_id"] == strategy_config.strat_id
+        assert call.kwargs["grid_step"] == strategy_config.grid_step
+        assert call.kwargs["grid_count"] == strategy_config.grid_count
+        assert len(call.kwargs["grid"]) == strategy_config.grid_count + 1
+
+    def test_on_grid_change_skips_empty_grid(self, strategy_config, mock_executor):
+        """Empty / single-WAIT intermediate states are not persisted."""
+        store = Mock()
+        store.load.return_value = None
+        runner = StrategyRunner(
+            strategy_config=strategy_config, executor=mock_executor, state_store=store,
+        )
+        runner._on_grid_change([])
+        runner._on_grid_change([{"side": "Wait", "price": 100.0}])
+        store.save.assert_not_called()
+
+    def test_on_grid_change_no_store_is_noop(self, strategy_config, mock_executor):
+        runner = StrategyRunner(strategy_config=strategy_config, executor=mock_executor)
+        runner._on_grid_change([{"side": "Wait", "price": 100.0}] * 5)
+

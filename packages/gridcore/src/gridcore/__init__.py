@@ -12,7 +12,7 @@ from gridcore.config import GridConfig
 from gridcore.grid import Grid, GridSideType
 from gridcore.engine import GridEngine
 from gridcore.position import PositionState, Position, PositionRiskManager, RiskConfig, DirectionType, SideType
-from gridcore.persistence import GridAnchorStore
+from gridcore.persistence import GridStateStore
 from gridcore.instrument_info import InstrumentInfo
 from gridcore.qty import create_qty_calculator
 from gridcore.pnl import (
@@ -50,7 +50,7 @@ __all__ = [
     "RiskConfig",
     "DirectionType",
     "SideType",
-    "GridAnchorStore",
+    "GridStateStore",
     "InstrumentInfo",
     "create_qty_calculator",
     "calc_unrealised_pnl",

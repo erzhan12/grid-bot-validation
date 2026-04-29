@@ -21,7 +21,7 @@ from bybit_adapter.normalizer import BybitNormalizer
 from grid_db import DatabaseFactory
 from grid_db import Run, Strategy, BybitAccount, User
 from gridcore import (
-    GridAnchorStore,
+    GridStateStore,
     InstrumentInfo,
     TickerEvent,
 )
@@ -81,12 +81,14 @@ class Orchestrator:
         Args:
             config: Gridbot configuration.
             db: Database factory for persistence (optional).
-            anchor_store_path: Path to grid anchor JSON file.
+            anchor_store_path: Path to grid state JSON file. Name preserved
+                for deploy-config compatibility; the file now holds full grid
+                state, not just anchor prices.
             notifier: Alert notifier (optional, log-only if None).
         """
         self._config = config
         self._db = db
-        self._anchor_store = GridAnchorStore(anchor_store_path)
+        self._state_store = GridStateStore(anchor_store_path)
         self._notifier = notifier or Notifier()
 
         # Per-account resources
@@ -569,7 +571,7 @@ class Orchestrator:
             strategy_config=strategy_config,
             executor=executor,
             instrument_info=instrument_info,
-            anchor_store=self._anchor_store,
+            state_store=self._state_store,
             on_intent_failed=lambda intent, error: retry_queue.add(intent, error),
             on_unknown_order=self._request_immediate_order_sync,
             notifier=self._notifier,

@@ -566,3 +566,143 @@ class TestGridAnchorPrice:
 
         # Anchor should remain the same
         assert grid.anchor_price == original_anchor
+
+
+class TestGridOnChangeCallback:
+    """Tests for the on_change callback wiring."""
+
+    def test_callback_fires_after_build_grid(self):
+        calls = []
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=10, grid_step=0.2,
+                    on_change=lambda g: calls.append(list(g)))
+        grid.build_grid(100.0)
+        assert len(calls) == 1
+        assert len(calls[0]) == 11  # 5 buy + 1 wait + 5 sell
+
+    def test_callback_fires_after_update_grid(self):
+        calls = []
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=10, grid_step=0.2,
+                    on_change=lambda g: calls.append(list(g)))
+        grid.build_grid(100.0)
+        calls.clear()
+        grid.update_grid(last_filled_price=100.2, last_close=100.0)
+        assert len(calls) == 1
+
+    def test_callback_does_not_fire_for_restore_grid(self):
+        """Restoration is not a mutation worth persisting (we just loaded
+        what was already on disk)."""
+        calls = []
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=10, grid_step=0.2,
+                    on_change=lambda g: calls.append(list(g)))
+        serialized = [
+            {'side': 'Buy', 'price': 99.0},
+            {'side': 'Buy', 'price': 99.5},
+            {'side': 'Wait', 'price': 100.0},
+            {'side': 'Sell', 'price': 100.5},
+            {'side': 'Sell', 'price': 101.0},
+        ]
+        grid.restore_grid(serialized)
+        assert calls == []
+
+    def test_callback_errors_do_not_break_grid(self):
+        """Callback failures are logged but never propagate — persistence
+        failures must not crash strategy logic."""
+        def raise_callback(g):
+            raise RuntimeError("boom")
+
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=10, grid_step=0.2,
+                    on_change=raise_callback)
+        grid.build_grid(100.0)  # Should not raise.
+        assert len(grid.grid) == 11
+
+
+class TestGridRestoreGrid:
+    """Tests for restore_grid()."""
+
+    def test_restore_valid_grid(self):
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=10, grid_step=0.2)
+        serialized = [
+            {'side': 'Buy', 'price': 99.0},
+            {'side': 'Buy', 'price': 99.5},
+            {'side': 'Wait', 'price': 100.0},
+            {'side': 'Sell', 'price': 100.5},
+            {'side': 'Sell', 'price': 101.0},
+        ]
+        assert grid.restore_grid(serialized) is True
+        assert len(grid.grid) == 5
+        assert grid.grid[2]['side'] == GridSideType.WAIT
+
+    def test_restore_invalid_pattern_returns_false(self):
+        """Grid that violates BUY→WAIT→SELL pattern is rejected."""
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=10, grid_step=0.2)
+        bad = [
+            {'side': 'Sell', 'price': 99.0},  # SELL before BUY — invalid
+            {'side': 'Buy', 'price': 99.5},
+            {'side': 'Wait', 'price': 100.0},
+        ]
+        assert grid.restore_grid(bad) is False
+        assert grid.grid == []
+
+    def test_restore_unknown_side_returns_false(self):
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=10, grid_step=0.2)
+        bad = [{'side': 'Garbage', 'price': 100.0}]
+        assert grid.restore_grid(bad) is False
+        assert grid.grid == []
+
+    def test_restore_missing_keys_returns_false(self):
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=10, grid_step=0.2)
+        bad = [{'side': 'Wait'}]  # missing 'price'
+        assert grid.restore_grid(bad) is False
+        assert grid.grid == []
+
+    def test_restore_derives_anchor_from_wait(self):
+        """anchor_price is derived from the WAIT center after restore."""
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=10, grid_step=0.2)
+        serialized = [
+            {'side': 'Buy', 'price': 99.0},
+            {'side': 'Wait', 'price': 100.0},
+            {'side': 'Sell', 'price': 101.0},
+        ]
+        grid.restore_grid(serialized)
+        assert grid.anchor_price == 100.0
+
+    def test_restore_derives_anchor_with_multi_wait(self):
+        """When restored grid has multiple consecutive WAITs (allowed by
+        is_grid_correct), anchor_price uses the middle WAIT."""
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=10, grid_step=0.2)
+        serialized = [
+            {'side': 'Buy', 'price': 99.0},
+            {'side': 'Wait', 'price': 99.5},
+            {'side': 'Wait', 'price': 100.0},
+            {'side': 'Wait', 'price': 100.5},
+            {'side': 'Sell', 'price': 101.0},
+        ]
+        grid.restore_grid(serialized)
+        # WAIT indices are [1, 2, 3], middle = 2 → price 100.0
+        assert grid.anchor_price == 100.0
+
+    def test_round_trip_identity(self):
+        """build_grid → serialize → restore_grid produces identical grid."""
+        grid_a = Grid(tick_size=Decimal('0.1'), grid_count=20, grid_step=0.3)
+        grid_a.build_grid(50.0)
+
+        serialized = [{'side': str(g['side']), 'price': g['price']} for g in grid_a.grid]
+
+        grid_b = Grid(tick_size=Decimal('0.1'), grid_count=20, grid_step=0.3)
+        assert grid_b.restore_grid(serialized) is True
+        assert grid_b.grid == grid_a.grid
+
+
+class TestGridMinMaxAccessors:
+    def test_min_max_grid_after_build(self):
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=10, grid_step=0.2)
+        grid.build_grid(100.0)
+        assert grid.min_grid == grid.grid[0]['price']
+        assert grid.max_grid == grid.grid[-1]['price']
+
+    def test_min_max_grid_raises_when_empty(self):
+        grid = Grid(tick_size=Decimal('0.1'), grid_count=10, grid_step=0.2)
+        with pytest.raises(ValueError):
+            _ = grid.min_grid
+        with pytest.raises(ValueError):
+            _ = grid.max_grid

@@ -114,12 +114,12 @@ Successfully extracted pure strategy logic from `bbu2-master` into `packages/gri
    │   ├── engine.py            # GridEngine (from strat.py)
    │   ├── position.py          # Position risk management
    │   ├── pnl.py               # Pure PnL formulas + MMTiers + parse_risk_limit_tiers
-   │   └── persistence.py       # Grid anchor persistence
+   │   └── persistence.py       # Full grid state persistence (GridStateStore)
    └── tests/
        ├── test_grid.py         # Grid calculation tests
        ├── test_engine.py       # Engine event processing tests
        ├── test_position.py     # Position risk tests
-       ├── test_persistence.py  # Anchor persistence tests
+       ├── test_persistence.py  # Grid state persistence tests
        └── test_comparison.py   # Comparison with original (optional)
    ```
 
@@ -243,6 +243,62 @@ make test-integration
   - See `docs/features/ORDER_IDENTITY_DESIGN.md`
 
 ### PnL Calculations (`pnl.py`)
+
+### Grid State Persistence (`persistence.py`)
+
+`GridStateStore` (renamed from the legacy `GridAnchorStore` in feature 0021) persists the **full** ordered grid per strategy across restarts, replacing the old anchor-only scheme. This restores per-fill WAIT zones, side reassignments, and `__center_grid` drift that were previously lost.
+
+**Usage**
+
+- File location: `db/grid_anchor.json` (filename preserved for deploy-config compatibility — orchestrator constructor still accepts `anchor_store_path`).
+- Wired by `Orchestrator → StrategyRunner` (`apps/gridbot/src/gridbot/orchestrator.py`, `apps/gridbot/src/gridbot/runner.py`). Runner registers `_on_grid_change` as a callback into `Grid` via `GridEngine(on_grid_change=...)`.
+- `Grid.build_grid()` and `Grid.update_grid()` invoke the callback at the end of every mutation; `Grid.restore_grid()` does NOT (loading is not a mutation worth re-persisting).
+
+**Schema**
+
+```json
+{
+  "ltcusdt_test": {
+    "grid": [
+      {"side": "Buy",  "price": 53.4},
+      {"side": "Wait", "price": 55.4},
+      {"side": "Sell", "price": 57.4}
+    ],
+    "grid_step": 0.3,
+    "grid_count": 20
+  }
+}
+```
+
+`side` values are `GridSideType` enum values (`"Buy"`, `"Sell"`, `"Wait"`). `grid_step` and `grid_count` are kept alongside the grid only for config-mismatch invalidation (see below).
+
+**Thread-safety + atomic write**
+
+- `save()` is a **sync API but non-blocking**. It computes a cheap fingerprint (tuple of `(side, price)` pairs + grid_step + grid_count), short-circuits if equal to the last-enqueued payload (dedupe BEFORE deepcopy), then dispatches via a per-strat pending slot.
+- **Single-writer-per-strat**: each `strat_id` has at most one daemon `threading.Thread` writing at a time. A new save while a writer is in flight overwrites the slot; the in-flight writer drains it on its next loop iteration. Coalesces rapid bursts into one final disk write per strat with **latest-wins ordering** (a naive `threading.Lock`-per-write would not be FIFO and could write older payloads after newer ones).
+- **Atomic on disk**: every write goes through tmp file + `f.flush()` + `os.fsync()` + `os.replace()`. A `kill -9` mid-write cannot leave a corrupted half-written file. Failed writes (disk full, permission denied) clean up the `.tmp` file before propagating the exception, so stale tmp files do not accumulate.
+- **Two locks**: `_io_lock` (`threading.Lock`) serializes disk I/O across strats — the file is shared. `_cv` (`threading.Condition`) gates dedupe state, the active-writer set, and `flush()` wait/notify.
+- **Failure semantics**: a write failure inside the writer is logged (`logger.error("Save failed for %s: %s", ...)`) and the dedupe fingerprint is rolled back (only if no newer payload arrived since), so the next identical save can retry. The writer thread continues to drain any newer pending payload — failures do not crash strategy logic.
+
+**Legacy format migration**
+
+Pre-0021 files contain `{anchor_price, grid_step, grid_count}` per strat (no `grid` key). On `load()`, missing-`grid` is detected and treated as no-saved-state; one info log fires (`"Legacy anchor format ignored, building fresh grid at market price"`) and the engine builds a fresh grid from market price on the first ticker. **No data-preserving conversion** is needed (a converter would produce the same result as building fresh from the anchor).
+
+**Config-mismatch invalidation**
+
+If the saved `grid_step` or `grid_count` differs from the current strategy config, the runner discards the saved grid and logs `"Config changed, will build fresh grid"`. Done in `runner._load_grid_state()` before passing `restored_grid` to `GridEngine`.
+
+**Self-healing on corruption**
+
+`_read_all_data()` returns `{}` on any error: missing file, JSON parse failure, or **non-dict root** (e.g. hand-edited `[]` / `"x"` / `1`). The next `save()` silently overwrites a corrupt file. Per-entry corruption (entry that isn't a dict, or grid that fails `is_grid_correct()`) also returns None / fresh build — the bot never crashes on a bad persistence file.
+
+**Pitfalls**
+
+- **Why threads, not asyncio?** Gridbot's `Orchestrator.run()` is a synchronous main loop using `time.sleep` — there is no event loop in the live runtime. `asyncio.create_task()` would always raise `RuntimeError` and fall through to synchronous fsync, blocking the main loop. Daemon threads work in both sync and async caller contexts. **Do not "modernize" to asyncio** without first making the orchestrator async end-to-end.
+- **`GridStateStore.flush()`** blocks until all pending writes complete. Use it in tests (deterministic instead of `time.sleep`) and in graceful shutdown. Production callers do not need it — daemon threads either complete or die with the process, and the next save retries.
+- **Drift guard on restore**: `engine._handle_ticker_event` rebuilds if `last_close` is outside `[grid.min_grid, grid.max_grid]`. Uses `Grid.bounds` (single-pass min+max) for the per-tick check — do not call `min_grid` and `max_grid` separately in hot paths.
+- **`anchor_price` parameter on `GridEngine` is retained for backtest compatibility**, separate from `restored_grid`. Backtest pins grid origin via `anchor_price`; live runner uses `restored_grid` for full-state restore. They serve different use cases.
+- **Known limitation**: an in-flight writer thread that has already popped a payload from `_pending_payload` and is waiting on `_io_lock` cannot be cancelled by a concurrent `delete()`. The writer will eventually re-persist the entry after the delete. Acceptable for current usage (delete is for "strat removed from config" — no concurrent saves expected); not currently fixed.
 
 ## Logging Configuration
 
