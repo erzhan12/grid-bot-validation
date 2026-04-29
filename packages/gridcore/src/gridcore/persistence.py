@@ -189,7 +189,20 @@ class GridStateStore:
         iteration writes the latest payload; concurrent saves arriving while
         the previous write is in flight just overwrite the slot and the next
         loop iteration picks them up. Errors are logged, never propagated —
-        persistence failures must not crash strategy logic."""
+        persistence failures must not crash strategy logic.
+
+        Exception strategy is two-level:
+          - inner `except Exception` (around _sync_write_to_disk): catches
+            recoverable per-write failures (disk full, permission denied,
+            fsync errors, JSON serialization errors). Logs, rolls back the
+            dedupe fingerprint so a retry with the same payload reaches
+            disk, and CONTINUES the loop to drain any newer pending payload.
+          - outer `except BaseException`: catches non-Exception signals
+            (KeyboardInterrupt, SystemExit, MemoryError) that the inner
+            handler intentionally lets through. Releases the _active_writers
+            slot before re-raising so a concurrent flush() does not deadlock
+            waiting for a thread that is about to die.
+        """
         try:
             while True:
                 with self._cv:
@@ -203,17 +216,18 @@ class GridStateStore:
                     with self._io_lock:
                         self._sync_write_to_disk(strat_id, payload)
                 except Exception as e:
+                    # Recoverable failure: log, rebrand dedupe, keep draining.
                     logger.error("Save failed for %s: %s", strat_id, e)
-                    # Roll back the dedupe key so the next identical save()
-                    # is not silently skipped — but only if no newer payload
-                    # has been enqueued in the meantime (whose fingerprint
-                    # would have replaced ours in _last_fingerprint).
+                    # Roll back the dedupe key only if no newer payload has
+                    # arrived since (a newer payload would have already
+                    # replaced our fingerprint in _last_fingerprint).
                     with self._cv:
                         if self._last_fingerprint.get(strat_id) == fingerprint:
                             self._last_fingerprint.pop(strat_id, None)
         except BaseException:
-            # Defensive: even on unexpected failure, release the active-writer
-            # slot so future saves can spawn a new thread.
+            # KeyboardInterrupt / SystemExit / other BaseException — release
+            # the writer slot so flush() can return, then let the signal
+            # propagate normally to terminate the thread (and the process).
             with self._cv:
                 self._active_writers.discard(strat_id)
                 self._cv.notify_all()
