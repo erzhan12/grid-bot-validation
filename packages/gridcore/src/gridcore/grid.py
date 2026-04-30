@@ -408,6 +408,7 @@ class Grid:
         Returns:
             True if prices are within grid_step/4 of each other
         """
+        # No zero-guard: price1 > 0 by grid invariants (positive traded prices, strictly-ascending sort), grid_step > 0 enforced by GridConfig.__post_init__.
         return abs(price1 - price2) / price1 * 100 < self.grid_step / 4
 
     def __is_price_sorted(self) -> bool:
