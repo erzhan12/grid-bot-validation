@@ -914,22 +914,23 @@ class TestAnchorPricePersistence:
         }
         engine.on_event(ticker_after_fill, existing_limits)
 
-        # Verify anchor_price still returns original center (100k), not filled price (99800)
+        # Verify anchor_price still returns original center (100k), not filled price (99800).
+        # The drift between last_close (99850) and original anchor (100000) is below
+        # one grid_step, so recenter does not walk and anchor stays put.
         anchor_after_fill = engine.get_anchor_price()
         assert anchor_after_fill == 100000.0, \
             f"Expected anchor_price to remain 100000.0 after fill, got {anchor_after_fill}"
 
-        # Only the filled level should be WAIT (price moved away from original center)
-        wait_items = [g for g in engine.grid.grid if g['side'] == GridSideType.WAIT]
-        assert len(wait_items) == 1, \
-            f"Should have only 1 WAIT item (filled level), got {len(wait_items)}: {[g['price'] for g in wait_items]}"
-        assert wait_items[0]['price'] == 99800.0, \
-            f"WAIT should be at filled price 99800, got {wait_items[0]['price']}"
-
-        # Original center should now be SELL (since price 99850 < 100000)
-        center_after_fill = next(g for g in engine.grid.grid if g['price'] == 100000.0)
-        assert center_after_fill['side'] == GridSideType.SELL, \
-            f"Original center should be SELL after price moved below it, got {center_after_fill['side']}"
+        # Filled level is marked WAIT by update_grid post-fill.
+        filled_level = next(g for g in engine.grid.grid if g['price'] == 99800.0)
+        assert filled_level['side'] == GridSideType.WAIT, \
+            f"Filled level should be WAIT, got {filled_level['side']}"
+        # Note: pre-0022 the per-tick update_grid call in _check_and_place would
+        # have reassigned the original center 100000.0 from WAIT to SELL on the
+        # ticker after the fill. Post-0022 below-threshold ticks are true no-ops
+        # (Step 2), so 100000.0 retains its build-time WAIT status until a walk
+        # rewrites the grid. This is by design — drift is measured against the
+        # persisted anchor, and side reassignment only happens on walks.
 
 
 class TestRestoredGrid:
@@ -1066,7 +1067,9 @@ class TestRestoredGrid:
             strat_id='btcusdt_test',
             restored_grid=restored,
         )
-        engine.on_event(self._ticker(100.5), {'long': [], 'short': []})
+        # Price within grid_step of WAIT center → neither bounds-based drift
+        # guard NOR feature-0022 recenter fires.
+        engine.on_event(self._ticker(100.1), {'long': [], 'short': []})
 
         prices = [g['price'] for g in engine.grid.grid]
         assert prices == [99.0, 99.5, 100.0, 100.5, 101.0]
@@ -1358,3 +1361,346 @@ class TestReduceOnlyMap:
                 f"direction={intent.direction}, side={intent.side}: "
                 f"expected reduce_only={expected}, got {intent.reduce_only}"
             )
+
+
+class TestRecenterIntegration:
+    """Engine-level tests for feature 0022 (per-tick grid drift detector)."""
+
+    def _ticker(self, price: float) -> TickerEvent:
+        return TickerEvent(
+            event_type=EventType.TICKER,
+            symbol='BTCUSDT',
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            last_price=Decimal(str(price)),
+            mark_price=Decimal(str(price)),
+            bid1_price=Decimal(str(price - 0.01)),
+            ask1_price=Decimal(str(price + 0.01)),
+            funding_rate=Decimal('0.0001'),
+        )
+
+    def _restored_grid_around_100(self) -> list[dict]:
+        """11-level grid centered at 100 with 1.0% step:
+        BUY 95..99, WAIT 100, SELL 101..105."""
+        return [
+            {'side': 'Buy', 'price': 95.0},
+            {'side': 'Buy', 'price': 96.0},
+            {'side': 'Buy', 'price': 97.0},
+            {'side': 'Buy', 'price': 98.0},
+            {'side': 'Buy', 'price': 99.0},
+            {'side': 'Wait', 'price': 100.0},
+            {'side': 'Sell', 'price': 101.0},
+            {'side': 'Sell', 'price': 102.0},
+            {'side': 'Sell', 'price': 103.0},
+            {'side': 'Sell', 'price': 104.0},
+            {'side': 'Sell', 'price': 105.0},
+        ]
+
+    def _make_engine(self, restored=True):
+        config = GridConfig(grid_count=10, grid_step=1.0)
+        kwargs = {
+            'symbol': 'BTCUSDT',
+            'tick_size': Decimal('0.01'),
+            'config': config,
+            'strat_id': 'btcusdt_test',
+        }
+        if restored:
+            kwargs['restored_grid'] = self._restored_grid_around_100()
+        return GridEngine(**kwargs)
+
+    def test_cold_start_drift_walks_grid(self, caplog):
+        """Restored grid centered at 100, ticker at 103.5 (within bounds, dev=3.5% > 1*step).
+        Expected n_steps = 3."""
+        engine = self._make_engine()
+        with caplog.at_level('INFO'):
+            engine.on_event(self._ticker(103.5), {'long': [], 'short': []})
+
+        # Grid walked: bottom three BUYs dropped, three SELLs added on top.
+        prices = [g['price'] for g in engine.grid.grid]
+        assert 95.0 not in prices
+        assert 96.0 not in prices
+        assert 97.0 not in prices
+        # Length preserved
+        assert len(prices) == 11
+        # New top is roughly 105 * (1.01)^3 ≈ 108.18 (after rounding)
+        assert prices[-1] > 105.0
+
+        drift_logs = [r.message for r in caplog.records if 'Grid drift' in r.message]
+        assert len(drift_logs) == 1
+        assert 'N=3' in drift_logs[0]
+        assert 'BTCUSDT' in drift_logs[0]
+
+    def test_mid_run_fast_move_recenters_in_one_tick(self, caplog):
+        """3 * grid_step jump triggers an N=3 walk in a single tick."""
+        engine = self._make_engine()
+        # Warm up with an in-band ticker first (no drift)
+        engine.on_event(self._ticker(100.2), {'long': [], 'short': []})
+        caplog.clear()
+        # Now jump 3% above WAIT center
+        with caplog.at_level('INFO'):
+            engine.on_event(self._ticker(103.2), {'long': [], 'short': []})
+
+        drift_logs = [r.message for r in caplog.records if 'Grid drift' in r.message]
+        assert len(drift_logs) == 1
+        assert 'N=3' in drift_logs[0]
+
+    def test_idempotent_no_second_walk(self, caplog):
+        """Two ticker events with the same last_close → only one walk."""
+        engine = self._make_engine()
+        with caplog.at_level('INFO'):
+            engine.on_event(self._ticker(103.5), {'long': [], 'short': []})
+            engine.on_event(self._ticker(103.5), {'long': [], 'short': []})
+        drift_logs = [r.message for r in caplog.records if 'Grid drift' in r.message]
+        assert len(drift_logs) == 1
+
+    def test_below_threshold_does_not_walk(self, caplog):
+        """Deviation = 0.5 * grid_step → no recenter, no log line."""
+        engine = self._make_engine()
+        with caplog.at_level('INFO'):
+            engine.on_event(self._ticker(100.5), {'long': [], 'short': []})
+        drift_logs = [r.message for r in caplog.records if 'Grid drift' in r.message]
+        assert drift_logs == []
+        # Grid prices unchanged
+        prices = [g['price'] for g in engine.grid.grid]
+        assert prices == [g['price'] for g in self._restored_grid_around_100()]
+
+    def test_below_threshold_does_not_migrate_wait_band(self):
+        """Sub-step drift must NOT migrate the WAIT band — that would let
+        cumulative drift hide indefinitely. Below-threshold ticks are true
+        no-ops: prices AND sides unchanged."""
+        engine = self._make_engine()
+        original_grid = self._restored_grid_around_100()
+        # Drift 0.9% (< 1.0 grid_step) — should be no-op
+        engine.on_event(self._ticker(100.9), {'long': [], 'short': []})
+
+        for actual, expected in zip(engine.grid.grid, original_grid):
+            assert actual['price'] == expected['price']
+            # Side must match restored (no migration of WAIT mark)
+            assert str(actual['side']) == expected['side'], (
+                f"side at {actual['price']} migrated: "
+                f"expected {expected['side']}, got {actual['side']}"
+            )
+
+    def test_cumulative_sub_step_drift_eventually_walks(self, caplog):
+        """A sequence of below-threshold ticks must eventually trigger a walk
+        once cumulative drift from the persisted anchor exceeds grid_step."""
+        engine = self._make_engine()
+        with caplog.at_level('INFO'):
+            for price in [100.5, 100.9, 100.99]:
+                engine.on_event(self._ticker(price), {'long': [], 'short': []})
+            drift_logs = [r.message for r in caplog.records if 'Grid drift' in r.message]
+            assert drift_logs == [], "no walk expected yet (all sub-step)"
+            # Now cross the threshold against fixed anchor=100
+            engine.on_event(self._ticker(101.5), {'long': [], 'short': []})
+
+        drift_logs = [r.message for r in caplog.records if 'Grid drift' in r.message]
+        assert len(drift_logs) == 1, f"expected exactly one walk, got {drift_logs}"
+
+    def test_fill_before_first_ticker_is_consumed_once(self):
+        """ExecutionEvent that arrives before any TickerEvent (last_close=None)
+        must be applied on the first ticker. Pre-0022 the per-tick update_grid
+        in _check_and_place would always re-apply it; post-0022 we use a
+        _fill_pending flag for one-shot consumption."""
+        engine = self._make_engine()
+        # Fill arrives before any ticker — last_close is still None.
+        fill_event = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol='BTCUSDT',
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            price=Decimal('99.0'),
+            qty=Decimal('0.01'),
+            side='Buy',
+        )
+        engine.on_event(fill_event)
+        assert engine._fill_pending is True
+
+        # First ticker — must consume the pending fill exactly once.
+        engine.on_event(self._ticker(100.0), {'long': [], 'short': []})
+        assert engine._fill_pending is False
+        # Filled level (99) is WAIT; level 100 is still the anchor (WAIT from build).
+        filled_level = next(g for g in engine.grid.grid if g['price'] == 99.0)
+        assert filled_level['side'] == GridSideType.WAIT
+
+    def test_recenter_result_truthy_only_on_walk(self):
+        """RecenterResult must be falsy on no-op so callers using
+        `if grid.recenter_if_drifted(...):` see only real walks."""
+        engine = self._make_engine()
+        result_no_walk = engine.grid.recenter_if_drifted(100.5)
+        assert bool(result_no_walk) is False
+        result_walk = engine.grid.recenter_if_drifted(103.5)
+        assert bool(result_walk) is True
+
+    def test_drift_measured_against_current_wait_band_after_fill(self, caplog):
+        """Plan Q1: drift reference is the CURRENT WAIT band, not the original
+        anchor. After a fill expands the WAIT band, recenter must measure
+        against the new wait_center so a tick that crosses one grid_step from
+        the new center triggers a walk even when it would not have crossed
+        from the original anchor."""
+        config = GridConfig(grid_count=10, grid_step=1.0)
+        engine = GridEngine(
+            symbol='BTCUSDT',
+            tick_size=Decimal('0.01'),
+            config=config,
+            strat_id='btcusdt_test',
+        )
+        # Build at 100.0; original anchor and wait_center both = 100.0.
+        engine.on_event(self._ticker(100.0), {'long': [], 'short': []})
+        assert engine.grid.anchor_price == 100.0
+
+        # Fill at 99.0 (last_close still 100.0 at fill time). update_grid
+        # marks 99.0 as WAIT and the equality keeps 100.0 as WAIT, so the
+        # WAIT band becomes [99.0, 100.0] and wait_center becomes 99.5.
+        fill = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol='BTCUSDT',
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            price=Decimal('99.0'),
+            qty=Decimal('0.01'),
+            side='Buy',
+        )
+        engine.on_event(fill)
+
+        # last_close = 100.6:
+        #   - drift from anchor=100.0: 0.6% → would NOT walk if anchor was the reference
+        #   - drift from wait_center=99.5: ≈1.106% > 1% → MUST walk per plan
+        with caplog.at_level('INFO'):
+            engine.on_event(self._ticker(100.6), {'long': [], 'short': []})
+
+        drift_logs = [r.message for r in caplog.records if 'Grid drift' in r.message]
+        assert len(drift_logs) == 1, (
+            f"expected one walk (drift > 1*step from current WAIT center 99.5), "
+            f"got {drift_logs}"
+        )
+
+    def test_fill_before_first_ticker_with_empty_grid(self):
+        """P2: pending fill must be consumed on the first ticker that builds
+        the grid (empty-engine path). Pre-fix the consume gate was skipped on
+        grid_just_built=True ticks, leaving the fill stranded for one cycle."""
+        config = GridConfig(grid_count=10, grid_step=1.0)
+        engine = GridEngine(
+            symbol='BTCUSDT',
+            tick_size=Decimal('0.01'),
+            config=config,
+            strat_id='btcusdt_test',
+        )
+        # No restored_grid, no anchor — engine starts truly empty.
+        assert len(engine.grid.grid) == 0
+
+        fill = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol='BTCUSDT',
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            price=Decimal('99.0'),
+            qty=Decimal('0.01'),
+            side='Buy',
+        )
+        engine.on_event(fill)
+        assert engine._fill_pending is True
+
+        # First ticker builds the grid AND consumes the pending fill.
+        engine.on_event(self._ticker(100.0), {'long': [], 'short': []})
+        assert engine._fill_pending is False, "pending fill must be consumed on first build tick"
+        filled_level = next(g for g in engine.grid.grid if g['price'] == 99.0)
+        assert filled_level['side'] == GridSideType.WAIT
+
+    def test_fresh_build_with_consumed_fill_runs_recenter(self, caplog):
+        """If a pending fill consumed on the same tick as build_grid shifts
+        the WAIT band far enough from last_close to exceed one grid_step,
+        recenter must run before order placement instead of being skipped
+        by the grid_just_built guard."""
+        config = GridConfig(grid_count=10, grid_step=1.0)
+        engine = GridEngine(
+            symbol='BTCUSDT',
+            tick_size=Decimal('0.01'),
+            config=config,
+            strat_id='btcusdt_test',
+        )
+
+        # Fill at 98.01 — this is a grid level 2 steps below the build anchor
+        # (100 * 0.99^2 = 98.01). After build at 100 and post-fill update_grid,
+        # WAIT band becomes [98.01, 100.0] → wait_center=99.005. Deviation
+        # |100 - 99.005| / 99.005 ≈ 1.005% > 1*grid_step → walk should fire.
+        fill = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol='BTCUSDT',
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            price=Decimal('98.01'),
+            qty=Decimal('0.01'),
+            side='Buy',
+        )
+        engine.on_event(fill)
+        assert engine._fill_pending is True
+
+        with caplog.at_level('INFO'):
+            engine.on_event(self._ticker(100.0), {'long': [], 'short': []})
+
+        drift_logs = [r.message for r in caplog.records if 'Grid drift' in r.message]
+        assert len(drift_logs) == 1, (
+            "fresh-build tick that consumed a pending fill must still run recenter "
+            "when the post-fill WAIT center diverges from last_close beyond one step; "
+            f"got {drift_logs}"
+        )
+
+    def test_stale_fill_does_not_cause_repeated_walks(self, caplog):
+        """P1 regression: a stale last_filled_price + existing limits used to
+        cause _check_and_place's update_grid to overwrite recenter's WAIT
+        assignment, so two identical ticks each triggered a fresh walk.
+        After fix, a stale fill must not re-trigger the walk on the second
+        identical ticker."""
+        engine = self._make_engine()
+        # Stale fill from a prior session — last_filled_price set, no fresh fill.
+        engine.last_filled_price = 99.0
+        existing_limits = {
+            'long': [{'orderId': '1', 'price': '99.0', 'side': 'Buy'}],
+            'short': [],
+        }
+        with caplog.at_level('INFO'):
+            engine.on_event(self._ticker(103.5), existing_limits)
+            grid_after_first = [g['price'] for g in engine.grid.grid]
+            engine.on_event(self._ticker(103.5), existing_limits)
+            grid_after_second = [g['price'] for g in engine.grid.grid]
+
+        drift_logs = [r.message for r in caplog.records if 'Grid drift' in r.message]
+        assert len(drift_logs) == 1, f"expected 1 drift log, got {len(drift_logs)}: {drift_logs}"
+        assert grid_after_first == grid_after_second, "second identical ticker must not mutate grid"
+
+    def test_out_of_bounds_rebuild_emits_drift_log(self, caplog):
+        """P3: when the bounds-guard rebuilds at last_close because price is
+        outside the restored grid, the planned 'Grid drift ... N=...' INFO line
+        is emitted alongside the existing 'Restored grid out of range' line."""
+        engine = self._make_engine()
+        # 200 is far outside the restored grid [95..105].
+        with caplog.at_level('INFO'):
+            engine.on_event(self._ticker(200.0), {'long': [], 'short': []})
+
+        msgs = [r.message for r in caplog.records]
+        assert any('Grid drift' in m and 'N=' in m for m in msgs)
+        assert any('Restored grid out of range' in m for m in msgs)
+        assert engine.grid.anchor_price == 200.0
+
+    def test_full_rebuild_fallback_via_engine(self, caplog):
+        """deviation that yields n_steps >= grid_count // 2 → full rebuild via fallback.
+        With grid_count=10, threshold = 5. A 6% deviation (last_close=106 inside bounds
+        of [95..105]? No — 106 is outside max, would trigger engine's own out-of-bounds
+        rebuild. Use a wider grid for this case."""
+        # Use grid_count=10 still but pick last_close close to upper bound but inside.
+        engine = self._make_engine()
+        # last_close = 104.99 → deviation ≈ 4.99% → n_steps = 4 → walk path (NOT fallback).
+        # Need n_steps >= 5 while staying in [95, 105]. With 1% step and centre=100,
+        # max in-bounds last_close ≈ 105 → max deviation ≈ 5%. n_steps = int(5/1) = 5,
+        # which equals grid_count // 2 = 5 → fallback triggers.
+        # Use last_close = 105.0 exactly (still inside bounds inclusive).
+        with caplog.at_level('INFO'):
+            engine.on_event(self._ticker(105.0), {'long': [], 'short': []})
+
+        drift_logs = [r.message for r in caplog.records if 'Grid drift' in r.message]
+        assert len(drift_logs) == 1
+        # Grid is fully rebuilt around 105.0 — anchor must equal 105.0.
+        assert engine.grid.anchor_price == 105.0
+        # Original prices like 95.0, 96.0 should not survive the rebuild.
+        prices = [g['price'] for g in engine.grid.grid]
+        assert 95.0 not in prices

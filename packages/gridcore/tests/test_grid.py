@@ -706,3 +706,191 @@ class TestGridMinMaxAccessors:
             _ = grid.min_grid
         with pytest.raises(ValueError):
             _ = grid.max_grid
+
+
+class TestWaitCenter:
+    """Tests for Grid._wait_center()."""
+
+    def test_single_wait_level_returns_its_price(self):
+        grid = Grid(tick_size=Decimal('0.01'), grid_count=10, grid_step=1.0)
+        grid.build_grid(100.0)
+        # build_grid produces exactly one WAIT level
+        assert grid._wait_center() == 100.0
+
+    def test_multi_wait_band_returns_midpoint(self):
+        grid = Grid(tick_size=Decimal('0.01'), grid_count=10, grid_step=1.0)
+        grid.build_grid(100.0)
+        # Manually expand the WAIT band: relabel a few levels around center as WAIT
+        center_idx = next(i for i, g in enumerate(grid.grid) if g['side'] == GridSideType.WAIT)
+        grid.grid[center_idx - 1]['side'] = GridSideType.WAIT
+        grid.grid[center_idx + 1]['side'] = GridSideType.WAIT
+        wait_prices = [g['price'] for g in grid.grid if g['side'] == GridSideType.WAIT]
+        expected = (min(wait_prices) + max(wait_prices)) / 2
+        assert grid._wait_center() == expected
+
+    def test_zero_wait_even_length_uses_mean_of_two_middles(self):
+        grid = Grid(tick_size=Decimal('0.01'), grid_count=10, grid_step=1.0)
+        grid.build_grid(100.0)
+        # Force even length
+        grid.grid.pop()
+        # Strip every WAIT mark
+        for level in grid.grid:
+            if level['side'] == GridSideType.WAIT:
+                level['side'] = GridSideType.BUY
+        n = len(grid.grid)
+        assert n % 2 == 0
+        expected = (grid.grid[n // 2 - 1]['price'] + grid.grid[n // 2]['price']) / 2
+        assert grid._wait_center() == expected
+
+    def test_zero_wait_odd_length_uses_single_middle(self):
+        grid = Grid(tick_size=Decimal('0.01'), grid_count=10, grid_step=1.0)
+        grid.build_grid(100.0)
+        n = len(grid.grid)
+        assert n % 2 == 1  # build_grid yields 11 levels for grid_count=10
+        for level in grid.grid:
+            if level['side'] == GridSideType.WAIT:
+                level['side'] = GridSideType.BUY
+        assert grid._wait_center() == grid.grid[n // 2]['price']
+
+
+class TestRecenterIfDrifted:
+    """Tests for Grid.recenter_if_drifted (feature 0022)."""
+
+    def _make_grid(self, anchor=100.0, grid_count=20, grid_step=1.0):
+        grid = Grid(tick_size=Decimal('0.01'), grid_count=grid_count, grid_step=grid_step)
+        grid.build_grid(anchor)
+        return grid
+
+    def test_no_action_when_grid_empty(self):
+        grid = Grid(tick_size=Decimal('0.01'), grid_count=10, grid_step=1.0)
+        walked, dev, n = grid.recenter_if_drifted(100.0)
+        assert walked is False
+        assert n == 0
+
+    def test_no_action_when_deviation_below_grid_step(self):
+        grid = self._make_grid(anchor=100.0, grid_step=1.0)
+        # 0.5% deviation < 1.0% grid_step
+        walked, dev, n = grid.recenter_if_drifted(100.5)
+        assert walked is False
+        assert n == 0
+        assert dev < 1.0
+
+    def test_no_action_at_exact_grid_step(self):
+        grid = self._make_grid(anchor=100.0, grid_step=1.0)
+        # exactly at threshold; trigger uses '>', not '>='
+        walked, dev, n = grid.recenter_if_drifted(101.0)
+        assert walked is False
+        assert n == 0
+
+    def test_walks_n_steps_up_when_price_above_band(self):
+        grid = self._make_grid(anchor=100.0, grid_count=20, grid_step=1.0)
+        original_min = grid.grid[0]['price']
+        original_max = grid.grid[-1]['price']
+        original_len = len(grid.grid)
+        # 3.5% deviation → n_steps = 3
+        walked, dev, n = grid.recenter_if_drifted(103.5)
+        assert walked is True
+        assert n == 3
+        assert len(grid.grid) == original_len  # length preserved
+        assert grid.grid[0]['price'] > original_min  # bottom raised
+        assert grid.grid[-1]['price'] > original_max  # top raised
+
+    def test_walks_n_steps_down_when_price_below_band(self):
+        grid = self._make_grid(anchor=100.0, grid_count=20, grid_step=1.0)
+        original_min = grid.grid[0]['price']
+        original_max = grid.grid[-1]['price']
+        original_len = len(grid.grid)
+        # -2.5% deviation → n_steps = 2 (deviation_pct ≈ 2.439, floor = 2)
+        walked, dev, n = grid.recenter_if_drifted(97.5)
+        assert walked is True
+        assert n == 2
+        assert len(grid.grid) == original_len
+        assert grid.grid[0]['price'] < original_min
+        assert grid.grid[-1]['price'] < original_max
+
+    def test_round_trip_outside_walked_region(self):
+        """Walk-up by N: levels at indices [0..len-N-1] post-walk == levels at [N..len-1] pre-walk."""
+        grid = self._make_grid(anchor=100.0, grid_count=20, grid_step=1.0)
+        pre_prices = [g['price'] for g in grid.grid]
+        walked, _, n = grid.recenter_if_drifted(103.5)
+        assert walked is True
+        post_prices = [g['price'] for g in grid.grid]
+        assert post_prices[: len(pre_prices) - n] == pre_prices[n:]
+
+    def test_full_rebuild_fallback_when_n_steps_exceeds_half(self):
+        grid = self._make_grid(anchor=100.0, grid_count=20, grid_step=1.0)
+        original_prices = {g['price'] for g in grid.grid}
+        # 15% deviation → n_steps = 15 > grid_count // 2 = 10 → fallback
+        walked, dev, n = grid.recenter_if_drifted(115.0)
+        assert walked is True
+        assert n >= grid.grid_count // 2
+        # Grid is rebuilt around 115.0; very few (if any) shared prices with original
+        new_prices = {g['price'] for g in grid.grid}
+        # Rebuilt grid is centered far from original — bulk of prices differ.
+        overlap = original_prices & new_prices
+        assert len(overlap) <= 1
+
+    def test_anchor_updated_to_wait_center_after_walk(self):
+        grid = self._make_grid(anchor=100.0, grid_count=20, grid_step=1.0)
+        walked, _, _ = grid.recenter_if_drifted(103.5)
+        assert walked is True
+        # _original_anchor_price should now equal new wait_center (close to 103.5)
+        assert grid._original_anchor_price == grid._wait_center()
+        assert abs(grid._original_anchor_price - 103.5) < 1.0
+
+    def test_assign_sides_post_walk(self):
+        grid = self._make_grid(anchor=100.0, grid_count=20, grid_step=1.0)
+        walked, _, _ = grid.recenter_if_drifted(103.5)
+        assert walked is True
+        last_close = 103.5
+        for level in grid.grid:
+            diff_pct = abs(level['price'] - last_close) / level['price'] * 100
+            if diff_pct < grid.grid_step / 4:
+                assert level['side'] == GridSideType.WAIT
+            elif level['price'] > last_close:
+                assert level['side'] == GridSideType.SELL
+            elif level['price'] < last_close:
+                assert level['side'] == GridSideType.BUY
+
+    def test_notify_change_called_on_walk(self):
+        calls = []
+        grid = Grid(
+            tick_size=Decimal('0.01'),
+            grid_count=20,
+            grid_step=1.0,
+            on_change=lambda g: calls.append(len(g)),
+        )
+        grid.build_grid(100.0)
+        calls_after_build = len(calls)
+        walked, _, _ = grid.recenter_if_drifted(103.5)
+        assert walked is True
+        assert len(calls) == calls_after_build + 1
+
+    def test_notify_change_not_called_when_no_action(self):
+        calls = []
+        grid = Grid(
+            tick_size=Decimal('0.01'),
+            grid_count=20,
+            grid_step=1.0,
+            on_change=lambda g: calls.append(len(g)),
+        )
+        grid.build_grid(100.0)
+        calls_after_build = len(calls)
+        walked, _, _ = grid.recenter_if_drifted(100.2)
+        assert walked is False
+        assert len(calls) == calls_after_build  # no extra notify
+
+    def test_assign_sides_with_fill_price_preserves_legacy(self):
+        """_assign_sides(last_close, fill_price=fp) preserves update_grid semantics:
+        WAIT marking is driven by proximity to fp, not last_close."""
+        grid = self._make_grid(anchor=100.0, grid_count=20, grid_step=1.0)
+        target_idx = 5
+        fp = grid.grid[target_idx]['price']
+        last_close = grid.grid[12]['price']  # well separated from fp (different level)
+        grid._assign_sides(last_close, fill_price=fp)
+        # Level at fp must be WAIT (driven by fill_price proximity)
+        assert grid.grid[target_idx]['side'] == GridSideType.WAIT
+        # The level at last_close must NOT be WAIT, because the WAIT rule uses
+        # fill_price as reference, not last_close. (If it were last_close, this
+        # level would also be WAIT.)
+        assert grid.grid[12]['side'] != GridSideType.WAIT
