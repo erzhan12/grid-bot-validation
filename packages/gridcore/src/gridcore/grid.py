@@ -265,7 +265,13 @@ class Grid:
 
     def wait_center(self) -> float:
         """Center price of the current WAIT band, with a median fallback when
-        no WAIT levels exist. Caller must guard against empty grid."""
+        no WAIT levels exist.
+
+        Raises:
+            ValueError: If called on an empty grid
+        """
+        if not self.grid:
+            raise ValueError("wait_center() called on empty grid")
         wait_prices = [g['price'] for g in self.grid if g['side'] == GridSideType.WAIT]
         if wait_prices:
             return (min(wait_prices) + max(wait_prices)) / 2
@@ -330,12 +336,16 @@ class Grid:
             return RecenterResult(False, 0.0, 0)
 
         wait_center = self.wait_center()
-        # No zero-guard: wait_center > 0 by invariants (positive traded prices, strictly-ascending sort, falsy last_close rejected by build_grid). Same in __is_too_close / _create_place_intent.
+        if wait_center == 0:
+            logger.warning('wait_center is zero, cannot calculate drift')
+            return RecenterResult(False, 0.0, 0)
         deviation_pct = abs(last_close - wait_center) / wait_center * 100
         if deviation_pct <= self.grid_step:
             return RecenterResult(False, deviation_pct, 0)
 
-        # No zero-guard on grid_step: GridConfig.__post_init__ enforces grid_step > 0.
+        if self.grid_step == 0:
+            logger.warning('grid_step is zero, cannot compute n_steps')
+            return RecenterResult(False, deviation_pct, 0)
         n_steps = int(deviation_pct / self.grid_step)
 
         if n_steps >= self.grid_count // 2:
@@ -408,7 +418,8 @@ class Grid:
         Returns:
             True if prices are within grid_step/4 of each other
         """
-        # No zero-guard: price1 > 0 by grid invariants (positive traded prices, strictly-ascending sort), grid_step > 0 enforced by GridConfig.__post_init__.
+        if price1 == 0 or self.grid_step == 0:
+            return False
         return abs(price1 - price2) / price1 * 100 < self.grid_step / 4
 
     def __is_price_sorted(self) -> bool:

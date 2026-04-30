@@ -162,13 +162,17 @@ class GridEngine:
                 # path uses, so out-of-bounds rebuilds are observable through
                 # the same telemetry hook (per 0022 Step 3).
                 wait_center = self.grid.wait_center()
-                # No zero-guard on wait_center — same invariants as grid.py recenter_if_drifted (see comment there).
-                deviation_pct = abs(self.last_close - wait_center) / wait_center * 100
-                n_steps = int(deviation_pct / self.grid.grid_step) if self.grid.grid_step > 0 else 0
-                logger.info(
-                    '%s: Grid drift %.2f%% (N=%d steps) — recentering at %s',
-                    self.symbol, deviation_pct, n_steps, self.last_close,
-                )
+                if wait_center == 0:
+                    logger.warning(
+                        '%s: wait_center is zero, cannot calculate drift metrics',
+                        self.symbol,
+                    )
+                    deviation_pct = 0.0
+                    n_steps = 0
+                else:
+                    deviation_pct = abs(self.last_close - wait_center) / wait_center * 100
+                    n_steps = int(deviation_pct / self.grid.grid_step) if self.grid.grid_step > 0 else 0
+                self._log_drift(deviation_pct, n_steps, self.last_close)
                 logger.info(
                     '%s: Restored grid out of range (last_close=%s, range=[%s, %s]), rebuilding',
                     self.symbol, self.last_close, min_p, max_p,
@@ -202,16 +206,20 @@ class GridEngine:
         if not grid_just_built or fill_consumed_this_tick:
             walked, deviation_pct, n_steps = self.grid.recenter_if_drifted(self.last_close)
             if walked:
-                logger.info(
-                    '%s: Grid drift %.2f%% (N=%d steps) — recentering at %s',
-                    self.symbol, deviation_pct, n_steps, self.last_close,
-                )
+                self._log_drift(deviation_pct, n_steps, self.last_close)
 
         # Check and place orders for both directions
         intents.extend(self._check_and_place('long', limit_orders.get('long', [])))
         intents.extend(self._check_and_place('short', limit_orders.get('short', [])))
 
         return intents
+
+    def _log_drift(self, deviation_pct: float, n_steps: int, last_close: float) -> None:
+        """Log grid drift recentering event."""
+        logger.info(
+            '%s: Grid drift %.2f%% (N=%d steps) — recentering at %s',
+            self.symbol, deviation_pct, n_steps, last_close,
+        )
 
     def _handle_execution_event(self, event: ExecutionEvent) -> list[PlaceLimitIntent | CancelIntent]:
         """
