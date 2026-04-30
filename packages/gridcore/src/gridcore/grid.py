@@ -199,9 +199,9 @@ class Grid:
 
         # Derive _original_anchor_price from the WAIT center so anchor_price
         # property continues to reflect a meaningful "center" value. Uses
-        # _wait_center() to keep the post-restore anchor consistent with the
+        # wait_center() to keep the post-restore anchor consistent with the
         # post-recenter-walk anchor (feature 0022, Step 5.5).
-        self._original_anchor_price = self._wait_center()
+        self._original_anchor_price = self.wait_center()
 
         return True
 
@@ -263,7 +263,7 @@ class Grid:
 
         self._notify_change()
 
-    def _wait_center(self) -> float:
+    def wait_center(self) -> float:
         """Center price of the current WAIT band, with a median fallback when
         no WAIT levels exist. Caller must guard against empty grid."""
         wait_prices = [g['price'] for g in self.grid if g['side'] == GridSideType.WAIT]
@@ -321,7 +321,7 @@ class Grid:
         a walk once cumulative drift from the current WAIT center exceeds the
         threshold.
 
-        Drift is measured against the current `_wait_center()` per plan Q1
+        Drift is measured against the current `wait_center()` per plan Q1
         (the detector self-adjusts as the grid walks or as `update_grid()`
         expands the WAIT band after a fill).
 
@@ -329,7 +329,7 @@ class Grid:
         if not self.grid:
             return RecenterResult(False, 0.0, 0)
 
-        wait_center = self._wait_center()
+        wait_center = self.wait_center()
         # No zero-guard: wait_center > 0 by invariants (positive traded prices, strictly-ascending sort, falsy last_close rejected by build_grid). Same in __is_too_close / _create_place_intent.
         deviation_pct = abs(last_close - wait_center) / wait_center * 100
         if deviation_pct <= self.grid_step:
@@ -347,7 +347,7 @@ class Grid:
         direction = 'up' if last_close > wait_center else 'down'
         self._shift_grid(n_steps, direction)
         self._assign_sides(last_close)
-        self._original_anchor_price = self._wait_center()
+        self._original_anchor_price = self.wait_center()
         self._notify_change()
         return RecenterResult(True, deviation_pct, n_steps)
 

@@ -709,13 +709,13 @@ class TestGridMinMaxAccessors:
 
 
 class TestWaitCenter:
-    """Tests for Grid._wait_center()."""
+    """Tests for Grid.wait_center()."""
 
     def test_single_wait_level_returns_its_price(self):
         grid = Grid(tick_size=Decimal('0.01'), grid_count=10, grid_step=1.0)
         grid.build_grid(100.0)
         # build_grid produces exactly one WAIT level
-        assert grid._wait_center() == 100.0
+        assert grid.wait_center() == 100.0
 
     def test_multi_wait_band_returns_midpoint(self):
         grid = Grid(tick_size=Decimal('0.01'), grid_count=10, grid_step=1.0)
@@ -726,7 +726,7 @@ class TestWaitCenter:
         grid.grid[center_idx + 1]['side'] = GridSideType.WAIT
         wait_prices = [g['price'] for g in grid.grid if g['side'] == GridSideType.WAIT]
         expected = (min(wait_prices) + max(wait_prices)) / 2
-        assert grid._wait_center() == expected
+        assert grid.wait_center() == expected
 
     def test_zero_wait_even_length_uses_mean_of_two_middles(self):
         grid = Grid(tick_size=Decimal('0.01'), grid_count=10, grid_step=1.0)
@@ -740,7 +740,7 @@ class TestWaitCenter:
         n = len(grid.grid)
         assert n % 2 == 0
         expected = (grid.grid[n // 2 - 1]['price'] + grid.grid[n // 2]['price']) / 2
-        assert grid._wait_center() == expected
+        assert grid.wait_center() == expected
 
     def test_zero_wait_odd_length_uses_single_middle(self):
         grid = Grid(tick_size=Decimal('0.01'), grid_count=10, grid_step=1.0)
@@ -750,7 +750,7 @@ class TestWaitCenter:
         for level in grid.grid:
             if level['side'] == GridSideType.WAIT:
                 level['side'] = GridSideType.BUY
-        assert grid._wait_center() == grid.grid[n // 2]['price']
+        assert grid.wait_center() == grid.grid[n // 2]['price']
 
 
 class TestRecenterIfDrifted:
@@ -835,7 +835,7 @@ class TestRecenterIfDrifted:
         walked, _, _ = grid.recenter_if_drifted(103.5)
         assert walked is True
         # _original_anchor_price should now equal new wait_center (close to 103.5)
-        assert grid._original_anchor_price == grid._wait_center()
+        assert grid._original_anchor_price == grid.wait_center()
         assert abs(grid._original_anchor_price - 103.5) < 1.0
 
     def test_assign_sides_post_walk(self):
