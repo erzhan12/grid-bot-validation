@@ -752,6 +752,65 @@ class TestWaitCenter:
                 level['side'] = GridSideType.BUY
         assert grid.wait_center() == grid.grid[n // 2]['price']
 
+    def test_wait_center_raises_on_empty_grid(self):
+        """Defensive contract: wait_center() must raise ValueError on empty grid
+        rather than IndexError or returning a meaningless value."""
+        grid = Grid(tick_size=Decimal('0.01'), grid_count=10, grid_step=1.0)
+        assert grid.grid == []
+        with pytest.raises(ValueError, match="empty grid"):
+            grid.wait_center()
+
+
+class TestZeroDivisionGuards:
+    """Defensive guards against division-by-zero in degenerate states.
+    The grid invariants (positive traded prices, GridConfig.grid_step > 0)
+    make these unreachable in production, but the guards are exercised here
+    to lock in the contract."""
+
+    def test_recenter_no_op_when_wait_center_is_zero(self, caplog):
+        """If the WAIT band is symmetric around zero (e.g. [-1, 1]), wait_center
+        returns 0. recenter_if_drifted must early-return rather than divide."""
+        grid = Grid(tick_size=Decimal('0.01'), grid_count=10, grid_step=1.0)
+        # Bypass build_grid validation by setting grid directly.
+        grid.grid = [
+            {'side': GridSideType.WAIT, 'price': -1.0},
+            {'side': GridSideType.WAIT, 'price': 1.0},
+        ]
+        assert grid.wait_center() == 0.0
+
+        with caplog.at_level('WARNING'):
+            result = grid.recenter_if_drifted(5.0)
+
+        assert bool(result) is False
+        assert result.n_steps == 0
+        assert any('wait_center is zero' in r.message for r in caplog.records)
+
+    def test_recenter_no_op_when_grid_step_is_zero(self, caplog):
+        """grid_step == 0 would crash int(deviation_pct / 0). Guard returns
+        a no-op RecenterResult."""
+        grid = Grid(tick_size=Decimal('0.01'), grid_count=10, grid_step=1.0)
+        grid.build_grid(100.0)
+        grid.grid_step = 0  # break GridConfig invariant for the test
+
+        with caplog.at_level('WARNING'):
+            result = grid.recenter_if_drifted(105.0)
+
+        assert bool(result) is False
+        assert result.n_steps == 0
+        assert any('grid_step is zero' in r.message for r in caplog.records)
+
+    def test_is_too_close_returns_false_on_zero_price(self):
+        """__is_too_close divides by price1 — guard short-circuits on zero."""
+        grid = Grid(tick_size=Decimal('0.01'), grid_count=10, grid_step=1.0)
+        # Name-mangled access for the private method
+        assert grid._Grid__is_too_close(0.0, 1.0) is False
+
+    def test_is_too_close_returns_false_on_zero_grid_step(self):
+        """grid_step == 0 makes the threshold 0; guard returns False."""
+        grid = Grid(tick_size=Decimal('0.01'), grid_count=10, grid_step=1.0)
+        grid.grid_step = 0
+        assert grid._Grid__is_too_close(100.0, 100.0) is False
+
 
 class TestRecenterIfDrifted:
     """Tests for Grid.recenter_if_drifted (feature 0022)."""

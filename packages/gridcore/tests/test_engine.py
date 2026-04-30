@@ -1606,6 +1606,32 @@ class TestRecenterIntegration:
         filled_level = next(g for g in engine.grid.grid if g['price'] == 99.0)
         assert filled_level['side'] == GridSideType.WAIT
 
+    def test_bounds_rebuild_handles_zero_wait_center(self, caplog):
+        """Defensive: if the bounds-guard rebuild path encounters wait_center==0
+        (degenerate restored grid), it must emit a WARNING and the consolidated
+        drift INFO line with deterministic zeros — and proceed to rebuild."""
+        config = GridConfig(grid_count=10, grid_step=1.0)
+        # Build a symmetric ±X grid where wait_center() returns 0. This needs to
+        # both (a) make wait_center == 0 and (b) trigger the bounds-guard so
+        # last_close is OUTSIDE [min_grid, max_grid] (last_close > 1.0 here).
+        engine = GridEngine(
+            symbol='BTCUSDT',
+            tick_size=Decimal('0.01'),
+            config=config,
+            strat_id='btcusdt_test',
+        )
+        engine.grid.grid = [
+            {'side': GridSideType.WAIT, 'price': -1.0},
+            {'side': GridSideType.WAIT, 'price': 1.0},
+        ]
+
+        with caplog.at_level('WARNING'):
+            engine.on_event(self._ticker(100.0), {'long': [], 'short': []})
+
+        assert any('wait_center is zero' in r.message for r in caplog.records)
+        # Rebuild still happens — anchor lands at last_close.
+        assert engine.grid.anchor_price == 100.0
+
     def test_fresh_build_with_consumed_fill_runs_recenter(self, caplog):
         """If a pending fill consumed on the same tick as build_grid shifts
         the WAIT band far enough from last_close to exceed one grid_step,
