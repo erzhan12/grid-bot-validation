@@ -330,6 +330,12 @@ class Grid:
             return RecenterResult(False, 0.0, 0)
 
         wait_center = self._wait_center()
+        # Zero-division on `wait_center` is theoretically possible but ruled out
+        # in practice: build_grid() rejects falsy last_close, __is_price_sorted
+        # enforces strictly-ascending prices, and traded-symbol prices are
+        # always positive — so wait_center is always > 0. Same assumption holds
+        # for __is_too_close and _create_place_intent (engine.py); if a future
+        # change ever loosens those invariants, add a zero-guard here too.
         deviation_pct = abs(last_close - wait_center) / wait_center * 100
         if deviation_pct <= self.grid_step:
             return RecenterResult(False, deviation_pct, 0)
