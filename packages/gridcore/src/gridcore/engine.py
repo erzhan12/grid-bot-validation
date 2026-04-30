@@ -162,6 +162,7 @@ class GridEngine:
                 # path uses, so out-of-bounds rebuilds are observable through
                 # the same telemetry hook (per 0022 Step 3).
                 wait_center = self.grid._wait_center()
+                # No zero-guard on wait_center — same invariants as grid.py recenter_if_drifted (see comment there).
                 deviation_pct = abs(self.last_close - wait_center) / wait_center * 100
                 n_steps = int(deviation_pct / self.grid.grid_step) if self.grid.grid_step > 0 else 0
                 logger.info(

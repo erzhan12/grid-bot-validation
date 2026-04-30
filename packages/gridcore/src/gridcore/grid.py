@@ -335,6 +335,7 @@ class Grid:
         if deviation_pct <= self.grid_step:
             return RecenterResult(False, deviation_pct, 0)
 
+        # No zero-guard on grid_step: GridConfig.__post_init__ enforces grid_step > 0.
         n_steps = int(deviation_pct / self.grid_step)
 
         if n_steps >= self.grid_count // 2:
