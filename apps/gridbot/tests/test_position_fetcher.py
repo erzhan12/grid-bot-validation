@@ -29,6 +29,7 @@ def _make_fetcher(
     notifier=None,
     wallet_cache_interval=300.0,
     position_check_interval=60.0,
+    on_position_changed=None,
 ):
     return PositionFetcher(
         rest_clients=rest_clients if rest_clients is not None else {},
@@ -36,6 +37,7 @@ def _make_fetcher(
         notifier=notifier if notifier is not None else Mock(spec=Notifier),
         wallet_cache_interval=wallet_cache_interval,
         position_check_interval=position_check_interval,
+        on_position_changed=on_position_changed,
     )
 
 
@@ -101,6 +103,85 @@ class TestOnPositionMessage:
         fetcher.on_position_message("acct", {"data": 12345})
         notifier.alert_exception.assert_called_once()
         assert "on_position" in notifier.alert_exception.call_args[0][0]
+
+    def test_callback_fires_once_per_symbol(self):
+        """Feature 0023: callback invoked once per (account, symbol),
+        deduped across sides arriving in the same message.
+        """
+        callback = Mock()
+        fetcher = _make_fetcher(on_position_changed=callback)
+        msg = {
+            "data": [
+                {"category": "linear", "symbol": "BTCUSDT", "side": "Buy", "size": "0.1"},
+                {"category": "linear", "symbol": "BTCUSDT", "side": "Sell", "size": "0.05"},
+                {"category": "linear", "symbol": "ETHUSDT", "side": "Buy", "size": "1.0"},
+            ]
+        }
+        fetcher.on_position_message("acct", msg)
+        # BTCUSDT once (despite Buy+Sell), ETHUSDT once.
+        assert callback.call_count == 2
+        symbols_called = {call.args[1] for call in callback.call_args_list}
+        assert symbols_called == {"BTCUSDT", "ETHUSDT"}
+        for call in callback.call_args_list:
+            assert call.args[0] == "acct"
+
+    def test_callback_not_fired_when_unregistered(self):
+        """Backward compat: when on_position_changed is None,
+        on_position_message behaves exactly as before.
+        """
+        # No callback wired — must not raise.
+        fetcher = _make_fetcher()
+        msg = {
+            "data": [
+                {"category": "linear", "symbol": "BTCUSDT", "side": "Buy", "size": "0.1"},
+            ]
+        }
+        fetcher.on_position_message("acct", msg)
+        # Cache write still happened.
+        assert fetcher._position_ws_data["acct"]["BTCUSDT"]["Buy"]["size"] == "0.1"
+
+    def test_callback_not_fired_for_filtered_messages(self):
+        """Non-linear / empty-symbol entries don't store and don't notify."""
+        callback = Mock()
+        fetcher = _make_fetcher(on_position_changed=callback)
+        msg = {
+            "data": [
+                {"category": "spot", "symbol": "BTCUSDT", "side": "Buy", "size": "1.0"},
+                {"category": "linear", "symbol": "", "side": "Buy", "size": "0.1"},
+            ]
+        }
+        fetcher.on_position_message("acct", msg)
+        callback.assert_not_called()
+
+    def test_callback_exception_isolated(self):
+        """A misbehaving callback must not wedge the WS thread —
+        cache writes succeed, exception is alerted via notifier.
+        """
+        notifier = Mock(spec=Notifier)
+        callback = Mock(side_effect=RuntimeError("boom"))
+        fetcher = _make_fetcher(notifier=notifier, on_position_changed=callback)
+        msg = {
+            "data": [
+                {"category": "linear", "symbol": "BTCUSDT", "side": "Buy", "size": "0.1"},
+            ]
+        }
+        # Must not raise.
+        fetcher.on_position_message("acct", msg)
+        # Cache write still happened.
+        assert fetcher._position_ws_data["acct"]["BTCUSDT"]["Buy"]["size"] == "0.1"
+        # Notifier was alerted.
+        notifier.alert_exception.assert_called_once()
+        assert "on_position_changed" in notifier.alert_exception.call_args[0][0]
+
+    def test_callback_skipped_when_message_raises(self):
+        """If on_position_message hits an exception during cache writes,
+        the callback must NOT fire — partial state should not leak.
+        """
+        callback = Mock()
+        fetcher = _make_fetcher(on_position_changed=callback)
+        # data=int triggers TypeError before any cache write.
+        fetcher.on_position_message("acct", {"data": 12345})
+        callback.assert_not_called()
 
 
 class TestGetPositionFromWs:
