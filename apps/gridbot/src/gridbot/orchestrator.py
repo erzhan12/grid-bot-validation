@@ -480,6 +480,12 @@ class Orchestrator:
 
         # Retry queues have no background task to stop (see 0017_PLAN.md).
 
+        # Grid state writes are dispatched to daemon threads so the hot path
+        # never blocks on disk I/O. On graceful shutdown, wait for any pending
+        # writes before the process exits; otherwise the daemon writer can be
+        # killed and the latest post-fill grid state is lost.
+        self._state_store.flush()
+
         # Update Run records
         self._update_run_records_stopped()
 

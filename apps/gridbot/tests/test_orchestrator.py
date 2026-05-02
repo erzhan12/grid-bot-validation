@@ -263,6 +263,29 @@ class TestOrchestratorLifecycle:
     @patch("gridbot.orchestrator.BybitRestClient")
     @patch("gridbot.orchestrator.PublicWebSocketClient")
     @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_stop_flushes_grid_state_store(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        gridbot_config,
+    ):
+        """stop() waits for pending async grid-state writes before exit."""
+        mock_public_ws.return_value.connect = Mock()
+        mock_private_ws.return_value.connect = Mock()
+        mock_rest_client.return_value.get_open_orders = Mock(return_value=[])
+
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator.start()
+        orchestrator._state_store.flush = Mock()
+
+        orchestrator.stop()
+
+        orchestrator._state_store.flush.assert_called_once_with()
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
     def test_start_calls_initial_position_fetch(
         self,
         mock_private_ws,
