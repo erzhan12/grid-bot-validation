@@ -422,7 +422,7 @@ class StrategyRunner:
         long_position: Optional[dict],
         short_position: Optional[dict],
         wallet_balance: float,
-        last_close: float,
+        last_close: Optional[float],
     ) -> None:
         """Update position state and recalculate multipliers.
 
@@ -430,7 +430,7 @@ class StrategyRunner:
             long_position: Long position data from exchange.
             short_position: Short position data from exchange.
             wallet_balance: Current wallet balance.
-            last_close: Current price.
+            last_close: Current price, or None when no ticker has been seen yet.
 
         Raises:
             Exception: Re-raised after logging so orchestrator can handle notification.
@@ -463,6 +463,22 @@ class StrategyRunner:
             self._long_position.position_ratio = position_ratio
             self._short_position.position_ratio = position_ratio
 
+            has_position = long_state is not None or short_state is not None
+            has_valid_price = (
+                last_close is not None
+                and math.isfinite(float(last_close))
+                and float(last_close) > 0
+            )
+            if has_position and not has_valid_price:
+                logger.warning(
+                    "%s: Position update has no valid market price; "
+                    "updated sizes/wallet but left risk multipliers unchanged",
+                    self.strat_id,
+                )
+                self._last_position_check = datetime.now(UTC)
+                return
+            price = float(last_close) if last_close is not None else 0.0
+
             # Reset both positions once before calculating (bbu2 pattern)
             self._long_position.reset_amount_multiplier()
             self._short_position.reset_amount_multiplier()
@@ -473,13 +489,13 @@ class StrategyRunner:
             if long_state:
                 opposite = short_state or PositionState(direction=DirectionType.SHORT)
                 self._long_position.calculate_amount_multiplier(
-                    long_state, opposite, last_close
+                    long_state, opposite, price
                 )
 
             if short_state:
                 opposite = long_state or PositionState(direction=DirectionType.LONG)
                 self._short_position.calculate_amount_multiplier(
-                    short_state, opposite, last_close
+                    short_state, opposite, price
                 )
 
             self._last_position_check = datetime.now(UTC)

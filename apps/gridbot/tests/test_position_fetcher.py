@@ -429,3 +429,21 @@ class TestFetchAndUpdate:
             last_close=42000.0,
         )
         rest.get_positions.assert_not_called()
+
+    def test_passes_none_when_runner_has_no_last_close(self):
+        """Position fetches before first ticker must not fabricate price=0.0."""
+        fetcher = _make_fetcher()
+        runner, rest = self._make_account_with_runner(fetcher, account_name="a")
+        runner.engine.last_close = None
+        long_pos = {"symbol": "BTCUSDT", "side": "Buy", "size": "0.2"}
+        short_pos = {"symbol": "BTCUSDT", "side": "Sell", "size": "0.1"}
+        rest.get_positions.return_value = [long_pos, short_pos]
+
+        fetcher.fetch_and_update(startup=True)
+
+        runner.on_position_update.assert_called_once_with(
+            long_position=long_pos,
+            short_position=short_pos,
+            wallet_balance=10000.0,
+            last_close=None,
+        )

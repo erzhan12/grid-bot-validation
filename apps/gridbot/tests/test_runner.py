@@ -491,6 +491,32 @@ class TestStrategyRunnerPositionUpdate:
         assert runner._long_position.get_amount_multiplier() == {"Buy": 1.0, "Sell": 1.0}
         assert runner._short_position.get_amount_multiplier() == {"Buy": 1.0, "Sell": 1.0}
 
+    def test_on_position_update_without_price_does_not_poison_risk_multipliers(
+        self, runner
+    ):
+        """Startup position refresh may arrive before the first ticker.
+
+        Sizes and wallet balance still need to update, but risk multipliers
+        must not be calculated with a fabricated 0.0 market price.
+        """
+        long_pos = {"size": "1.0", "avgPrice": "50000", "liqPrice": "40000"}
+
+        runner._long_position.amount_multiplier = {"Buy": 1.25, "Sell": 1.75}
+        runner._short_position.amount_multiplier = {"Buy": 0.5, "Sell": 2.0}
+
+        runner.on_position_update(
+            long_position=long_pos,
+            short_position=None,
+            wallet_balance=25000.0,
+            last_close=None,
+        )
+
+        assert runner._wallet_balance == Decimal("25000.0")
+        assert runner._long_position.size == Decimal("1.0")
+        assert runner._short_position.size == Decimal("0")
+        assert runner._long_position.get_amount_multiplier() == {"Buy": 1.25, "Sell": 1.75}
+        assert runner._short_position.get_amount_multiplier() == {"Buy": 0.5, "Sell": 2.0}
+
     def test_get_amount_multiplier_long(self, runner):
         """Test get_amount_multiplier returns correct value for long direction."""
         runner._long_position.amount_multiplier = {"Buy": 2.0, "Sell": 1.5}

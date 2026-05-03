@@ -394,14 +394,12 @@ class PositionFetcher:
                         elif side == "Sell" and short_pos is None:
                             short_pos = pos
 
-                last_close = runner.engine.last_close or 0.0
-
                 try:
                     runner.on_position_update(
                         long_position=long_pos,
                         short_position=short_pos,
                         wallet_balance=wallet_balance,
-                        last_close=last_close,
+                        last_close=runner.engine.last_close,
                     )
                 except Exception as e:
                     logger.error(

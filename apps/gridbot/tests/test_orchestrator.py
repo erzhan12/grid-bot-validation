@@ -2,11 +2,13 @@
 
 import threading
 import time
+from datetime import datetime, UTC
 from decimal import Decimal
 from unittest.mock import Mock, MagicMock, patch
 
 import pytest
 
+from gridcore import EventType, TickerEvent
 from gridbot.config import GridbotConfig, AccountConfig, StrategyConfig
 from gridbot.notifier import Notifier
 from gridbot.orchestrator import Orchestrator
@@ -882,6 +884,41 @@ class TestOrchestratorWsPositionDrain:
         assert kwargs["short_position"]["size"] == "0.2"
         assert kwargs["wallet_balance"] == 1000.0
         assert kwargs["last_close"] == 42500.0
+
+    def test_drain_uses_queued_ticker_before_engine_last_close(
+        self, gridbot_config, account_config, strategy_config
+    ):
+        """If the first WS position and ticker arrive before one tick, the
+        position drain must use the queued ticker price instead of 0.0.
+        """
+        orch, runner = self._make_orch(gridbot_config, account_config, strategy_config)
+        runner.engine.last_close = None
+        orch._latest_ticker["BTCUSDT"] = TickerEvent(
+            event_type=EventType.TICKER,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            last_price=Decimal("42600.0"),
+        )
+
+        self._push_ws(orch, "BTCUSDT", long_size="0.3", short_size="0.2")
+        orch._tick()
+
+        kwargs = runner.on_position_update.call_args.kwargs
+        assert kwargs["last_close"] == 42600.0
+
+    def test_drain_passes_none_when_no_market_price(
+        self, gridbot_config, account_config, strategy_config
+    ):
+        """No ticker yet is represented as None so runner risk math can skip."""
+        orch, runner = self._make_orch(gridbot_config, account_config, strategy_config)
+        runner.engine.last_close = None
+
+        self._push_ws(orch, "BTCUSDT", long_size="0.3", short_size="0.2")
+        orch._tick()
+
+        kwargs = runner.on_position_update.call_args.kwargs
+        assert kwargs["last_close"] is None
 
     def test_drain_idempotent_on_unchanged_seq(self, gridbot_config, account_config, strategy_config):
         """Two consecutive ticks with no new WS push → dispatch fires once."""
