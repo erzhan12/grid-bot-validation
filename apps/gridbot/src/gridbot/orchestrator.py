@@ -483,8 +483,11 @@ class Orchestrator:
         # Grid state writes are dispatched to daemon threads so the hot path
         # never blocks on disk I/O. On graceful shutdown, wait for any pending
         # writes before the process exits; otherwise the daemon writer can be
-        # killed and the latest post-fill grid state is lost.
-        self._state_store.flush()
+        # killed and the latest post-fill grid state is lost. Bound the wait
+        # so a stuck writer (slow/dead disk) cannot block stop() forever —
+        # losing one save is preferable to a process that won't exit on
+        # SIGTERM. 10s matches typical fsync upper bounds on healthy disks.
+        self._state_store.flush(timeout=10.0)
 
         # Update Run records
         self._update_run_records_stopped()

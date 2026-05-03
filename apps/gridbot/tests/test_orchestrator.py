@@ -281,7 +281,7 @@ class TestOrchestratorLifecycle:
 
         orchestrator.stop()
 
-        orchestrator._state_store.flush.assert_called_once_with()
+        orchestrator._state_store.flush.assert_called_once_with(timeout=10.0)
 
     @patch("gridbot.orchestrator.BybitRestClient")
     @patch("gridbot.orchestrator.PublicWebSocketClient")
