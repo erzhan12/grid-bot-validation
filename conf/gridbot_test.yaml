@@ -1,12 +1,12 @@
 accounts:
-  - name: testnet_dev
+  - name: mainnet_live
     api_key: "${BYBIT_API_KEY}"
     api_secret: "${BYBIT_API_SECRET}"
     testnet: false
 
 strategies:
   - strat_id: ltcusdt_test
-    account: testnet_dev
+    account: mainnet_live
     symbol: LTCUSDT
     tick_size: "0.1"
     grid_count: 20
