@@ -259,10 +259,25 @@ class PublicWebSocketClient:
         logger.debug("Heartbeat watchdog started")
 
     def _stop_heartbeat_watchdog(self) -> None:
-        """Stop heartbeat watchdog thread."""
+        """Stop heartbeat watchdog thread.
+
+        Skips `join()` when the calling thread IS the heartbeat thread —
+        otherwise Python raises `RuntimeError: cannot join current thread`.
+        This makes `reset()` safe to call directly from an `on_disconnect`
+        callback (which fires on the heartbeat thread). The orphaned loop
+        observes its own (still-set) event at the top of the next iteration
+        and exits cleanly; `_start_heartbeat_watchdog` already replaces
+        `self._stop_heartbeat` with a fresh Event, so the new heartbeat
+        thread does not interfere.
+        """
         self._stop_heartbeat.set()
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
-            self._heartbeat_thread.join(timeout=2.0)
+        thread = self._heartbeat_thread
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=2.0)
         self._heartbeat_thread = None
         logger.debug("Heartbeat watchdog stopped")
 
@@ -556,10 +571,25 @@ class PrivateWebSocketClient:
         logger.debug("Heartbeat watchdog started")
 
     def _stop_heartbeat_watchdog(self) -> None:
-        """Stop heartbeat watchdog thread."""
+        """Stop heartbeat watchdog thread.
+
+        Skips `join()` when the calling thread IS the heartbeat thread —
+        otherwise Python raises `RuntimeError: cannot join current thread`.
+        This makes `reset()` safe to call directly from an `on_disconnect`
+        callback (which fires on the heartbeat thread). The orphaned loop
+        observes its own (still-set) event at the top of the next iteration
+        and exits cleanly; `_start_heartbeat_watchdog` already replaces
+        `self._stop_heartbeat` with a fresh Event, so the new heartbeat
+        thread does not interfere.
+        """
         self._stop_heartbeat.set()
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
-            self._heartbeat_thread.join(timeout=2.0)
+        thread = self._heartbeat_thread
+        if (
+            thread is not None
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=2.0)
         self._heartbeat_thread = None
         logger.debug("Heartbeat watchdog stopped")
 

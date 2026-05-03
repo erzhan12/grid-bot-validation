@@ -1029,20 +1029,18 @@ class Orchestrator:
         """Secondary signal — heartbeat-detected message gap → reset.
 
         Called from the WS-client's heartbeat thread when the
-        message-gap detector fires. We MUST dispatch `reset()` to a
-        one-shot worker thread rather than calling it inline:
+        message-gap detector fires. We dispatch `reset()` to a one-shot
+        worker thread for two reasons:
 
-        1. `reset()` calls `_stop_heartbeat_watchdog()`, which calls
-           `Thread.join()`. Joining the current thread raises
-           `RuntimeError: cannot join current thread`.
-        2. Even if we suppressed the self-join, `reset()` calls
-           `connect()` which clears `_stop_heartbeat` and spawns a
-           new heartbeat thread; the old thread (still on the call
-           stack) would then loop back and live as a zombie.
-
-        Dispatching to a worker lets the heartbeat thread return up
-        the stack, observe `_stop_heartbeat.is_set()`, and exit
-        cleanly while the worker performs the reset.
+        1. The wrapper now self-skips `Thread.join()` when called from
+           the heartbeat thread, so `reset()` is safe to invoke inline,
+           but the heartbeat thread would still block waiting for the
+           full disconnect+connect cycle (TCP teardown, WS handshake,
+           subscription replay). Dispatching frees the heartbeat thread
+           to return up the stack and exit promptly via the swapped Event.
+        2. It keeps `reset()` failures from turning into unhandled
+           exceptions on the heartbeat thread (which would only get
+           logged by the WS wrapper's generic callback try/except).
         """
         client = (
             self._public_ws.get(account_name)

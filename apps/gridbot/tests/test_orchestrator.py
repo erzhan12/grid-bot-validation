@@ -89,6 +89,37 @@ class TestOrchestratorInit:
     @patch("gridbot.orchestrator.BybitRestClient")
     @patch("gridbot.orchestrator.PublicWebSocketClient")
     @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_init_account_wires_on_disconnect_callbacks(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        gridbot_config,
+        account_config,
+    ):
+        """_init_account passes on_disconnect bound to (account, kind) → _on_ws_disconnect."""
+        from datetime import datetime, timezone
+
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._on_ws_disconnect = MagicMock()
+        orchestrator._init_account(account_config)
+
+        pub_kwargs = mock_public_ws.call_args.kwargs
+        priv_kwargs = mock_private_ws.call_args.kwargs
+
+        assert "on_disconnect" in pub_kwargs
+        assert "on_disconnect" in priv_kwargs
+
+        ts = datetime.now(timezone.utc)
+        pub_kwargs["on_disconnect"](ts)
+        priv_kwargs["on_disconnect"](ts)
+
+        orchestrator._on_ws_disconnect.assert_any_call("test_account", "public", ts)
+        orchestrator._on_ws_disconnect.assert_any_call("test_account", "private", ts)
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
     def test_init_strategy(
         self,
         mock_private_ws,

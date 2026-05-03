@@ -632,35 +632,56 @@ class TestPublicWebSocketClientSocketAliveAndReset:
         client.disconnect()
 
     @patch("bybit_adapter.ws_client.WebSocket")
-    def test_reset_from_disconnect_callback_does_not_hang(self, mock_ws_class):
-        """on_disconnect → reset() (dispatched to worker) completes promptly.
+    def test_reset_directly_from_disconnect_callback_does_not_self_join(
+        self, mock_ws_class
+    ):
+        """on_disconnect → reset() called inline must not raise self-join.
 
-        Validates the heartbeat-thread sharp edge: the orchestrator
-        dispatches reset() to a worker thread to avoid self-join.
-        Here we simulate the same dispatch and assert non-hang.
+        The heartbeat thread fires `on_disconnect`. If a consumer calls
+        `client.reset()` directly in that callback, `_stop_heartbeat_watchdog`
+        used to do `self._heartbeat_thread.join(timeout=2.0)` on the
+        current thread → `RuntimeError: cannot join current thread`. After
+        the fix, that join is skipped when called from the heartbeat thread
+        itself; the orphaned loop exits via its own (set) event.
         """
-        done = threading.Event()
+        ws_instances = []
+
+        def make_ws(*args, **kwargs):
+            inst = MagicMock()
+            ws_instances.append(inst)
+            return inst
+
+        mock_ws_class.side_effect = make_ws
+
+        callback_done = threading.Event()
+        callback_error: list = []
+
+        def on_disconnect(ts):
+            try:
+                client.reset()
+            except BaseException as e:
+                callback_error.append(e)
+            finally:
+                callback_done.set()
+
         client = PublicWebSocketClient(
             symbols=["BTCUSDT"],
             testnet=True,
             on_ticker=lambda x: None,
+            on_disconnect=on_disconnect,
             heartbeat_interval=0.05,
             disconnect_threshold=0.1,
         )
-
-        def on_disconnect(ts):
-            # Dispatch reset to a worker to mirror orchestrator pattern
-            def _do():
-                client.reset()
-                done.set()
-
-            threading.Thread(target=_do, daemon=True).start()
-
-        client.on_disconnect = on_disconnect
         client.connect()
 
-        # Wait for heartbeat to fire on_disconnect, which spawns reset worker
-        assert done.wait(timeout=3.0), "reset() did not complete from disconnect callback"
+        # Heartbeat thread will fire on_disconnect after the threshold.
+        assert callback_done.wait(timeout=3.0), "on_disconnect callback never fired"
+        assert callback_error == [], (
+            f"reset() raised from heartbeat callback: {callback_error}"
+        )
+        # New WS was created (initial + reset) and old one was exited.
+        assert len(ws_instances) >= 2
+        ws_instances[0].exit.assert_called()
         client.disconnect()
 
 
@@ -734,4 +755,45 @@ class TestPrivateWebSocketClientSocketAliveAndReset:
 
         kwargs = mock_ws_class.call_args.kwargs
         assert kwargs.get("retries") == 0
+        client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket")
+    def test_is_socket_alive_swallows_exception(self, mock_ws_class):
+        """is_socket_alive returns False if pybit's is_connected raises."""
+        mock_ws = MagicMock()
+        mock_ws.is_connected.side_effect = AttributeError("ws.sock is None")
+        mock_ws_class.return_value = mock_ws
+
+        client = PrivateWebSocketClient(
+            api_key="k", api_secret="s", testnet=True,
+            on_execution=lambda x: None,
+        )
+        client.connect()
+
+        assert client.is_socket_alive() is False
+        client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket")
+    def test_reset_idempotent_when_exit_raises(self, mock_ws_class):
+        """reset() completes even if old ws.exit() raises."""
+        ws_instances = []
+
+        def make_ws(*args, **kwargs):
+            inst = MagicMock()
+            ws_instances.append(inst)
+            return inst
+
+        mock_ws_class.side_effect = make_ws
+
+        client = PrivateWebSocketClient(
+            api_key="k", api_secret="s", testnet=True,
+            on_execution=lambda x: None,
+        )
+        client.connect()
+        ws_instances[0].exit.side_effect = Exception("socket already torn down")
+
+        client.reset()  # Should not raise
+
+        assert client.is_connected()
+        assert len(ws_instances) == 2
         client.disconnect()
