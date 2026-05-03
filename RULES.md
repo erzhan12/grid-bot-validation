@@ -213,6 +213,7 @@ make test-integration
   - Short: High liq → Position ratios/margin → Moderate liq (modifies opposite)
 - **SHORT position bug**: Reference code had incorrect liq risk logic (`<` instead of `>`). Higher ratio = closer to liquidation for shorts.
 - **Position.size**: Stored on `Position` object, updated in `StrategyRunner.on_position_update()` from both REST and WS paths. Used by `_is_good_to_place()` to validate reduce-only orders.
+- **Unknown market price**: REST/WS position updates can arrive before the first ticker. Pass `last_close=None` (or a queued ticker price if available), never `0.0`; `StrategyRunner.on_position_update()` updates wallet/position sizes but skips risk multiplier recalculation until a real positive price exists.
 
 ### Pre-placement Validation (`_is_good_to_place`)
 

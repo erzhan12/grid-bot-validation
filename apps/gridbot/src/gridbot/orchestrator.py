@@ -47,6 +47,16 @@ _UNKNOWN_ORDER_DEBOUNCE_SEC = 2.0  # min interval between WS-triggered fast-trac
 logger = logging.getLogger(__name__)
 
 
+def _runner_market_price(runner: StrategyRunner, latest_ticker: TickerEvent | None = None) -> float | None:
+    """Return a real market price for position-risk math, never a fabricated zero."""
+    last_close = runner.engine.last_close
+    if last_close is not None:
+        return last_close
+    if latest_ticker is None:
+        return None
+    return float(latest_ticker.last_price)
+
+
 class Orchestrator:
     """Coordinates multiple strategies across accounts.
 
@@ -387,7 +397,9 @@ class Orchestrator:
                         long_position=snapshot["long"],
                         short_position=snapshot["short"],
                         wallet_balance=wallet_balance,
-                        last_close=runner.engine.last_close or 0.0,
+                        last_close=_runner_market_price(
+                            runner, self._latest_ticker.get(runner.symbol)
+                        ),
                     )
                 except Exception as e:
                     logger.error(
