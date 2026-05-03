@@ -932,6 +932,18 @@ Successfully implemented a multi-tenant grid trading bot using gridcore strategy
    - **WS client API**: `ws_client.is_connected()` and `ws_client.get_connection_state()` already existed in bybit_adapter
    - File: `apps/gridbot/src/gridbot/orchestrator.py`
 
+10. **Active WS reconnect with TCP-level probe (2026-05-03, feature 0024)**: bbu2 `_ensure_*_connection` pattern
+   - **Problem**: Wrapper's `is_connected()` is state-flag based — flips False only on explicit `disconnect()`. A dead TCP socket pybit hadn't noticed left it stuck True. Mainnet observed 6–15 min reconnect gaps.
+   - **Two health signals (both call `client.reset()`)**:
+     - **Primary** (TCP-level, every 10s): `Orchestrator._ws_health_check_once()` calls new `client.is_socket_alive()` → pybit's `ws.sock.connected`. Mirrors bbu2 `ENSURE_SOCKET_INTERVAL = 10`.
+     - **Secondary** (message-gap, on heartbeat fire): existing 30s gap detector → `on_disconnect` callback → `Orchestrator._on_ws_disconnect()` → `client.reset()`. Catches "socket alive but server silent" failure mode that TCP check misses.
+   - **`reset()`**: Stop heartbeat → `_disconnect_internal()` → `connect()` (re-subscribes all streams). Idempotent — back-to-back resets are a no-op + a single re-establishment.
+   - **Heartbeat thread sharp edge**: `on_disconnect` callback runs on the heartbeat thread. **Wrapper-level guard**: `_stop_heartbeat_watchdog` skips `Thread.join()` when `threading.current_thread() is self._heartbeat_thread`, so calling `reset()` inline from a callback is safe (no `RuntimeError`). The orchestrator still dispatches reset to a one-shot daemon worker (`WSReset-{account}-{kind}`) to avoid blocking the heartbeat thread on the full TCP teardown / handshake / subscription replay.
+   - **Zombie heartbeat protection**: `_start_heartbeat_watchdog` replaces `self._stop_heartbeat` with a fresh `threading.Event` each start; the old loop holds a reference to the old (still-set) event and exits cleanly. `_heartbeat_loop(stop_event)` takes the event as parameter.
+   - **`retries=0`**: Both `connect()` methods pass `retries=0` to `pybit.unified_trading.WebSocket(...)` → pybit's `infinitely_reconnect=True`. Removes the 10-attempt cliff at which pybit raises `WebSocketTimeoutException` and gives up.
+   - **Orchestrator wiring**: `_init_account` constructs WS clients with `on_disconnect=lambda ts, a=name: self._on_ws_disconnect(a, "public"|"private", ts)`. Periodic gate `_next_ws_health_check` in `_tick()` between `_next_health_check` and `_next_order_sync`.
+   - Files: `packages/bybit_adapter/src/bybit_adapter/ws_client.py`, `apps/gridbot/src/gridbot/orchestrator.py`
+
 ### Test Commands
 ```bash
 # Run gridbot tests

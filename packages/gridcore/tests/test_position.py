@@ -348,12 +348,13 @@ class TestPositionRiskManagerRules:
         )
         _, short_manager = PositionRiskManager.create_linked_pair(risk_config)
 
-        # High liquidation risk: liq_ratio > 0.95 * max_liq_ratio (1.14)
+        # EMERGENCY high liq risk for SHORT: liq_ratio close to 1.0 = imminent
+        # liquidation. Triggers when 0 < liq_ratio < 0.95 * max_liq_ratio (1.14).
         short_position_state = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('4.2'),
             entry_price=Decimal('3102.0'),
-            liquidation_price=Decimal('3565.0'),  # liq_ratio = 1.15
+            liquidation_price=Decimal('3400.0'),  # liq_ratio = 3400/3100 ≈ 1.097 (in EMERGENCY range)
             margin=Decimal('0.65'),
             leverage=10
         )
@@ -540,11 +541,13 @@ class TestPositionRiskManagerRules:
         _, short_manager = PositionRiskManager.create_linked_pair(risk_config)
 
         # Large position (ratio > 2.0) and losing (price above entry)
+        # liq_price chosen safe (ratio = 130000/105000 ≈ 1.238 > max_liq_ratio)
+        # so neither EMERGENCY nor moderate liq fires; position_ratio rule fires.
         short_position_state = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('2.0'),
             entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('110000.0'),
+            liquidation_price=Decimal('130000.0'),
             margin=Decimal('4.0'),
             leverage=10
         )
@@ -576,12 +579,12 @@ class TestPositionRiskManagerRules:
         )
         _, short_manager = PositionRiskManager.create_linked_pair(risk_config)
 
-        # Very large position (ratio > 5.0)
+        # Very large position (ratio > 5.0); liq_ratio = 1.30 (safe, no liq rules)
         short_position_state = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('5.0'),
             entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('110000.0'),
+            liquidation_price=Decimal('130000.0'),
             margin=Decimal('4.0'),
             leverage=10
         )
@@ -614,15 +617,15 @@ class TestPositionRiskManagerRules:
         # Use helper to create properly linked positions
         long_manager, short_manager = PositionRiskManager.create_linked_pair(risk_config)
 
-        # Moderate liquidation risk scenario
-        # liq_ratio = 108000 / 100000 = 1.08 (between 0 and 1.2)
-        # Not high enough to trigger emergency (< 0.95 * 1.2 = 1.14)
-        # But moderate risk exists
+        # Moderate liquidation risk scenario for SHORT.
+        # EMERGENCY range: 0 < liq_ratio < 0.95 * 1.2 = 1.14
+        # Moderate range:  EMERGENCY upper bound <= liq_ratio < max_liq_ratio (1.2)
+        # liq_ratio = 116000 / 100000 = 1.16 (in moderate range, NOT in EMERGENCY)
         position = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('108000.0'),  # Moderate risk
+            liquidation_price=Decimal('116000.0'),  # Moderate risk (between 1.14 and 1.2)
             margin=Decimal('3.0'),
             leverage=10
         )
@@ -1303,8 +1306,13 @@ class TestShortPositionRuleBoundaries:
         # 1.14 is NOT > 1.14, so high liq rule should NOT trigger
         assert result['Buy'] == 1.0
 
-    def test_high_liq_ratio_just_above_boundary(self):
-        """High liq ratio just above 0.95 * max_liq_ratio triggers rule."""
+    def test_high_liq_ratio_just_below_boundary(self):
+        """High liq ratio just below 0.95 * max_liq_ratio triggers EMERGENCY for SHORT.
+
+        For SHORT, EMERGENCY fires when liq_ratio is between 1.0 and 0.95*max
+        (close to 1.0 = imminent liquidation). This tests the upper boundary
+        of the EMERGENCY range.
+        """
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
@@ -1313,12 +1321,12 @@ class TestShortPositionRuleBoundaries:
         )
         _, short_mgr = Position.create_linked_pair(risk_config)
 
-        # liq_ratio = 114100 / 100000 = 1.141 > 1.14
+        # liq_ratio = 113900 / 100000 = 1.139 < 1.14 → in EMERGENCY range
         position = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('114100.0'),  # Just above boundary
+            liquidation_price=Decimal('113900.0'),  # Just below boundary
             margin=Decimal('2.0'),
             leverage=10
         )
@@ -1330,8 +1338,42 @@ class TestShortPositionRuleBoundaries:
 
         result = short_mgr.calculate_amount_multiplier(position, opposite, last_close=100000.0)
 
-        # 1.141 > 1.14, so high liq rule triggers
+        # 1.139 < 1.14, so EMERGENCY high liq rule triggers
         assert result['Buy'] == 1.5
+
+    def test_safe_short_far_above_max_liq_ratio_does_not_emergency(self):
+        """REGRESSION (post-bugfix): a SHORT with liq_ratio >> max_liq_ratio is
+        SAFE (price is far below liq_price → lots of headroom). Must NOT trigger
+        EMERGENCY high_liq_risk. Catches the previous inverted-operator bug
+        where `liq_ratio > 0.95 * max_liq_ratio` fired EMERGENCY for safe shorts.
+        """
+        risk_config = RiskConfig(
+            min_liq_ratio=0.8,
+            max_liq_ratio=1.2,
+            max_margin=5.0,
+            min_total_margin=1.0
+        )
+        _, short_mgr = Position.create_linked_pair(risk_config)
+
+        # liq_ratio = 500000 / 100000 = 5.0 → very safe (price 5x below liq)
+        position = PositionState(
+            direction=Position.DIRECTION_SHORT,
+            size=Decimal('1.0'),
+            entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('500000.0'),
+            margin=Decimal('2.0'),
+            leverage=10
+        )
+
+        opposite = PositionState(
+            direction=Position.DIRECTION_LONG,
+            margin=Decimal('2.0')
+        )
+
+        result = short_mgr.calculate_amount_multiplier(position, opposite, last_close=100000.0)
+
+        # Position is SAFE: must NOT trigger EMERGENCY (Buy=1.5) or moderate.
+        assert result == {'Buy': 1.0, 'Sell': 1.0}
 
     def test_position_ratio_exactly_2_0_boundary(self):
         """position_ratio exactly 2.0 doesn't trigger large losing rule."""
@@ -1343,12 +1385,12 @@ class TestShortPositionRuleBoundaries:
         )
         _, short_mgr = Position.create_linked_pair(risk_config)
 
-        # ratio = 2.0 / 1.0 = 2.0
+        # ratio = 2.0 / 1.0 = 2.0; liq_ratio = 130000/100000 = 1.30 (safe, > max_liq_ratio)
         position = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('2.0'),
             entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('110000.0'),  # Safe liq ratio
+            liquidation_price=Decimal('130000.0'),  # Safe liq ratio (above max)
             margin=Decimal('2.0'),
             leverage=10
         )
@@ -1379,12 +1421,12 @@ class TestShortPositionRuleBoundaries:
         )
         _, short_mgr = Position.create_linked_pair(risk_config)
 
-        # ratio = 5.0 / 1.0 = 5.0
+        # ratio = 5.0 / 1.0 = 5.0; liq_ratio = 130000/100000 = 1.30 (safe, > max_liq_ratio)
         position = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('5.0'),
             entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('110000.0'),  # Safe liq ratio
+            liquidation_price=Decimal('130000.0'),  # Safe liq ratio (above max)
             margin=Decimal('5.0'),
             leverage=10
         )
@@ -1410,11 +1452,12 @@ class TestShortPositionRuleBoundaries:
         _, short_mgr = Position.create_linked_pair(risk_config)
 
         # ratio = 3.0 / 1.0 = 3.0 (> 2.0 but profitable)
+        # liq_ratio = 130000/100000 = 1.30 (safe, > max_liq_ratio)
         position = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('3.0'),
             entry_price=Decimal('105000.0'),  # Entry above current (profitable for short)
-            liquidation_price=Decimal('110000.0'),  # Safe liq ratio
+            liquidation_price=Decimal('130000.0'),  # Safe liq ratio (above max)
             margin=Decimal('3.0'),
             leverage=10
         )
@@ -1443,13 +1486,15 @@ class TestShortPositionRuleBoundaries:
         )
         _, short_mgr = Position.create_linked_pair(risk_config)
 
-        # Equal positions with low total margin
-        # liq_ratio = 113000 / 100000 = 1.13 (below 0.95 * 1.5 = 1.425)
+        # Equal positions with low total margin.
+        # max_liq_ratio=1.5 → EMERGENCY range = (0, 0.95*1.5) = (0, 1.425),
+        # moderate range = [1.425, 1.5). liq_ratio = 160000/100000 = 1.60
+        # is OUTSIDE both ranges (safe), so liq rules skip and low_margin fires.
         position = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('113000.0'),  # Safe liq ratio for short
+            liquidation_price=Decimal('160000.0'),  # Safe liq ratio (above max)
             margin=Decimal('0.4'),
             leverage=10
         )
@@ -1476,13 +1521,15 @@ class TestShortPositionRuleBoundaries:
         )
         _, short_mgr = Position.create_linked_pair(risk_config)
 
-        # Equal positions with low total margin
-        # liq_ratio = 113000 / 100000 = 1.13 (below 0.95 * 1.5 = 1.425)
+        # Equal positions with low total margin.
+        # max_liq_ratio=1.5 → EMERGENCY range = (0, 0.95*1.5) = (0, 1.425),
+        # moderate range = [1.425, 1.5). liq_ratio = 160000/100000 = 1.60
+        # is OUTSIDE both ranges (safe), so liq rules skip and low_margin fires.
         position = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('113000.0'),  # Safe liq ratio for short
+            liquidation_price=Decimal('160000.0'),  # Safe liq ratio (above max)
             margin=Decimal('0.4'),
             leverage=10
         )
@@ -1498,8 +1545,10 @@ class TestShortPositionRuleBoundaries:
         assert result['Buy'] == 0.5
         assert result['Sell'] == 1.0
 
-    def test_moderate_liq_at_max_boundary(self):
-        """Moderate liq exactly at max_liq_ratio triggers high liq rule for shorts."""
+    def test_liq_ratio_exactly_at_max_boundary(self):
+        """liq_ratio exactly equal to max_liq_ratio is the safe-side boundary
+        for SHORT — neither EMERGENCY nor moderate fires (both use strict <).
+        """
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
@@ -1509,13 +1558,14 @@ class TestShortPositionRuleBoundaries:
         long_mgr, short_mgr = Position.create_linked_pair(risk_config)
 
         # liq_ratio = 120000 / 100000 = 1.2 = max_liq_ratio
-        # For shorts, high liq triggers when liq_ratio > 0.95 * max_liq_ratio = 1.14
-        # Since 1.2 > 1.14, high liq rule triggers
+        # EMERGENCY: 0 < 1.2 < 1.14 → False
+        # Moderate:  0 < 1.2 < 1.2  → False (strict less than)
+        # → Neither liq rule fires; nothing modifies multipliers.
         position = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('120000.0'),  # Exactly at max (triggers high liq)
+            liquidation_price=Decimal('120000.0'),  # Exactly at max (boundary)
             margin=Decimal('2.0'),
             leverage=10
         )
@@ -1527,9 +1577,8 @@ class TestShortPositionRuleBoundaries:
 
         result = short_mgr.calculate_amount_multiplier(position, opposite, last_close=100000.0)
 
-        # liq_ratio = 1.2 > 0.95 * 1.2 = 1.14, so HIGH liq rule triggers (not moderate)
-        assert result == {'Buy': 1.5, 'Sell': 1.0}
-        # Long multipliers are reset but not modified by short's high liq rule
+        # No rule triggers at the exact boundary.
+        assert result == {'Buy': 1.0, 'Sell': 1.0}
         assert long_mgr.amount_multiplier == {'Buy': 1.0, 'Sell': 1.0}
 
 
@@ -1624,12 +1673,13 @@ class TestUnrealizedPnLCalculation:
 
         # Entry at 100000, current at 90000 (10% down)
         # Large position ratio so we can test large losing rule behavior
-        # liq_ratio = 100000 / 90000 = 1.11 (safe, below 0.95 * 2.0 = 1.9)
+        # liq_ratio = 200000 / 90000 ≈ 2.22 (safe, > max_liq_ratio=2.0,
+        # so neither EMERGENCY nor moderate liq rule triggers)
         position = PositionState(
             direction=Position.DIRECTION_SHORT,
             size=Decimal('3.0'),
             entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('100000.0'),  # Safe liq ratio
+            liquidation_price=Decimal('200000.0'),  # Safe liq ratio (above max)
             margin=Decimal('3.0'),
             leverage=10
         )

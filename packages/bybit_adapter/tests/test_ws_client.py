@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
+import threading
 import time
 
 from bybit_adapter.ws_client import (
@@ -486,4 +487,313 @@ class TestPrivateWebSocketClientHandlers:
 
         assert client._state.last_message_ts > past
         mock_callback.assert_called_once_with(msg)
+        client.disconnect()
+
+
+class TestPublicWebSocketClientSocketAliveAndReset:
+    """Tests for is_socket_alive() and reset() — feature 0024."""
+
+    @patch("bybit_adapter.ws_client.WebSocket")
+    def test_is_socket_alive_returns_false_when_not_connected(self, mock_ws_class):
+        """is_socket_alive returns False before connect()."""
+        client = PublicWebSocketClient(symbols=["BTCUSDT"], testnet=True)
+        assert client.is_socket_alive() is False
+
+    @patch("bybit_adapter.ws_client.WebSocket")
+    def test_is_socket_alive_delegates_to_pybit(self, mock_ws_class):
+        """is_socket_alive returns whatever pybit's is_connected() returns."""
+        mock_ws = MagicMock()
+        mock_ws.is_connected.return_value = True
+        mock_ws_class.return_value = mock_ws
+
+        client = PublicWebSocketClient(symbols=["BTCUSDT"], testnet=True)
+        client.connect()
+
+        assert client.is_socket_alive() is True
+        mock_ws.is_connected.assert_called()
+
+        # Force underlying pybit ws to report dead
+        mock_ws.is_connected.return_value = False
+        assert client.is_socket_alive() is False
+
+        client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket")
+    def test_is_socket_alive_swallows_exception(self, mock_ws_class):
+        """is_socket_alive returns False if pybit's is_connected raises."""
+        mock_ws = MagicMock()
+        mock_ws.is_connected.side_effect = AttributeError("ws.sock is None")
+        mock_ws_class.return_value = mock_ws
+
+        client = PublicWebSocketClient(symbols=["BTCUSDT"], testnet=True)
+        client.connect()
+
+        assert client.is_socket_alive() is False
+        client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket")
+    def test_reset_calls_disconnect_then_connect(self, mock_ws_class):
+        """reset() tears down old socket and brings up a new one."""
+        ws_instances = []
+
+        def make_ws(*args, **kwargs):
+            inst = MagicMock()
+            ws_instances.append(inst)
+            return inst
+
+        mock_ws_class.side_effect = make_ws
+
+        client = PublicWebSocketClient(
+            symbols=["BTCUSDT"],
+            testnet=True,
+            on_ticker=lambda x: None,
+        )
+        client.connect()
+        first_ws = ws_instances[0]
+
+        client.reset()
+
+        # First WS got exited
+        first_ws.exit.assert_called()
+        # New WS is a different instance
+        assert len(ws_instances) == 2
+        assert client._ws is ws_instances[1]
+        assert client.is_connected()
+        client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket")
+    def test_reset_resubscribes_to_streams(self, mock_ws_class):
+        """reset() re-subscribes to all configured streams via connect()."""
+        # Each WebSocket() call returns a fresh MagicMock so we can count
+        # subscription calls per instance.
+        ws_instances = []
+
+        def make_ws(*args, **kwargs):
+            inst = MagicMock()
+            ws_instances.append(inst)
+            return inst
+
+        mock_ws_class.side_effect = make_ws
+
+        client = PublicWebSocketClient(
+            symbols=["BTCUSDT", "ETHUSDT"],
+            testnet=True,
+            on_ticker=lambda x: None,
+            on_trade=lambda x: None,
+        )
+        client.connect()
+        client.reset()
+
+        # 2 instances created (initial + reset), each got 2 ticker + 2 trade subs
+        assert len(ws_instances) == 2
+        for inst in ws_instances:
+            assert inst.ticker_stream.call_count == 2
+            assert inst.trade_stream.call_count == 2
+        client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket")
+    def test_reset_idempotent_when_exit_raises(self, mock_ws_class):
+        """reset() completes even if old ws.exit() raises."""
+        ws_instances = []
+
+        def make_ws(*args, **kwargs):
+            inst = MagicMock()
+            ws_instances.append(inst)
+            return inst
+
+        mock_ws_class.side_effect = make_ws
+
+        client = PublicWebSocketClient(
+            symbols=["BTCUSDT"],
+            testnet=True,
+            on_ticker=lambda x: None,
+        )
+        client.connect()
+        ws_instances[0].exit.side_effect = Exception("socket already torn down")
+
+        client.reset()  # Should not raise
+
+        assert client.is_connected()
+        assert len(ws_instances) == 2
+        client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket")
+    def test_retries_zero_passed_to_pybit_constructor(self, mock_ws_class):
+        """connect() passes retries=0 to pybit's WebSocket constructor."""
+        client = PublicWebSocketClient(
+            symbols=["BTCUSDT"],
+            testnet=True,
+            on_ticker=lambda x: None,
+        )
+        client.connect()
+
+        kwargs = mock_ws_class.call_args.kwargs
+        assert kwargs.get("retries") == 0
+        client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket")
+    def test_reset_directly_from_disconnect_callback_does_not_self_join(
+        self, mock_ws_class
+    ):
+        """on_disconnect → reset() called inline must not raise self-join.
+
+        The heartbeat thread fires `on_disconnect`. If a consumer calls
+        `client.reset()` directly in that callback, `_stop_heartbeat_watchdog`
+        used to do `self._heartbeat_thread.join(timeout=2.0)` on the
+        current thread → `RuntimeError: cannot join current thread`. After
+        the fix, that join is skipped when called from the heartbeat thread
+        itself; the orphaned loop exits via its own (set) event.
+        """
+        ws_instances = []
+
+        def make_ws(*args, **kwargs):
+            inst = MagicMock()
+            ws_instances.append(inst)
+            return inst
+
+        mock_ws_class.side_effect = make_ws
+
+        callback_done = threading.Event()
+        callback_error: list = []
+
+        def on_disconnect(ts):
+            try:
+                client.reset()
+            except BaseException as e:
+                callback_error.append(e)
+            finally:
+                callback_done.set()
+
+        client = PublicWebSocketClient(
+            symbols=["BTCUSDT"],
+            testnet=True,
+            on_ticker=lambda x: None,
+            on_disconnect=on_disconnect,
+            heartbeat_interval=0.05,
+            disconnect_threshold=0.1,
+        )
+        client.connect()
+
+        # Heartbeat thread will fire on_disconnect after the threshold.
+        assert callback_done.wait(timeout=3.0), "on_disconnect callback never fired"
+        assert callback_error == [], (
+            f"reset() raised from heartbeat callback: {callback_error}"
+        )
+        # New WS was created (initial + reset) and old one was exited.
+        assert len(ws_instances) >= 2
+        ws_instances[0].exit.assert_called()
+        client.disconnect()
+
+
+class TestPrivateWebSocketClientSocketAliveAndReset:
+    """Tests for is_socket_alive() and reset() on private client — feature 0024."""
+
+    @patch("bybit_adapter.ws_client.WebSocket")
+    def test_is_socket_alive_returns_false_when_not_connected(self, mock_ws_class):
+        """is_socket_alive returns False before connect()."""
+        client = PrivateWebSocketClient(
+            api_key="k", api_secret="s", testnet=True,
+        )
+        assert client.is_socket_alive() is False
+
+    @patch("bybit_adapter.ws_client.WebSocket")
+    def test_is_socket_alive_delegates_to_pybit(self, mock_ws_class):
+        """is_socket_alive reflects pybit's native check."""
+        mock_ws = MagicMock()
+        mock_ws.is_connected.return_value = True
+        mock_ws_class.return_value = mock_ws
+
+        client = PrivateWebSocketClient(
+            api_key="k", api_secret="s", testnet=True,
+            on_execution=lambda x: None,
+        )
+        client.connect()
+        assert client.is_socket_alive() is True
+
+        mock_ws.is_connected.return_value = False
+        assert client.is_socket_alive() is False
+        client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket")
+    def test_reset_resubscribes_all_private_streams(self, mock_ws_class):
+        """reset() re-subscribes execution/order/position/wallet streams."""
+        ws_instances = []
+
+        def make_ws(*args, **kwargs):
+            inst = MagicMock()
+            ws_instances.append(inst)
+            return inst
+
+        mock_ws_class.side_effect = make_ws
+
+        client = PrivateWebSocketClient(
+            api_key="k", api_secret="s", testnet=True,
+            on_execution=lambda x: None,
+            on_order=lambda x: None,
+            on_position=lambda x: None,
+            on_wallet=lambda x: None,
+        )
+        client.connect()
+        client.reset()
+
+        assert len(ws_instances) == 2
+        for inst in ws_instances:
+            inst.execution_stream.assert_called_once()
+            inst.order_stream.assert_called_once()
+            inst.position_stream.assert_called_once()
+            inst.wallet_stream.assert_called_once()
+        client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket")
+    def test_retries_zero_passed_to_pybit_constructor(self, mock_ws_class):
+        """connect() passes retries=0 to pybit's WebSocket constructor."""
+        client = PrivateWebSocketClient(
+            api_key="k", api_secret="s", testnet=True,
+            on_execution=lambda x: None,
+        )
+        client.connect()
+
+        kwargs = mock_ws_class.call_args.kwargs
+        assert kwargs.get("retries") == 0
+        client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket")
+    def test_is_socket_alive_swallows_exception(self, mock_ws_class):
+        """is_socket_alive returns False if pybit's is_connected raises."""
+        mock_ws = MagicMock()
+        mock_ws.is_connected.side_effect = AttributeError("ws.sock is None")
+        mock_ws_class.return_value = mock_ws
+
+        client = PrivateWebSocketClient(
+            api_key="k", api_secret="s", testnet=True,
+            on_execution=lambda x: None,
+        )
+        client.connect()
+
+        assert client.is_socket_alive() is False
+        client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket")
+    def test_reset_idempotent_when_exit_raises(self, mock_ws_class):
+        """reset() completes even if old ws.exit() raises."""
+        ws_instances = []
+
+        def make_ws(*args, **kwargs):
+            inst = MagicMock()
+            ws_instances.append(inst)
+            return inst
+
+        mock_ws_class.side_effect = make_ws
+
+        client = PrivateWebSocketClient(
+            api_key="k", api_secret="s", testnet=True,
+            on_execution=lambda x: None,
+        )
+        client.connect()
+        ws_instances[0].exit.side_effect = Exception("socket already torn down")
+
+        client.reset()  # Should not raise
+
+        assert client.is_connected()
+        assert len(ws_instances) == 2
         client.disconnect()

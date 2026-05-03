@@ -465,10 +465,11 @@ class TestPositionRiskManagerBehavior:
         short_manager.set_opposite(long_manager)
         long_manager.set_opposite(short_manager)
 
-        # liq_ratio = 108000 / 100000 = 1.08 (0.0 < 1.08 < 1.2) ✓
+        # liq_ratio = 116000 / 100000 = 1.16 (in moderate range [1.14, 1.2),
+        # NOT in EMERGENCY range (0, 1.14)) ✓
         position = PositionState(
             direction=Position.DIRECTION_SHORT, size=Decimal('0.015'), entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('108000.0'), margin=Decimal('1500.0'), leverage=10
+            liquidation_price=Decimal('116000.0'), margin=Decimal('1500.0'), leverage=10
         )
         opposite = PositionState(
             direction=Position.DIRECTION_LONG, size=Decimal('0.015'), entry_price=Decimal('100000.0'),
@@ -528,9 +529,10 @@ class TestPositionRiskManagerBehavior:
 
         # position_ratio = 2000 / 500 = 4.0 > 2.0 ✓
         # Price above entry (105000 > 100000) means short is losing
+        # liq_ratio = 130000/105000 ≈ 1.238 (safe, > max_liq_ratio so liq rules skip)
         position = PositionState(
             direction=Position.DIRECTION_SHORT, size=Decimal('2.0'), entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('110000.0'), margin=Decimal('2000.0'), leverage=10
+            liquidation_price=Decimal('130000.0'), margin=Decimal('2000.0'), leverage=10
         )
         opposite = PositionState(
             direction=Position.DIRECTION_LONG, size=Decimal('0.5'), entry_price=Decimal('100000.0'),

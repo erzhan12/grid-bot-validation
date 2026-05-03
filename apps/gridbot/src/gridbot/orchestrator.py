@@ -9,6 +9,7 @@ The orchestrator is the main entry point for the gridbot. It:
 """
 
 import logging
+import threading
 import time
 from collections import deque
 from datetime import datetime, UTC
@@ -37,6 +38,7 @@ from gridbot.position_fetcher import PositionFetcher, _POSITION_TICK_BASE
 from gridbot.auth_cooldown_manager import AuthCooldownManager
 
 _HEALTH_CHECK_INTERVAL = 10  # seconds
+_WS_HEALTH_CHECK_INTERVAL = 10.0  # seconds — bbu2 ENSURE_SOCKET_INTERVAL parity
 _CHECK_INTERVAL = 0.1  # 100 ms main loop tick (bbu2 value)
 _RETRY_TICK_INTERVAL = 1.0  # seconds between retry-queue drains
 _WS_RECONNECT_SLOW_THRESHOLD = 5.0  # log a warning if a single WS disconnect+connect takes longer
@@ -199,6 +201,7 @@ class Orchestrator:
         # Periodic-tick schedulers (bbu2 timestamp-gating pattern).
         self._next_position_check: float = 0.0
         self._next_health_check: float = 0.0
+        self._next_ws_health_check: float = 0.0
         self._next_order_sync: float = 0.0
         self._next_retry_tick: float = 0.0
 
@@ -281,6 +284,7 @@ class Orchestrator:
         now = time.monotonic()
         self._next_position_check = now + _POSITION_TICK_BASE
         self._next_health_check = now + _HEALTH_CHECK_INTERVAL
+        self._next_ws_health_check = now + _WS_HEALTH_CHECK_INTERVAL
         self._next_order_sync = now  # order sync runs immediately on first tick
         self._next_retry_tick = now + _RETRY_TICK_INTERVAL
 
@@ -467,6 +471,19 @@ class Orchestrator:
                     "_health_check_once", e,
                     error_key="periodic_health_check",
                 )
+        if now >= self._next_ws_health_check:
+            self._next_ws_health_check = now + _WS_HEALTH_CHECK_INTERVAL
+            try:
+                self._ws_health_check_once()
+            except Exception as e:
+                logger.error(
+                    "Periodic check failed (_ws_health_check_once): %s",
+                    e, exc_info=True,
+                )
+                self._notifier.alert_exception(
+                    "_ws_health_check_once", e,
+                    error_key="periodic_ws_health_check",
+                )
         if (
             self._config.order_sync_interval > 0
             and now >= self._next_order_sync
@@ -602,6 +619,7 @@ class Orchestrator:
             on_ticker=lambda msg, a=name: self._on_ticker(
                 a, msg.get("data", {}).get("symbol", ""), msg
             ),
+            on_disconnect=lambda ts, a=name: self._on_ws_disconnect(a, "public", ts),
         )
         self._private_ws[name] = PrivateWebSocketClient(
             api_key=account_config.api_key,
@@ -610,6 +628,7 @@ class Orchestrator:
             on_position=lambda msg, a=name: self._position_fetcher.on_position_message(a, msg),
             on_order=lambda msg, a=name: self._on_order(a, msg),
             on_execution=lambda msg, a=name: self._on_execution(a, msg),
+            on_disconnect=lambda ts, a=name: self._on_ws_disconnect(a, "private", ts),
         )
 
         logger.info(f"Initialized account: {name}")
@@ -954,6 +973,105 @@ class Orchestrator:
             self._notifier.alert_exception(
                 "_health_check_once", e, error_key="health_check_loop",
             )
+
+    def _ws_health_check_once(self) -> None:
+        """TCP-level WS socket probe with active reset on dead sockets.
+
+        Walks every public/private WS client and calls `is_socket_alive()`
+        (pybit's native `ws.sock.connected` check). If the socket is dead
+        we don't wait for pybit's internal reconnect — call `client.reset()`
+        immediately. Mirrors bbu2's `_ensure_*_connection` pattern.
+
+        Distinct from `_health_check_once`, which uses the wrapper's
+        state-flag `is_connected()` (only flipped on explicit disconnect)
+        and therefore cannot detect a dead-but-not-noticed socket.
+        """
+        for account_name, pub_ws in list(self._public_ws.items()):
+            try:
+                if pub_ws.is_socket_alive():
+                    continue
+                logger.warning(
+                    "WS socket dead for %s/public; resetting",
+                    account_name,
+                )
+                pub_ws.reset()
+            except Exception as e:
+                logger.error(
+                    "ws_health_check failed for %s/public: %s",
+                    account_name, e, exc_info=True,
+                )
+                self._notifier.alert_exception(
+                    f"ws_health_check {account_name}/public", e,
+                    error_key=f"ws_health_check_pub_{account_name}",
+                )
+        for account_name, priv_ws in list(self._private_ws.items()):
+            try:
+                if priv_ws.is_socket_alive():
+                    continue
+                logger.warning(
+                    "WS socket dead for %s/private; resetting",
+                    account_name,
+                )
+                priv_ws.reset()
+            except Exception as e:
+                logger.error(
+                    "ws_health_check failed for %s/private: %s",
+                    account_name, e, exc_info=True,
+                )
+                self._notifier.alert_exception(
+                    f"ws_health_check {account_name}/private", e,
+                    error_key=f"ws_health_check_priv_{account_name}",
+                )
+
+    def _on_ws_disconnect(
+        self, account_name: str, kind: str, disconnected_at: datetime
+    ) -> None:
+        """Secondary signal — heartbeat-detected message gap → reset.
+
+        Called from the WS-client's heartbeat thread when the
+        message-gap detector fires. We dispatch `reset()` to a one-shot
+        worker thread for two reasons:
+
+        1. The wrapper now self-skips `Thread.join()` when called from
+           the heartbeat thread, so `reset()` is safe to invoke inline,
+           but the heartbeat thread would still block waiting for the
+           full disconnect+connect cycle (TCP teardown, WS handshake,
+           subscription replay). Dispatching frees the heartbeat thread
+           to return up the stack and exit promptly via the swapped Event.
+        2. It keeps `reset()` failures from turning into unhandled
+           exceptions on the heartbeat thread (which would only get
+           logged by the WS wrapper's generic callback try/except).
+        """
+        client = (
+            self._public_ws.get(account_name)
+            if kind == "public"
+            else self._private_ws.get(account_name)
+        )
+        if client is None:
+            return
+        logger.warning(
+            "WS message gap detected for %s/%s; resetting",
+            account_name, kind,
+        )
+
+        def _do_reset() -> None:
+            try:
+                client.reset()
+            except Exception as e:
+                logger.error(
+                    "WS reset failed for %s/%s: %s",
+                    account_name, kind, e, exc_info=True,
+                )
+                self._notifier.alert_exception(
+                    f"ws_reset {account_name}/{kind}", e,
+                    error_key=f"ws_reset_{kind}_{account_name}",
+                )
+
+        threading.Thread(
+            target=_do_reset,
+            daemon=True,
+            name=f"WSReset-{account_name}-{kind}",
+        ).start()
 
     def _request_immediate_order_sync(self, strat_id: str) -> None:
         """Fast-track the next order-sync sweep.
