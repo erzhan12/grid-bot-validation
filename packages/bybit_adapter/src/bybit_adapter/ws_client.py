@@ -113,6 +113,7 @@ class PublicWebSocketClient:
             self._ws = WebSocket(
                 testnet=self.testnet,
                 channel_type=CHANNEL_TYPE_LINEAR,
+                retries=0,
             )
 
             # Subscribe to streams for each symbol
@@ -176,9 +177,49 @@ class PublicWebSocketClient:
             )
 
     def is_connected(self) -> bool:
-        """Check if WebSocket is currently connected."""
+        """Check if WebSocket is logically connected (state-flag based).
+
+        Returns True after `connect()` and before `disconnect()`. Does NOT
+        check the underlying TCP socket — use `is_socket_alive()` for that.
+        """
         with self._lock:
             return self._state.is_connected and self._ws is not None
+
+    def is_socket_alive(self) -> bool:
+        """Check if the underlying TCP socket is alive (pybit-native).
+
+        Calls pybit's `WebSocket.is_connected()`, which checks
+        `self.ws.sock.connected` — a true TCP-level boolean. Distinct from
+        the wrapper's `is_connected()`, which only reflects whether
+        `connect()` has been called. Used by the orchestrator to detect
+        a dead socket that pybit hasn't noticed yet.
+        """
+        with self._lock:
+            if self._ws is None:
+                return False
+            try:
+                return bool(self._ws.is_connected())
+            except Exception as e:
+                logger.warning(f"is_socket_alive check raised: {e}")
+                return False
+
+    def reset(self) -> None:
+        """Force a full WS reset: disconnect and reconnect.
+
+        Order matches `disconnect()`: stop heartbeat → close socket → reopen.
+        `connect()` automatically restarts the heartbeat watchdog and
+        re-subscribes to all configured streams. Safe to call concurrently
+        with disconnect detection — `connect()` itself disconnects first
+        if `_ws` is already set.
+        """
+        logger.info("Public WebSocket reset (reconnect attempt)")
+        # Stop heartbeat first to prevent stale _detected_disconnect flag
+        # from racing with the new connection.
+        self._stop_heartbeat_watchdog()
+        with self._lock:
+            self._disconnect_internal()
+        # connect() acquires the lock itself and restarts heartbeat.
+        self.connect()
 
     def _handle_ticker(self, message: dict) -> None:
         """Handle raw ticker message from WebSocket."""
@@ -199,10 +240,18 @@ class PublicWebSocketClient:
                 logger.error(f"Error in trade callback: {e}")
 
     def _start_heartbeat_watchdog(self) -> None:
-        """Start background thread to detect disconnection via message gap."""
-        self._stop_heartbeat.clear()
+        """Start background thread to detect disconnection via message gap.
+
+        Replaces `_stop_heartbeat` with a fresh Event so any leftover
+        heartbeat thread from a prior cycle (e.g., a `reset()` that timed
+        out the 2s join because we were called from inside the heartbeat
+        thread itself) keeps observing its old, still-set event and exits
+        cleanly. The new thread uses the new event.
+        """
+        self._stop_heartbeat = threading.Event()
         self._heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop,
+            args=(self._stop_heartbeat,),
             daemon=True,
             name="PublicWS-Heartbeat"
         )
@@ -217,11 +266,16 @@ class PublicWebSocketClient:
         self._heartbeat_thread = None
         logger.debug("Heartbeat watchdog stopped")
 
-    def _heartbeat_loop(self) -> None:
-        """Background loop to detect disconnection via message gap."""
-        while not self._stop_heartbeat.is_set():
-            self._stop_heartbeat.wait(self.heartbeat_interval)
-            if self._stop_heartbeat.is_set():
+    def _heartbeat_loop(self, stop_event: threading.Event) -> None:
+        """Background loop to detect disconnection via message gap.
+
+        Receives `stop_event` as a parameter so a stale loop (whose event
+        was replaced by a subsequent `_start_heartbeat_watchdog`) keeps
+        observing its own set event and exits cleanly.
+        """
+        while not stop_event.is_set():
+            stop_event.wait(self.heartbeat_interval)
+            if stop_event.is_set():
                 break
 
             # Initialize outside lock to avoid UnboundLocalError
@@ -345,6 +399,7 @@ class PrivateWebSocketClient:
                 api_key=self.api_key,
                 api_secret=self.api_secret,
                 trace_logging=False,
+                retries=0,
             )
 
             # Subscribe to streams based on provided callbacks
@@ -409,9 +464,43 @@ class PrivateWebSocketClient:
             )
 
     def is_connected(self) -> bool:
-        """Check if WebSocket is currently connected."""
+        """Check if WebSocket is logically connected (state-flag based).
+
+        Returns True after `connect()` and before `disconnect()`. Does NOT
+        check the underlying TCP socket — use `is_socket_alive()` for that.
+        """
         with self._lock:
             return self._state.is_connected and self._ws is not None
+
+    def is_socket_alive(self) -> bool:
+        """Check if the underlying TCP socket is alive (pybit-native).
+
+        Calls pybit's `WebSocket.is_connected()`, which checks
+        `self.ws.sock.connected` — a true TCP-level boolean. Distinct from
+        the wrapper's `is_connected()`, which only reflects whether
+        `connect()` has been called.
+        """
+        with self._lock:
+            if self._ws is None:
+                return False
+            try:
+                return bool(self._ws.is_connected())
+            except Exception as e:
+                logger.warning(f"is_socket_alive check raised: {e}")
+                return False
+
+    def reset(self) -> None:
+        """Force a full WS reset: disconnect and reconnect.
+
+        Order matches `disconnect()`: stop heartbeat → close socket → reopen.
+        `connect()` automatically restarts the heartbeat watchdog and
+        re-subscribes to all streams whose callbacks are set.
+        """
+        logger.info("Private WebSocket reset (reconnect attempt)")
+        self._stop_heartbeat_watchdog()
+        with self._lock:
+            self._disconnect_internal()
+        self.connect()
 
     def _handle_execution(self, message: dict) -> None:
         """Handle raw execution message from WebSocket."""
@@ -450,10 +539,16 @@ class PrivateWebSocketClient:
                 logger.error(f"Error in wallet callback: {e}")
 
     def _start_heartbeat_watchdog(self) -> None:
-        """Start background thread to detect disconnection via message gap."""
-        self._stop_heartbeat.clear()
+        """Start background thread to detect disconnection via message gap.
+
+        Replaces `_stop_heartbeat` with a fresh Event so any leftover
+        heartbeat thread from a prior cycle exits cleanly via its old,
+        still-set event. See PublicWebSocketClient for full rationale.
+        """
+        self._stop_heartbeat = threading.Event()
         self._heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop,
+            args=(self._stop_heartbeat,),
             daemon=True,
             name="PrivateWS-Heartbeat"
         )
@@ -468,11 +563,16 @@ class PrivateWebSocketClient:
         self._heartbeat_thread = None
         logger.debug("Heartbeat watchdog stopped")
 
-    def _heartbeat_loop(self) -> None:
-        """Background loop to detect disconnection via message gap."""
-        while not self._stop_heartbeat.is_set():
-            self._stop_heartbeat.wait(self.heartbeat_interval)
-            if self._stop_heartbeat.is_set():
+    def _heartbeat_loop(self, stop_event: threading.Event) -> None:
+        """Background loop to detect disconnection via message gap.
+
+        Receives `stop_event` as a parameter so a stale loop (whose event
+        was replaced by a subsequent `_start_heartbeat_watchdog`) keeps
+        observing its own set event and exits cleanly.
+        """
+        while not stop_event.is_set():
+            stop_event.wait(self.heartbeat_interval)
+            if stop_event.is_set():
                 break
 
             # Initialize outside lock to avoid UnboundLocalError

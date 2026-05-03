@@ -2677,3 +2677,163 @@ class TestRequestImmediateOrderSync:
             fake_now[0] += _UNKNOWN_ORDER_DEBOUNCE_SEC
             orchestrator._request_immediate_order_sync("btcusdt_test")
             assert orchestrator._next_order_sync == 0.0
+
+
+class TestWsHealthCheck:
+    """Periodic TCP-level WS socket probe (feature 0024)."""
+
+    def _make_orchestrator(self, gridbot_config):
+        orchestrator = Orchestrator(gridbot_config)
+        # Plug in mock public/private WS clients without going through start().
+        pub = MagicMock()
+        priv = MagicMock()
+        orchestrator._public_ws["test_account"] = pub
+        orchestrator._private_ws["test_account"] = priv
+        return orchestrator, pub, priv
+
+    def test_resets_dead_public_ws(self, gridbot_config):
+        orchestrator, pub, priv = self._make_orchestrator(gridbot_config)
+        pub.is_socket_alive.return_value = False
+        priv.is_socket_alive.return_value = True
+
+        orchestrator._ws_health_check_once()
+
+        pub.reset.assert_called_once()
+        priv.reset.assert_not_called()
+
+    def test_resets_dead_private_ws(self, gridbot_config):
+        orchestrator, pub, priv = self._make_orchestrator(gridbot_config)
+        pub.is_socket_alive.return_value = True
+        priv.is_socket_alive.return_value = False
+
+        orchestrator._ws_health_check_once()
+
+        pub.reset.assert_not_called()
+        priv.reset.assert_called_once()
+
+    def test_skipped_when_alive(self, gridbot_config):
+        orchestrator, pub, priv = self._make_orchestrator(gridbot_config)
+        pub.is_socket_alive.return_value = True
+        priv.is_socket_alive.return_value = True
+
+        orchestrator._ws_health_check_once()
+
+        pub.reset.assert_not_called()
+        priv.reset.assert_not_called()
+
+    def test_isolation_one_failure_does_not_skip_others(self, gridbot_config):
+        """A reset() exception on one client must not abort the iteration."""
+        orchestrator, pub, priv = self._make_orchestrator(gridbot_config)
+        pub.is_socket_alive.return_value = False
+        priv.is_socket_alive.return_value = False
+        pub.reset.side_effect = Exception("boom")
+
+        notifier = Mock()
+        orchestrator._notifier = notifier
+
+        orchestrator._ws_health_check_once()
+
+        pub.reset.assert_called_once()
+        priv.reset.assert_called_once()  # still called despite pub failure
+        assert notifier.alert_exception.called
+
+    def test_tick_rate_limits_health_check(self, gridbot_config):
+        """Two consecutive _tick() calls trigger reset only once within 10s."""
+        from gridbot.orchestrator import _WS_HEALTH_CHECK_INTERVAL
+
+        orchestrator, pub, priv = self._make_orchestrator(gridbot_config)
+        pub.is_socket_alive.return_value = False
+        priv.is_socket_alive.return_value = True
+
+        # Pretend nothing else needs to fire on this tick.
+        far_future = time.monotonic() + 1e6
+        orchestrator._next_position_check = far_future
+        orchestrator._next_health_check = far_future
+        orchestrator._next_order_sync = far_future
+        orchestrator._next_retry_tick = far_future
+        orchestrator._next_ws_health_check = 0.0
+
+        orchestrator._tick()
+        assert pub.reset.call_count == 1
+
+        # Second tick immediately after — gate not yet expired
+        orchestrator._tick()
+        assert pub.reset.call_count == 1
+
+        # Force the gate past
+        orchestrator._next_ws_health_check = time.monotonic() - 1.0
+        orchestrator._tick()
+        assert pub.reset.call_count == 2
+
+        # Verify the cadence variable matches plan
+        assert _WS_HEALTH_CHECK_INTERVAL == 10.0
+
+
+class TestOnWsDisconnect:
+    """on_disconnect callback path (feature 0024)."""
+
+    def test_resets_corresponding_public_client(self, gridbot_config):
+        orchestrator = Orchestrator(gridbot_config)
+        pub = MagicMock()
+        priv = MagicMock()
+        orchestrator._public_ws["test_account"] = pub
+        orchestrator._private_ws["test_account"] = priv
+
+        orchestrator._on_ws_disconnect(
+            "test_account", "public",
+            __import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        )
+
+        # Reset is dispatched to a worker thread — wait briefly.
+        deadline = time.monotonic() + 1.0
+        while not pub.reset.called and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        pub.reset.assert_called_once()
+        priv.reset.assert_not_called()
+
+    def test_resets_corresponding_private_client(self, gridbot_config):
+        orchestrator = Orchestrator(gridbot_config)
+        pub = MagicMock()
+        priv = MagicMock()
+        orchestrator._public_ws["test_account"] = pub
+        orchestrator._private_ws["test_account"] = priv
+
+        orchestrator._on_ws_disconnect(
+            "test_account", "private",
+            __import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        )
+
+        deadline = time.monotonic() + 1.0
+        while not priv.reset.called and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        priv.reset.assert_called_once()
+        pub.reset.assert_not_called()
+
+    def test_unknown_account_is_safe(self, gridbot_config):
+        orchestrator = Orchestrator(gridbot_config)
+        # Should not raise even with no clients registered.
+        orchestrator._on_ws_disconnect(
+            "missing", "public",
+            __import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        )
+
+    def test_reset_exception_alerts_notifier(self, gridbot_config):
+        orchestrator = Orchestrator(gridbot_config)
+        pub = MagicMock()
+        pub.reset.side_effect = Exception("boom")
+        orchestrator._public_ws["test_account"] = pub
+        notifier = Mock()
+        orchestrator._notifier = notifier
+
+        orchestrator._on_ws_disconnect(
+            "test_account", "public",
+            __import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        )
+
+        deadline = time.monotonic() + 1.0
+        while not notifier.alert_exception.called and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert notifier.alert_exception.called
