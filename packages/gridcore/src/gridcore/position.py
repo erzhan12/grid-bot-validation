@@ -314,8 +314,13 @@ class Position:
         Capital preservation > strategy optimization.
         """
         # High liquidation risk (short) → decrease short position (EMERGENCY)
-        # For shorts: liq_ratio > max means liquidation is imminent (corrected from original bug)
-        if liq_ratio > 0.95 * self.risk_config.max_liq_ratio:
+        # For shorts: liq_ratio = liq_price / last_close, so ratio > 1 always
+        # (liq_price is above current). Ratio decreases toward 1.0 as price
+        # rises toward liquidation. Therefore "imminent liquidation" is a
+        # ratio CLOSE to 1.0 (small headroom). EMERGENCY fires when ratio
+        # falls below 0.95 * max_liq_ratio (i.e., headroom < 95% of the
+        # configured max). Matches bbu2-master/position.py:78.
+        if 0.0 < liq_ratio < 0.95 * self.risk_config.max_liq_ratio:
             logger.info('Position adjustment: %s EMERGENCY high_liq_risk (ratio=%.2f)', self.direction, liq_ratio)
             self.set_amount_multiplier(self.SIDE_BUY, 1.5)
 
