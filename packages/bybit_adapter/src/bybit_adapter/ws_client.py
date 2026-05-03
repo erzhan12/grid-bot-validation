@@ -14,7 +14,6 @@ from datetime import datetime, UTC
 from typing import Callable, Optional
 import logging
 import threading
-import time
 
 from pybit.unified_trading import WebSocket
 
