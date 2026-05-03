@@ -811,6 +811,262 @@ class TestOrchestratorTick:
         notifier.alert_exception.assert_called_once()
 
 
+class TestOrchestratorWsPositionDrain:
+    """Feature 0023 — coalesced WS position snapshot drained from main loop.
+
+    `_on_position(account, symbol)` runs in WS thread and writes a snapshot
+    + monotonic seq into `_latest_position`. `_tick()` dispatches the
+    latest snapshot per (account, symbol) once via `runner.on_position_update`.
+    """
+
+    def _make_orch(self, gridbot_config, account_config, strategy_config):
+        """Build a fully-routed orchestrator with a mock runner stand-in.
+
+        Real PositionFetcher is left in place (we want its WS-cache reads
+        through `get_position_from_ws`). The runner is mocked because we
+        only assert on `on_position_update` calls.
+        """
+        with patch("gridbot.orchestrator.BybitRestClient"), \
+             patch("gridbot.orchestrator.PublicWebSocketClient"), \
+             patch("gridbot.orchestrator.PrivateWebSocketClient"):
+            orchestrator = Orchestrator(gridbot_config)
+            orchestrator._init_account(account_config)
+            orchestrator._init_strategy(strategy_config)
+            orchestrator._build_routing_maps()
+
+        from collections import deque
+        orchestrator._pending_executions["btcusdt_test"] = deque()
+        orchestrator._pending_orders["btcusdt_test"] = deque()
+
+        mock_runner = Mock()
+        mock_runner.strat_id = "btcusdt_test"
+        mock_runner.symbol = "BTCUSDT"
+        mock_runner.engine.last_close = 42500.0
+        orchestrator._runners = {"btcusdt_test": mock_runner}
+        orchestrator._account_to_runners = {"test_account": [mock_runner]}
+        orchestrator._symbol_to_runners = {"BTCUSDT": [mock_runner]}
+
+        # Stub wallet fetch — real impl raises from non-main thread guards
+        # in some paths and we want a deterministic value here.
+        orchestrator._position_fetcher.get_wallet_balance = Mock(return_value=1000.0)
+        return orchestrator, mock_runner
+
+    @staticmethod
+    def _push_ws(orchestrator, symbol, *, long_size, short_size):
+        """Simulate a WS message arriving and `_on_position` firing."""
+        msg = {"data": []}
+        if long_size is not None:
+            msg["data"].append({
+                "category": "linear", "symbol": symbol, "side": "Buy",
+                "size": str(long_size),
+            })
+        if short_size is not None:
+            msg["data"].append({
+                "category": "linear", "symbol": symbol, "side": "Sell",
+                "size": str(short_size),
+            })
+        orchestrator._position_fetcher.on_position_message("test_account", msg)
+
+    def test_drain_dispatches_snapshot(self, gridbot_config, account_config, strategy_config):
+        """A WS push lands in _latest_position; the next tick dispatches
+        it through runner.on_position_update with paired long/short data.
+        """
+        orch, runner = self._make_orch(gridbot_config, account_config, strategy_config)
+
+        self._push_ws(orch, "BTCUSDT", long_size="0.3", short_size="0.2")
+        orch._tick()
+
+        runner.on_position_update.assert_called_once()
+        kwargs = runner.on_position_update.call_args.kwargs
+        assert kwargs["long_position"]["size"] == "0.3"
+        assert kwargs["short_position"]["size"] == "0.2"
+        assert kwargs["wallet_balance"] == 1000.0
+        assert kwargs["last_close"] == 42500.0
+
+    def test_drain_idempotent_on_unchanged_seq(self, gridbot_config, account_config, strategy_config):
+        """Two consecutive ticks with no new WS push → dispatch fires once."""
+        orch, runner = self._make_orch(gridbot_config, account_config, strategy_config)
+
+        self._push_ws(orch, "BTCUSDT", long_size="0.3", short_size="0.2")
+        orch._tick()
+        orch._tick()
+
+        runner.on_position_update.assert_called_once()
+
+    def test_drain_coalesces_to_latest(self, gridbot_config, account_config, strategy_config):
+        """Multiple WS pushes between ticks collapse to one dispatch with
+        the latest snapshot — older sizes are never seen by the runner.
+        """
+        orch, runner = self._make_orch(gridbot_config, account_config, strategy_config)
+
+        self._push_ws(orch, "BTCUSDT", long_size="0.1", short_size="0.0")
+        self._push_ws(orch, "BTCUSDT", long_size="0.2", short_size="0.0")
+        self._push_ws(orch, "BTCUSDT", long_size="0.3", short_size="0.0")
+        orch._tick()
+
+        runner.on_position_update.assert_called_once()
+        kwargs = runner.on_position_update.call_args.kwargs
+        assert kwargs["long_position"]["size"] == "0.3"
+
+    def test_new_push_after_first_tick_dispatches_again(self, gridbot_config, account_config, strategy_config):
+        """A fresh WS push after a previous tick triggers a second dispatch."""
+        orch, runner = self._make_orch(gridbot_config, account_config, strategy_config)
+
+        self._push_ws(orch, "BTCUSDT", long_size="0.2", short_size="0.2")
+        orch._tick()
+        self._push_ws(orch, "BTCUSDT", long_size="0.3", short_size="0.2")
+        orch._tick()
+
+        assert runner.on_position_update.call_count == 2
+        last_kwargs = runner.on_position_update.call_args_list[-1].kwargs
+        assert last_kwargs["long_position"]["size"] == "0.3"
+
+    def test_drain_skips_runners_without_snapshot(self, gridbot_config, account_config, strategy_config):
+        """If `_latest_position[account][symbol]` is absent, the runner
+        for that symbol is not dispatched — no exception, no spurious call.
+        """
+        orch, runner = self._make_orch(gridbot_config, account_config, strategy_config)
+
+        # No WS push for BTCUSDT.
+        orch._tick()
+        runner.on_position_update.assert_not_called()
+
+    def test_drain_only_dispatches_matching_runner(self, gridbot_config, account_config, strategy_config):
+        """A WS snapshot for ETHUSDT must NOT reach a BTCUSDT runner."""
+        orch, runner = self._make_orch(gridbot_config, account_config, strategy_config)
+
+        self._push_ws(orch, "ETHUSDT", long_size="1.0", short_size="0.0")
+        orch._tick()
+
+        runner.on_position_update.assert_not_called()
+
+    def test_drain_isolates_runner_exceptions(self, gridbot_config, account_config, strategy_config):
+        """If runner.on_position_update raises, the tick keeps running and
+        the notifier is alerted (matches existing exec/order conventions).
+        """
+        notifier = Mock(spec=Notifier)
+        with patch("gridbot.orchestrator.BybitRestClient"), \
+             patch("gridbot.orchestrator.PublicWebSocketClient"), \
+             patch("gridbot.orchestrator.PrivateWebSocketClient"):
+            orch = Orchestrator(gridbot_config, notifier=notifier)
+            orch._init_account(account_config)
+            orch._init_strategy(strategy_config)
+            orch._build_routing_maps()
+        from collections import deque
+        orch._pending_executions["btcusdt_test"] = deque()
+        orch._pending_orders["btcusdt_test"] = deque()
+        mock_runner = Mock()
+        mock_runner.strat_id = "btcusdt_test"
+        mock_runner.symbol = "BTCUSDT"
+        mock_runner.engine.last_close = 42500.0
+        mock_runner.on_position_update.side_effect = ValueError("boom")
+        orch._runners = {"btcusdt_test": mock_runner}
+        orch._account_to_runners = {"test_account": [mock_runner]}
+        orch._symbol_to_runners = {"BTCUSDT": [mock_runner]}
+        orch._position_fetcher.get_wallet_balance = Mock(return_value=1000.0)
+
+        self._push_ws(orch, "BTCUSDT", long_size="0.3", short_size="0.2")
+        orch._tick()  # must not raise
+
+        notifier.alert_exception.assert_called_once()
+        assert "on_position_update" in notifier.alert_exception.call_args[0][0]
+
+    def test_drain_skips_when_ws_cache_incomplete(self, gridbot_config, account_config, strategy_config):
+        """P1 regression: a one-sided WS message must NOT cause the drain
+        to call `runner.on_position_update` with `short_position=None`.
+
+        Previously the drain would dispatch a snapshot like
+        `{long: <fresh>, short: None}` and runner.py:443-448 would coerce
+        the missing side to Decimal('0'), erroneously zeroing the
+        opposite-side size that REST already knew was nonzero. The fix
+        is to skip publishing the snapshot until both sides are present
+        in the WS cache; the periodic REST cycle handles the gap.
+        """
+        orch, runner = self._make_orch(gridbot_config, account_config, strategy_config)
+
+        # Only Buy side ever cached (Sell never WS-pushed for this symbol).
+        self._push_ws(orch, "BTCUSDT", long_size="0.3", short_size=None)
+        orch._tick()
+
+        # Drain must NOT dispatch — the snapshot would be incomplete.
+        runner.on_position_update.assert_not_called()
+        # And `_latest_position` must not carry a half-snapshot.
+        assert "BTCUSDT" not in orch._latest_position.get("test_account", {})
+
+    def test_drain_dispatches_after_second_side_arrives(self, gridbot_config, account_config, strategy_config):
+        """Companion to the incomplete-cache guard: once the opposite
+        side lands in the cache, the next WS push (with either side)
+        produces a complete snapshot and the drain dispatches.
+        """
+        orch, runner = self._make_orch(gridbot_config, account_config, strategy_config)
+
+        # Step 1: only Buy in cache → drain skips.
+        self._push_ws(orch, "BTCUSDT", long_size="0.3", short_size=None)
+        orch._tick()
+        runner.on_position_update.assert_not_called()
+
+        # Step 2: Sell now arrives. Now both sides cached.
+        self._push_ws(orch, "BTCUSDT", long_size=None, short_size="0.2")
+        orch._tick()
+
+        runner.on_position_update.assert_called_once()
+        kwargs = runner.on_position_update.call_args.kwargs
+        assert kwargs["long_position"]["size"] == "0.3"
+        assert kwargs["short_position"]["size"] == "0.2"
+
+    def test_prime_position_seq_survives_concurrent_mutation(self, gridbot_config, account_config, strategy_config):
+        """P2 regression: `_prime_position_seq` must not raise
+        `RuntimeError: dictionary changed size during iteration` when a
+        WS thread inserts into `_latest_position` (or its inner dicts)
+        mid-iteration. The fix is to snapshot via list(...) before
+        iterating.
+        """
+        orch, _runner = self._make_orch(gridbot_config, account_config, strategy_config)
+
+        # Custom dict that mutates itself when items() is called, simulating
+        # a WS-thread insertion landing during the priming iteration. With
+        # the bare `for ... in dict.items()` pattern this raises RuntimeError;
+        # the list(...) snapshot is immune.
+        class _MutatingDict(dict):
+            def items(self_inner):
+                snapshot = list(super().items())
+                # Mutate AFTER the view is requested. Without list(), the
+                # subsequent iteration would observe the mutation and raise.
+                self_inner["LATE_INSERT"] = {"long": {"size": "0.5"},
+                                              "short": {"size": "0.5"},
+                                              "seq": 999}
+                return snapshot
+
+        orch._latest_position = {"test_account": _MutatingDict({
+            "BTCUSDT": {"long": {"size": "0.3"}, "short": {"size": "0.2"}, "seq": 1},
+        })}
+
+        # Must not raise.
+        orch._prime_position_seq()
+
+        # The originally-seen entry was primed.
+        assert orch._last_processed_position_seq[("test_account", "BTCUSDT")] == 1
+
+    def test_startup_prime_skips_first_tick(self, gridbot_config, account_config, strategy_config):
+        """Mimic start()'s priming: simulate a WS-populated `_latest_position`
+        already drained by startup REST, prime `_last_processed_position_seq`,
+        and verify the first tick does NOT redispatch the snapshot.
+        """
+        orch, runner = self._make_orch(gridbot_config, account_config, strategy_config)
+
+        self._push_ws(orch, "BTCUSDT", long_size="0.2", short_size="0.2")
+        # Mimic the priming step in start() right after fetch_and_update(startup=True).
+        orch._prime_position_seq()
+
+        orch._tick()
+        runner.on_position_update.assert_not_called()
+
+        # New push after startup priming — should now dispatch.
+        self._push_ws(orch, "BTCUSDT", long_size="0.3", short_size="0.2")
+        orch._tick()
+        runner.on_position_update.assert_called_once()
+
+
 class TestOrchestratorTickPeriodicCheckIsolation:
     """Each periodic REST check is isolated so one failure doesn't wedge
     WS-event drain via the outer backoff path."""

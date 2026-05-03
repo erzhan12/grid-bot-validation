@@ -19,7 +19,7 @@ import logging
 import threading
 import time
 from datetime import datetime, UTC
-from typing import Optional
+from typing import Callable, Optional
 
 from bybit_adapter.rest_client import BybitRestClient
 
@@ -58,6 +58,7 @@ class PositionFetcher:
         notifier: Notifier,
         wallet_cache_interval: float,
         position_check_interval: float,
+        on_position_changed: Optional[Callable[[str, str], None]] = None,
     ):
         # Dicts are held by reference; Orchestrator mutates them in place
         # during _init_account, and those updates are visible here.
@@ -66,6 +67,10 @@ class PositionFetcher:
         self._notifier = notifier
         self._wallet_cache_interval = wallet_cache_interval
         self._position_check_interval = position_check_interval
+        # Optional WS-thread notification: called once per (account, symbol)
+        # after on_position_message has written the cache. Orchestrator uses
+        # this to coalesce a snapshot for the main-loop drain (feature 0023).
+        self._on_position_changed = on_position_changed
 
         # WebSocket position data cache: account_name -> symbol -> side -> position_data
         # Follows original bbu2 pattern: WebSocket provides real-time updates,
@@ -128,6 +133,7 @@ class PositionFetcher:
             ]
         }
         """
+        changed_symbols: set[str] = set()
         try:
             # Initialize account cache if needed. setdefault is a single
             # C-level call and is GIL-atomic (unlike check-then-assign,
@@ -152,6 +158,7 @@ class PositionFetcher:
 
                 # Store position data by side — atomic dict-set under GIL.
                 symbol_cache[side] = pos
+                changed_symbols.add(symbol)
 
                 logger.debug(
                     f"Position WS update: {account_name}/{symbol}/{side} "
@@ -160,6 +167,21 @@ class PositionFetcher:
 
         except Exception as e:
             self._notifier.alert_exception("_on_position", e, error_key="ws_on_position")
+            return
+
+        # Notify orchestrator (feature 0023). Done after the cache writes so
+        # the callback can read the freshest snapshot via get_position_from_ws.
+        # Deduped to one call per (account, symbol) regardless of how many
+        # sides arrived in this message. Wrapped so a misbehaving callback
+        # cannot wedge the WS thread.
+        if self._on_position_changed is not None:
+            for symbol in changed_symbols:
+                try:
+                    self._on_position_changed(account_name, symbol)
+                except Exception as e:
+                    self._notifier.alert_exception(
+                        "_on_position_changed", e, error_key="ws_on_position_changed",
+                    )
 
     def get_position_from_ws(
         self, account_name: str, symbol: str, side: str

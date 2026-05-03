@@ -122,6 +122,16 @@ class Orchestrator:
         self._started = False
         self._running = False
 
+        # Coalesced WS position snapshot (feature 0023).
+        # Outer key = account_name, inner key = symbol, value = dict with
+        # "long" / "short" position dicts and a monotonic "seq". The WS
+        # callback (`_on_position`) writes the latest snapshot here; the
+        # main-loop tick drains it once per (account, symbol). Seq lives
+        # in `_position_seq` and is bumped under the WS thread.
+        self._latest_position: dict[str, dict[str, dict]] = {}
+        self._last_processed_position_seq: dict[tuple[str, str], int] = {}
+        self._position_seq: int = 0
+
         # Position-fetch subsystem (WS cache + REST fallback + wallet cache
         # + startup batch + rotation tick). Constructed eagerly so that
         # _init_account — which registers WS callbacks bound to
@@ -130,12 +140,19 @@ class Orchestrator:
         # fetcher holds _rest_clients / _account_to_runners by reference
         # (they are empty dicts at this point and get populated in place
         # by _init_account / _init_strategy).
+        #
+        # `on_position_changed=self._on_position` rewires the WS-thread
+        # callback so a snapshot lands in `_latest_position` for the next
+        # main-loop drain (feature 0023). Method-bound reference is fine —
+        # `_on_position` is defined on the class, available before any WS
+        # message can fire (sockets only connect inside start()).
         self._position_fetcher = PositionFetcher(
             rest_clients=self._rest_clients,
             account_to_runners=self._account_to_runners,
             notifier=self._notifier,
             wallet_cache_interval=self._config.wallet_cache_interval,
             position_check_interval=self._config.position_check_interval,
+            on_position_changed=self._on_position,
         )
 
         # Auth-cooldown subsystem. Constructed eagerly for the same reason
@@ -244,6 +261,11 @@ class Orchestrator:
         logger.info("Fetching initial positions before entering main loop")
         self._position_fetcher.fetch_and_update(startup=True)
 
+        # Prime the coalesced-position seq map so the first main-loop tick
+        # does not redispatch snapshots already covered by the startup
+        # REST batch (feature 0023).
+        self._prime_position_seq()
+
         # Prime periodic-tick schedulers so the first main loop iteration
         # does not immediately re-run expensive checks.
         now = time.monotonic()
@@ -338,6 +360,43 @@ class Orchestrator:
                     self._notifier.alert_exception(
                         "runner.on_order_update", e,
                         error_key=f"on_order_update_{runner.strat_id}",
+                    )
+
+        # 2.5 Drain coalesced WS position snapshots (feature 0023).
+        #     One dispatch per (account, symbol) per tick, deduped via the
+        #     monotonic seq counter set in `_on_position`. Older snapshots
+        #     overwrite each other in `_latest_position`; only the freshest
+        #     is dispatched. Runs BEFORE the ticker drain so `_check_and_place`
+        #     reasons over fresh position size on the same tick.
+        for account_name, runners in self._account_to_runners.items():
+            account_slot = self._latest_position.get(account_name)
+            if not account_slot:
+                continue
+            wallet_balance = self._position_fetcher.get_wallet_balance(account_name)
+            for runner in runners:
+                snapshot = account_slot.get(runner.symbol)
+                if snapshot is None:
+                    continue
+                seq = snapshot["seq"]
+                key = (account_name, runner.symbol)
+                if self._last_processed_position_seq.get(key) == seq:
+                    continue
+                self._last_processed_position_seq[key] = seq
+                try:
+                    runner.on_position_update(
+                        long_position=snapshot["long"],
+                        short_position=snapshot["short"],
+                        wallet_balance=wallet_balance,
+                        last_close=runner.engine.last_close or 0.0,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "%s: on_position_update error (WS drain): %s",
+                        runner.strat_id, e, exc_info=True,
+                    )
+                    self._notifier.alert_exception(
+                        "runner.on_position_update", e,
+                        error_key=f"on_position_update_{runner.strat_id}",
                     )
 
         # 3. Process latest ticker per symbol (coalesced — WS callback
@@ -611,6 +670,85 @@ class Orchestrator:
         self._private_ws[account_name].connect()
 
         logger.info(f"Connected WebSockets for account: {account_name}")
+
+    def _prime_position_seq(self) -> None:
+        """Prime `_last_processed_position_seq` from `_latest_position`.
+
+        Called from `start()` AFTER `fetch_and_update(startup=True)` has
+        pushed initial state through `runner.on_position_update`. Without
+        this priming, the first `_tick()` would redispatch any WS-cached
+        snapshot that the startup REST batch already covered.
+
+        Snapshot via list(...) before iterating: pybit WS threads are
+        already running by this point and `_on_position` can insert new
+        entries into `_latest_position` (or its inner dicts) concurrently.
+        Iterating the live dict could otherwise raise
+        `RuntimeError: dictionary changed size during iteration`. Worst
+        case with the snapshot: a WS-thread insert that lands AFTER we
+        took the list() but BEFORE the first `_tick()` runs is correctly
+        NOT primed here, so the first tick will dispatch it — that's
+        acceptable because it represents data the startup REST batch
+        didn't see.
+        """
+        for account_name, account_slot in list(self._latest_position.items()):
+            for symbol, snapshot in list(account_slot.items()):
+                self._last_processed_position_seq[(account_name, symbol)] = snapshot["seq"]
+
+    def _on_position(self, account_name: str, symbol: str) -> None:
+        """Handle WS position notification (runs in pybit WS thread).
+
+        Called by `PositionFetcher.on_position_message` AFTER its cache
+        write completes, so `get_position_from_ws` returns the freshest
+        per-side data here. Builds a paired snapshot (long + short +
+        monotonic seq) into `_latest_position[account_name][symbol]`
+        for the main-loop drain to pick up — feature 0023.
+
+        Incomplete-cache guard: skips publishing the snapshot if either
+        side is missing from the WS cache. Bybit may push an update for
+        only the changed side; the opposite side's cache slot can be
+        absent until the first push for that side ever lands. Without
+        this guard, the drain would call `runner.on_position_update`
+        with `long_position=None` (or `short=None`), and runner.py:443-448
+        would coerce that to `Decimal('0')`, erroneously zeroing the
+        opposite-side size that REST already knew was nonzero. The
+        periodic REST cycle keeps working in the meantime — it has its
+        own REST fallback for missing WS sides and updates the runner
+        directly without going through this drain.
+
+        Thread-safety: per-`(account, symbol)` writes have at most one
+        WS-thread writer, since pybit dispatches private-socket callbacks
+        from a single thread per account, and `(account, symbol)` is
+        partitioned by account. `_position_seq += 1` is shared across
+        all private WS threads; with multiple accounts, two concurrent
+        increments can collide and produce a duplicate seq value, but
+        the resulting snapshots land in different `_latest_position`
+        slots and are dispatched independently against per-key entries
+        in `_last_processed_position_seq`, so no update is lost. Within
+        the same `(account, symbol)`, only one writer exists, so the
+        seq comparison in the drain is a clean single-writer monotonic
+        check. Reads on the main thread are GIL-atomic.
+        """
+        try:
+            long_pos = self._position_fetcher.get_position_from_ws(
+                account_name, symbol, "Buy"
+            )
+            short_pos = self._position_fetcher.get_position_from_ws(
+                account_name, symbol, "Sell"
+            )
+            if long_pos is None or short_pos is None:
+                # Wait for the opposite side to arrive (or for the next
+                # periodic REST cycle to refresh runner state). See
+                # incomplete-cache guard rationale above.
+                return
+            self._position_seq += 1
+            account_slot = self._latest_position.setdefault(account_name, {})
+            account_slot[symbol] = {
+                "long": long_pos,
+                "short": short_pos,
+                "seq": self._position_seq,
+            }
+        except Exception as e:
+            self._notifier.alert_exception("_on_position", e, error_key="ws_on_position")
 
     def _on_ticker(self, account_name: str, symbol: str, message: dict) -> None:
         """Handle ticker WebSocket message (runs in pybit WS thread).
