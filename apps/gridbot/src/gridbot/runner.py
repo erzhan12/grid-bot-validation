@@ -179,6 +179,11 @@ class StrategyRunner:
         self._recent_executions_long: deque[dict] = deque(maxlen=2)
         self._recent_executions_short: deque[dict] = deque(maxlen=2)
         self._same_order_error: bool = False
+        # Track which (order_id, order_id) pairs we already cross-checked
+        # against REST after a SAME ORDER trigger, to avoid hammering the API
+        # on the flapping error state. Entries here are frozenset of two
+        # order_ids; small set, never trimmed (resets on bot restart).
+        self._diagnosed_same_order_pairs: set[frozenset[str]] = set()
 
     @property
     def strat_id(self) -> str:
@@ -1043,4 +1048,62 @@ class StrategyRunner:
                         f"Order placement BLOCKED.",
                         error_key=f"same_order_{self.strat_id}",
                     )
+
+                # Diagnostic REST cross-check (rate-limited to once per
+                # order_id pair so the flap doesn't hammer the API). Verifies
+                # whether Bybit-side actually has two distinct fills, or the
+                # WS stream duplicated a single fill event. The latter would
+                # mean SAME ORDER is a WS-glitch false positive, not a real
+                # grid duplicate.
+                pair_key = frozenset((current["order_id"], previous["order_id"]))
+                if pair_key not in self._diagnosed_same_order_pairs:
+                    self._diagnosed_same_order_pairs.add(pair_key)
+                    self._diagnostic_rest_check_executions(current, previous)
                 return
+
+    def _diagnostic_rest_check_executions(self, current: dict, previous: dict) -> None:
+        """Cross-check SAME ORDER trigger against Bybit REST execution history.
+
+        Hypothesis being tested: WS execution stream may emit duplicate events
+        for a single Bybit-side fill, making `_check_same_orders` see "two
+        different orders" when there's actually one. REST `get_executions` is
+        the authoritative source — it returns Bybit's stored execution list.
+
+        For each of the two order_ids from the SAME ORDER pair, count how
+        many actual fills REST reports. If REST says 1 per orderId → buffer
+        was correct, real duplicate. If REST disagrees (e.g., 0 or some
+        order_id not in REST list) → WS lied.
+
+        Failures here are logged as ERROR but never raised — diagnostic is
+        best-effort, never breaks the main loop.
+        """
+        try:
+            # Access the rest_client through the executor. This is a
+            # diagnostic-only path; a proper API addition can come later.
+            rest_client = self._executor._client
+            executions, _ = rest_client.get_executions(
+                symbol=self.symbol, limit=50,
+            )
+            cur_id = current["order_id"]
+            prev_id = previous["order_id"]
+            cur_matches = [e for e in executions if e.get("orderId") == cur_id]
+            prev_matches = [e for e in executions if e.get("orderId") == prev_id]
+            verdict = (
+                "REAL_DUPLICATE" if len(cur_matches) >= 1 and len(prev_matches) >= 1
+                and cur_id != prev_id
+                else "WS_GLITCH_SUSPECTED"
+            )
+            logger.error(
+                f"{self.strat_id}: SAME ORDER REST cross-check — verdict={verdict} "
+                f"(REST returned {len(executions)} recent executions for {self.symbol}). "
+                f"current order_id={cur_id} → {len(cur_matches)} REST matches "
+                f"[{[(m.get('execId'), m.get('execPrice'), m.get('execQty'), m.get('orderLinkId'), m.get('execType')) for m in cur_matches[:3]]}]; "
+                f"previous order_id={prev_id} → {len(prev_matches)} REST matches "
+                f"[{[(m.get('execId'), m.get('execPrice'), m.get('execQty'), m.get('orderLinkId'), m.get('execType')) for m in prev_matches[:3]]}]"
+            )
+        except Exception as e:
+            logger.error(
+                f"{self.strat_id}: SAME ORDER REST cross-check failed "
+                f"(diagnostic only, ignoring): {e}", exc_info=True,
+            )
+
