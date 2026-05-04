@@ -948,14 +948,25 @@ class StrategyRunner:
 
         if (event.side == "Buy" and not is_closing) or (event.side == "Sell" and is_closing):
             buffer = self._recent_executions_long
+            buffer_label = "long"
         else:
             buffer = self._recent_executions_short
+            buffer_label = "short"
 
-        # Add to buffer (newest first)
+        # Add to buffer (newest first). Diagnostic fields (closed_size,
+        # order_link_id, buffer_label) are kept on the record so SAME ORDER
+        # ERROR can dump the actual classification path — needed to tell apart
+        # a real grid-duplicate (both fills truly the same intent) from a
+        # hedge-mode misclassification (classifier put two distinct hedge-pair
+        # fills into the same buffer because closedSize was reported as 0 by
+        # Bybit on a reduce-only fill).
         exec_record = {
             "order_id": event.order_id,
+            "order_link_id": event.order_link_id,
             "price": event.price,
             "side": event.side,
+            "closed_size": event.closed_size,
+            "buffer": buffer_label,
             "exchange_ts": event.exchange_ts,
         }
         buffer.appendleft(exec_record)
@@ -996,10 +1007,33 @@ class StrategyRunner:
                     # Same order ID (partial fills) - OK
                     return
                 # Different order IDs at same price = DUPLICATE ERROR
+                # Diagnostic dump: include closed_size, order_link_id, and
+                # tracked-order reduce_only (looked up via _tracked_orders)
+                # for both fills. This determines whether it's a real
+                # grid-duplicate (same reduce_only, both tracked) or a
+                # hedge-mode misclassification (different reduce_only or one
+                # untracked).
+                cur_tracked = self._tracked_orders.get(current.get("order_link_id", ""))
+                prev_tracked = self._tracked_orders.get(previous.get("order_link_id", ""))
+                cur_reduce_only = (
+                    cur_tracked.intent.reduce_only
+                    if cur_tracked and cur_tracked.intent else "unknown"
+                )
+                prev_reduce_only = (
+                    prev_tracked.intent.reduce_only
+                    if prev_tracked and prev_tracked.intent else "unknown"
+                )
                 logger.error(
                     f"{self.strat_id}: SAME ORDER ERROR - Two different orders filled "
                     f"at same price {current['price']} side={current['side']} "
-                    f"(order_ids: {current['order_id']}, {previous['order_id']})"
+                    f"(order_ids: {current['order_id']}, {previous['order_id']}) "
+                    f"[diagnostic: buffer={current.get('buffer','?')}, "
+                    f"current closed_size={current.get('closed_size','?')} "
+                    f"order_link_id={current.get('order_link_id','')!r} "
+                    f"reduce_only={cur_reduce_only}, "
+                    f"previous closed_size={previous.get('closed_size','?')} "
+                    f"order_link_id={previous.get('order_link_id','')!r} "
+                    f"reduce_only={prev_reduce_only}]"
                 )
                 self._same_order_error = True
                 if self._notifier:
