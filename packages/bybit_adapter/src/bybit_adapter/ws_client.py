@@ -387,6 +387,7 @@ class PrivateWebSocketClient:
     on_reconnect: Optional[Callable[[datetime, datetime], None]] = None
     heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL
     disconnect_threshold: float = DEFAULT_DISCONNECT_THRESHOLD
+    message_gap_watchdog_enabled: bool = True
 
     _ws: Optional[WebSocket] = field(default=None, init=False, repr=False)
     _state: ConnectionState = field(default_factory=ConnectionState, init=False)
@@ -439,8 +440,14 @@ class PrivateWebSocketClient:
             self._state._detected_disconnect = False
             logger.info("Private WebSocket connected")
 
-            # Start heartbeat watchdog
-            self._start_heartbeat_watchdog()
+            # Start heartbeat watchdog (gated — see message_gap_watchdog_enabled)
+            if self.message_gap_watchdog_enabled:
+                self._start_heartbeat_watchdog()
+            else:
+                logger.info(
+                    "Heartbeat watchdog disabled for private "
+                    "(relying on TCP probe)"
+                )
 
     def disconnect(self) -> None:
         """Gracefully disconnect WebSocket."""

@@ -120,6 +120,26 @@ class TestOrchestratorInit:
     @patch("gridbot.orchestrator.BybitRestClient")
     @patch("gridbot.orchestrator.PublicWebSocketClient")
     @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_init_account_disables_private_message_gap_watchdog(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        gridbot_config,
+        account_config,
+    ):
+        """Private WS is constructed with the message-gap watchdog disabled
+        (feature 0026 — TCP probe is the sole disconnect signal for private).
+        """
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._init_account(account_config)
+
+        priv_kwargs = mock_private_ws.call_args.kwargs
+        assert priv_kwargs.get("message_gap_watchdog_enabled") is False
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
     def test_init_strategy(
         self,
         mock_private_ws,
