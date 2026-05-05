@@ -51,6 +51,13 @@ _FLOAT_TO_DECIMAL = {
     2.0: Decimal("2"),
 }
 
+# Time window for SAME ORDER detection: only flag pairs whose exchange_ts
+# are within this many seconds. Concurrent grid duplicates (the bug bbu2
+# was designed to catch) fill within milliseconds; sequential grid-walk
+# replacements at the same price are minutes-to-hours apart and must not
+# trigger. See docs/features/0025_PLAN.md.
+_SAME_ORDER_TIME_WINDOW_SEC = 5.0
+
 
 @dataclass
 class TrackedOrder:
@@ -988,11 +995,23 @@ class StrategyRunner:
         self._check_same_orders_side(self._recent_executions_short)
 
     def _check_same_orders_side(self, executions: deque) -> None:
-        """Check execution buffer for same-price duplicates.
+        """Check execution buffer for same-price duplicates within a time window.
 
         Compares consecutive executions. If same price and side but different
-        order_id, this indicates a duplicate order was placed at the same
-        price level - a grid bug.
+        order_id AND the two fills happened within ``_SAME_ORDER_TIME_WINDOW_SEC``,
+        this indicates a duplicate order was placed at the same price level -
+        a grid bug.
+
+        Time-window rationale (feature 0025): bbu2's detector was designed
+        for *concurrent* grid duplication — two intents emitted for the same
+        slot in the same tick, so both fills land within milliseconds. Our
+        engine instead exhibits *sequential* grid-walk replacement: as price
+        walks up/down, an old level is rebuilt later at the same price,
+        minutes-to-hours after the original fill. Without a time-window
+        guard, every legitimate grid replacement looks like a duplicate. The
+        5-second window is comfortably above worst-case hedge-pair
+        concurrent-fill latency (<500 ms) and far below any plausible
+        grid-replacement gap.
 
         Set-on-error only: this method sets ``_same_order_error`` to
         True on detection and never clears it. The caller
@@ -1011,6 +1030,17 @@ class StrategyRunner:
                 if current["order_id"] == previous["order_id"]:
                     # Same order ID (partial fills) - OK
                     return
+                # Time-window guard: skip pairs that are far apart in time.
+                # Buffer is maxlen=2, so a single mismatched pair means no
+                # duplicate exists in the buffer at all — `return` is correct.
+                # If the buffer ever grows past 2, switch to `continue` so
+                # other pairs in the buffer can still be evaluated.
+                cur_ts = current.get("exchange_ts")
+                prev_ts = previous.get("exchange_ts")
+                if cur_ts is not None and prev_ts is not None:
+                    delta_sec = abs((cur_ts - prev_ts).total_seconds())
+                    if delta_sec > _SAME_ORDER_TIME_WINDOW_SEC:
+                        return
                 # Different order IDs at same price = DUPLICATE ERROR
                 # Diagnostic dump: include closed_size, order_link_id, and
                 # tracked-order reduce_only (looked up via _tracked_orders)
