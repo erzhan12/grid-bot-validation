@@ -232,6 +232,90 @@ class TestPrivateWebSocketClientDisconnectDetection:
         state = client.get_connection_state()
         assert state.reconnect_count == 2
 
+    @patch("bybit_adapter.ws_client.WebSocket")
+    def test_private_watchdog_disabled_skips_heartbeat_thread(self, mock_ws_class):
+        """When message_gap_watchdog_enabled=False, connect() does not start
+        the heartbeat thread, but still completes the connection and
+        subscribes to all configured streams.
+        """
+        mock_ws = MagicMock()
+        mock_ws_class.return_value = mock_ws
+
+        client = PrivateWebSocketClient(
+            api_key="test_key",
+            api_secret="test_secret",
+            testnet=True,
+            on_execution=lambda x: None,
+            on_order=lambda x: None,
+            on_position=lambda x: None,
+            on_wallet=lambda x: None,
+            heartbeat_interval=0.1,
+            disconnect_threshold=0.3,
+            message_gap_watchdog_enabled=False,
+        )
+
+        client.connect()
+
+        # Heartbeat thread must not be started.
+        assert client._heartbeat_thread is None
+        # connect() did not short-circuit: connection is logically up and
+        # all four stream subscriptions were registered with pybit.
+        assert client.is_connected() is True
+        mock_ws.execution_stream.assert_called_once()
+        mock_ws.order_stream.assert_called_once()
+        mock_ws.position_stream.assert_called_once()
+        mock_ws.wallet_stream.assert_called_once()
+
+        client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket")
+    def test_private_watchdog_disabled_never_fires_on_disconnect(self, mock_ws_class):
+        """With watchdog disabled, on_disconnect callback never fires even
+        after the silence threshold is exceeded.
+        """
+        disconnect_callback = MagicMock()
+
+        client = PrivateWebSocketClient(
+            api_key="test_key",
+            api_secret="test_secret",
+            testnet=True,
+            on_execution=lambda x: None,
+            on_disconnect=disconnect_callback,
+            heartbeat_interval=0.1,
+            disconnect_threshold=0.3,
+            message_gap_watchdog_enabled=False,
+        )
+
+        client.connect()
+        # Wait well past the disconnect_threshold the watchdog WOULD use.
+        time.sleep(0.5)
+        client.disconnect()
+
+        assert not disconnect_callback.called
+
+    @patch("bybit_adapter.ws_client.WebSocket")
+    def test_private_watchdog_disabled_survives_reset(self, mock_ws_class):
+        """reset() must not re-enable the heartbeat thread when the watchdog
+        is disabled (regression guard for the gate-inside-connect approach).
+        """
+        client = PrivateWebSocketClient(
+            api_key="test_key",
+            api_secret="test_secret",
+            testnet=True,
+            on_execution=lambda x: None,
+            heartbeat_interval=0.1,
+            disconnect_threshold=0.3,
+            message_gap_watchdog_enabled=False,
+        )
+
+        client.connect()
+        assert client._heartbeat_thread is None
+
+        client.reset()
+        assert client._heartbeat_thread is None
+
+        client.disconnect()
+
 
 class TestPublicWebSocketClientEdgeCases:
     """Additional edge case tests for PublicWebSocketClient."""

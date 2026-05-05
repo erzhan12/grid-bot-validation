@@ -629,6 +629,7 @@ class Orchestrator:
             on_order=lambda msg, a=name: self._on_order(a, msg),
             on_execution=lambda msg, a=name: self._on_execution(a, msg),
             on_disconnect=lambda ts, a=name: self._on_ws_disconnect(a, "private", ts),
+            message_gap_watchdog_enabled=False,
         )
 
         logger.info(f"Initialized account: {name}")
