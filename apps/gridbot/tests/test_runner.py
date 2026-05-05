@@ -1,6 +1,6 @@
 """Tests for gridbot strategy runner module."""
 
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
 from decimal import Decimal
 from unittest.mock import Mock, MagicMock
 
@@ -1856,6 +1856,191 @@ class TestSameOrderDetection:
         # Buffer still has only 1 entry (the fully filled one)
         assert len(runner._recent_executions_long) == 1
         assert runner.same_order_error is False
+
+    def test_same_order_skips_when_fills_far_apart(self, runner, caplog):
+        """Sequential grid-walk replacement: two same-price fills 10 minutes apart.
+
+        This is the production failure mode that feature 0025 fixes.
+        Without the time-window guard, this fired SAME ORDER ERROR and
+        blocked placement on every legitimate grid replacement.
+        """
+        import logging
+
+        t0 = datetime.now(UTC)
+
+        event1 = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=t0,
+            local_ts=t0,
+            exec_id="exec_1",
+            order_id="order_1",
+            order_link_id="abc123",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("0"),
+        )
+        runner._check_same_orders(event1)
+
+        # Second fill at the same price, 10 minutes later — legitimate
+        # grid-walk replacement, not a duplicate.
+        t1 = t0 + timedelta(minutes=10)
+        event2 = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=t1,
+            local_ts=t1,
+            exec_id="exec_2",
+            order_id="order_2",
+            order_link_id="def456",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("0"),
+        )
+        with caplog.at_level(logging.ERROR):
+            runner._check_same_orders(event2)
+
+        assert runner.same_order_error is False
+        same_order_errors = [r for r in caplog.records if "SAME ORDER ERROR" in r.message]
+        assert same_order_errors == []
+
+    def test_same_order_fires_when_fills_within_window(self, runner):
+        """Concurrent grid duplication: two same-price fills 2 seconds apart.
+
+        Within the 5-second window, the detector still triggers — preserving
+        the original bbu2 protection against the bug it was designed to catch.
+        """
+        t0 = datetime.now(UTC)
+
+        event1 = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=t0,
+            local_ts=t0,
+            exec_id="exec_1",
+            order_id="order_1",
+            order_link_id="abc123",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("0"),
+        )
+        runner._check_same_orders(event1)
+
+        t1 = t0 + timedelta(seconds=2)
+        event2 = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=t1,
+            local_ts=t1,
+            exec_id="exec_2",
+            order_id="order_2",
+            order_link_id="def456",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("0"),
+        )
+        runner._check_same_orders(event2)
+
+        assert runner.same_order_error is True
+
+    def test_same_order_at_window_boundary(self, runner):
+        """Boundary: delta_sec == 5.0 still fires (we use strict `>`)."""
+        t0 = datetime.now(UTC)
+
+        event1 = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=t0,
+            local_ts=t0,
+            exec_id="exec_1",
+            order_id="order_1",
+            order_link_id="abc123",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("0"),
+        )
+        runner._check_same_orders(event1)
+
+        t1 = t0 + timedelta(seconds=5)
+        event2 = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=t1,
+            local_ts=t1,
+            exec_id="exec_2",
+            order_id="order_2",
+            order_link_id="def456",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("0"),
+        )
+        runner._check_same_orders(event2)
+
+        assert runner.same_order_error is True
+
+    def test_same_order_window_does_not_break_hedge_pair_isolation(self, runner):
+        """Regression-guard: concurrent hedge-pair fills at the same price.
+
+        Hedge mode emits an Open-Long Buy and a Close-Short Buy at the same
+        price simultaneously. ``closed_size`` routes them into different
+        buffers (long vs short), so even within the time window they must
+        never compare against each other and must not trigger SAME ORDER.
+        """
+        t0 = datetime.now(UTC)
+
+        # Open Long Buy: closed_size == 0 → long buffer
+        open_long = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=t0,
+            local_ts=t0,
+            exec_id="exec_open",
+            order_id="order_open",
+            order_link_id="open_link",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("0"),
+            closed_size=Decimal("0"),
+        )
+        runner._check_same_orders(open_long)
+
+        # Close Short Buy: closed_size > 0 → short buffer. Same price,
+        # ~1 ms later (within the time window).
+        t1 = t0 + timedelta(milliseconds=1)
+        close_short = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=t1,
+            local_ts=t1,
+            exec_id="exec_close",
+            order_id="order_close",
+            order_link_id="close_link",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("5.0"),
+            closed_size=Decimal("0.1"),
+        )
+        runner._check_same_orders(close_short)
+
+        assert runner.same_order_error is False
+        assert len(runner._recent_executions_long) == 1
+        assert len(runner._recent_executions_short) == 1
 
 
 class TestRunnerAuthCooldown:
