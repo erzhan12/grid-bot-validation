@@ -1951,6 +1951,149 @@ class TestSameOrderDetection:
 
         assert runner.same_order_error is True
 
+    def test_same_order_fires_for_tracked_orders_placed_together_but_filled_later(self, runner):
+        """Duplicate resting orders can fill far apart in thin markets.
+
+        The safety check must key off placement proximity when tracking data is
+        available. Otherwise two concurrently placed duplicates at the same
+        price can evade detection just because the market fills them more than
+        five seconds apart.
+        """
+        t0 = datetime.now(UTC)
+
+        intent1 = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.1"),
+            grid_level=1,
+            direction="long",
+        )
+        intent2 = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.1"),
+            grid_level=1,
+            direction="long",
+        )
+        # Force distinct client IDs to simulate the duplicate-order bug that
+        # bypassed deterministic intent identity and reached the exchange.
+        tracked1 = TrackedOrder(
+            client_order_id="link_1",
+            order_id="order_1",
+            intent=intent1,
+            status="placed",
+            placed_ts=t0,
+        )
+        tracked2 = TrackedOrder(
+            client_order_id="link_2",
+            order_id="order_2",
+            intent=intent2,
+            status="placed",
+            placed_ts=t0 + timedelta(seconds=1),
+        )
+        runner._tracked_orders["link_1"] = tracked1
+        runner._tracked_orders["link_2"] = tracked2
+
+        event1 = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=t0,
+            local_ts=t0,
+            exec_id="exec_1",
+            order_id="order_1",
+            order_link_id="link_1",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("0"),
+        )
+        runner._check_same_orders(event1)
+
+        # Fill arrives after the old 5s fill-time window, but both orders were
+        # placed together and were concurrently resting at the same grid slot.
+        t1 = t0 + timedelta(seconds=30)
+        event2 = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=t1,
+            local_ts=t1,
+            exec_id="exec_2",
+            order_id="order_2",
+            order_link_id="link_2",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("0"),
+        )
+        runner._check_same_orders(event2)
+
+        assert runner.same_order_error is True
+
+    def test_same_order_skips_tracked_orders_placed_far_apart(self, runner):
+        """Tracked sequential replacements use placement time to avoid false positives."""
+        t0 = datetime.now(UTC)
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.1"),
+            grid_level=1,
+            direction="long",
+        )
+        runner._tracked_orders["link_1"] = TrackedOrder(
+            client_order_id="link_1",
+            order_id="order_1",
+            intent=intent,
+            status="placed",
+            placed_ts=t0,
+        )
+        runner._tracked_orders["link_2"] = TrackedOrder(
+            client_order_id="link_2",
+            order_id="order_2",
+            intent=intent,
+            status="placed",
+            placed_ts=t0 + timedelta(minutes=10),
+        )
+
+        event1 = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=t0 + timedelta(minutes=10),
+            local_ts=t0,
+            exec_id="exec_1",
+            order_id="order_1",
+            order_link_id="link_1",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("0"),
+        )
+        runner._check_same_orders(event1)
+
+        event2 = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=t0 + timedelta(minutes=10, seconds=1),
+            local_ts=t0,
+            exec_id="exec_2",
+            order_id="order_2",
+            order_link_id="link_2",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("0"),
+        )
+        runner._check_same_orders(event2)
+
+        assert runner.same_order_error is False
+
     def test_same_order_at_window_boundary(self, runner):
         """Boundary: delta_sec == 5.0 still fires (we use strict `>`)."""
         t0 = datetime.now(UTC)

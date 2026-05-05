@@ -1030,17 +1030,37 @@ class StrategyRunner:
                 if current["order_id"] == previous["order_id"]:
                     # Same order ID (partial fills) - OK
                     return
-                # Time-window guard: skip pairs that are far apart in time.
-                # Buffer is maxlen=2, so a single mismatched pair means no
-                # duplicate exists in the buffer at all — `return` is correct.
-                # If the buffer ever grows past 2, switch to `continue` so
-                # other pairs in the buffer can still be evaluated.
-                cur_ts = current.get("exchange_ts")
-                prev_ts = previous.get("exchange_ts")
-                if cur_ts is not None and prev_ts is not None:
-                    delta_sec = abs((cur_ts - prev_ts).total_seconds())
+                cur_tracked = self._find_tracked_order(
+                    current.get("order_link_id"), current.get("order_id")
+                )
+                prev_tracked = self._find_tracked_order(
+                    previous.get("order_link_id"), previous.get("order_id")
+                )
+
+                # Time-window guard: when both orders are tracked, compare
+                # placement times rather than fill times. Concurrent duplicate
+                # orders can fill slowly in thin markets; legitimate sequential
+                # grid-walk replacements are placed far apart because the later
+                # order is emitted only after the earlier one filled.
+                if cur_tracked is not None and prev_tracked is not None:
+                    delta_sec = abs(
+                        (cur_tracked.placed_ts - prev_tracked.placed_ts).total_seconds()
+                    )
                     if delta_sec > _SAME_ORDER_TIME_WINDOW_SEC:
                         return
+                else:
+                    # Fallback for tests, older/incomplete tracking, and
+                    # external events where placement time is unavailable.
+                    # Buffer is maxlen=2, so a single mismatched pair means no
+                    # duplicate exists in the buffer at all — `return` is correct.
+                    # If the buffer ever grows past 2, switch to `continue` so
+                    # other pairs in the buffer can still be evaluated.
+                    cur_ts = current.get("exchange_ts")
+                    prev_ts = previous.get("exchange_ts")
+                    if cur_ts is not None and prev_ts is not None:
+                        delta_sec = abs((cur_ts - prev_ts).total_seconds())
+                        if delta_sec > _SAME_ORDER_TIME_WINDOW_SEC:
+                            return
                 # Different order IDs at same price = DUPLICATE ERROR
                 # Diagnostic dump: include closed_size, order_link_id, and
                 # tracked-order reduce_only (looked up via _tracked_orders)
@@ -1048,8 +1068,6 @@ class StrategyRunner:
                 # grid-duplicate (same reduce_only, both tracked) or a
                 # hedge-mode misclassification (different reduce_only or one
                 # untracked).
-                cur_tracked = self._tracked_orders.get(current.get("order_link_id", ""))
-                prev_tracked = self._tracked_orders.get(previous.get("order_link_id", ""))
                 cur_reduce_only = (
                     cur_tracked.intent.reduce_only
                     if cur_tracked and cur_tracked.intent else "unknown"
