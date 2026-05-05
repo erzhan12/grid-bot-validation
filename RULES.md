@@ -225,6 +225,10 @@ make test-integration
 - **Decimal conversion safety**: Always use `Decimal(str(value))` — never bare `Decimal(value)` — when converting order dict fields (`price`, `qty`) or any variable that might be a float. `Decimal(0.5)` produces `0.500000000000000027...` which silently breaks equality checks. The `Decimal(str(...))` pattern is safe for strings, floats, and Decimals alike.
 - **Zero-size rejection is intentional, not a bug**: When `position_size == Decimal('0')` the reduce-only order is silently rejected (debug log only). This is bbu2-faithful — bbu2 expresses the same behavior implicitly via `position_size > limits_qty` arithmetic. A race can occur when the engine emits a close intent in the sub-tick window after a fill but before the position update lands; it self-heals on the next tick because the engine re-emits the same reduce-only intent every tick from scratch. **Do NOT "allow through on staleness"** — that would place orders against known-stale state and make things worse. If the position feed itself dies, fix it in the position-update path (heartbeat, REST reconcile), not here. See `runner.py:748-753`.
 
+### SAME ORDER detection
+
+- `StrategyRunner._check_same_orders_side()` compares tracked orders by `TrackedOrder.placed_ts` when both fills map to tracked orders; use fill `exchange_ts` only as a fallback for untracked/legacy events. Duplicate same-price orders can rest concurrently and fill more than 5s apart in thin markets, so fill-time-only windows silently miss the critical duplicate-placement bug.
+
 ### Enums
 
 | Enum | Module | Values | Notes |
