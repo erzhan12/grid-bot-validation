@@ -516,27 +516,30 @@ class TestPositionRiskManagerBehavior:
 
     def test_large_short_position_losing_increases_short(self):
         """
-        Large short position (ratio > 2.0) that's losing should increase short (Sell=2.0).
+        Short position with shared ratio long/short > 2.0 (i.e., long is bigger,
+        short is smaller) AND short losing should increase short (Sell=2.0).
 
-        Original logic (position.py:89-90):
+        Original bbu2 logic (position.py:89-90):
         elif self.position_ratio > 2.0 and self.__upnl < 0:
             self.set_amount_multiplier(Position.SIDE_SELL, 2)
+
+        Feature 0027 aligned the formula to bbu2's shared `long.margin / short.margin`.
         """
         from gridcore.position import PositionRiskManager, PositionState, RiskConfig, Position
 
         risk_config = RiskConfig(min_liq_ratio=0.8, max_liq_ratio=1.2, max_margin=5000.0, min_total_margin=1000.0)
         _, manager = PositionRiskManager.create_linked_pair(risk_config)
 
-        # position_ratio = 2000 / 500 = 4.0 > 2.0 ✓
+        # Shared position_ratio = long.margin / short.margin = 2000 / 500 = 4.0 > 2.0 ✓
         # Price above entry (105000 > 100000) means short is losing
         # liq_ratio = 130000/105000 ≈ 1.238 (safe, > max_liq_ratio so liq rules skip)
         position = PositionState(
-            direction=Position.DIRECTION_SHORT, size=Decimal('2.0'), entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('130000.0'), margin=Decimal('2000.0'), leverage=10
+            direction=Position.DIRECTION_SHORT, size=Decimal('0.5'), entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('130000.0'), margin=Decimal('500.0'), leverage=10
         )
         opposite = PositionState(
-            direction=Position.DIRECTION_LONG, size=Decimal('0.5'), entry_price=Decimal('100000.0'),
-            liquidation_price=Decimal('90000.0'), margin=Decimal('500.0'), leverage=10
+            direction=Position.DIRECTION_LONG, size=Decimal('2.0'), entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('90000.0'), margin=Decimal('2000.0'), leverage=10
         )
 
         multipliers = manager.calculate_amount_multiplier(position, opposite, 105000.0)

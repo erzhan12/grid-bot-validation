@@ -206,9 +206,28 @@ class Position:
         # Calculate liquidation ratio
         liq_ratio = self._get_liquidation_ratio(position.liquidation_price, last_close)
 
-        # Calculate position ratio (margin ratio between long/short)
-        opposite_margin = float(opposite_position.margin) if opposite_position.margin else 0.0001
-        self.position_ratio = float(position.margin) / opposite_margin
+        # Calculate position ratio: a SINGLE shared long-vs-short metric used by
+        # both branches. Reference: bbu_reference/bbu2-master/bybit_api_usdt.py:548
+        # (`position_ratio = position['long'].size / position['short'].size`) and
+        # :411-412 (the same value is assigned to both Position instances). bbu2
+        # uses size; we use margin (positionValue / walletBalance) as the analog
+        # — under uniform leverage on the same symbol, margin tracks capital
+        # exposure the same way size does in bbu2.
+        #
+        # The shared formula is `long_margin / short_margin` regardless of which
+        # branch we are on. The long-branch rule `position_ratio < 0.5` then
+        # fires when long is the smaller, losing side; the short-branch rule
+        # `position_ratio > 2.0` fires when short is the smaller, losing side.
+        # See _apply_*_position_rules for the full bbu2-aligned rule set.
+        if self.direction == self.DIRECTION_LONG:
+            long_margin = float(position.margin)
+            short_margin = float(opposite_position.margin)
+        else:
+            long_margin = float(opposite_position.margin)
+            short_margin = float(position.margin)
+        if not short_margin:
+            short_margin = 0.0001
+        self.position_ratio = long_margin / short_margin
 
         # Calculate total margin
         total_margin = float(position.margin) + float(opposite_position.margin)
@@ -305,48 +324,57 @@ class Position:
 
         Reference: bbu2-master/position.py:76-92
 
-        Priority order (SAFER - liquidation-first):
-        1. High liquidation risk (emergency) - prevents total loss
-        2. Specific position sizing conditions - strategic adjustments
-        3. Moderate liquidation risk (safety) - hedging via opposite position
+        Priority order (mirrors bbu2 short branch exactly):
+        1. EMERGENCY high liquidation risk → decrease short
+        2. Moderate liquidation risk → hedge via opposite (long)
+        3. Equal positions with low total margin → adjust
+        4. Small short losing (shared ratio > 2 AND upnl < 0) → martingale short
+        5. Very small short (shared ratio > 5) → martingale short
 
-        Note: High liquidation checked first, moderate checked last.
-        Capital preservation > strategy optimization.
+        Capital preservation > strategy optimization. The if/elif chain means
+        only one arm fires per call. position_ratio is the shared
+        long.margin / short.margin metric; see calculate_amount_multiplier.
         """
-        # High liquidation risk (short) → decrease short position (EMERGENCY)
+        # 1. High liquidation risk (short) → decrease short position (EMERGENCY)
         # For shorts: liq_ratio = liq_price / last_close, so ratio > 1 always
         # (liq_price is above current). Ratio decreases toward 1.0 as price
         # rises toward liquidation. Therefore "imminent liquidation" is a
         # ratio CLOSE to 1.0 (small headroom). EMERGENCY fires when ratio
         # falls below 0.95 * max_liq_ratio (i.e., headroom < 95% of the
-        # configured max). Matches bbu2-master/position.py:78.
+        # configured max). Matches bbu_reference/bbu2-master/position.py:78.
         if 0.0 < liq_ratio < 0.95 * self.risk_config.max_liq_ratio:
             logger.info('Position adjustment: %s EMERGENCY high_liq_risk (ratio=%.2f)', self.direction, liq_ratio)
             self.set_amount_multiplier(self.SIDE_BUY, 1.5)
 
-        # Positions equal but low total margin → adjust
-        elif is_position_equal and total_margin < self.risk_config.min_total_margin:
-            logger.info('Position adjustment: %s low_margin (total=%.2f)', self.direction, total_margin)
-            self._adjust_position_for_low_margin()
-
-        # Short position too large and losing → increase short
-        elif self.position_ratio > 2.0 and unrealized_pnl_pct < 0:
-            logger.info('Position adjustment: %s ratio=%.2f increasing sells', self.direction, self.position_ratio)
-            self.set_amount_multiplier(self.SIDE_SELL, 2.0)
-
-        # Short position very large → increase short
-        elif self.position_ratio > 5.0:
-            logger.info('Position adjustment: %s ratio=%.2f increasing sells', self.direction, self.position_ratio)
-            self.set_amount_multiplier(self.SIDE_SELL, 2.0)
-
-        # Moderate liquidation risk → increase opposite (long) position as hedge
-        # Reference: bbu2-master/position.py:81-86
-        # Checked AFTER position ratio checks (per original sequence)
+        # 2. Moderate liquidation risk → grow opposite (long) as hedge
+        # Reference: bbu_reference/bbu2-master/position.py:81-86. Must be
+        # checked BEFORE the martingale arms (Feature 0027): if the moderate
+        # band overlaps with `position_ratio > 2.0 AND upnl < 0`, the safer
+        # action (hedge) wins over the martingale (grow the at-risk side).
         elif 0.0 < liq_ratio < self.risk_config.max_liq_ratio:
             logger.info('Position adjustment: %s moderate_liq_risk (ratio=%.2f)', self.direction, liq_ratio)
             if self._opposite:
                 # Reduce long's sell orders → allows long to grow as hedge
                 self._opposite.set_amount_multiplier(self.SIDE_SELL, 0.5)
+
+        # 3. Positions equal but low total margin → adjust
+        elif is_position_equal and total_margin < self.risk_config.min_total_margin:
+            logger.info('Position adjustment: %s low_margin (total=%.2f)', self.direction, total_margin)
+            self._adjust_position_for_low_margin()
+
+        # 4. Short is the smaller side AND losing → martingale grow short
+        # Shared ratio > 2.0 means long.margin > 2 × short.margin, i.e., short
+        # is the smaller side. Combined with upnl < 0 the rule averages into
+        # the smaller losing side. Matches bbu_reference/bbu2-master/position.py:89-90.
+        elif self.position_ratio > 2.0 and unrealized_pnl_pct < 0:
+            logger.info('Position adjustment: %s ratio=%.2f increasing sells', self.direction, self.position_ratio)
+            self.set_amount_multiplier(self.SIDE_SELL, 2.0)
+
+        # 5. Short extremely small (shared ratio > 5) → martingale grow short
+        # No upnl gate. Matches bbu_reference/bbu2-master/position.py:91-92.
+        elif self.position_ratio > 5.0:
+            logger.info('Position adjustment: %s ratio=%.2f increasing sells', self.direction, self.position_ratio)
+            self.set_amount_multiplier(self.SIDE_SELL, 2.0)
 
     def _adjust_position_for_low_margin(self) -> None:
         """
