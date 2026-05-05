@@ -2,7 +2,6 @@
 Unit tests for Position module.
 """
 
-import pytest
 from decimal import Decimal
 from gridcore.position import PositionState, PositionRiskManager, RiskConfig, Position
 
@@ -530,8 +529,13 @@ class TestPositionRiskManagerRules:
         assert long_multipliers['Buy'] == 2.0
         assert long_multipliers['Sell'] == 1.0
 
-    def test_large_short_position_losing_increases_short(self):
-        """Large short position that's losing increases short multiplier."""
+    def test_small_short_position_losing_increases_short(self):
+        """Small (smaller-than-long) short position that's losing increases short multiplier.
+
+        Feature 0027: shared position_ratio = long.margin / short.margin. Rule
+        `> 2.0 AND upnl < 0` fires when short is the smaller side AND losing,
+        which means short is the side worth averaging into.
+        """
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
@@ -540,24 +544,25 @@ class TestPositionRiskManagerRules:
         )
         _, short_manager = PositionRiskManager.create_linked_pair(risk_config)
 
-        # Large position (ratio > 2.0) and losing (price above entry)
-        # liq_price chosen safe (ratio = 130000/105000 ≈ 1.238 > max_liq_ratio)
-        # so neither EMERGENCY nor moderate liq fires; position_ratio rule fires.
+        # Shared ratio = long.margin / short.margin = 4.0 / 1.0 = 4.0 (> 2.0).
+        # Short is the SMALLER side (margin 1.0 vs long's 4.0) and losing.
+        # liq_price chosen safe: liq_ratio = 130000/105000 ≈ 1.238 > max_liq_ratio,
+        # so neither EMERGENCY nor moderate liq fires; martingale arm fires.
         short_position_state = PositionState(
             direction=Position.DIRECTION_SHORT,
-            size=Decimal('2.0'),
+            size=Decimal('0.5'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('130000.0'),
-            margin=Decimal('4.0'),
+            margin=Decimal('1.0'),
             leverage=10
         )
 
         long_position_state = PositionState(
             direction=Position.DIRECTION_LONG,
-            size=Decimal('0.5'),
+            size=Decimal('2.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('90000.0'),
-            margin=Decimal('1.0'),  # Much smaller (ratio = 4.0)
+            margin=Decimal('4.0'),  # Much larger (shared ratio = 4.0)
             leverage=10
         )
 
@@ -569,8 +574,13 @@ class TestPositionRiskManagerRules:
         assert short_multipliers['Sell'] == 2.0
         assert short_multipliers['Buy'] == 1.0
 
-    def test_very_large_short_position_increases_short(self):
-        """Very large short position (ratio > 5.0) increases short multiplier."""
+    def test_very_small_short_position_increases_short(self):
+        """Very small short (shared ratio > 5.0, no upnl gate) increases short multiplier.
+
+        Feature 0027: shared position_ratio = long.margin / short.margin.
+        Rule `> 5.0` fires when short is extremely small relative to long
+        regardless of upnl.
+        """
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
@@ -579,22 +589,22 @@ class TestPositionRiskManagerRules:
         )
         _, short_manager = PositionRiskManager.create_linked_pair(risk_config)
 
-        # Very large position (ratio > 5.0); liq_ratio = 1.30 (safe, no liq rules)
+        # Shared ratio = 4.0 / 0.4 = 10.0 (> 5.0); liq_ratio = 1.30 (safe).
         short_position_state = PositionState(
             direction=Position.DIRECTION_SHORT,
-            size=Decimal('5.0'),
+            size=Decimal('0.5'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('130000.0'),
-            margin=Decimal('4.0'),
+            margin=Decimal('0.4'),
             leverage=10
         )
 
         long_position_state = PositionState(
             direction=Position.DIRECTION_LONG,
-            size=Decimal('0.5'),
+            size=Decimal('5.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('90000.0'),
-            margin=Decimal('0.4'),  # Much smaller (ratio = 10.0)
+            margin=Decimal('4.0'),  # Much larger (shared ratio = 10.0)
             leverage=10
         )
 
@@ -1376,7 +1386,10 @@ class TestShortPositionRuleBoundaries:
         assert result == {'Buy': 1.0, 'Sell': 1.0}
 
     def test_position_ratio_exactly_2_0_boundary(self):
-        """position_ratio exactly 2.0 doesn't trigger large losing rule."""
+        """Shared position_ratio exactly 2.0 doesn't trigger martingale (strict `>`).
+
+        Feature 0027: shared ratio = long.margin / short.margin.
+        """
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
@@ -1385,34 +1398,34 @@ class TestShortPositionRuleBoundaries:
         )
         _, short_mgr = Position.create_linked_pair(risk_config)
 
-        # ratio = 2.0 / 1.0 = 2.0; liq_ratio = 130000/100000 = 1.30 (safe, > max_liq_ratio)
+        # Shared ratio = 2.0 / 1.0 = 2.0 (long bigger). short liq_ratio = 130000/105000 ≈ 1.238 (safe).
         position = PositionState(
             direction=Position.DIRECTION_SHORT,
-            size=Decimal('2.0'),
+            size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('130000.0'),  # Safe liq ratio (above max)
-            margin=Decimal('2.0'),
+            margin=Decimal('1.0'),
             leverage=10
         )
 
         opposite = PositionState(
             direction=Position.DIRECTION_LONG,
-            margin=Decimal('1.0')
+            margin=Decimal('2.0')
         )
 
         result = short_mgr.calculate_amount_multiplier(
             position, opposite, last_close=105000.0  # Price above entry (losing for short)
         )
 
-        # ratio = 2.0 is NOT > 2.0, so large losing rule doesn't trigger
-        # But moderate liq might trigger if liq_ratio in range
-        # liq_ratio = 110000 / 105000 = 1.048, which is between 0 and 1.2
-        # But not high enough for emergency
-        # Should trigger moderate liq rule
+        # ratio = 2.0 is NOT > 2.0 (strict), so martingale arm doesn't fire.
+        # Moderate-liq doesn't fire either (1.238 > max_liq_ratio=1.2).
         assert result == {'Buy': 1.0, 'Sell': 1.0}
 
     def test_position_ratio_exactly_5_0_boundary(self):
-        """position_ratio exactly 5.0 doesn't trigger very large rule."""
+        """Shared position_ratio exactly 5.0 doesn't trigger martingale (strict `>`).
+
+        Feature 0027: shared ratio = long.margin / short.margin.
+        """
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
@@ -1421,28 +1434,33 @@ class TestShortPositionRuleBoundaries:
         )
         _, short_mgr = Position.create_linked_pair(risk_config)
 
-        # ratio = 5.0 / 1.0 = 5.0; liq_ratio = 130000/100000 = 1.30 (safe, > max_liq_ratio)
+        # Shared ratio = 5.0 / 1.0 = 5.0 (long bigger). short liq_ratio = 1.30 (safe).
         position = PositionState(
             direction=Position.DIRECTION_SHORT,
-            size=Decimal('5.0'),
+            size=Decimal('1.0'),
             entry_price=Decimal('100000.0'),
             liquidation_price=Decimal('130000.0'),  # Safe liq ratio (above max)
-            margin=Decimal('5.0'),
+            margin=Decimal('1.0'),
             leverage=10
         )
 
         opposite = PositionState(
             direction=Position.DIRECTION_LONG,
-            margin=Decimal('1.0')
+            margin=Decimal('5.0')
         )
 
         result = short_mgr.calculate_amount_multiplier(position, opposite, last_close=100000.0)
 
-        # ratio = 5.0 is NOT > 5.0, so very large rule doesn't trigger
+        # ratio = 5.0 is NOT > 5.0 (strict). The `> 2.0 AND upnl < 0` arm also
+        # doesn't fire (last_close == entry_price, upnl == 0). No rule fires.
         assert result == {'Buy': 1.0, 'Sell': 1.0}
 
-    def test_large_position_but_profitable_no_increase(self):
-        """Large short position that's profitable doesn't trigger large losing rule."""
+    def test_small_short_but_profitable_no_increase(self):
+        """Small (smaller-than-long) short that's profitable doesn't trigger martingale.
+
+        Feature 0027: shared ratio > 2.0 AND upnl < 0 is the gate. With upnl > 0
+        the martingale arm should NOT fire even though the ratio condition is met.
+        """
         risk_config = RiskConfig(
             min_liq_ratio=0.8,
             max_liq_ratio=1.2,
@@ -1451,28 +1469,28 @@ class TestShortPositionRuleBoundaries:
         )
         _, short_mgr = Position.create_linked_pair(risk_config)
 
-        # ratio = 3.0 / 1.0 = 3.0 (> 2.0 but profitable)
-        # liq_ratio = 130000/100000 = 1.30 (safe, > max_liq_ratio)
+        # Shared ratio = 3.0 / 1.0 = 3.0 (> 2.0 but profitable)
+        # short liq_ratio = 130000/100000 = 1.30 (safe, > max_liq_ratio)
         position = PositionState(
             direction=Position.DIRECTION_SHORT,
-            size=Decimal('3.0'),
+            size=Decimal('1.0'),
             entry_price=Decimal('105000.0'),  # Entry above current (profitable for short)
             liquidation_price=Decimal('130000.0'),  # Safe liq ratio (above max)
-            margin=Decimal('3.0'),
+            margin=Decimal('1.0'),
             leverage=10
         )
 
         opposite = PositionState(
             direction=Position.DIRECTION_LONG,
-            margin=Decimal('1.0')
+            margin=Decimal('3.0')
         )
 
         result = short_mgr.calculate_amount_multiplier(
             position, opposite, last_close=100000.0  # Price below entry (profitable for short)
         )
 
-        # ratio > 2.0 but unrealized_pnl_pct > 0 (profitable), so large losing rule doesn't trigger
-        # ratio < 5.0, so very large rule doesn't trigger
+        # ratio > 2.0 but unrealized_pnl_pct > 0 (profitable), so martingale doesn't fire
+        # ratio < 5.0, so very small rule doesn't trigger
         assert result == {'Buy': 1.0, 'Sell': 1.0}
 
     def test_short_low_margin_increase_same_position(self):
@@ -1816,3 +1834,334 @@ class TestEdgeValues:
         result = long_mgr.calculate_amount_multiplier(position, opposite, last_close=100000.0)
         assert 'Buy' in result
         assert 'Sell' in result
+
+
+class TestPositionRulesBBU2Alignment:
+    """Feature 0027 — verify position-rule alignment with bbu2 reference.
+
+    Two bugs were fixed together:
+    - Bug A: short branch used inverted formula (short.margin / long.margin).
+      Now both branches use shared `position_ratio = long.margin / short.margin`.
+      Reference: bbu_reference/bbu2-master/bybit_api_usdt.py:548, :411-412.
+    - Bug B: `moderate_liq_risk` arm was last on the short branch. Now it runs
+      second (right after EMERGENCY high-liq), matching bbu2 short ordering at
+      bbu_reference/bbu2-master/position.py:76-92.
+
+    Helper construction pattern (matches Position.calculate_amount_multiplier
+    docstring): create linked pair, reset both, call long, then short.
+    """
+
+    @staticmethod
+    def _default_config() -> RiskConfig:
+        # Production defaults from apps/gridbot/src/gridbot/config.py:47-49.
+        return RiskConfig(
+            min_liq_ratio=0.8,
+            max_liq_ratio=1.2,
+            max_margin=8.0,
+            min_total_margin=0.15,
+        )
+
+    @staticmethod
+    def _eval(long_mgr, short_mgr, long_state, short_state, last_close):
+        long_mgr.reset_amount_multiplier()
+        short_mgr.reset_amount_multiplier()
+        long_mgr.calculate_amount_multiplier(long_state, short_state, last_close=last_close)
+        short_mgr.calculate_amount_multiplier(short_state, long_state, last_close=last_close)
+
+    # ---------- Bug A regression and mirror ---------------------------------
+
+    def test_production_replay_2026_05_06_no_multipliers_fire(self):
+        """Bug A regression: 2026-05-06 01:06:49 production snapshot.
+
+        long.margin=0.38, long.upnl≈+1.52% (winning). short.margin=1.05,
+        short.upnl≈-0.90% (losing). Both liq_ratios safe. With the buggy
+        per-direction formula, short read its own ratio as 1.05/0.38 ≈ 2.76
+        and fired Sell=2.0 on a losing already-large short — exactly the
+        wrong action. With the shared formula, ratio = long/short ≈ 0.36
+        and no rule fires on either branch.
+        """
+        cfg = self._default_config()
+        long_mgr, short_mgr = Position.create_linked_pair(cfg)
+
+        # last_close=100000; long entry slightly below (winning), short entry slightly below (losing).
+        # Choose entries so unrealized_pnl_pct lands ~+1.52% (long) and ~-0.90% (short)
+        # at leverage=1. Long: (100000 - 99850)/99850*100 ≈ 0.150% — too small.
+        # Use leverage=10 to amplify (matches production): entry chosen for ~1.5%/leverage = 0.15% raw.
+        # 100000 - 99850 → +0.150% × 10 = +1.502%.
+        long_state = PositionState(
+            direction=Position.DIRECTION_LONG,
+            size=Decimal('0.5'),
+            entry_price=Decimal('99850.0'),
+            liquidation_price=Decimal('70000.0'),  # liq_ratio = 0.70 (safe — below 1.05*0.8=0.84)
+            margin=Decimal('0.38'),
+            leverage=10,
+        )
+        # Short: (99910 - 100000)/99910*100 ≈ -0.0901% × 10 = -0.901%.
+        short_state = PositionState(
+            direction=Position.DIRECTION_SHORT,
+            size=Decimal('1.0'),
+            entry_price=Decimal('99910.0'),
+            liquidation_price=Decimal('130000.0'),  # liq_ratio = 1.30 (safe — above max=1.2)
+            margin=Decimal('1.05'),
+            leverage=10,
+        )
+        self._eval(long_mgr, short_mgr, long_state, short_state, last_close=100000.0)
+
+        assert long_mgr.amount_multiplier == {'Buy': 1.0, 'Sell': 1.0}
+        assert short_mgr.amount_multiplier == {'Buy': 1.0, 'Sell': 1.0}
+        # Sanity: shared ratio is long/short and matches expected (~0.362).
+        assert abs(long_mgr.position_ratio - (0.38 / 1.05)) < 1e-9
+        assert abs(short_mgr.position_ratio - (0.38 / 1.05)) < 1e-9
+
+    def test_production_replay_mirror_long_bigger_losing_no_fire(self):
+        """Mirror of production replay: long is the bigger losing side.
+
+        With shared ratio = long/short ≈ 2.76, the long-branch rules
+        `< 0.5` and `< 0.20` correctly do NOT fire (long is bigger, not
+        smaller). Tests symmetry of the formula fix.
+        """
+        cfg = self._default_config()
+        long_mgr, short_mgr = Position.create_linked_pair(cfg)
+
+        # Long losing.
+        long_state = PositionState(
+            direction=Position.DIRECTION_LONG,
+            size=Decimal('1.0'),
+            entry_price=Decimal('100090.0'),  # last_close < entry → losing
+            liquidation_price=Decimal('70000.0'),
+            margin=Decimal('1.05'),
+            leverage=10,
+        )
+        # Short winning.
+        short_state = PositionState(
+            direction=Position.DIRECTION_SHORT,
+            size=Decimal('0.5'),
+            entry_price=Decimal('100150.0'),  # last_close < entry → winning
+            liquidation_price=Decimal('130000.0'),
+            margin=Decimal('0.38'),
+            leverage=10,
+        )
+        self._eval(long_mgr, short_mgr, long_state, short_state, last_close=100000.0)
+
+        assert long_mgr.amount_multiplier == {'Buy': 1.0, 'Sell': 1.0}
+        assert short_mgr.amount_multiplier == {'Buy': 1.0, 'Sell': 1.0}
+
+    # ---------- bbu2-design positives ---------------------------------------
+
+    def test_short_smaller_and_losing_fires_short_martingale(self):
+        """bbu2-design positive: short is smaller (long/short=3) AND losing.
+
+        Reference: bbu_reference/bbu2-master/position.py:89-90.
+        """
+        cfg = self._default_config()
+        long_mgr, short_mgr = Position.create_linked_pair(cfg)
+
+        long_state = PositionState(
+            direction=Position.DIRECTION_LONG,
+            size=Decimal('1.0'),
+            entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('70000.0'),  # safe
+            margin=Decimal('0.6'),
+            leverage=10,
+        )
+        short_state = PositionState(
+            direction=Position.DIRECTION_SHORT,
+            size=Decimal('0.3'),
+            entry_price=Decimal('99000.0'),  # losing: last_close > entry
+            liquidation_price=Decimal('130000.0'),  # safe
+            margin=Decimal('0.2'),
+            leverage=10,
+        )
+        self._eval(long_mgr, short_mgr, long_state, short_state, last_close=100000.0)
+
+        assert short_mgr.amount_multiplier == {'Buy': 1.0, 'Sell': 2.0}
+        assert long_mgr.amount_multiplier == {'Buy': 1.0, 'Sell': 1.0}
+
+    def test_long_smaller_and_losing_fires_long_martingale(self):
+        """bbu2-design positive: long is smaller (long/short≈0.333) AND losing.
+
+        Reference: bbu_reference/bbu2-master/position.py:71-72.
+        """
+        cfg = self._default_config()
+        long_mgr, short_mgr = Position.create_linked_pair(cfg)
+
+        long_state = PositionState(
+            direction=Position.DIRECTION_LONG,
+            size=Decimal('0.3'),
+            entry_price=Decimal('101000.0'),  # losing: last_close < entry
+            liquidation_price=Decimal('70000.0'),  # safe
+            margin=Decimal('0.2'),
+            leverage=10,
+        )
+        short_state = PositionState(
+            direction=Position.DIRECTION_SHORT,
+            size=Decimal('1.0'),
+            entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('130000.0'),  # safe
+            margin=Decimal('0.6'),
+            leverage=10,
+        )
+        self._eval(long_mgr, short_mgr, long_state, short_state, last_close=100000.0)
+
+        assert long_mgr.amount_multiplier == {'Buy': 2.0, 'Sell': 1.0}
+        assert short_mgr.amount_multiplier == {'Buy': 1.0, 'Sell': 1.0}
+
+    # ---------- Boundary and extreme ---------------------------------------
+
+    def test_shared_ratio_exactly_two_strict_no_fire(self):
+        """Shared ratio exactly 2.0 — strict `>` means martingale arm doesn't fire."""
+        cfg = self._default_config()
+        long_mgr, short_mgr = Position.create_linked_pair(cfg)
+
+        long_state = PositionState(
+            direction=Position.DIRECTION_LONG,
+            size=Decimal('1.0'),
+            entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('70000.0'),
+            margin=Decimal('2.0'),
+            leverage=10,
+        )
+        short_state = PositionState(
+            direction=Position.DIRECTION_SHORT,
+            size=Decimal('0.5'),
+            entry_price=Decimal('99000.0'),  # losing
+            liquidation_price=Decimal('130000.0'),
+            margin=Decimal('1.0'),
+            leverage=10,
+        )
+        self._eval(long_mgr, short_mgr, long_state, short_state, last_close=100000.0)
+
+        assert short_mgr.position_ratio == 2.0
+        assert short_mgr.amount_multiplier == {'Buy': 1.0, 'Sell': 1.0}
+        assert long_mgr.amount_multiplier == {'Buy': 1.0, 'Sell': 1.0}
+
+    def test_shared_ratio_above_five_fires_without_upnl_gate(self):
+        """Shared ratio > 5.0 fires martingale even when short is winning.
+
+        Reference: bbu_reference/bbu2-master/position.py:91-92 (no upnl check).
+        """
+        cfg = self._default_config()
+        long_mgr, short_mgr = Position.create_linked_pair(cfg)
+
+        long_state = PositionState(
+            direction=Position.DIRECTION_LONG,
+            size=Decimal('1.0'),
+            entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('70000.0'),
+            margin=Decimal('5.5'),
+            leverage=10,
+        )
+        # Short is winning (last_close < entry), but ratio > 5 fires anyway.
+        short_state = PositionState(
+            direction=Position.DIRECTION_SHORT,
+            size=Decimal('0.5'),
+            entry_price=Decimal('101000.0'),
+            liquidation_price=Decimal('130000.0'),
+            margin=Decimal('1.0'),
+            leverage=10,
+        )
+        self._eval(long_mgr, short_mgr, long_state, short_state, last_close=100000.0)
+
+        assert short_mgr.position_ratio == 5.5
+        assert short_mgr.amount_multiplier == {'Buy': 1.0, 'Sell': 2.0}
+
+    # ---------- Bug B: moderate-liq beats martingale ------------------------
+
+    def test_short_moderate_liq_band_hedges_not_martingales(self):
+        """Bug B regression: short with moderate-liq AND martingale conditions.
+
+        liq_ratio in (0.95*max_liq, max_liq) for short, shared ratio > 2,
+        short upnl < 0. After Feature 0027 reorder, moderate-liq fires
+        FIRST → opposite (long) Sell=0.5 hedge. Today's code (pre-fix) would
+        have fired short.Sell=2.0 in this same scenario (as observed in the
+        2026-05-06 production incident).
+        """
+        cfg = self._default_config()  # max_liq_ratio=1.2 → moderate band: (1.14, 1.2)
+        long_mgr, short_mgr = Position.create_linked_pair(cfg)
+
+        long_state = PositionState(
+            direction=Position.DIRECTION_LONG,
+            size=Decimal('2.0'),
+            entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('70000.0'),  # safe
+            margin=Decimal('4.0'),
+            leverage=10,
+        )
+        # short liq_ratio = 116000/100000 = 1.16 (in moderate band, NOT EMERGENCY)
+        short_state = PositionState(
+            direction=Position.DIRECTION_SHORT,
+            size=Decimal('0.5'),
+            entry_price=Decimal('99000.0'),  # losing: last_close > entry
+            liquidation_price=Decimal('116000.0'),
+            margin=Decimal('1.0'),
+            leverage=10,
+        )
+        self._eval(long_mgr, short_mgr, long_state, short_state, last_close=100000.0)
+
+        # Hedge fires on opposite (long).
+        assert long_mgr.amount_multiplier == {'Buy': 1.0, 'Sell': 0.5}
+        # Short branch did NOT martingale.
+        assert short_mgr.amount_multiplier == {'Buy': 1.0, 'Sell': 1.0}
+
+    def test_long_moderate_liq_band_hedges_not_martingales(self):
+        """Symmetric long-side test. Long branch ordering already matched bbu2 —
+        included as a guard against accidental regression introduced by the
+        refactor.
+        """
+        cfg = self._default_config()  # min_liq_ratio=0.8 → moderate band: (0.8, 0.84)
+        long_mgr, short_mgr = Position.create_linked_pair(cfg)
+
+        # long liq_ratio = 82000/100000 = 0.82 (in moderate band, NOT EMERGENCY)
+        long_state = PositionState(
+            direction=Position.DIRECTION_LONG,
+            size=Decimal('0.5'),
+            entry_price=Decimal('101000.0'),  # losing: last_close < entry
+            liquidation_price=Decimal('82000.0'),
+            margin=Decimal('1.0'),
+            leverage=10,
+        )
+        short_state = PositionState(
+            direction=Position.DIRECTION_SHORT,
+            size=Decimal('2.0'),
+            entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('130000.0'),  # safe
+            margin=Decimal('4.0'),
+            leverage=10,
+        )
+        self._eval(long_mgr, short_mgr, long_state, short_state, last_close=100000.0)
+
+        # Hedge fires on opposite (short).
+        assert short_mgr.amount_multiplier == {'Buy': 0.5, 'Sell': 1.0}
+        # Long branch did NOT martingale.
+        assert long_mgr.amount_multiplier == {'Buy': 1.0, 'Sell': 1.0}
+
+    # ---------- Order-preserving regression --------------------------------
+
+    def test_short_martingale_still_fires_when_only_martingale_matches(self):
+        """Reorder did not swallow the martingale: with safe liq_ratio,
+        shared ratio > 2, and short losing, short.Sell=2.0 still fires.
+        """
+        cfg = self._default_config()
+        long_mgr, short_mgr = Position.create_linked_pair(cfg)
+
+        long_state = PositionState(
+            direction=Position.DIRECTION_LONG,
+            size=Decimal('2.0'),
+            entry_price=Decimal('100000.0'),
+            liquidation_price=Decimal('70000.0'),
+            margin=Decimal('4.0'),
+            leverage=10,
+        )
+        # short liq_ratio = 150000/100000 = 1.50 (well above max_liq_ratio=1.2 → safe)
+        short_state = PositionState(
+            direction=Position.DIRECTION_SHORT,
+            size=Decimal('0.5'),
+            entry_price=Decimal('99000.0'),  # losing
+            liquidation_price=Decimal('150000.0'),
+            margin=Decimal('1.0'),
+            leverage=10,
+        )
+        self._eval(long_mgr, short_mgr, long_state, short_state, last_close=100000.0)
+
+        assert short_mgr.amount_multiplier == {'Buy': 1.0, 'Sell': 2.0}
+        assert long_mgr.amount_multiplier == {'Buy': 1.0, 'Sell': 1.0}
