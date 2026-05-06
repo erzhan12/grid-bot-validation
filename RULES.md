@@ -129,6 +129,34 @@ Successfully extracted pure strategy logic from `bbu2-master` into `packages/gri
    - Never modify reference code
    - **WARNING**: Reference code may contain bugs (e.g., short position liquidation risk logic)
 
+9. **Legacy bbu2 paths intentionally not ported**
+
+   These bbu2 code paths exist for products we do not target (Bybit
+   inverse contracts: BTCUSD, ETHUSD, etc.). gridcore is intentionally
+   scoped to Bybit linear USDT-perps. Future audits MUST recognize
+   these as legacy carve-outs and not re-flag them as divergences:
+
+   - **`"b..." amount mode`** — bbu2 `bybit_api_usdt.py:509-518`. The
+     "b" prefix means "btc-equivalent" with two branches: `BTCUSD` →
+     `btc_amount * price` (inverse), non-BTCUSD → `math.ceil(btc_amount
+     / price)` (legacy linear non-USDT). Removed from `gridcore/qty.py`
+     in Feature 0028. If a config tries to use `b...` it now raises
+     `ValueError: invalid amount string`.
+   - **`"x" mode currency derivation by symbol`** — bbu2
+     `bybit_api_usdt.py:496-501`. bbu2 picks `USDT` if `'USDT' in
+     symbol` else `symbol[:3]` (e.g., `BTC` for `BTCUSD`). This handles
+     inverse contracts margined in coin. Our `gridcore/qty.py` always
+     reads `wallet_balance` as USDT — correct for linear USDT-perps,
+     would need a redesign (not a bbu2 port) if USDC or inverse support
+     is ever added.
+   - **`BTCUSD`-specific branches anywhere in bbu2** — inverse
+     contract logic. Out of scope.
+
+   If you ever consider reintroducing inverse / non-USDT support,
+   start by re-reading the legacy paths in `bbu_reference/`, not by
+   re-porting them blindly: bbu2's `'USDT' in symbol` heuristic does
+   not handle USDC pairs (`BTCPERP`, `BTCUSDC`) correctly either.
+
 ## Package Management with uv
 
 This project uses [uv](https://github.com/astral-sh/uv) for package management.
@@ -1040,7 +1068,7 @@ Successfully implemented a backtest system using gridcore's GridEngine with trad
    - Backtest does NOT use gridcore.Position for PnL tracking
 
 3. **Quantity Calculation**
-   - Uses same amount format as gridbot: `"100"` (fixed USDT), `"x0.001"` (wallet fraction), `"b0.001"` (base currency)
+   - Uses same amount format as gridbot: `"100"` (fixed USDT), `"x0.001"` (wallet fraction). The legacy `"b..."` mode was removed in feature 0028 (see Section 9).
    - `qty_calculator` function passed to executor
 
 4. **Data Sources**
@@ -1835,7 +1863,7 @@ Two-layer: Runner logs + re-raises → Orchestrator catches + sends Telegram ale
 
 - **Order format for GridEngine**: camelCase keys (`orderId`, `orderLinkId`, `price` as string)
 - **`BacktestPositionTracker`** tracks PnL; **`gridcore.Position`** handles risk multipliers (different purposes)
-- **Quantity**: same amount format as gridbot (`"100"`, `"x0.001"`, `"b0.001"`); rounding uses `math.ceil`
+- **Quantity**: same amount format as gridbot (`"100"`, `"x0.001"`); rounding uses `math.ceil`. Legacy `"b..."` removed in 0028.
 - **Two-phase tick**: `process_fills()` → equity update → `execute_tick()` (fills reflected before sizing)
 - **Equity update**: Engine level, not runner level (aggregates all runners' unrealized PnL)
 - **`WindDownMode` StrEnum**: `LEAVE_OPEN`, `CLOSE_ALL`

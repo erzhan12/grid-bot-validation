@@ -90,6 +90,20 @@ class Position:
             direction: 'long' or 'short'
             risk_config: Risk management parameters
 
+        Instance attributes (mutated by runners between ticks):
+            size: Latest position size in contracts; mirror of
+                PositionState.size, kept as a plain field so consumers
+                like _resolve_qty / _apply_risk_to_qty can read it
+                without rebuilding a snapshot.
+            liquidation_price: Latest exchange liq_price; same caching
+                pattern as size. Read by the early_imbalance_multiplier
+                gate to detect the pre-liquidation phase.
+            position_ratio: Set externally as a size-based ratio, then
+                OVERWRITTEN by calculate_amount_multiplier with a
+                margin-based ratio (long_margin / short_margin). Do
+                NOT read this for size-based bbu2 conditions; compute
+                size_ratio inline from `size` instead.
+
         Reference: bbu2-master/position.py:8-22
         """
         self.direction = direction
@@ -97,6 +111,7 @@ class Position:
         self.amount_multiplier = {self.SIDE_BUY: 1.0, self.SIDE_SELL: 1.0}
         self.position_ratio = 1.0
         self.size: Decimal = Decimal('0')
+        self.liquidation_price: Decimal = Decimal('0')
         self._opposite: Optional['Position'] = None
 
     def set_opposite(self, opposite: 'Position') -> None:

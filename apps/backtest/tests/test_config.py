@@ -52,6 +52,18 @@ class TestBacktestStrategyConfig:
 
         assert config.commission_rate == Decimal("0.0001")
 
+    def test_legacy_long_koef_rejected_with_migration_message(self):
+        """Reject legacy `long_koef` so migrating users do not silently lose
+        the multiplier (Pydantic ignores unknown fields by default)."""
+        import pytest
+        with pytest.raises(ValueError, match="renamed to 'early_imbalance_multiplier'"):
+            BacktestStrategyConfig(
+                strat_id="test",
+                symbol="BTCUSDT",
+                tick_size="0.1",
+                long_koef=1.5,
+            )
+
 
 class TestBacktestConfig:
     """Tests for BacktestConfig."""

@@ -579,6 +579,25 @@ class BacktestRunner:
             self._short_tracker, wallet_balance, DirectionType.SHORT
         )
 
+        # Cache size-based position_ratio + liq_price on both Position
+        # instances so consumers (e.g. early_imbalance_multiplier in
+        # _apply_risk_to_qty) read consistent values even when one side
+        # is empty and calculate_amount_multiplier is skipped below.
+        long_size = float(long_state.size) if long_state.size else 0.0
+        short_size = float(short_state.size) if short_state.size else 0.0
+        if short_size > 0:
+            position_ratio = long_size / short_size
+        elif long_size > 0:
+            position_ratio = float("inf")
+        else:
+            position_ratio = 1.0
+        self._long_position.position_ratio = position_ratio
+        self._short_position.position_ratio = position_ratio
+        self._long_position.size = long_state.size
+        self._short_position.size = short_state.size
+        self._long_position.liquidation_price = long_state.liquidation_price
+        self._short_position.liquidation_price = short_state.liquidation_price
+
         # Reset then calculate (bbu2 pattern — cross-position effects preserved)
         self._long_position.reset_amount_multiplier()
         self._short_position.reset_amount_multiplier()
@@ -635,6 +654,35 @@ class BacktestRunner:
 
         multiplier = self.get_amount_multiplier(intent.direction, intent.side)
         result = base_qty * Decimal(str(multiplier))
+
+        # bbu2 ref: bbu_reference/bbu2-master/bybit_api_usdt.py:257-261.
+        # Asymmetric: fires only when long dominates short (1.1 < ratio < 10),
+        # AND both sides are still pre-liquidation. Inherited from bbu2 design.
+        # Applied before round_qty to mirror bbu2 __round_amount(amount * mult).
+        # Skipped when risk module is disabled (backtest convention).
+        #
+        # IMPORTANT: bbu2 uses SIZE-based ratio (`long.size / short.size` at
+        # bbu2 bybit_api_usdt.py:548). We must NOT read Position.position_ratio
+        # here — that field is overwritten with a MARGIN-based ratio by
+        # Position.calculate_amount_multiplier (gridcore/position.py:231).
+        # Compute size ratio inline from Position.size.
+        if self._enable_risk:
+            early_imb = self._config.early_imbalance_multiplier
+            if early_imb != 1.0:
+                long_size = float(self._long_position.size)
+                short_size = float(self._short_position.size)
+                if short_size > 0:
+                    size_ratio = long_size / short_size
+                elif long_size > 0:
+                    size_ratio = float("inf")
+                else:
+                    size_ratio = 1.0
+                long_liq = self._long_position.liquidation_price
+                short_liq = self._short_position.liquidation_price
+                if (1.1 < size_ratio < 10
+                        and long_liq == 0
+                        and short_liq == 0):
+                    result = result * Decimal(str(early_imb))
 
         # Re-round after multiplier to ensure qty aligns with exchange qty_step
         # (matches live runner _resolve_qty lines 526-527)

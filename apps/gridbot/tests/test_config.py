@@ -116,6 +116,20 @@ class TestStrategyConfig:
                 grid_step=0,
             )
 
+    def test_legacy_long_koef_rejected_with_migration_message(self):
+        """Pydantic ignores unknown fields by default — without an explicit
+        guard, a config with `long_koef: 1.5` would silently load and the
+        renamed `early_imbalance_multiplier` would stay at default 1.0.
+        Reject explicitly with a migration message."""
+        with pytest.raises(ValueError, match="renamed to 'early_imbalance_multiplier'"):
+            StrategyConfig(
+                strat_id="test",
+                account="test",
+                symbol="BTCUSDT",
+                tick_size=Decimal("0.1"),
+                long_koef=1.5,
+            )
+
 
 class TestGridbotConfig:
     """Tests for GridbotConfig model."""
