@@ -23,6 +23,7 @@ from gridcore import (
     Position,
     PositionState,
     RiskConfig,
+    apply_early_imbalance,
 )
 from gridcore.instrument_info import InstrumentInfo
 from gridcore.pnl import calc_position_value, calc_margin_ratio, calc_maintenance_margin, MMTiers, MM_TIERS, MM_TIERS_DEFAULT
@@ -655,34 +656,16 @@ class BacktestRunner:
         multiplier = self.get_amount_multiplier(intent.direction, intent.side)
         result = base_qty * Decimal(str(multiplier))
 
-        # bbu2 ref: bbu_reference/bbu2-master/bybit_api_usdt.py:257-261.
-        # Asymmetric: fires only when long dominates short (1.1 < ratio < 10),
-        # AND both sides are still pre-liquidation. Inherited from bbu2 design.
-        # Applied before round_qty to mirror bbu2 __round_amount(amount * mult).
-        # Skipped when risk module is disabled (backtest convention).
-        #
-        # IMPORTANT: bbu2 uses SIZE-based ratio (`long.size / short.size` at
-        # bbu2 bybit_api_usdt.py:548). We must NOT read Position.position_ratio
-        # here — that field is overwritten with a MARGIN-based ratio by
-        # Position.calculate_amount_multiplier (gridcore/position.py:231).
-        # Compute size ratio inline from Position.size.
+        # bbu2 early-imbalance multiplier — see gridcore.qty.apply_early_imbalance
+        # for full semantic. Outer guard skips when risk module is disabled
+        # (Position instances are None in that mode — backtest convention).
         if self._enable_risk:
-            early_imb = self._config.early_imbalance_multiplier
-            if early_imb != 1.0:
-                long_size = float(self._long_position.size)
-                short_size = float(self._short_position.size)
-                if short_size > 0:
-                    size_ratio = long_size / short_size
-                elif long_size > 0:
-                    size_ratio = float("inf")
-                else:
-                    size_ratio = 1.0
-                long_liq = self._long_position.liquidation_price
-                short_liq = self._short_position.liquidation_price
-                if (1.1 < size_ratio < 10
-                        and long_liq == 0
-                        and short_liq == 0):
-                    result = result * Decimal(str(early_imb))
+            result = apply_early_imbalance(
+                result,
+                self._long_position,
+                self._short_position,
+                self._config.early_imbalance_multiplier,
+            )
 
         # Re-round after multiplier to ensure qty aligns with exchange qty_step
         # (matches live runner _resolve_qty lines 526-527)

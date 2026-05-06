@@ -33,6 +33,7 @@ from gridcore import (
     calc_position_value,
     calc_margin_ratio,
     create_qty_calculator,
+    apply_early_imbalance,
 )
 
 from gridbot.config import StrategyConfig
@@ -568,33 +569,15 @@ class StrategyRunner:
         multiplier = _FLOAT_TO_DECIMAL.get(mult_float, Decimal(str(mult_float)))
         resolved_qty = base_qty * multiplier
 
-        # bbu2 ref: bbu_reference/bbu2-master/bybit_api_usdt.py:257-261.
-        # Asymmetric: fires only when long dominates short (1.1 < ratio < 10),
-        # AND both sides are still pre-liquidation. Inherited from bbu2 design.
-        # Applied before round_qty to mirror bbu2 __round_amount(amount * mult).
-        #
-        # IMPORTANT: bbu2 uses SIZE-based ratio (`long.size / short.size` at
-        # bbu2 bybit_api_usdt.py:548). We must NOT read Position.position_ratio
-        # here — that field is overwritten with a MARGIN-based ratio by
-        # Position.calculate_amount_multiplier (gridcore/position.py:231).
-        # Margin ratio diverges from size ratio because long/short entry
-        # prices differ. Compute size ratio inline from Position.size.
-        early_imb = self._config.early_imbalance_multiplier
-        if early_imb != 1.0:
-            long_size = float(self._long_position.size)
-            short_size = float(self._short_position.size)
-            if short_size > 0:
-                size_ratio = long_size / short_size
-            elif long_size > 0:
-                size_ratio = float("inf")
-            else:
-                size_ratio = 1.0
-            long_liq = self._long_position.liquidation_price
-            short_liq = self._short_position.liquidation_price
-            if (1.1 < size_ratio < 10
-                    and long_liq == 0
-                    and short_liq == 0):
-                resolved_qty = resolved_qty * Decimal(str(early_imb))
+        # bbu2 early-imbalance multiplier — applied before round_qty to mirror
+        # bbu2 __round_amount(amount * mult). See gridcore.qty.apply_early_imbalance
+        # for the full semantic (including the size-vs-margin ratio invariant).
+        resolved_qty = apply_early_imbalance(
+            resolved_qty,
+            self._long_position,
+            self._short_position,
+            self._config.early_imbalance_multiplier,
+        )
 
         # Re-round after multiplier to ensure qty aligns with exchange qty_step
         if self._instrument_info and resolved_qty > 0:

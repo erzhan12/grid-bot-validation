@@ -10,6 +10,7 @@ from typing import Callable, Optional
 
 from gridcore.instrument_info import InstrumentInfo
 from gridcore.intents import PlaceLimitIntent
+from gridcore.position import Position
 
 # Type alias for qty calculator callable
 QtyCalculator = Callable[[PlaceLimitIntent, Decimal], Decimal]
@@ -17,6 +18,63 @@ QtyCalculator = Callable[[PlaceLimitIntent, Decimal], Decimal]
 # bbu2 hardcodes a $5 USDT minimum notional in __get_amount; matches
 # `min_amount_usdt = 5` at bbu_reference/bbu2-master/bybit_api_usdt.py:491.
 _MIN_NOTIONAL_USDT = Decimal("5")
+
+# Early-imbalance trigger band — bbu2 reference
+# `bbu_reference/bbu2-master/bybit_api_usdt.py:257-261`. Asymmetric:
+# fires only when long.size / short.size lands in this open band.
+_EARLY_IMBALANCE_MIN_RATIO = 1.1
+_EARLY_IMBALANCE_MAX_RATIO = 10.0
+
+
+def apply_early_imbalance(
+    qty: Decimal,
+    long_position: Position,
+    short_position: Position,
+    multiplier: float,
+) -> Decimal:
+    """Apply bbu2 early-imbalance multiplier to a resolved qty.
+
+    Mirrors bbu2 bybit_api_usdt.py:257-261 — multiplies the next order's
+    qty by `multiplier` when:
+      - `_EARLY_IMBALANCE_MIN_RATIO < size_ratio < _EARLY_IMBALANCE_MAX_RATIO`
+        (asymmetric: long must dominate short; no short-dominant mirror)
+      - both positions are pre-liquidation (`liquidation_price == 0`)
+
+    bbu2 uses a SIZE-based ratio (`long.size / short.size`). Reads
+    `Position.size` directly. Do NOT use `Position.position_ratio`,
+    which is overwritten with margin-based ratio inside
+    `Position.calculate_amount_multiplier` (`gridcore/position.py:231`).
+
+    Args:
+        qty: The qty already composed with `amount_multiplier`, before
+            instrument-step rounding (matches bbu2 ordering: multiplier
+            is applied before `__round_amount`).
+        long_position: Long-direction Position with current `size` and
+            `liquidation_price` cached.
+        short_position: Short-direction Position with same.
+        multiplier: User-configured `early_imbalance_multiplier`. The
+            common no-op case (== 1.0) short-circuits without any of
+            the size/liq reads.
+
+    Returns:
+        `qty * multiplier` if the bbu2 trigger fires, else `qty`
+        unchanged.
+    """
+    if multiplier == 1.0:
+        return qty
+    long_size = float(long_position.size)
+    short_size = float(short_position.size)
+    if short_size > 0:
+        size_ratio = long_size / short_size
+    elif long_size > 0:
+        size_ratio = float("inf")  # short empty — out of band by `< MAX`
+    else:
+        size_ratio = 1.0
+    if (_EARLY_IMBALANCE_MIN_RATIO < size_ratio < _EARLY_IMBALANCE_MAX_RATIO
+            and long_position.liquidation_price == 0
+            and short_position.liquidation_price == 0):
+        return qty * Decimal(str(multiplier))
+    return qty
 
 
 def _apply_min_notional(raw_qty: Decimal, price: Decimal) -> Decimal:

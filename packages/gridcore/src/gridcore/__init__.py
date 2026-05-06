@@ -14,7 +14,7 @@ from gridcore.engine import GridEngine
 from gridcore.position import PositionState, Position, PositionRiskManager, RiskConfig, DirectionType, SideType
 from gridcore.persistence import GridStateStore
 from gridcore.instrument_info import InstrumentInfo
-from gridcore.qty import create_qty_calculator
+from gridcore.qty import create_qty_calculator, apply_early_imbalance
 from gridcore.pnl import (
     calc_unrealised_pnl,
     calc_unrealised_pnl_pct,
@@ -53,6 +53,7 @@ __all__ = [
     "GridStateStore",
     "InstrumentInfo",
     "create_qty_calculator",
+    "apply_early_imbalance",
     "calc_unrealised_pnl",
     "calc_unrealised_pnl_pct",
     "calc_position_value",
