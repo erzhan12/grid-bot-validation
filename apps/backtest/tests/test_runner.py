@@ -700,6 +700,171 @@ class TestBacktestRunnerRiskMultipliers:
         assert called_with[0] == 95000.0
 
 
+class TestEarlyImbalanceMultiplierBacktest:
+    """Tests for early_imbalance_multiplier in backtest qty path.
+
+    Mirrors apps/gridbot tests for live/backtest parity.
+    bbu2 ref: bbu_reference/bbu2-master/bybit_api_usdt.py:257-261.
+    """
+
+    def _build_runner(self, early_imb: float, enable_risk: bool = True):
+        config = BacktestStrategyConfig(
+            strat_id="test_early_imb",
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            grid_count=50,
+            grid_step=0.2,
+            amount="x0.001",
+            max_margin=8.0,
+            commission_rate=Decimal("0.0002"),
+            min_liq_ratio=0.8,
+            max_liq_ratio=1.2,
+            min_total_margin=0.15,
+            leverage=10,
+            maintenance_margin_rate=0.005,
+            enable_risk_multipliers=enable_risk,
+            early_imbalance_multiplier=early_imb,
+        )
+        session = BacktestSession(session_id="test_early_imb", initial_balance=Decimal("10000"))
+        fill_sim = TradeThroughFillSimulator()
+        order_mgr = BacktestOrderManager(
+            fill_simulator=fill_sim,
+            commission_rate=config.commission_rate,
+        )
+
+        def qty_from_usdt(intent, wallet_balance):
+            if intent.price <= 0:
+                return Decimal("0")
+            return Decimal("100") / intent.price  # base = 100/50000 = 0.002
+
+        executor = BacktestExecutor(order_manager=order_mgr, qty_calculator=qty_from_usdt)
+        return BacktestRunner(
+            strategy_config=config,
+            executor=executor,
+            session=session,
+        )
+
+    def _make_intent(self):
+        return PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+            qty=Decimal("0"), grid_level=1, direction="long",
+        )
+
+    def _set_size_ratio(self, runner, long_size: str, short_size: str):
+        """Set sizes (NOT position_ratio) — bbu2 keys early_imbalance on size."""
+        runner._long_position.size = Decimal(long_size)
+        runner._short_position.size = Decimal(short_size)
+
+    def test_default_multiplier_is_no_op(self):
+        runner = self._build_runner(early_imb=1.0)
+        self._set_size_ratio(runner, "2", "1")
+        runner._long_position.liquidation_price = Decimal("0")
+        runner._short_position.liquidation_price = Decimal("0")
+
+        result = runner._apply_risk_to_qty(self._make_intent(), Decimal("10000"))
+        # base 0.002, mult 1.0, no early-imb boost
+        assert result == Decimal("0.002")
+
+    def test_fires_when_long_dominates_and_both_pre_liquidation(self):
+        runner = self._build_runner(early_imb=1.5)
+        self._set_size_ratio(runner, "2", "1")
+        runner._long_position.liquidation_price = Decimal("0")
+        runner._short_position.liquidation_price = Decimal("0")
+
+        result = runner._apply_risk_to_qty(self._make_intent(), Decimal("10000"))
+        # base 0.002 * 1.5 = 0.003
+        assert result == Decimal("0.003")
+
+    def test_no_op_when_ratio_out_of_band(self):
+        runner = self._build_runner(early_imb=1.5)
+        self._set_size_ratio(runner, "11", "1")
+        runner._long_position.liquidation_price = Decimal("0")
+        runner._short_position.liquidation_price = Decimal("0")
+
+        result = runner._apply_risk_to_qty(self._make_intent(), Decimal("10000"))
+        assert result == Decimal("0.002")
+
+    def test_no_op_when_long_liq_price_set(self):
+        runner = self._build_runner(early_imb=1.5)
+        self._set_size_ratio(runner, "2", "1")
+        runner._long_position.liquidation_price = Decimal("45000")
+        runner._short_position.liquidation_price = Decimal("0")
+
+        result = runner._apply_risk_to_qty(self._make_intent(), Decimal("10000"))
+        assert result == Decimal("0.002")
+
+    def test_no_op_when_short_empty_size_ratio_inf(self):
+        """short.size=0, long.size>0 → size_ratio=inf, out of band → no-op."""
+        runner = self._build_runner(early_imb=1.5)
+        self._set_size_ratio(runner, "2", "0")  # short empty → ratio = inf
+        runner._long_position.liquidation_price = Decimal("0")
+        runner._short_position.liquidation_price = Decimal("0")
+
+        result = runner._apply_risk_to_qty(self._make_intent(), Decimal("10000"))
+        assert result == Decimal("0.002")
+
+    def test_uses_size_not_margin_ratio(self):
+        """Regression: must read sizes, not Position.position_ratio (margin-based after calculate_amount_multiplier)."""
+        runner = self._build_runner(early_imb=1.5)
+        # Equal sizes (size_ratio=1.0 — out of band) but poison position_ratio.
+        self._set_size_ratio(runner, "1", "1")
+        runner._long_position.position_ratio = 2.0
+        runner._short_position.position_ratio = 2.0
+        runner._long_position.liquidation_price = Decimal("0")
+        runner._short_position.liquidation_price = Decimal("0")
+
+        result = runner._apply_risk_to_qty(self._make_intent(), Decimal("10000"))
+        assert result == Decimal("0.002")
+
+    def test_end_to_end_through_update_risk_multipliers(self):
+        """End-to-end: drive trackers via process_fill, then _update_risk_multipliers
+        and _apply_risk_to_qty. Confirms backtest plumbing wires Position.size +
+        liquidation_price correctly through the real pipeline (not direct field
+        access). Mirrors live e2e test in apps/gridbot/tests/test_runner.py.
+
+        Setup: long entry $25k size 2.0, short entry $50k size 1.0,
+        wallet large enough that estimated liq is far above market → liq=0.
+        size_ratio=2.0 (in band) but margin_ratio≈1.0 (out of band).
+        """
+        runner = self._build_runner(early_imb=1.5)
+        # Inflate session balance so liquidation estimates land at 0
+        # (long: liq <= 0 floored to 0; short: liq > 2*entry returned as 0).
+        runner._session.current_balance = Decimal("1000000")
+
+        # Drive long: process_fill with Buy (opens long).
+        runner._long_tracker.process_fill(
+            side="Buy", qty=Decimal("2.0"), price=Decimal("25000"),
+        )
+        # Drive short: process_fill with Sell (opens short).
+        runner._short_tracker.process_fill(
+            side="Sell", qty=Decimal("1.0"), price=Decimal("50000"),
+        )
+
+        # Drive the real risk-multiplier update path.
+        runner._update_risk_multipliers(last_price=50000.0)
+
+        # Plumbing assertion.
+        assert runner._long_position.size == Decimal("2.0")
+        assert runner._short_position.size == Decimal("1.0")
+        assert runner._long_position.liquidation_price == Decimal("0")
+        assert runner._short_position.liquidation_price == Decimal("0")
+
+        # Capture position-rules multiplier and compute expected.
+        strategy_mult = Decimal(str(runner.get_amount_multiplier("long", "Buy")))
+        # base from fixture: 100 / 50000 = 0.002
+        expected_pre_round = Decimal("0.002") * strategy_mult * Decimal("1.5")
+        # Backtest fixture has no instrument_info → no rounding.
+        result = runner._apply_risk_to_qty(self._make_intent(), Decimal("1000000"))
+        assert result == expected_pre_round
+        # Sanity: with mult=1.5 active, qty must exceed the no-boost baseline.
+        assert result > Decimal("0.002") * strategy_mult
+
+    # Note: when enable_risk=False, BacktestRunner does NOT install
+    # _apply_risk_to_qty as the executor's qty_calculator (runner.py:121-137),
+    # so the early_imb path is unreachable by construction. No separate test
+    # needed for that case.
+
+
 class TestBacktestRunnerRiskIntegration:
     """Integration test: risk-enabled runner with qty_calculator places non-zero orders."""
 

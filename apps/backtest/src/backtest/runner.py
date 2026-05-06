@@ -23,6 +23,7 @@ from gridcore import (
     Position,
     PositionState,
     RiskConfig,
+    apply_early_imbalance,
 )
 from gridcore.instrument_info import InstrumentInfo
 from gridcore.pnl import calc_position_value, calc_margin_ratio, calc_maintenance_margin, MMTiers, MM_TIERS, MM_TIERS_DEFAULT
@@ -579,6 +580,25 @@ class BacktestRunner:
             self._short_tracker, wallet_balance, DirectionType.SHORT
         )
 
+        # Cache size-based position_ratio + liq_price on both Position
+        # instances so consumers (e.g. early_imbalance_multiplier in
+        # _apply_risk_to_qty) read consistent values even when one side
+        # is empty and calculate_amount_multiplier is skipped below.
+        long_size = float(long_state.size) if long_state.size else 0.0
+        short_size = float(short_state.size) if short_state.size else 0.0
+        if short_size > 0:
+            position_ratio = long_size / short_size
+        elif long_size > 0:
+            position_ratio = float("inf")
+        else:
+            position_ratio = 1.0
+        self._long_position.position_ratio = position_ratio
+        self._short_position.position_ratio = position_ratio
+        self._long_position.size = long_state.size
+        self._short_position.size = short_state.size
+        self._long_position.liquidation_price = long_state.liquidation_price
+        self._short_position.liquidation_price = short_state.liquidation_price
+
         # Reset then calculate (bbu2 pattern — cross-position effects preserved)
         self._long_position.reset_amount_multiplier()
         self._short_position.reset_amount_multiplier()
@@ -635,6 +655,17 @@ class BacktestRunner:
 
         multiplier = self.get_amount_multiplier(intent.direction, intent.side)
         result = base_qty * Decimal(str(multiplier))
+
+        # bbu2 early-imbalance multiplier — see gridcore.qty.apply_early_imbalance
+        # for full semantic. Outer guard skips when risk module is disabled
+        # (Position instances are None in that mode — backtest convention).
+        if self._enable_risk:
+            result = apply_early_imbalance(
+                result,
+                self._long_position,
+                self._short_position,
+                self._config.early_imbalance_multiplier,
+            )
 
         # Re-round after multiplier to ensure qty aligns with exchange qty_step
         # (matches live runner _resolve_qty lines 526-527)

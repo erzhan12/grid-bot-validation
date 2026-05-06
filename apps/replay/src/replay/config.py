@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from backtest.config import WindDownMode
 
@@ -36,10 +36,15 @@ class ReplayStrategyConfig(BaseModel):
     # Position sizing
     amount: str = Field(
         default="x0.001",
-        description="Order amount: fixed USDT, 'x0.001' wallet fraction, 'b0.001' BTC equivalent",
+        description="Order amount: fixed USDT, or 'x0.001' wallet fraction",
     )
     max_margin: float = Field(default=8.0, gt=0, description="Maximum margin per position")
-    long_koef: float = Field(default=1.0, gt=0, description="Long/short bias multiplier")
+    early_imbalance_multiplier: float = Field(
+        default=1.0,
+        gt=0,
+        le=100.0,
+        description="Multiplier applied to next order qty when long dominates short by 1.1-10x AND both positions are pre-liquidation (liq_price==0). Inherited asymmetric trigger from bbu2 (no short-dominant mirror). Upper bound 100 also rejects float('inf') from misconfigured YAML.",
+    )
 
     # Risk
     enable_risk_multipliers: bool = Field(
@@ -58,6 +63,28 @@ class ReplayStrategyConfig(BaseModel):
     def parse_decimal_fields(cls, v):
         """Convert string/numeric to Decimal."""
         return _parse_decimal(v)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_renamed_long_koef(cls, data):
+        """Catch legacy `long_koef` config name and force migration.
+
+        Pydantic ignores unknown fields by default, so a config with
+        `long_koef: 1.5` would silently load and the renamed
+        `early_imbalance_multiplier` would stay at default 1.0 — the user
+        would believe the multiplier is active when it is not. Reject
+        explicitly with a migration message instead of silent acceptance.
+        Renamed in feature 0028 (D-3) for clearer semantics.
+        """
+        if isinstance(data, dict) and "long_koef" in data:
+            raise ValueError(
+                "Config field 'long_koef' was renamed to "
+                "'early_imbalance_multiplier' in feature 0028. The semantic "
+                "is unchanged (multiplier on next-order qty when long "
+                "dominates short by 1.1-10x AND both positions pre-"
+                "liquidation). Rename the field in your YAML."
+            )
+        return data
 
 
 class ReplayConfig(BaseModel):

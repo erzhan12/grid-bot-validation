@@ -10,13 +10,13 @@ that the backtest faithfully reproduces the same trading decisions as
 the live execution path, using deterministic client_order_id matching.
 """
 
-import math
 import pytest
 from dataclasses import replace
 from decimal import Decimal
 
 from gridcore import DirectionType
 from gridcore.instrument_info import InstrumentInfo
+from gridcore.qty import create_qty_calculator
 
 from backtest.config import BacktestConfig, BacktestStrategyConfig, WindDownMode
 from backtest.engine import BacktestEngine
@@ -89,17 +89,21 @@ def _make_price_events():
 
 
 def _qty_calculator(intent, wallet_balance):
-    """Match BacktestEngine's qty calculator for fixed USDT amount.
+    """Use the canonical gridcore qty calculator instead of reimplementing.
 
-    Replicates the logic in BacktestEngine._create_qty_calculator()
-    with InstrumentInfo.round_qty() rounding up to qty_step.
+    Earlier this re-derived the qty math inline, which silently diverged from
+    production after feature 0028 added the $5 USDT min-notional floor.
+    Delegate to the same factory both gridbot and backtest use to guarantee
+    parity going forward.
     """
-    if intent.price <= 0:
-        return Decimal("0")
-    raw_qty = Decimal(AMOUNT) / intent.price
-    # Round up to nearest qty_step (matching InstrumentInfo.round_qty behavior)
-    steps = math.ceil(float(raw_qty) / float(QTY_STEP))
-    return Decimal(str(steps)) * QTY_STEP
+    info = InstrumentInfo(
+        symbol=SYMBOL,
+        qty_step=QTY_STEP,
+        tick_size=Decimal(TICK_SIZE),
+        min_qty=QTY_STEP,
+        max_qty=Decimal("1000"),
+    )
+    return create_qty_calculator(AMOUNT, info)(intent, wallet_balance)
 
 
 def _run_path_a(events):

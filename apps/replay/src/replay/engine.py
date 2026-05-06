@@ -107,7 +107,7 @@ class ReplayEngine:
             grid_step=config.strategy.grid_step,
             amount=config.strategy.amount,
             max_margin=config.strategy.max_margin,
-            long_koef=config.strategy.long_koef,
+            early_imbalance_multiplier=config.strategy.early_imbalance_multiplier,
             commission_rate=config.strategy.commission_rate,
             enable_risk_multipliers=config.strategy.enable_risk_multipliers,
         )

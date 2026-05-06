@@ -86,29 +86,57 @@ class TestFixedUSDT:
         assert qty == Decimal("0")
 
 
-class TestFixedBase:
-    """Tests for 'b...' fixed base currency amount strings."""
+class TestMinNotionalFloor:
+    """Tests for the $5 USDT min-notional floor (bbu2 parity)."""
 
-    def test_basic_base(self, instrument_info):
-        calc = create_qty_calculator("b0.005", instrument_info)
+    def test_fraction_below_floor_bumps_up(self, instrument_info):
+        calc = create_qty_calculator("x0.001", instrument_info)
+        intent = _make_intent("50000")
+        # 100 * 0.001 / 50000 = 0.000002 → notional 0.10 USDT (well below $5)
+        # Floor: 5 / 50000 = 0.0001 → rounded up to qty_step 0.001
+        qty = calc(intent, Decimal("100"))
+        assert qty == Decimal("0.001")
+
+    def test_usdt_below_floor_bumps_up(self, instrument_info):
+        # Fixed 1 USDT request → 1/50000 = 0.00002, notional $1 < $5 floor.
+        # Floor: 5 / 50000 = 0.0001 → rounded up to qty_step 0.001
+        calc = create_qty_calculator("1", instrument_info)
         intent = _make_intent("50000")
         qty = calc(intent, Decimal("10000"))
-        # Fixed base = 0.005, rounds up to 0.005
-        assert qty == Decimal("0.005")
+        assert qty == Decimal("0.001")
 
-    def test_base_rounds_up(self, instrument_info):
-        calc = create_qty_calculator("b0.0015", instrument_info)
+    # Note: a true strict-`<` vs `<=` boundary discriminator at exactly $5
+    # cannot be written numerically — at the boundary `_MIN_NOTIONAL / price`
+    # equals the raw qty, so both implementations yield identical output.
+    # We rely on `test_floor_just_below_5_fires` (firing path) and
+    # `test_floor_just_above_5_passes_through` (non-firing path) to cover
+    # both sides of the boundary instead.
+
+    def test_floor_just_above_5_passes_through(self):
+        # Notional slightly above $5 must NOT be bumped (passthrough).
+        # amount "5.01" at price 40000 → 0.00012525 raw.
+        calc = create_qty_calculator("5.01", None)
+        intent = _make_intent("40000")
+        qty = calc(intent, Decimal("10000"))
+        assert qty == Decimal("5.01") / Decimal("40000")  # passthrough
+
+    def test_floor_just_below_5_fires(self):
+        # Notional $4.99 (strictly below $5) MUST be bumped to floor.
+        # Discriminator: without instrument_info, raw output reveals whether
+        # floor fired. amount "4.99" at price 40000 → 0.00012475 raw.
+        # Floor fires: replaces with 5/40000 = 0.000125.
+        calc = create_qty_calculator("4.99", None)
+        intent = _make_intent("40000")
+        qty = calc(intent, Decimal("10000"))
+        assert qty == Decimal("5") / Decimal("40000")  # bumped to floor
+        assert qty != Decimal("4.99") / Decimal("40000")  # not passthrough
+
+    def test_above_floor_passthrough(self, instrument_info):
+        # 100 / 50000 = 0.002, notional 100 USDT >> 5; passthrough.
+        calc = create_qty_calculator("100", instrument_info)
         intent = _make_intent("50000")
         qty = calc(intent, Decimal("10000"))
-        # 0.0015 rounds up to 0.002
         assert qty == Decimal("0.002")
-
-    def test_base_ignores_price_and_balance(self, instrument_info):
-        calc = create_qty_calculator("b0.01", instrument_info)
-        intent = _make_intent("0")
-        qty = calc(intent, Decimal("0"))
-        # Fixed base always returns the amount, regardless of price/balance
-        assert qty == Decimal("0.01")
 
 
 class TestNoInstrumentInfo:
@@ -141,10 +169,6 @@ class TestEdgeCases:
         with pytest.raises(ValueError, match="invalid amount string"):
             create_qty_calculator("xnotanumber")
 
-    def test_invalid_base_raises(self):
-        with pytest.raises(ValueError, match="invalid amount string"):
-            create_qty_calculator("bnotanumber")
-
     def test_invalid_usdt_raises(self):
         with pytest.raises(ValueError, match="invalid amount string"):
             create_qty_calculator("notanumber")
@@ -153,9 +177,11 @@ class TestEdgeCases:
         with pytest.raises(ValueError, match="invalid amount string"):
             create_qty_calculator("x")
 
-    def test_bare_b_raises(self):
+    def test_legacy_b_mode_now_rejected(self):
+        # "b..." mode (BTC-equivalent for inverse contracts) is removed.
+        # Strings starting with "b" route through the numeric branch and fail.
         with pytest.raises(ValueError, match="invalid amount string"):
-            create_qty_calculator("b")
+            create_qty_calculator("b0.005")
 
     def test_negative_price(self, instrument_info):
         calc = create_qty_calculator("100", instrument_info)

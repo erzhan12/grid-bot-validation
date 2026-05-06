@@ -33,6 +33,7 @@ from gridcore import (
     calc_position_value,
     calc_margin_ratio,
     create_qty_calculator,
+    apply_early_imbalance,
 )
 
 from gridbot.config import StrategyConfig
@@ -474,6 +475,12 @@ class StrategyRunner:
             # Update position managers
             self._long_position.position_ratio = position_ratio
             self._short_position.position_ratio = position_ratio
+            self._long_position.liquidation_price = (
+                long_state.liquidation_price if long_state else Decimal('0')
+            )
+            self._short_position.liquidation_price = (
+                short_state.liquidation_price if short_state else Decimal('0')
+            )
 
             has_position = long_state is not None or short_state is not None
             has_valid_price = (
@@ -561,6 +568,16 @@ class StrategyRunner:
             return replace(intent, qty=Decimal("0"))
         multiplier = _FLOAT_TO_DECIMAL.get(mult_float, Decimal(str(mult_float)))
         resolved_qty = base_qty * multiplier
+
+        # bbu2 early-imbalance multiplier — applied before round_qty to mirror
+        # bbu2 __round_amount(amount * mult). See gridcore.qty.apply_early_imbalance
+        # for the full semantic (including the size-vs-margin ratio invariant).
+        resolved_qty = apply_early_imbalance(
+            resolved_qty,
+            self._long_position,
+            self._short_position,
+            self._config.early_imbalance_multiplier,
+        )
 
         # Re-round after multiplier to ensure qty aligns with exchange qty_step
         if self._instrument_info and resolved_qty > 0:

@@ -24,6 +24,12 @@ class TestReplayStrategyConfig:
         with pytest.raises(ValidationError):
             ReplayStrategyConfig(tick_size=Decimal("0.1"), grid_count=2)
 
+    def test_legacy_long_koef_rejected_with_migration_message(self):
+        """Reject legacy `long_koef` so migrating users do not silently lose
+        the multiplier (Pydantic ignores unknown fields by default)."""
+        with pytest.raises(ValidationError, match="renamed to 'early_imbalance_multiplier'"):
+            ReplayStrategyConfig(tick_size=Decimal("0.1"), long_koef=1.5)
+
 
 class TestReplayConfig:
     """Tests for ReplayConfig."""

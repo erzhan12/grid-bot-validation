@@ -824,9 +824,9 @@ class TestQtyResolution:
         resolved = runner._resolve_qty(intent)
         assert resolved.qty == Decimal("0.002")
 
-    def test_resolve_qty_fixed_base(self, strategy_config, mock_executor, instrument_info):
-        """Fixed base amount: 'b0.005' → always 0.005."""
-        strategy_config.amount = "b0.005"
+    def test_resolve_qty_fixed_usdt_yields_expected_base(self, strategy_config, mock_executor, instrument_info):
+        """Fixed USDT amount '250' at price 50000 → 0.005 base qty."""
+        strategy_config.amount = "250"
         runner = StrategyRunner(
             strategy_config=strategy_config,
             executor=mock_executor,
@@ -974,7 +974,7 @@ class TestResolveQtyExtended:
 
     def test_multiplier_0_5_rerounds(self, strategy_config, mock_executor, instrument_info):
         """Multiplier 0.5 halves qty, then re-rounds up to qty_step."""
-        strategy_config.amount = "b0.003"
+        strategy_config.amount = "150"  # 150/50000 = 0.003 base qty
         runner = StrategyRunner(
             strategy_config=strategy_config,
             executor=mock_executor,
@@ -988,7 +988,7 @@ class TestResolveQtyExtended:
             qty=Decimal("0"), grid_level=1, direction="long",
         )
         resolved = runner._resolve_qty(intent)
-        # base = 0.003 (rounded to 0.003), * 0.5 = 0.0015, re-rounds up to 0.002
+        # base = 0.003, * 0.5 = 0.0015, re-rounds up to 0.002
         assert resolved.qty == Decimal("0.002")
 
     def test_min_qty_clamping(self, strategy_config, mock_executor):
@@ -1000,7 +1000,7 @@ class TestResolveQtyExtended:
             min_qty=Decimal("0.01"),  # high min_qty
             max_qty=Decimal("1000"),
         )
-        strategy_config.amount = "b0.001"
+        strategy_config.amount = "50"  # 50/50000 = 0.001 base qty
         runner = StrategyRunner(
             strategy_config=strategy_config,
             executor=mock_executor,
@@ -1025,7 +1025,7 @@ class TestResolveQtyExtended:
             min_qty=Decimal("0.001"),
             max_qty=Decimal("0.005"),  # low max_qty
         )
-        strategy_config.amount = "b0.01"
+        strategy_config.amount = "500"  # 500/50000 = 0.01 base qty
         runner = StrategyRunner(
             strategy_config=strategy_config,
             executor=mock_executor,
@@ -1095,6 +1095,183 @@ class TestResolveQtyExtended:
         qty_zero_records = [r for r in caplog.records if "Resolved qty=0" in r.message]
         assert len(qty_zero_records) == 1
         assert qty_zero_records[0].levelno == logging.DEBUG
+
+
+class TestEarlyImbalanceMultiplier:
+    """Tests for the early-imbalance qty multiplier (bbu2 ref: bybit_api_usdt.py:257-261).
+
+    Asymmetric trigger: fires only when long dominates short
+    (1.1 < ratio < 10) AND both positions are pre-liquidation
+    (liq_price == 0). No symmetric short-dominant mirror.
+    """
+
+    def _make_intent(self):
+        return PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("50000"),
+            qty=Decimal("0"), grid_level=1, direction="long",
+        )
+
+    def _set_size_ratio(self, runner, long_size: str, short_size: str):
+        """Set sizes (NOT position_ratio) — bbu2 keys early_imbalance on size."""
+        runner._long_position.size = Decimal(long_size)
+        runner._short_position.size = Decimal(short_size)
+
+    def test_default_multiplier_is_no_op(self, runner):
+        """Default early_imbalance_multiplier=1.0 → qty unchanged regardless of state."""
+        self._set_size_ratio(runner, "2", "1")  # size_ratio = 2.0
+        runner._long_position.liquidation_price = Decimal("0")
+        runner._short_position.liquidation_price = Decimal("0")
+
+        resolved = runner._resolve_qty(self._make_intent())
+        # base = 10000 * 0.001 / 50000 = 0.0002 → round_up to 0.001
+        assert resolved.qty == Decimal("0.001")
+
+    def test_fires_when_long_dominates_and_both_pre_liquidation(self, strategy_config, mock_executor, instrument_info):
+        """size_ratio=2.0, both liq=0, mult=1.5 → qty scaled by 1.5 before round_qty."""
+        strategy_config.early_imbalance_multiplier = 1.5
+        strategy_config.amount = "100"  # base = 100/50000 = 0.002
+        r = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+        )
+        r._wallet_balance = Decimal("10000")
+        self._set_size_ratio(r, "2", "1")
+        r._long_position.liquidation_price = Decimal("0")
+        r._short_position.liquidation_price = Decimal("0")
+
+        resolved = r._resolve_qty(self._make_intent())
+        # base 0.002 * mult 1.0 (no risk) * early 1.5 = 0.003
+        assert resolved.qty == Decimal("0.003")
+
+    def test_no_op_when_ratio_out_of_band(self, strategy_config, mock_executor, instrument_info):
+        """size_ratio=11 (above 10) → multiplier suppressed even with mult=1.5."""
+        strategy_config.early_imbalance_multiplier = 1.5
+        strategy_config.amount = "100"
+        r = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+        )
+        r._wallet_balance = Decimal("10000")
+        self._set_size_ratio(r, "11", "1")
+        r._long_position.liquidation_price = Decimal("0")
+        r._short_position.liquidation_price = Decimal("0")
+
+        resolved = r._resolve_qty(self._make_intent())
+        # base 0.002, no early-imb boost
+        assert resolved.qty == Decimal("0.002")
+
+    def test_no_op_when_long_liq_price_set(self, strategy_config, mock_executor, instrument_info):
+        """long.liq_price > 0 → not pre-liquidation, multiplier suppressed."""
+        strategy_config.early_imbalance_multiplier = 1.5
+        strategy_config.amount = "100"
+        r = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+        )
+        r._wallet_balance = Decimal("10000")
+        self._set_size_ratio(r, "2", "1")
+        r._long_position.liquidation_price = Decimal("45000")
+        r._short_position.liquidation_price = Decimal("0")
+
+        resolved = r._resolve_qty(self._make_intent())
+        assert resolved.qty == Decimal("0.002")
+
+    def test_no_op_when_short_empty_size_ratio_inf(self, strategy_config, mock_executor, instrument_info):
+        """short.size=0, long.size>0 → size_ratio=inf, out of band (10), no-op.
+
+        Regression guard: catches a bug that flipped the inf branch to 1.0
+        (which would put us in the `1.0 < 1.1` band — also no-op by accident,
+        but for the wrong reason). Strict `< 10` keeps inf out.
+        """
+        strategy_config.early_imbalance_multiplier = 1.5
+        strategy_config.amount = "100"
+        r = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+        )
+        r._wallet_balance = Decimal("10000")
+        self._set_size_ratio(r, "2", "0")  # short empty → ratio = inf
+        r._long_position.liquidation_price = Decimal("0")
+        r._short_position.liquidation_price = Decimal("0")
+
+        resolved = r._resolve_qty(self._make_intent())
+        assert resolved.qty == Decimal("0.002")
+
+    def test_uses_size_not_margin_ratio(self, strategy_config, mock_executor, instrument_info):
+        """Regression: must read sizes, not Position.position_ratio (which is margin-based after calculate_amount_multiplier)."""
+        strategy_config.early_imbalance_multiplier = 1.5
+        strategy_config.amount = "100"
+        r = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+        )
+        r._wallet_balance = Decimal("10000")
+        # Sizes are EQUAL (size_ratio=1.0, out of band) but margin-ratio
+        # field set to 2.0. With the bug, code reads margin_ratio=2.0 and
+        # incorrectly fires. Fixed code reads sizes → 1.0 → no-op.
+        self._set_size_ratio(r, "1", "1")
+        r._long_position.position_ratio = 2.0  # poisoned
+        r._short_position.position_ratio = 2.0
+        r._long_position.liquidation_price = Decimal("0")
+        r._short_position.liquidation_price = Decimal("0")
+
+        resolved = r._resolve_qty(self._make_intent())
+        assert resolved.qty == Decimal("0.002")
+
+    def test_end_to_end_through_on_position_update(self, strategy_config, mock_executor, instrument_info):
+        """End-to-end: drive on_position_update with realistic exchange dicts,
+        then call _resolve_qty. Proves the plumbing wires Position.size and
+        Position.liquidation_price correctly even after calculate_amount_multiplier
+        runs and overwrites position_ratio.
+
+        Critical setup: long entry $25k, short entry $50k. With size_ratio=2.0
+        (in band), margin_ratio = 2 * (25000/50000) = 1.0 (OUT of band).
+        If the implementation regressed to read position_ratio, the multiplier
+        would NOT fire. Reading sizes (correct), it fires.
+        """
+        strategy_config.early_imbalance_multiplier = 1.5
+        strategy_config.amount = "100"
+        r = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+        )
+
+        # Both positions pre-liquidation (liqPrice=0). Different entry prices
+        # so size_ratio diverges from margin_ratio.
+        long_pos = {"size": "2.0", "avgPrice": "25000", "liqPrice": "0"}
+        short_pos = {"size": "1.0", "avgPrice": "50000", "liqPrice": "0"}
+        r.on_position_update(
+            long_position=long_pos,
+            short_position=short_pos,
+            wallet_balance=10000.0,
+            last_close=50000.0,
+        )
+
+        # Plumbing assertion: Position.size and liquidation_price set via real path.
+        assert r._long_position.size == Decimal("2.0")
+        assert r._short_position.size == Decimal("1.0")
+        assert r._long_position.liquidation_price == Decimal("0")
+        assert r._short_position.liquidation_price == Decimal("0")
+
+        # Capture the position-rules multiplier so the test isolates early_imb.
+        strategy_mult = Decimal(str(r.get_amount_multiplier("long", "Buy")))
+        # Expected: base * strategy_mult * early_imb, then round_qty (ceil to 0.001)
+        # base = 100 / 50000 = 0.002
+        from decimal import ROUND_UP
+        expected_pre_round = Decimal("0.002") * strategy_mult * Decimal("1.5")
+        steps = (expected_pre_round / Decimal("0.001")).to_integral_value(rounding=ROUND_UP)
+        expected_qty = steps * Decimal("0.001")
+
+        resolved = r._resolve_qty(self._make_intent())
+        assert resolved.qty == expected_qty
+        # Sanity: with mult=1.5 active, qty must exceed the no-boost result.
+        assert resolved.qty > Decimal("0.002") * strategy_mult
 
 
 class TestSameOrderDetection:

@@ -16,7 +16,7 @@ strategies:
     grid_step: 0.2
     amount: "x0.001"  # 0.1% of wallet per order
     max_margin: 8
-    long_koef: 1.0
+    early_imbalance_multiplier: 1.0
     min_liq_ratio: 0.8
     max_liq_ratio: 1.2
     min_total_margin: 0.15
@@ -30,7 +30,7 @@ strategies:
     grid_step: 0.2
     amount: "x0.001"
     max_margin: 8
-    long_koef: 1.0
+    early_imbalance_multiplier: 1.0
     shadow_mode: true  # Shadow mode for testing
 
 # Database connection
