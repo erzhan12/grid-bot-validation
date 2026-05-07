@@ -3,6 +3,7 @@
 Manages limit orders in simulation, checks for fills, and generates execution events.
 """
 
+import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -12,6 +13,9 @@ from typing import Optional
 from gridcore import ExecutionEvent, EventType
 
 from backtest.fill_simulator import TradeThroughFillSimulator
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -151,6 +155,16 @@ class BacktestOrderManager:
                 ``exchange_ts``.
         """
         for seed in orders:
+            # 0029 PR #68 P1: defense-in-depth against a malformed seed
+            # batch with duplicate exchange_order_id (would otherwise
+            # silently overwrite the first entry).
+            if seed.exchange_order_id in self.active_orders:
+                logger.warning(
+                    "Duplicate exchange_order_id %r in seed batch; skipping "
+                    "second occurrence",
+                    seed.exchange_order_id,
+                )
+                continue
             order = SimulatedOrder(
                 order_id=seed.exchange_order_id,
                 client_order_id=seed.client_id,
