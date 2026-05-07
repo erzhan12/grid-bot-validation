@@ -267,3 +267,63 @@ class TestInitialRestSnapshot:
             assert all(r.size == r.size.__class__("0") for r in pos_rows)
 
         await recorder.stop()
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_warning_emitted_when_wallet_snapshot_empty(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
+        config_with_account, db, caplog,
+    ):
+        """When wallet REST returns empty (e.g. credential issue), an explicit
+        WARNING is logged so operator catches the seeding-blocker at recorder
+        start instead of finding out hours later when replay's pre-check fails.
+        Open orders being zero is NOT warned on (clean account is valid).
+        """
+        import logging
+
+        mock_pub_cls.return_value = _make_pub_mock()
+        mock_priv = _make_priv_mock()
+        mock_priv_cls.return_value = mock_priv
+
+        # Wallet response empty → wallet_count == 0 → WARNING expected.
+        # Position response has one Buy row for the configured symbol; the
+        # contract still writes a zero Sell row, so position_count == 2 > 0.
+        # Open orders empty — must NOT trip the warning by itself.
+        snapshot_client = _stub_rest_client(
+            wallet_response={"list": []},
+            positions_by_symbol={
+                "BTCUSDT": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "side": "Buy",
+                        "size": "0.5",
+                        "entryPrice": "50000",
+                        "liqPrice": "45000",
+                        "unrealisedPnl": "0",
+                    }
+                ]
+            },
+            open_orders_by_symbol={"BTCUSDT": []},
+        )
+        mock_rest_cls.side_effect = [MagicMock(), snapshot_client]
+
+        recorder = Recorder(config=config_with_account, db=db)
+        with caplog.at_level(logging.WARNING, logger="recorder.recorder"):
+            await recorder.start()
+
+        warnings = [
+            r for r in caplog.records
+            if r.levelno == logging.WARNING
+            and "Initial REST snapshot incomplete" in r.message
+        ]
+        assert len(warnings) == 1, (
+            f"expected exactly one incomplete-snapshot warning, "
+            f"got {len(warnings)}: {[r.message for r in warnings]}"
+        )
+        assert "wallet_rows=0" in warnings[0].message
+        # position_rows>0 in this scenario; spot-check that the message
+        # surfaces the actual count so the warning is actionable.
+        assert "position_rows=" in warnings[0].message
+
+        await recorder.stop()

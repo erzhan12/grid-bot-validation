@@ -306,6 +306,21 @@ class Recorder:
             f"positions={position_count} rows, open_orders={order_count}"
         )
 
+        # 0029 cross-cutting #4: empty wallet OR position dimension means
+        # the seed loader will not find a t=0 row and Phase 4's pre-check
+        # will refuse to seed from this run. Surface this loudly at recorder
+        # start so an operator catches credential/permissions problems early
+        # instead of finding out hours later when replay refuses. open_orders
+        # legitimately can be zero (clean account) — not warned on.
+        if wallet_count == 0 or position_count == 0:
+            logger.warning(
+                "Initial REST snapshot incomplete: "
+                f"wallet_rows={wallet_count}, position_rows={position_count} "
+                "(zero on either dimension means seed-aware replay from this "
+                "run_id will fail Phase 4 pre-check; check API credentials / "
+                "permissions / category=linear settleCoin=USDT scope)"
+            )
+
     async def _snapshot_wallet(
         self,
         client: BybitRestClient,
