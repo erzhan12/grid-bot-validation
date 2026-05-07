@@ -14,11 +14,21 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from grid_db import DatabaseFactory, Run, RunRepository, redact_db_url
+from sqlalchemy import func
+
+from grid_db import (
+    DatabaseFactory,
+    PositionSnapshot,
+    Run,
+    RunRepository,
+    WalletSnapshot,
+    redact_db_url,
+)
 
 from gridcore import DirectionType, create_qty_calculator
+from gridcore.persistence import GridStateStore
 
 from backtest.config import BacktestStrategyConfig, WindDownMode
 from backtest.data_provider import HistoricalDataProvider, InMemoryDataProvider
@@ -40,10 +50,27 @@ from comparator import (
     ValidationMetrics,
 )
 
-from replay.config import ReplayConfig
+from replay.config import ReplayConfig, SeedConfig
+from replay.snapshot_loader import (
+    ActiveOrderSeed,
+    GridStateSeed,
+    PositionStateSeed,
+    load_active_orders,
+    load_grid_state,
+    load_position_snapshots,
+    load_wallet_snapshot,
+)
 
 
 logger = logging.getLogger(__name__)
+
+
+# Minimum gap between the latest required initial-snapshot row and seed.at_ts.
+# Used by the Phase 4 pre-check (which lives in the engine — see Phase 3 plan).
+# 5 seconds matches the example in docs/features/0029_PLAN.md and gives enough
+# slack for clock skew between recorder and live without masking the
+# "initial REST snapshot has not landed yet" misconfig.
+_SEED_PRE_CHECK_MARGIN = timedelta(seconds=5)
 
 
 @dataclass
@@ -112,8 +139,39 @@ class ReplayEngine:
             enable_risk_multipliers=config.strategy.enable_risk_multipliers,
         )
 
-        session = BacktestSession(initial_balance=config.initial_balance)
-        runner = self._init_runner(strategy_config, session)
+        # 2a. Load seed material (positions/wallet/orders/grid) when enabled.
+        # When disabled this returns the all-None tuple and the runner
+        # constructs from scratch — preserving pre-0029 behaviour exactly.
+        (
+            wallet_seed,
+            long_seed,
+            short_seed,
+            grid_seed,
+            order_seeds,
+        ) = self._load_seed(config, run_id)
+
+        initial_balance = wallet_seed if wallet_seed is not None else config.initial_balance
+        session = BacktestSession(initial_balance=initial_balance)
+        runner = self._init_runner(
+            strategy_config,
+            session,
+            long_seed=long_seed,
+            short_seed=short_seed,
+            grid_seed=grid_seed,
+            order_seeds=order_seeds,
+        )
+
+        if config.seed.enabled:
+            logger.info(
+                "Seeded run_id=%s: long.size=%s, short.size=%s, "
+                "anchor_or_grid_levels=%s, balance=%s, active_orders=%s",
+                run_id,
+                long_seed.size if long_seed is not None else Decimal("0"),
+                short_seed.size if short_seed is not None else Decimal("0"),
+                len(grid_seed.grid) if grid_seed is not None else 0,
+                initial_balance,
+                len(order_seeds) if order_seeds is not None else 0,
+            )
 
         # 3. Create data provider
         if data_provider is not None:
@@ -279,8 +337,35 @@ class ReplayEngine:
         self,
         strategy_config: BacktestStrategyConfig,
         session: BacktestSession,
+        long_seed: Optional[PositionStateSeed] = None,
+        short_seed: Optional[PositionStateSeed] = None,
+        grid_seed: Optional[GridStateSeed] = None,
+        order_seeds: Optional[list[ActiveOrderSeed]] = None,
     ) -> BacktestRunner:
-        """Initialize a BacktestRunner for the replay."""
+        """Initialize a BacktestRunner for the replay.
+
+        Args:
+            strategy_config: Backtest strategy config (already projected
+                from ``ReplayConfig``).
+            session: Pre-constructed ``BacktestSession`` — when seeding,
+                its ``initial_balance`` is the wallet snapshot.
+            long_seed: Optional long-direction position seed; when present
+                AND non-zero, ``BacktestPositionTracker.seed_state`` is
+                called before the runner gets the tracker. Skipping the
+                ``seed_state`` call on a zero seed avoids polluting the
+                tracker with a no-op write — both branches yield the same
+                tracker state, but the unconditional path is cheaper to
+                reason about, so we still call it whenever a seed exists.
+            short_seed: Same for short direction.
+            grid_seed: Optional grid-state seed; ``grid_seed.grid`` (the
+                full level list) is forwarded to ``BacktestRunner`` as
+                ``restored_grid``, which routes through
+                ``GridEngine.__init__(restored_grid=...)``.
+            order_seeds: Optional list of pre-existing live orders; passed
+                to ``BacktestRunner`` as ``seeded_active_orders``, which
+                pre-loads the ``BacktestOrderManager`` so they participate
+                in fill checks on the first tick.
+        """
         instrument_info = self._instrument_provider.get(strategy_config.symbol)
         logger.info(
             f"Instrument {strategy_config.symbol}: "
@@ -308,6 +393,14 @@ class ReplayEngine:
             commission_rate=strategy_config.commission_rate,
         )
 
+        # Seed trackers BEFORE handing them to BacktestRunner so the
+        # runner's _copy_seeded_state_to_positions sees the seeded values
+        # when constructing the gridcore.Position pair (risk path).
+        if long_seed is not None:
+            long_tracker.seed_state(long_seed)
+        if short_seed is not None:
+            short_tracker.seed_state(short_seed)
+
         return BacktestRunner(
             strategy_config=strategy_config,
             executor=executor,
@@ -315,7 +408,151 @@ class ReplayEngine:
             long_tracker=long_tracker,
             short_tracker=short_tracker,
             instrument_info=instrument_info,
+            restored_grid=grid_seed.grid if grid_seed is not None else None,
+            seeded_active_orders=order_seeds,
         )
+
+    def _load_seed(
+        self,
+        config: ReplayConfig,
+        run_id: str,
+    ) -> tuple[
+        Optional[Decimal],
+        Optional[PositionStateSeed],
+        Optional[PositionStateSeed],
+        Optional[GridStateSeed],
+        Optional[list[ActiveOrderSeed]],
+    ]:
+        """Load all four seed dimensions for a replay run.
+
+        Returns ``(None, None, None, None, None)`` when ``seed.enabled``
+        is False — caller falls back to blank-start construction.
+
+        When enabled:
+
+        1. Runs the Phase 4 pre-check inline: both ``wallet_snapshots``
+           and ``position_snapshots`` must have at least one row for the
+           ``run_id`` AND the latest of those two ``MIN(exchange_ts)``
+           values must be ``<= seed.at_ts - 5s``. ``orders`` is excluded
+           from the pre-check because a clean grid legitimately has no
+           open orders at recorder start.
+        2. Loads grid state from the shared ``GridStateStore`` JSON file
+           (returns ``None`` on no-entry / legacy / step-or-count
+           mismatch — replay then falls back to fresh-build).
+        3. Loads position pair, wallet balance, and active orders inside
+           a single DB session.
+
+        Args:
+            config: Full replay config (read for ``seed`` and ``symbol``).
+            run_id: Resolved recorder run identifier.
+        """
+        seed: SeedConfig = config.seed
+        if not seed.enabled:
+            return (None, None, None, None, None)
+
+        # Defensive: validators run at config load, but a programmatic
+        # constructor that bypasses model validation could leave these
+        # None. Guard so the loaders below don't get None where they
+        # expect strings/datetimes.
+        if seed.at_ts is None or seed.account_id is None or seed.strat_id is None:
+            raise ValueError(
+                "seed.enabled=True but at_ts/account_id/strat_id are unset"
+            )
+
+        # Grid state lives outside the DB; load before opening a session.
+        grid_seed = load_grid_state(
+            GridStateStore(file_path=seed.grid_state_path),
+            seed.strat_id,
+            expected_step=config.strategy.grid_step,
+            expected_count=config.strategy.grid_count,
+        )
+
+        with self._db.get_session() as db_session:
+            self._seed_pre_check(db_session, run_id, seed.at_ts)
+
+            long_seed, short_seed = load_position_snapshots(
+                db_session,
+                run_id,
+                seed.account_id,
+                config.symbol,
+                seed.at_ts,
+            )
+            wallet_seed = load_wallet_snapshot(
+                db_session,
+                run_id,
+                seed.account_id,
+                seed.at_ts,
+                coin=seed.wallet_coin,
+            )
+            order_seeds = load_active_orders(
+                db_session,
+                run_id,
+                seed.account_id,
+                config.symbol,
+                seed.at_ts,
+            )
+
+        return wallet_seed, long_seed, short_seed, grid_seed, order_seeds
+
+    @staticmethod
+    def _seed_pre_check(
+        db_session,
+        run_id: str,
+        at_ts: datetime,
+    ) -> None:
+        """Phase 4 pre-check (lives in engine per Phase 3 plan).
+
+        Confirms the recorder's initial REST snapshot landed for both
+        wallet and position dimensions before ``at_ts``. ``orders`` is
+        intentionally excluded — a clean account legitimately has zero
+        open orders at recorder start, so a strict ``MIN`` requirement
+        would falsely reject a valid happy path.
+
+        Raises ``ValueError`` (not ``SeedError``) so the failure surfaces
+        as a config / setup error to the operator, distinct from data-
+        quality errors raised by the loaders.
+        """
+        wallet_min = (
+            db_session.query(func.min(WalletSnapshot.exchange_ts))
+            .filter(WalletSnapshot.run_id == run_id)
+            .scalar()
+        )
+        position_min = (
+            db_session.query(func.min(PositionSnapshot.exchange_ts))
+            .filter(PositionSnapshot.run_id == run_id)
+            .scalar()
+        )
+
+        missing = []
+        if wallet_min is None:
+            missing.append("wallet_snapshots")
+        if position_min is None:
+            missing.append("position_snapshots")
+        if missing:
+            raise ValueError(
+                f"Seed pre-check failed for run_id={run_id}: no rows in "
+                f"{', '.join(missing)}. Recorder must write an initial REST "
+                "snapshot on private-stream connect; this run cannot be seeded."
+            )
+
+        # Compare ts values without tzinfo — SQLite may strip timezone on read,
+        # so wallet_min / position_min may be naive while at_ts may be aware
+        # (or vice versa). Strip uniformly before comparing.
+        def _strip_tz(dt: datetime) -> datetime:
+            return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+
+        latest_min = max(wallet_min, position_min)
+        required_at_ts = _strip_tz(latest_min) + _SEED_PRE_CHECK_MARGIN
+
+        if _strip_tz(at_ts) < required_at_ts:
+            raise ValueError(
+                f"Seed pre-check failed for run_id={run_id}: seed.at_ts "
+                f"({at_ts}) must be at least {_SEED_PRE_CHECK_MARGIN.total_seconds():.0f}s "
+                f"after the latest initial-snapshot row "
+                f"(wallet_min={wallet_min}, position_min={position_min}, "
+                f"latest_min={latest_min}). Initial REST snapshot has not "
+                "landed yet — seeding would silently fall back to defaults."
+            )
 
     def _create_qty_calculator(self, config, instrument_info):
         """Create qty calculator from amount pattern.

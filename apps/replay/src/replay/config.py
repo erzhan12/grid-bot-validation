@@ -87,6 +87,73 @@ class ReplayStrategyConfig(BaseModel):
         return data
 
 
+class SeedConfig(BaseModel):
+    """Seed-aware replay configuration (feature 0029).
+
+    When ``enabled=True`` the replay engine reconstructs live's state at
+    ``at_ts`` from the recorder DB (positions, wallet, active orders) and
+    the shared ``GridStateStore`` JSON file (grid level list). This closes
+    the state-gap that otherwise makes replay diverge from live on the
+    very first tick even when the strategy is identical.
+
+    All four DB-backed loaders are scoped by ``run_id`` (resolved by the
+    engine from ``ReplayConfig.run_id`` / auto-discovery) and
+    ``account_id``; the grid loader is keyed by ``strat_id``.
+
+    Validation: when ``enabled=True``, ``at_ts``, ``account_id``, and
+    ``strat_id`` are all required. ``grid_state_path`` and ``wallet_coin``
+    have safe defaults so a minimal seed YAML stays terse.
+
+    Default ``enabled=False`` preserves the existing blank-start replay
+    flow for callers that don't have recorded private-stream data.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable seed-from-recorder mode (feature 0029)",
+    )
+    at_ts: Optional[datetime] = Field(
+        default=None,
+        description="Moment to seed from (typically replay window start). Required when enabled.",
+    )
+    account_id: Optional[str] = Field(
+        default=None,
+        description="Account ID for run-scoped DB queries. Required when enabled.",
+    )
+    strat_id: Optional[str] = Field(
+        default=None,
+        description="Strategy identifier used as GridStateStore key. Required when enabled.",
+    )
+    grid_state_path: str = Field(
+        default="db/grid_anchor.json",
+        description="Path to grid-state JSON file shared with live (legacy filename retained from feature 0021).",
+    )
+    wallet_coin: str = Field(
+        default="USDT",
+        description="Wallet coin to seed initial balance from.",
+    )
+
+    @model_validator(mode="after")
+    def require_seed_fields_when_enabled(self):
+        """Reject incomplete seed configs at load time.
+
+        Pydantic ``Optional`` fields default to ``None`` to keep the
+        ``enabled=False`` happy path terse, but with ``enabled=True`` the
+        loader queries depend on all three. Failing here surfaces the
+        misconfig before the engine starts a partial seed.
+        """
+        if self.enabled:
+            missing = [
+                name for name in ("at_ts", "account_id", "strat_id")
+                if getattr(self, name) is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"seed.enabled=True requires fields: {', '.join(missing)}"
+                )
+        return self
+
+
 class ReplayConfig(BaseModel):
     """Root configuration for replay engine."""
 
@@ -113,6 +180,11 @@ class ReplayConfig(BaseModel):
 
     strategy: ReplayStrategyConfig = Field(
         ..., description="Grid strategy configuration"
+    )
+
+    seed: SeedConfig = Field(
+        default_factory=SeedConfig,
+        description="Seed-from-recorder configuration (feature 0029); off by default.",
     )
 
     # Backtest parameters
