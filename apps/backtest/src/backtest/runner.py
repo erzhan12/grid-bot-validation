@@ -70,6 +70,8 @@ class BacktestRunner:
         short_tracker: Optional[BacktestPositionTracker] = None,
         anchor_price: Optional[float] = None,
         instrument_info: Optional[InstrumentInfo] = None,
+        restored_grid: Optional[list[dict]] = None,
+        seeded_active_orders: Optional[list] = None,
     ):
         """Initialize backtest runner.
 
@@ -80,15 +82,29 @@ class BacktestRunner:
             long_tracker: Position tracker for long direction.
             short_tracker: Position tracker for short direction.
             anchor_price: Optional anchor price for grid initialization.
+                Ignored when ``restored_grid`` is provided (matches live).
             instrument_info: Optional instrument info for qty re-rounding
                 after risk multiplier application.
+            restored_grid: Optional serialized grid (list of {side, price})
+                passed through to ``GridEngine.__init__(restored_grid=...)``.
+                Used by replay (feature 0029) to seed the grid from the
+                shared ``GridStateStore`` JSON file. When provided,
+                ``anchor_price`` is ignored — mirrors live runner's
+                ``_load_grid_state()`` → ``GridEngine`` flow.
+            seeded_active_orders: Optional list of ``ActiveOrderSeed``
+                objects (replay feature 0029). When non-empty, the order
+                manager is pre-loaded with these as active orders via
+                ``BacktestOrderManager.seed_active_orders``. The orders
+                participate in fill checks on the very first tick.
         """
         self._config = strategy_config
         self._executor = executor
         self._session = session
         self._instrument_info = instrument_info
 
-        # Create GridEngine
+        # Create GridEngine. When restored_grid is provided, anchor_price is
+        # ignored (matches live: a restored grid has its own structure and
+        # WAIT center; anchor is only used as the fresh-build origin).
         grid_config = GridConfig(
             grid_count=strategy_config.grid_count,
             grid_step=strategy_config.grid_step,
@@ -98,7 +114,8 @@ class BacktestRunner:
             tick_size=strategy_config.tick_size,
             config=grid_config,
             strat_id=strategy_config.strat_id,
-            anchor_price=anchor_price,
+            anchor_price=anchor_price if restored_grid is None else None,
+            restored_grid=restored_grid,
         )
 
         # Position trackers (create if not provided)
@@ -128,6 +145,15 @@ class BacktestRunner:
             )
             self._long_position, self._short_position = Position.create_linked_pair(risk_config)
 
+            # 0029 seeding: when trackers were pre-seeded (via seed_state)
+            # before the runner was constructed, copy size + liquidation_price
+            # into the gridcore.Position instances as well. Without this, the
+            # first tick's early_imbalance gate (D-3 from feature 0028) and
+            # _apply_*_position_rules margin/liq branches see Position.size=0
+            # and liquidation_price=0 — i.e., the seeded snapshot is invisible
+            # until the first fill triggers _update_risk_multipliers.
+            self._copy_seeded_state_to_positions()
+
             # Compose risk multiplier with existing qty_calculator so that
             # base qty (from amount pattern + rounding) is computed first,
             # then scaled by the risk multiplier.
@@ -137,11 +163,45 @@ class BacktestRunner:
             self._long_position = None
             self._short_position = None
 
+        # 0029 seeding: register active orders pre-existing on the live exchange
+        # at seed.at_ts. Done after Grid setup so the order manager is fully
+        # initialised; subsequent process_tick calls run fill_simulator over
+        # these orders alongside any newly-placed ones.
+        if seeded_active_orders:
+            self._executor.order_manager.seed_active_orders(seeded_active_orders)
+
         # Last price seen (needed for multiplier recalculation)
         self._last_price: Optional[Decimal] = None
 
         # Track whether grid has been built
         self._grid_built = False
+
+    def _copy_seeded_state_to_positions(self) -> None:
+        """Mirror seeded tracker state into gridcore.Position instances.
+
+        Called only when ``enable_risk_multipliers=True``. Detects a seeded
+        tracker by a non-zero ``state.size`` OR non-zero
+        ``state.liquidation_price`` (a fresh tracker has both at zero).
+        Without this copy, the very first tick's early_imbalance gate
+        (feature 0028 D-3) and ``_apply_*_position_rules`` margin/liq
+        branches read ``Position.size=0`` / ``liquidation_price=0`` and
+        the seeded snapshot has no effect until the first fill triggers
+        ``_update_risk_multipliers``.
+
+        Uses the same liq_price the tracker holds, so the gridcore side
+        sees Bybit's snapshot value until the next risk update overwrites
+        with ``_estimate_liquidation_price`` (see feature 0029 plan,
+        "Edge cases — liquidation_price divergence after first risk update").
+        """
+        long_state = self._long_tracker.state
+        if long_state.size != 0 or long_state.liquidation_price != 0:
+            self._long_position.size = long_state.size
+            self._long_position.liquidation_price = long_state.liquidation_price
+
+        short_state = self._short_tracker.state
+        if short_state.size != 0 or short_state.liquidation_price != 0:
+            self._short_position.size = short_state.size
+            self._short_position.liquidation_price = short_state.liquidation_price
 
     @property
     def strat_id(self) -> str:

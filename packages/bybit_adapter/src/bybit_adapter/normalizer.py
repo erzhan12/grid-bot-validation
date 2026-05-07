@@ -326,6 +326,8 @@ class BybitNormalizer:
                 price=Decimal(order_data.get("price", "0")),
                 qty=Decimal(order_data.get("qty", "0")),
                 leaves_qty=Decimal(order_data.get("leavesQty", "0")),
+                # 0029: required for active-order seed direction derivation.
+                reduce_only=bool(order_data.get("reduceOnly", False)),
             )
             events.append(event)
 

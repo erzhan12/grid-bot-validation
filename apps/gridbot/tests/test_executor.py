@@ -108,6 +108,7 @@ class TestExecutorPlaceOrder:
             price="50000.0",
             reduce_only=False,
             position_idx=1,  # long direction
+            order_link_id=place_intent.client_order_id,
         )
 
     def test_place_order_short_direction(self, executor, mock_rest_client):
@@ -135,7 +136,39 @@ class TestExecutorPlaceOrder:
             price="50000.0",
             reduce_only=False,
             position_idx=2,  # short direction
+            order_link_id=intent.client_order_id,
         )
+
+    def test_execute_place_passes_orderLinkId_from_client_order_id(
+        self, executor, mock_rest_client
+    ):
+        """Test execute_place passes intent.client_order_id as order_link_id kwarg.
+
+        This is critical for Feature 0029 (seed-aware replay): the live executor
+        must propagate the deterministic SHA256-based client_order_id to Bybit
+        so private_executions rows have a non-NULL order_link_id that matches
+        the replay's deterministic client_order_id, enabling comparator parity.
+        """
+        # Build an intent and override its (frozen) client_order_id to "abc123"
+        # so we can assert exact propagation regardless of identity hash logic.
+        base_intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.001"),
+            grid_level=10,
+            direction="long",
+            reduce_only=False,
+        )
+        from dataclasses import replace
+        intent = replace(base_intent, client_order_id="abc123")
+
+        result = executor.execute_place(intent)
+
+        assert result.success is True
+        # Verify the kwarg was forwarded verbatim.
+        _, kwargs = mock_rest_client.place_order.call_args
+        assert kwargs.get("order_link_id") == "abc123"
 
     def test_place_order_failure(self, executor, mock_rest_client, place_intent):
         """Test order placement failure."""

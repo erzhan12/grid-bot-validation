@@ -42,6 +42,12 @@ class PositionState:
     maintenance_margin: Decimal = field(default_factory=lambda: Decimal("0"))
     mmr_rate: Decimal = field(default_factory=lambda: Decimal("0"))
 
+    # 0029: seeded directly from PositionSnapshot.liq_price (Bybit's value)
+    # at replay start. Lives until the first _update_risk_multipliers call,
+    # at which point _estimate_liquidation_price overwrites it. Default 0
+    # (the same sentinel `Position.liquidation_price` uses).
+    liquidation_price: Decimal = field(default_factory=lambda: Decimal("0"))
+
 
 class BacktestPositionTracker:
     """Track position and calculate PnL for backtest.
@@ -88,6 +94,35 @@ class BacktestPositionTracker:
         self.tiers = tiers
         self.symbol = symbol
         self.state = PositionState()
+
+    def seed_state(self, seed) -> None:
+        """Direct state write from a PositionStateSeed. Bypasses process_fill.
+
+        Used by replay engine (feature 0029) to restore live position state
+        at ``seed.at_ts`` without replaying history. Sets ``size``,
+        ``avg_entry_price``, and ``liquidation_price`` from the seed and
+        zeroes ``realized_pnl``, ``commission_paid``, ``funding_paid`` so
+        the replay accounting window starts fresh from ``at_ts`` (any
+        pre-seed PnL belongs to the live session).
+
+        Args:
+            seed: A ``PositionStateSeed`` from
+                ``apps/replay/src/replay/snapshot_loader.py``. Accepted as a
+                duck-typed object with ``size``, ``entry_price``, and
+                ``liquidation_price`` attributes (all ``Decimal``).
+
+        Note: The seeded ``liquidation_price`` is the snapshot value from
+        Bybit (``PositionSnapshot.liq_price``). It survives until the next
+        ``BacktestRunner._update_risk_multipliers`` call, at which point
+        the backtest's ``_estimate_liquidation_price`` overwrites it. See
+        feature 0029 plan, "Edge cases — liquidation_price divergence".
+        """
+        self.state.size = seed.size
+        self.state.avg_entry_price = seed.entry_price
+        self.state.liquidation_price = seed.liquidation_price
+        self.state.realized_pnl = Decimal("0")
+        self.state.commission_paid = Decimal("0")
+        self.state.funding_paid = Decimal("0")
 
     def process_fill(
         self,

@@ -104,20 +104,28 @@ class LiveTradeLoader:
         if symbol:
             executions = [e for e in executions if e.symbol == symbol]
 
-        # Group by (order_link_id, order_id) to separate partial fills from
-        # lifecycle reuse. Same order_link_id + same order_id = partial fills
-        # (aggregate). Same order_link_id + different order_id = ID reuse
+        # Group by (client_id, order_id) to separate partial fills from
+        # lifecycle reuse. Same client_id + same order_id = partial fills
+        # (aggregate). Same client_id + different order_id = ID reuse
         # (separate trades).
+        #
+        # 0029: client_id = order_link_id or order_id. Live didn't always send
+        # orderLinkId before cross-cutting #1; rows with NULL order_link_id are
+        # joined via the Bybit-assigned order_id instead. The previous
+        # skip-on-NULL behaviour silently dropped those executions.
         grouped: dict[tuple[str, str], list[PrivateExecution]] = defaultdict(list)
-        skipped = 0
+        fallback_hits = 0
         for ex in executions:
+            client_id = ex.order_link_id or ex.order_id
             if not ex.order_link_id:
-                skipped += 1
-                continue
-            grouped[(ex.order_link_id, ex.order_id)].append(ex)
+                fallback_hits += 1
+            grouped[(client_id, ex.order_id)].append(ex)
 
-        if skipped:
-            logger.info("Skipped %d executions without order_link_id", skipped)
+        if fallback_hits:
+            logger.info(
+                "Used order_id fallback for %d executions without order_link_id",
+                fallback_hits,
+            )
 
         trades = []
         for (client_id, _order_id), fills in grouped.items():
@@ -129,7 +137,7 @@ class LiveTradeLoader:
         # Assign occurrence index per client_order_id (handles ID reuse)
         _assign_occurrences(trades)
 
-        logger.info("Loaded %d live trades (%d raw executions)", len(trades), len(executions) - skipped)
+        logger.info("Loaded %d live trades (%d raw executions)", len(trades), len(executions))
         return trades
 
     def _aggregate_fills(

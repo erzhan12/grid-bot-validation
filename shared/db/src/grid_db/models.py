@@ -334,6 +334,9 @@ class Order(Base):
     price: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
     qty: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
     leaves_qty: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
+    # 0029: needed for active-order seed direction derivation. Nullable for
+    # back-compat with pre-0029 rows; loader treats NULL as SeedSchemaError.
+    reduce_only: Mapped[Optional[bool]] = mapped_column(nullable=True)
     raw_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
 
     # Relationships
@@ -342,6 +345,9 @@ class Order(Base):
     __table_args__ = (
         Index("ix_orders_account_exchange_ts", "account_id", "exchange_ts"),
         Index("ix_orders_run_id", "run_id"),
+        # 0029: supports OrderRepository.get_active_at(run_id, account_id, symbol, at_ts).
+        Index("ix_orders_run_account_symbol_ts",
+              "run_id", "account_id", "symbol", "exchange_ts"),
         UniqueConstraint("account_id", "order_id", "exchange_ts",
                         name="uq_orders_account_order_ts"),
     )
@@ -361,6 +367,14 @@ class PositionSnapshot(Base):
         primary_key=True,
         autoincrement=True,
     )
+    # 0029: scopes seed queries to one recorder run, prevents cross-run
+    # leak of stale snapshots when accounts are reused. Nullable for
+    # back-compat with pre-0029 rows.
+    run_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("runs.run_id", ondelete="CASCADE"),
+        nullable=True,
+    )
     account_id: Mapped[str] = mapped_column(String(36), nullable=False)
     symbol: Mapped[str] = mapped_column(String(20), nullable=False)
     exchange_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -374,6 +388,12 @@ class PositionSnapshot(Base):
 
     __table_args__ = (
         Index("ix_position_snapshots_account_ts", "account_id", "exchange_ts"),
+        # 0029: supports PositionSnapshotRepository.get_latest_before
+        # (run_id, account_id, symbol, side, at_ts).
+        Index(
+            "ix_position_snapshots_run_account_symbol_side_ts",
+            "run_id", "account_id", "symbol", "side", "exchange_ts",
+        ),
     )
 
 
@@ -391,6 +411,12 @@ class WalletSnapshot(Base):
         primary_key=True,
         autoincrement=True,
     )
+    # 0029: same as PositionSnapshot.run_id — run-scoping for seed.
+    run_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("runs.run_id", ondelete="CASCADE"),
+        nullable=True,
+    )
     account_id: Mapped[str] = mapped_column(String(36), nullable=False)
     exchange_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     local_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -401,4 +427,10 @@ class WalletSnapshot(Base):
 
     __table_args__ = (
         Index("ix_wallet_snapshots_account_ts", "account_id", "exchange_ts"),
+        # 0029: supports WalletSnapshotRepository.get_latest_before
+        # (run_id, account_id, coin, at_ts).
+        Index(
+            "ix_wallet_snapshots_run_account_coin_ts",
+            "run_id", "account_id", "coin", "exchange_ts",
+        ),
     )

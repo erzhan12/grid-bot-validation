@@ -10,6 +10,7 @@ import signal
 import threading
 from concurrent.futures import Future
 from datetime import datetime, UTC
+from decimal import Decimal
 from typing import Optional
 from uuid import UUID, uuid4
 
@@ -20,6 +21,12 @@ from grid_db import (
     BybitAccount,
     Strategy,
     Run,
+    Order,
+    OrderRepository,
+    PositionSnapshot,
+    PositionSnapshotRepository,
+    WalletSnapshot,
+    WalletSnapshotRepository,
 )
 from gridcore.events import PublicTradeEvent, ExecutionEvent, OrderUpdateEvent, TickerEvent
 
@@ -130,6 +137,18 @@ class Recorder:
             )
 
             await self._init_writers()
+
+            # 0029 Cross-cutting #4: write the t=0 row of the recording session
+            # via REST BEFORE the private collector subscribes. Bybit's private
+            # streams are event-driven, so a quiet account would otherwise leave
+            # the seed-aware replay loader returning NULL for wallet/positions/
+            # orders even though state existed live. Failures here are logged
+            # but DO NOT abort recorder start (the WS stream still gets captured;
+            # Phase 4's pre-check will refuse to seed from a run missing the
+            # initial snapshot).
+            if self._config.account:
+                await self._write_initial_rest_snapshot()
+
             await self._init_collectors()
 
             # Start health logging
@@ -167,10 +186,16 @@ class Recorder:
             await self._trade_writer.start_auto_flush()
 
         if self._config.account:
+            # 0029: stamp run_id on every wallet/position row so seed-aware
+            # replay can scope its lookups to one recorder run. Order rows
+            # already carry run_id via OrderUpdateEvent.run_id; passing the
+            # kwarg is a no-op for Order/Execution/Trade/Ticker writers and
+            # is only consumed by Wallet/Position writers.
+            run_id_str = str(self._run_id) if self._run_id else None
             self._execution_writer = ExecutionWriter(**writer_kwargs)
             self._order_writer = OrderWriter(**writer_kwargs)
-            self._position_writer = PositionWriter(**writer_kwargs)
-            self._wallet_writer = WalletWriter(**writer_kwargs)
+            self._position_writer = PositionWriter(**writer_kwargs, run_id=run_id_str)
+            self._wallet_writer = WalletWriter(**writer_kwargs, run_id=run_id_str)
             await self._execution_writer.start_auto_flush()
             await self._order_writer.start_auto_flush()
             await self._position_writer.start_auto_flush()
@@ -213,6 +238,336 @@ class Recorder:
                 on_gap_detected=self._handle_private_gap,
             )
             await self._private_collector.start()
+
+    async def _write_initial_rest_snapshot(self) -> None:
+        """Write a one-shot REST snapshot as the t=0 row of the recording.
+
+        0029 Cross-cutting #4. Bybit private streams are event-driven; a quiet
+        account between recorder start and the first wallet/position/order
+        change leaves the seed-aware replay loader returning NULL. This method
+        fetches wallet, positions, and open orders via REST and persists them
+        directly through the snapshot repositories so the loader's
+        ``latest <= at_ts`` query always finds at least one row per dimension.
+
+        Contract (per docs/features/0029_PLAN.md "Initial-snapshot row contract"):
+        - WalletSnapshot: one row per coin returned by ``get_wallet_balance``
+          (downstream filters to USDT; writing all coins is fine).
+        - PositionSnapshot: ALWAYS two rows per configured symbol — one
+          ``side='Buy'`` and one ``side='Sell'`` — even when the corresponding
+          side is absent in the REST response (size=0, entry_price=0,
+          liq_price=NULL). The "always two rows" invariant lets the loader
+          treat exactly one side missing as ``SeedDataQualityError`` rather
+          than a benign "no activity" case.
+        - Order: one row per open order with ``status``, ``leaves_qty``,
+          ``reduce_only``, ``order_link_id`` from the response. ``exchange_ts``
+          and ``local_ts`` are the REST-call wall-clock (NOT the order's
+          original ``createdTime``) so this snapshot row sorts BEFORE any
+          subsequent WS-stream rows for the same ``order_id`` in this run.
+
+        All rows are stamped with ``self._run_id`` so they share scope with
+        subsequent stream rows.
+
+        Errors per call are logged and swallowed: the recorder must still
+        capture the WS stream even when REST is degraded.
+        """
+        if not self._config.account or not self._run_id:
+            return
+
+        # Authenticated REST client for private endpoints. The recorder's
+        # existing self._reconciler client uses empty credentials (public
+        # endpoints only), so a fresh client is required here. It is
+        # one-shot — no need to retain.
+        try:
+            auth_client = BybitRestClient(
+                api_key=self._config.account.api_key.get_secret_value(),
+                api_secret=self._config.account.api_secret.get_secret_value(),
+                testnet=self._config.testnet,
+            )
+        except Exception as e:
+            logger.error(f"Failed to construct authenticated REST client for initial snapshot: {e}")
+            return
+
+        run_id_str = str(self._run_id)
+        account_id_str = str(_RECORDER_ACCOUNT_ID)
+        snapshot_ts = datetime.now(UTC)
+
+        wallet_count = await self._snapshot_wallet(
+            auth_client, run_id_str, account_id_str, snapshot_ts
+        )
+        position_count = await self._snapshot_positions(
+            auth_client, run_id_str, account_id_str, snapshot_ts
+        )
+        order_count = await self._snapshot_open_orders(
+            auth_client, run_id_str, account_id_str, snapshot_ts
+        )
+
+        logger.info(
+            f"Initial REST snapshot: wallet={wallet_count} coins, "
+            f"positions={position_count} rows, open_orders={order_count}"
+        )
+
+        # 0029 cross-cutting #4: empty wallet OR position dimension means
+        # the seed loader will not find a t=0 row and Phase 4's pre-check
+        # will refuse to seed from this run. Surface this loudly at recorder
+        # start so an operator catches credential/permissions problems early
+        # instead of finding out hours later when replay refuses. open_orders
+        # legitimately can be zero (clean account) — not warned on.
+        if wallet_count == 0 or position_count == 0:
+            logger.warning(
+                "Initial REST snapshot incomplete: "
+                f"wallet_rows={wallet_count}, position_rows={position_count} "
+                "(zero on either dimension means seed-aware replay from this "
+                "run_id will fail Phase 4 pre-check; check API credentials / "
+                "permissions / category=linear settleCoin=USDT scope)"
+            )
+
+    async def _snapshot_wallet(
+        self,
+        client: BybitRestClient,
+        run_id: str,
+        account_id: str,
+        snapshot_ts: datetime,
+    ) -> int:
+        """REST-fetch wallet balance and write one row per coin. Returns row count."""
+        try:
+            result = await asyncio.to_thread(client.get_wallet_balance, "UNIFIED")
+        except Exception as e:
+            logger.error(f"Initial snapshot: get_wallet_balance failed: {e}")
+            return 0
+
+        # Bybit V5 shape: result["list"][0]["coin"] = list of per-coin dicts.
+        accounts = result.get("list") or []
+        snapshots: list[WalletSnapshot] = []
+        for acct in accounts:
+            for coin_data in acct.get("coin") or []:
+                try:
+                    snapshots.append(
+                        WalletSnapshot(
+                            run_id=run_id,
+                            account_id=account_id,
+                            exchange_ts=snapshot_ts,
+                            local_ts=snapshot_ts,
+                            coin=coin_data.get("coin", ""),
+                            wallet_balance=Decimal(
+                                str(coin_data.get("walletBalance") or "0")
+                            ),
+                            available_balance=Decimal(
+                                str(
+                                    coin_data.get("availableToWithdraw")
+                                    or coin_data.get("availableBalance")
+                                    or "0"
+                                )
+                            ),
+                            raw_json=coin_data,
+                        )
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Initial snapshot: skipped malformed wallet coin row: {e}"
+                    )
+                    continue
+
+        if not snapshots:
+            return 0
+
+        try:
+            await asyncio.to_thread(self._bulk_insert_wallet_snapshots, snapshots)
+        except Exception as e:
+            logger.error(f"Initial snapshot: wallet bulk_insert failed: {e}")
+            return 0
+        return len(snapshots)
+
+    def _bulk_insert_wallet_snapshots(self, snapshots: list[WalletSnapshot]) -> None:
+        with self._db.get_session() as session:
+            WalletSnapshotRepository(session).bulk_insert(snapshots)
+
+    async def _snapshot_positions(
+        self,
+        client: BybitRestClient,
+        run_id: str,
+        account_id: str,
+        snapshot_ts: datetime,
+    ) -> int:
+        """REST-fetch positions and write BOTH sides per configured symbol.
+
+        Contract: ALWAYS exactly two rows per symbol (Buy + Sell). When the
+        REST response omits a side, write a zero-size row for it.
+        """
+        snapshots: list[PositionSnapshot] = []
+        for symbol in self._config.symbols:
+            try:
+                positions = await asyncio.to_thread(client.get_positions, symbol)
+            except Exception as e:
+                logger.error(
+                    f"Initial snapshot: get_positions({symbol}) failed: {e}"
+                )
+                # Still write zero-rows for both sides so the loader's
+                # "exactly one side missing" check doesn't fire on a
+                # transient REST failure.
+                positions = []
+
+            # Index by side for O(1) lookup.
+            by_side: dict[str, dict] = {}
+            for pos in positions:
+                if pos.get("symbol") != symbol:
+                    continue
+                side = pos.get("side")
+                if side in ("Buy", "Sell"):
+                    by_side[side] = pos
+
+            for side in ("Buy", "Sell"):
+                pos = by_side.get(side)
+                if pos is not None:
+                    try:
+                        snapshots.append(
+                            PositionSnapshot(
+                                run_id=run_id,
+                                account_id=account_id,
+                                symbol=symbol,
+                                exchange_ts=snapshot_ts,
+                                local_ts=snapshot_ts,
+                                side=side,
+                                size=Decimal(str(pos.get("size") or "0")),
+                                entry_price=Decimal(
+                                    str(pos.get("entryPrice") or pos.get("avgPrice") or "0")
+                                ),
+                                liq_price=(
+                                    Decimal(str(pos.get("liqPrice")))
+                                    if pos.get("liqPrice") not in (None, "", "0")
+                                    else None
+                                ),
+                                unrealised_pnl=(
+                                    Decimal(str(pos.get("unrealisedPnl")))
+                                    if pos.get("unrealisedPnl") not in (None, "")
+                                    else None
+                                ),
+                                raw_json=pos,
+                            )
+                        )
+                        continue
+                    except Exception as e:
+                        logger.warning(
+                            f"Initial snapshot: malformed position row "
+                            f"({symbol} {side}); writing zero-row: {e}"
+                        )
+                # Absent (or malformed): write the contract zero-row.
+                snapshots.append(
+                    PositionSnapshot(
+                        run_id=run_id,
+                        account_id=account_id,
+                        symbol=symbol,
+                        exchange_ts=snapshot_ts,
+                        local_ts=snapshot_ts,
+                        side=side,
+                        size=Decimal("0"),
+                        entry_price=Decimal("0"),
+                        liq_price=None,
+                        unrealised_pnl=None,
+                        raw_json=None,
+                    )
+                )
+
+        if not snapshots:
+            return 0
+
+        try:
+            await asyncio.to_thread(self._bulk_insert_position_snapshots, snapshots)
+        except Exception as e:
+            logger.error(f"Initial snapshot: position bulk_insert failed: {e}")
+            return 0
+        return len(snapshots)
+
+    def _bulk_insert_position_snapshots(self, snapshots: list[PositionSnapshot]) -> None:
+        with self._db.get_session() as session:
+            PositionSnapshotRepository(session).bulk_insert(snapshots)
+
+    async def _snapshot_open_orders(
+        self,
+        client: BybitRestClient,
+        run_id: str,
+        account_id: str,
+        snapshot_ts: datetime,
+    ) -> int:
+        """REST-fetch open orders for configured symbols and write one row each.
+
+        ``exchange_ts``/``local_ts`` are the snapshot timestamp (REST-call
+        wall-clock), NOT the order's ``createdTime``. This guarantees the
+        snapshot row sorts BEFORE any subsequent WS-stream rows for the same
+        ``order_id`` in this run, so the loader's MAX(exchange_ts) GROUP BY
+        order_id picks up a later WS state when one exists.
+        """
+        models: list[Order] = []
+        for symbol in self._config.symbols:
+            try:
+                orders = await asyncio.to_thread(
+                    client.get_open_orders, symbol, "Limit"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Initial snapshot: get_open_orders({symbol}) failed: {e}"
+                )
+                continue
+
+            for order in orders:
+                try:
+                    qty = Decimal(str(order.get("qty") or "0"))
+                    cum_exec_qty = Decimal(str(order.get("cumExecQty") or "0"))
+                    leaves_from_resp = order.get("leavesQty")
+                    leaves_qty = (
+                        Decimal(str(leaves_from_resp))
+                        if leaves_from_resp not in (None, "")
+                        else qty - cum_exec_qty
+                    )
+                    status = "PartiallyFilled" if cum_exec_qty > 0 else "New"
+                    # If the response carries an explicit orderStatus, prefer it.
+                    if order.get("orderStatus"):
+                        status = order["orderStatus"]
+
+                    order_link_id = order.get("orderLinkId") or None
+                    reduce_only_raw = order.get("reduceOnly")
+                    reduce_only = (
+                        bool(reduce_only_raw)
+                        if reduce_only_raw is not None
+                        else False
+                    )
+
+                    models.append(
+                        Order(
+                            run_id=run_id,
+                            account_id=account_id,
+                            order_id=order.get("orderId", ""),
+                            order_link_id=order_link_id,
+                            symbol=order.get("symbol", symbol),
+                            exchange_ts=snapshot_ts,
+                            local_ts=snapshot_ts,
+                            status=status,
+                            side=order.get("side", ""),
+                            price=Decimal(str(order.get("price") or "0")),
+                            qty=qty,
+                            leaves_qty=leaves_qty,
+                            reduce_only=reduce_only,
+                            raw_json=order,
+                        )
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Initial snapshot: skipped malformed open order: {e}"
+                    )
+                    continue
+
+        if not models:
+            return 0
+
+        try:
+            await asyncio.to_thread(self._bulk_insert_orders, models)
+        except Exception as e:
+            logger.error(f"Initial snapshot: order bulk_insert failed: {e}")
+            return 0
+        return len(models)
+
+    def _bulk_insert_orders(self, models: list[Order]) -> None:
+        with self._db.get_session() as session:
+            OrderRepository(session).bulk_insert(models)
 
     async def stop(self, *, error: bool = False) -> None:
         """Stop all components gracefully.

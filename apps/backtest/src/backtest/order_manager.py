@@ -3,6 +3,7 @@
 Manages limit orders in simulation, checks for fills, and generates execution events.
 """
 
+import logging
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -12,6 +13,9 @@ from typing import Optional
 from gridcore import ExecutionEvent, EventType
 
 from backtest.fill_simulator import TradeThroughFillSimulator
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -116,6 +120,66 @@ class BacktestOrderManager:
         self.active_orders[order_id] = order
         self._client_order_ids.add(client_order_id)
         return order
+
+    def seed_active_orders(self, orders) -> None:
+        """Register pre-existing live orders as active simulated orders.
+
+        Used by the replay engine (feature 0029) to seed the order book
+        with orders that were live on the exchange at ``seed.at_ts``.
+        Each seed becomes a ``SimulatedOrder`` with status ``"pending"``
+        (the active-state marker the simulator uses) and is inserted
+        into ``self.active_orders`` keyed by ``exchange_order_id``;
+        ``client_id`` is recorded in ``self._client_order_ids`` for
+        deduplication.
+
+        Subsequent ``check_fills`` calls iterate ``self.active_orders``
+        and run the fill simulator on every order;
+        ``TradeThroughFillSimulator._should_fill`` reads only ``side``
+        / ``price`` / ``current_price`` (with strict ``<`` for Buy and
+        strict ``>`` for Sell — see ``fill_simulator.py``), so seeded
+        orders are eligible for fills as soon as price crosses the
+        limit strictly.
+
+        ``grid_level`` is set to ``0`` for every seeded order: live
+        active orders carry no level metadata, and the simulator does
+        not consult ``grid_level`` for fill eligibility — the field
+        exists only for grid-internal accounting that does not apply
+        to externally-seeded orders.
+
+        Args:
+            orders: Iterable of ``ActiveOrderSeed`` from
+                ``apps/replay/src/replay/snapshot_loader.py``. Accepted
+                as duck-typed objects with attributes ``client_id``,
+                ``exchange_order_id``, ``symbol``, ``side``, ``direction``,
+                ``price``, ``remaining_qty``, ``reduce_only``,
+                ``exchange_ts``.
+        """
+        for seed in orders:
+            # 0029 PR #68 P1: defense-in-depth against a malformed seed
+            # batch with duplicate exchange_order_id (would otherwise
+            # silently overwrite the first entry).
+            if seed.exchange_order_id in self.active_orders:
+                logger.warning(
+                    "Duplicate exchange_order_id %r in seed batch; skipping "
+                    "second occurrence",
+                    seed.exchange_order_id,
+                )
+                continue
+            order = SimulatedOrder(
+                order_id=seed.exchange_order_id,
+                client_order_id=seed.client_id,
+                symbol=seed.symbol,
+                side=seed.side,
+                price=seed.price,
+                qty=seed.remaining_qty,
+                direction=seed.direction,
+                grid_level=0,
+                status="pending",
+                created_ts=seed.exchange_ts,
+                reduce_only=seed.reduce_only,
+            )
+            self.active_orders[seed.exchange_order_id] = order
+            self._client_order_ids.add(seed.client_id)
 
     def cancel_order(self, order_id: str, timestamp: datetime) -> bool:
         """Cancel order from simulated order book.

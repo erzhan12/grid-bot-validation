@@ -117,6 +117,9 @@ class OrderUpdateEvent(Event):
     price: Decimal = Decimal('0')
     qty: Decimal = Decimal('0')
     leaves_qty: Decimal = Decimal('0')  # Remaining unfilled quantity
+    # 0029: required for direction derivation in active-order seed path.
+    # Adapter populates from `reduceOnly` in the private-stream payload.
+    reduce_only: bool = False
 
     def __post_init__(self):
         if self.event_type != EventType.ORDER_UPDATE:

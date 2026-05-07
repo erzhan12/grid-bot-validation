@@ -134,16 +134,18 @@ class TestLiveTradeLoader:
         expected_ts = ts + timedelta(seconds=1)
         assert t.timestamp.replace(tzinfo=None) == expected_ts.replace(tzinfo=None)
 
-    def test_skips_null_order_link_id(self, db):
-        """Executions without order_link_id are skipped."""
+    def test_null_order_link_id_falls_back_to_order_id(self, db):
+        """Executions without order_link_id use order_id as the client_id (0029)."""
         run_id = self._seed_data(db)
         ts = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
 
+        # Execution with no order_link_id: should fall back to order_id="oid_e1"
         self._add_execution(
             db, run_id, "e1", None, "Buy",
             Decimal("100000"), Decimal("0.001"), Decimal("0.02"), Decimal("0"),
             ts,
         )
+        # Execution with order_link_id present
         self._add_execution(
             db, run_id, "e2", "client_1", "Buy",
             Decimal("100000"), Decimal("0.001"), Decimal("0.02"), Decimal("0"),
@@ -154,8 +156,78 @@ class TestLiveTradeLoader:
             loader = LiveTradeLoader(session)
             trades = loader.load(run_id, ts - timedelta(hours=1), ts + timedelta(hours=1))
 
+        # Both executions are now loaded; one via order_link_id, the other
+        # via order_id fallback.
+        assert len(trades) == 2
+        client_ids = {t.client_order_id for t in trades}
+        assert client_ids == {"client_1", "oid_e1"}
+
+    def test_loader_groups_by_order_link_id_when_present(self, db):
+        """When order_link_id is present, it is used as the client_order_id (0029)."""
+        run_id = self._seed_data(db)
+        ts = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+        self._add_execution(
+            db, run_id, "e1", "LX-1", "Buy",
+            Decimal("100000"), Decimal("0.001"), Decimal("0.02"), Decimal("0"),
+            ts, order_id="ORD-A",
+        )
+
+        with db.get_session() as session:
+            loader = LiveTradeLoader(session)
+            trades = loader.load(run_id, ts - timedelta(hours=1), ts + timedelta(hours=1))
+
         assert len(trades) == 1
-        assert trades[0].client_order_id == "client_1"
+        assert trades[0].client_order_id == "LX-1"
+
+    def test_loader_falls_back_to_order_id_when_link_id_null(self, db):
+        """When order_link_id is NULL, order_id is used as the client_order_id (0029)."""
+        run_id = self._seed_data(db)
+        ts = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+        self._add_execution(
+            db, run_id, "e1", None, "Buy",
+            Decimal("100000"), Decimal("0.001"), Decimal("0.02"), Decimal("0"),
+            ts, order_id="ORD-B",
+        )
+
+        with db.get_session() as session:
+            loader = LiveTradeLoader(session)
+            trades = loader.load(run_id, ts - timedelta(hours=1), ts + timedelta(hours=1))
+
+        assert len(trades) == 1
+        assert trades[0].client_order_id == "ORD-B"
+
+    def test_loader_separates_distinct_link_id_and_distinct_order_id(self, db):
+        """Two rows where fallback yields the same client_id but order_ids
+        differ remain distinct, because the group key is (client_id, order_id) (0029)."""
+        run_id = self._seed_data(db)
+        ts = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+        # Row 1: order_link_id='LX', order_id='A' → client_id='LX'
+        self._add_execution(
+            db, run_id, "e1", "LX", "Buy",
+            Decimal("100000"), Decimal("0.001"), Decimal("0.02"), Decimal("0"),
+            ts, order_id="A",
+        )
+        # Row 2: order_link_id=None, order_id='LX' → client_id='LX' via fallback
+        self._add_execution(
+            db, run_id, "e2", None, "Buy",
+            Decimal("100000"), Decimal("0.001"), Decimal("0.02"), Decimal("0"),
+            ts + timedelta(seconds=1), order_id="LX",
+        )
+
+        with db.get_session() as session:
+            loader = LiveTradeLoader(session)
+            trades = loader.load(run_id, ts - timedelta(hours=1), ts + timedelta(hours=1))
+
+        # Both produce client_id='LX' but distinct order_ids → 2 separate trades.
+        assert len(trades) == 2
+        # Both share the same client_order_id, but occurrence assignment
+        # separates them.
+        assert all(t.client_order_id == "LX" for t in trades)
+        occurrences = sorted(t.occurrence for t in trades)
+        assert occurrences == [0, 1]
 
     def test_symbol_filter(self, db):
         """Symbol filter only returns matching trades."""

@@ -123,6 +123,9 @@ class OrderWriter:
                     price=event.price,
                     qty=event.qty,
                     leaves_qty=event.leaves_qty,
+                    # 0029: persist reduce_only so seed-aware replay can derive
+                    # direction in hedge-mode (Buy+reduce_only=long-close, etc).
+                    reduce_only=event.reduce_only,
                     raw_json=None,
                 )
                 )

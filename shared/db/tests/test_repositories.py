@@ -1,6 +1,6 @@
 """Tests for repository pattern with multi-tenant filtering."""
 
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
 
 from grid_db.repositories import (
     BaseRepository,
@@ -1155,6 +1155,250 @@ class TestWalletSnapshotRepository:
             base_ts - timedelta(hours=1),
         )
         assert len(results) == 0
+
+
+class TestSeedAwareReplayRepositoryMethods:
+    """Feature 0029: get_latest_before / get_active_at on the three
+    private-stream repositories. Run-scoped queries that the seed loader
+    in apps/replay relies on."""
+
+    def test_position_get_latest_before_picks_older_when_ts_between(
+        self, session, sample_account, sample_run
+    ):
+        from grid_db import PositionSnapshotRepository, PositionSnapshot
+        from decimal import Decimal
+        from datetime import timedelta
+
+        repo = PositionSnapshotRepository(session)
+        base = datetime(2026, 5, 7, 10, 0, 0, tzinfo=UTC)
+        repo.bulk_insert([
+            PositionSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                symbol="BTCUSDT", exchange_ts=base, local_ts=base,
+                side="Buy", size=Decimal("1.0"), entry_price=Decimal("50000"),
+            ),
+            PositionSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                symbol="BTCUSDT",
+                exchange_ts=base + timedelta(seconds=10),
+                local_ts=base + timedelta(seconds=10),
+                side="Buy", size=Decimal("2.0"), entry_price=Decimal("50100"),
+            ),
+        ])
+
+        # at_ts strictly between → older row.
+        between = base + timedelta(seconds=5)
+        got = repo.get_latest_before(
+            sample_run.run_id, str(sample_account.account_id),
+            "BTCUSDT", "Buy", between,
+        )
+        assert got is not None
+        assert got.size == Decimal("1.0")
+
+        # at_ts at or after the newer row → newer row.
+        got = repo.get_latest_before(
+            sample_run.run_id, str(sample_account.account_id),
+            "BTCUSDT", "Buy", base + timedelta(seconds=20),
+        )
+        assert got is not None
+        assert got.size == Decimal("2.0")
+
+    def test_position_get_latest_before_excludes_other_runs(
+        self, session, sample_user, sample_account, sample_strategy, sample_run
+    ):
+        """Same account/symbol/side in a DIFFERENT run must not leak in."""
+        from grid_db import PositionSnapshotRepository, PositionSnapshot
+        from grid_db.models import Run
+        from decimal import Decimal
+
+        # Make a second run for the same account.
+        other_run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="live", status="completed",
+            start_ts=datetime(2026, 5, 6, tzinfo=UTC),
+        )
+        session.add(other_run)
+        session.flush()
+
+        repo = PositionSnapshotRepository(session)
+        ts = datetime(2026, 5, 7, 10, 0, 0, tzinfo=UTC)
+        repo.bulk_insert([
+            PositionSnapshot(
+                run_id=other_run.run_id,  # OTHER RUN
+                account_id=str(sample_account.account_id),
+                symbol="BTCUSDT", exchange_ts=ts, local_ts=ts,
+                side="Buy", size=Decimal("99"),
+                entry_price=Decimal("50000"),
+            ),
+        ])
+
+        # Queried with sample_run.run_id → no row.
+        got = repo.get_latest_before(
+            sample_run.run_id, str(sample_account.account_id),
+            "BTCUSDT", "Buy", ts + timedelta(seconds=10),
+        )
+        assert got is None
+
+    def test_wallet_get_latest_before_filters_by_coin_and_run(
+        self, session, sample_account, sample_run
+    ):
+        from grid_db import WalletSnapshotRepository, WalletSnapshot
+        from decimal import Decimal
+        from datetime import timedelta
+
+        repo = WalletSnapshotRepository(session)
+        base = datetime(2026, 5, 7, 10, 0, 0, tzinfo=UTC)
+        repo.bulk_insert([
+            WalletSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                exchange_ts=base, local_ts=base,
+                coin="USDT",
+                wallet_balance=Decimal("100"),
+                available_balance=Decimal("100"),
+            ),
+            WalletSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                exchange_ts=base, local_ts=base,
+                coin="BTC",  # different coin — must not be returned for USDT query
+                wallet_balance=Decimal("0.5"),
+                available_balance=Decimal("0.5"),
+            ),
+        ])
+
+        got = repo.get_latest_before(
+            sample_run.run_id, str(sample_account.account_id),
+            "USDT", base + timedelta(seconds=1),
+        )
+        assert got is not None
+        assert got.coin == "USDT"
+        assert got.wallet_balance == Decimal("100")
+
+    def test_order_get_active_at_returns_only_latest_active(
+        self, session, sample_account, sample_run
+    ):
+        """Per order_id, only the latest snapshot at_or_before at_ts; only
+        active states (New/PartiallyFilled) with leaves_qty > 0 are kept.
+        """
+        from grid_db import OrderRepository, Order
+        from decimal import Decimal
+        from datetime import timedelta
+
+        repo = OrderRepository(session)
+        base = datetime(2026, 5, 7, 10, 0, 0, tzinfo=UTC)
+        repo.bulk_insert([
+            # Order 1: New then Filled — should NOT be in active set.
+            Order(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                order_id="O1", symbol="BTCUSDT",
+                exchange_ts=base, local_ts=base,
+                status="New", side="Buy",
+                price=Decimal("50000"), qty=Decimal("0.001"),
+                leaves_qty=Decimal("0.001"), reduce_only=False,
+            ),
+            Order(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                order_id="O1", symbol="BTCUSDT",
+                exchange_ts=base + timedelta(seconds=5),
+                local_ts=base + timedelta(seconds=5),
+                status="Filled", side="Buy",
+                price=Decimal("50000"), qty=Decimal("0.001"),
+                leaves_qty=Decimal("0"), reduce_only=False,
+            ),
+            # Order 2: only New — IS in active set.
+            Order(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                order_id="O2", symbol="BTCUSDT",
+                exchange_ts=base + timedelta(seconds=2),
+                local_ts=base + timedelta(seconds=2),
+                status="New", side="Sell",
+                price=Decimal("51000"), qty=Decimal("0.002"),
+                leaves_qty=Decimal("0.002"), reduce_only=False,
+            ),
+        ])
+
+        active = repo.get_active_at(
+            sample_run.run_id, str(sample_account.account_id),
+            "BTCUSDT", base + timedelta(seconds=10),
+        )
+        assert len(active) == 1
+        assert active[0].order_id == "O2"
+
+    def test_order_get_active_at_excludes_prior_run(
+        self, session, sample_user, sample_account, sample_strategy, sample_run
+    ):
+        """Stale 'New' row from a previous run must not leak when recorder
+        was killed before the terminal update."""
+        from grid_db import OrderRepository, Order
+        from grid_db.models import Run
+        from decimal import Decimal
+        from datetime import timedelta
+
+        prior_run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="live", status="completed",
+            start_ts=datetime(2026, 5, 6, tzinfo=UTC),
+        )
+        session.add(prior_run)
+        session.flush()
+
+        repo = OrderRepository(session)
+        ts = datetime(2026, 5, 6, 12, 0, 0, tzinfo=UTC)
+        repo.bulk_insert([
+            Order(
+                run_id=prior_run.run_id,  # PRIOR RUN
+                account_id=str(sample_account.account_id),
+                order_id="O-leaked", symbol="BTCUSDT",
+                exchange_ts=ts, local_ts=ts,
+                status="New", side="Buy",
+                price=Decimal("50000"), qty=Decimal("0.001"),
+                leaves_qty=Decimal("0.001"), reduce_only=False,
+            ),
+        ])
+
+        # New run starts the next day; query at later timestamp.
+        active = repo.get_active_at(
+            sample_run.run_id, str(sample_account.account_id),
+            "BTCUSDT", datetime(2026, 5, 7, 13, 0, 0, tzinfo=UTC),
+        )
+        assert active == []
+
+    def test_order_get_active_at_persists_reduce_only(
+        self, session, sample_account, sample_run
+    ):
+        """The new column must round-trip through bulk_insert + query."""
+        from grid_db import OrderRepository, Order
+        from decimal import Decimal
+
+        repo = OrderRepository(session)
+        ts = datetime(2026, 5, 7, 10, 0, 0, tzinfo=UTC)
+        repo.bulk_insert([
+            Order(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                order_id="O-ro", symbol="BTCUSDT",
+                exchange_ts=ts, local_ts=ts,
+                status="New", side="Sell",
+                price=Decimal("51000"), qty=Decimal("0.001"),
+                leaves_qty=Decimal("0.001"), reduce_only=True,
+            ),
+        ])
+        active = repo.get_active_at(
+            sample_run.run_id, str(sample_account.account_id),
+            "BTCUSDT", ts + timedelta(seconds=10),
+        )
+        assert len(active) == 1
+        assert active[0].reduce_only is True
 
 
 class TestTickerSnapshotRepository:

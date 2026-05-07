@@ -2,6 +2,7 @@
 
 from typing import Generic, TypeVar, Optional, List
 
+from sqlalchemy import func, tuple_
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -794,6 +795,71 @@ class OrderRepository(BaseRepository[Order]):
         )
         return result[0] if result else None
 
+    def get_active_at(
+        self,
+        run_id: str,
+        account_id: str,
+        symbol: str,
+        at_ts: datetime,
+    ) -> List[Order]:
+        """Get the latest active-state snapshot per order for a moment in time.
+
+        Used by the seed-aware replay loader (feature 0029) to reconstruct
+        the set of open orders that existed live at ``at_ts``. The ``orders``
+        table stores a stream of state-change snapshots, so "active orders
+        at at_ts" = "for each order_id in this run/account/symbol, take the
+        latest snapshot at-or-before at_ts; keep it iff status is active and
+        leaves_qty > 0".
+
+        Run-scoping is mandatory: an order whose terminal update was missed
+        because recorder restarted would have a "New" snapshot in a previous
+        run that must NOT leak into a later run's seed.
+
+        Args:
+            run_id: Recorder run identifier.
+            account_id: Account ID.
+            symbol: Trading symbol.
+            at_ts: Inclusive upper bound on ``exchange_ts``.
+
+        Returns:
+            List of latest-per-order Order rows whose latest state at at_ts
+            is ``'New'`` or ``'PartiallyFilled'`` AND ``leaves_qty > 0``.
+        """
+        # Subquery: for each order_id in this scope, the latest exchange_ts
+        # at-or-before at_ts. Composite (order_id, max_ts) is then joined
+        # back to the Order table to fetch the full row.
+        latest_per_order = (
+            self.session.query(
+                Order.order_id.label("oid"),
+                func.max(Order.exchange_ts).label("max_ts"),
+            )
+            .filter(
+                Order.run_id == run_id,
+                Order.account_id == account_id,
+                Order.symbol == symbol,
+                Order.exchange_ts <= at_ts,
+            )
+            .group_by(Order.order_id)
+            .subquery()
+        )
+
+        return (
+            self.session.query(Order)
+            .join(
+                latest_per_order,
+                tuple_(Order.order_id, Order.exchange_ts)
+                == tuple_(latest_per_order.c.oid, latest_per_order.c.max_ts),
+            )
+            .filter(
+                Order.run_id == run_id,
+                Order.account_id == account_id,
+                Order.symbol == symbol,
+                Order.status.in_(("New", "PartiallyFilled")),
+                Order.leaves_qty > 0,
+            )
+            .all()
+        )
+
     def bulk_insert(self, orders: List[Order]) -> int:
         """Bulk insert orders for efficient high-volume data insertion.
 
@@ -823,6 +889,10 @@ class OrderRepository(BaseRepository[Order]):
                 "price": order.price,
                 "qty": order.qty,
                 "leaves_qty": order.leaves_qty,
+                # 0029: persist reduce_only for active-order seed direction
+                # derivation. None for pre-0029 callers, treated as
+                # SeedSchemaError by the loader.
+                "reduce_only": order.reduce_only,
                 "raw_json": order.raw_json,
             }
             for order in orders
@@ -889,6 +959,7 @@ class PositionSnapshotRepository(BaseRepository[PositionSnapshot]):
         # Convert ORM instances to dict for insert
         snapshots_data = [
             {
+                "run_id": s.run_id,  # 0029: run-scoped seed lookups
                 "account_id": s.account_id,
                 "symbol": s.symbol,
                 "exchange_ts": s.exchange_ts,
@@ -933,6 +1004,43 @@ class PositionSnapshotRepository(BaseRepository[PositionSnapshot]):
             .first()
         )
 
+    def get_latest_before(
+        self,
+        run_id: str,
+        account_id: str,
+        symbol: str,
+        side: str,
+        at_ts: datetime,
+    ) -> Optional[PositionSnapshot]:
+        """Get the latest snapshot for a run/account/symbol/side at-or-before at_ts.
+
+        Used by the seed-aware replay loader (feature 0029) to scope position
+        seeding to one recorder run. Pre-0029 rows have NULL ``run_id`` and
+        are excluded.
+
+        Args:
+            run_id: Recorder run identifier.
+            account_id: Account ID.
+            symbol: Trading symbol.
+            side: 'Buy' (long) or 'Sell' (short) — Bybit hedge-mode convention.
+            at_ts: Inclusive upper bound on ``exchange_ts``.
+
+        Returns:
+            Latest matching PositionSnapshot, or None if no row exists.
+        """
+        return (
+            self.session.query(PositionSnapshot)
+            .filter(
+                PositionSnapshot.run_id == run_id,
+                PositionSnapshot.account_id == account_id,
+                PositionSnapshot.symbol == symbol,
+                PositionSnapshot.side == side,
+                PositionSnapshot.exchange_ts <= at_ts,
+            )
+            .order_by(PositionSnapshot.exchange_ts.desc())
+            .first()
+        )
+
 
 class WalletSnapshotRepository(BaseRepository[WalletSnapshot]):
     """Repository for WalletSnapshot operations."""
@@ -955,6 +1063,7 @@ class WalletSnapshotRepository(BaseRepository[WalletSnapshot]):
         # Convert ORM instances to dict for insert
         snapshots_data = [
             {
+                "run_id": s.run_id,  # 0029: run-scoped seed lookups
                 "account_id": s.account_id,
                 "exchange_ts": s.exchange_ts,
                 "local_ts": s.local_ts,
@@ -1021,6 +1130,39 @@ class WalletSnapshotRepository(BaseRepository[WalletSnapshot]):
             .filter(
                 WalletSnapshot.account_id == account_id,
                 WalletSnapshot.coin == coin,
+            )
+            .order_by(WalletSnapshot.exchange_ts.desc())
+            .first()
+        )
+
+    def get_latest_before(
+        self,
+        run_id: str,
+        account_id: str,
+        coin: str,
+        at_ts: datetime,
+    ) -> Optional[WalletSnapshot]:
+        """Get the latest wallet snapshot for a run/account/coin at-or-before at_ts.
+
+        Used by the seed-aware replay loader (feature 0029). Pre-0029 rows
+        have NULL ``run_id`` and are excluded.
+
+        Args:
+            run_id: Recorder run identifier.
+            account_id: Account ID.
+            coin: Coin symbol (e.g., 'USDT').
+            at_ts: Inclusive upper bound on ``exchange_ts``.
+
+        Returns:
+            Latest matching WalletSnapshot, or None if no row exists.
+        """
+        return (
+            self.session.query(WalletSnapshot)
+            .filter(
+                WalletSnapshot.run_id == run_id,
+                WalletSnapshot.account_id == account_id,
+                WalletSnapshot.coin == coin,
+                WalletSnapshot.exchange_ts <= at_ts,
             )
             .order_by(WalletSnapshot.exchange_ts.desc())
             .first()

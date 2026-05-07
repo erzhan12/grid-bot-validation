@@ -1,6 +1,7 @@
 """Tests for backtest runner."""
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -1240,3 +1241,261 @@ class TestGetPendingCloseQty:
             )
         assert runner._get_pending_close_qty(DirectionType.LONG) == Decimal("0.08")
         assert runner._get_pending_close_qty(DirectionType.SHORT) == Decimal("0.07")
+
+
+class TestSeedAwareConstruction:
+    """Tests for replay-driven seeding of trackers, order manager, and runner.
+
+    Covers feature 0029 Phase 2B: replay constructs the runner with
+    pre-populated position state, active orders on the exchange, and a
+    restored grid layout. Seed dataclasses live in
+    ``apps/replay/src/replay/snapshot_loader.py`` (Phase 2A); these tests
+    use lightweight stand-ins matching the documented attribute set so the
+    backtest side stays decoupled from the loader module's import path.
+    """
+
+    # --- minimal seed stand-ins (duck typed; mirror Phase 2A dataclasses) ---
+
+    @dataclass
+    class _PositionStateSeed:
+        direction: str
+        size: Decimal
+        entry_price: Decimal
+        liquidation_price: Decimal
+
+    @dataclass
+    class _ActiveOrderSeed:
+        client_id: str
+        exchange_order_id: str
+        symbol: str
+        side: str
+        direction: str
+        price: Decimal
+        remaining_qty: Decimal
+        reduce_only: bool
+        exchange_ts: datetime
+
+    # --- fixtures ---
+
+    @pytest.fixture
+    def seed_strategy_config(self):
+        """Strategy config with risk multipliers enabled (matches replay use)."""
+        return BacktestStrategyConfig(
+            strat_id="test_seed",
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            grid_count=50,
+            grid_step=0.2,
+            amount="x0.001",
+            max_margin=8.0,
+            commission_rate=Decimal("0.0002"),
+            min_liq_ratio=0.8,
+            max_liq_ratio=1.2,
+            min_total_margin=0.15,
+            leverage=10,
+            maintenance_margin_rate=0.005,
+            enable_risk_multipliers=True,
+        )
+
+    @pytest.fixture
+    def seed_runner_components(self, seed_strategy_config):
+        """Build trackers/executor/session/order_manager wired together."""
+        session = BacktestSession(
+            session_id="test_seed", initial_balance=Decimal("10000"),
+        )
+        fill_sim = TradeThroughFillSimulator()
+        order_mgr = BacktestOrderManager(
+            fill_simulator=fill_sim,
+            commission_rate=seed_strategy_config.commission_rate,
+        )
+
+        def qty_from_usdt(intent, wallet_balance):
+            if intent.price <= 0:
+                return Decimal("0")
+            return Decimal("100") / intent.price
+
+        executor = BacktestExecutor(
+            order_manager=order_mgr, qty_calculator=qty_from_usdt,
+        )
+        return seed_strategy_config, executor, session, order_mgr
+
+    # --- A. tracker.seed_state ---
+
+    def test_seed_state_writes_position_fields(self):
+        """seed_state writes size/entry/liq and zeroes the accounting fields."""
+        from backtest.position_tracker import BacktestPositionTracker
+
+        tracker = BacktestPositionTracker(
+            direction="long", commission_rate=Decimal("0.0002"),
+        )
+        # Pre-populate the accounting fields so we can prove they get reset.
+        tracker.state.realized_pnl = Decimal("123")
+        tracker.state.commission_paid = Decimal("4.5")
+        tracker.state.funding_paid = Decimal("0.7")
+
+        seed = self._PositionStateSeed(
+            direction="long",
+            size=Decimal("2.0"),
+            entry_price=Decimal("25000"),
+            liquidation_price=Decimal("20000"),
+        )
+        tracker.seed_state(seed)
+
+        assert tracker.state.size == Decimal("2.0")
+        assert tracker.state.avg_entry_price == Decimal("25000")
+        assert tracker.state.liquidation_price == Decimal("20000")
+        assert tracker.state.realized_pnl == Decimal("0")
+        assert tracker.state.commission_paid == Decimal("0")
+        assert tracker.state.funding_paid == Decimal("0")
+
+    # --- B. order_manager.seed_active_orders ---
+
+    def test_seed_active_orders_register_in_store(self):
+        """Both seeded orders land in active_orders + their client_ids."""
+        from backtest.order_manager import BacktestOrderManager
+
+        order_mgr = BacktestOrderManager(
+            fill_simulator=TradeThroughFillSimulator(),
+            commission_rate=Decimal("0.0002"),
+        )
+        ts = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+        seed1 = self._ActiveOrderSeed(
+            client_id="LX-001",
+            exchange_order_id="exch-A",
+            symbol="BTCUSDT",
+            side="Buy",
+            direction="long",
+            price=Decimal("49000"),
+            remaining_qty=Decimal("0.05"),
+            reduce_only=False,
+            exchange_ts=ts,
+        )
+        # client_id deliberately equals exchange_order_id to mirror the
+        # `client_id = order_link_id or order_id` fallback case (live order
+        # placed before the orderLinkId fix where order_link_id is NULL).
+        seed2 = self._ActiveOrderSeed(
+            client_id="exch-B",
+            exchange_order_id="exch-B",
+            symbol="BTCUSDT",
+            side="Sell",
+            direction="short",
+            price=Decimal("51000"),
+            remaining_qty=Decimal("0.04"),
+            reduce_only=False,
+            exchange_ts=ts,
+        )
+
+        order_mgr.seed_active_orders([seed1, seed2])
+
+        assert "exch-A" in order_mgr.active_orders
+        assert "exch-B" in order_mgr.active_orders
+        assert order_mgr.active_orders["exch-A"].client_order_id == "LX-001"
+        assert order_mgr.active_orders["exch-B"].client_order_id == "exch-B"
+        assert order_mgr.active_orders["exch-A"].grid_level == 0
+        assert "LX-001" in order_mgr._client_order_ids
+        assert "exch-B" in order_mgr._client_order_ids
+
+    # --- C. seeded order participates in fill check ---
+
+    def test_seed_active_order_fills_on_strict_cross(self):
+        """Seeded Buy@50000 does NOT fill at 50001, DOES fill at 49999."""
+        from backtest.order_manager import BacktestOrderManager
+
+        order_mgr = BacktestOrderManager(
+            fill_simulator=TradeThroughFillSimulator(),
+            commission_rate=Decimal("0.0002"),
+        )
+        ts = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+        seed = self._ActiveOrderSeed(
+            client_id="LX-buy",
+            exchange_order_id="exch-buy",
+            symbol="BTCUSDT",
+            side="Buy",
+            direction="long",
+            price=Decimal("50000"),
+            remaining_qty=Decimal("0.1"),
+            reduce_only=False,
+            exchange_ts=ts,
+        )
+        order_mgr.seed_active_orders([seed])
+
+        # Above limit + at limit: no fill (strict <).
+        fills_above = order_mgr.check_fills(
+            current_price=Decimal("50001"), timestamp=ts, symbol=None,
+        )
+        assert fills_above == []
+        assert "exch-buy" in order_mgr.active_orders
+
+        # Below limit: fill.
+        fills_below = order_mgr.check_fills(
+            current_price=Decimal("49999"), timestamp=ts, symbol=None,
+        )
+        assert len(fills_below) == 1
+        assert fills_below[0].order_id == "exch-buy"
+        assert fills_below[0].order_link_id == "LX-buy"
+        assert fills_below[0].price == Decimal("50000")
+        assert "exch-buy" not in order_mgr.active_orders
+
+    # --- D. runner propagates restored_grid ---
+
+    def test_runner_propagates_restored_grid(self, seed_runner_components):
+        """restored_grid is plumbed through GridEngine and rebuilt on Grid."""
+        config, executor, session, _ = seed_runner_components
+        restored = [
+            {"side": "Buy", "price": "49000"},
+            {"side": "Sell", "price": "51000"},
+        ]
+
+        runner = BacktestRunner(
+            strategy_config=config,
+            executor=executor,
+            session=session,
+            restored_grid=restored,
+        )
+
+        grid = runner._engine.grid.grid
+        assert len(grid) == 2
+        # Grid.restore_grid coerces side to GridSideType and price to float.
+        assert str(grid[0]["side"]) in ("GridSideType.BUY", "Buy")
+        assert grid[0]["price"] == 49000.0
+        assert grid[1]["price"] == 51000.0
+
+    # --- E. runner copies seeded state into gridcore.Position ---
+
+    def test_runner_copies_seeded_state_to_gridcore_position(
+        self, seed_runner_components,
+    ):
+        """Pre-seeded tracker state lands on gridcore.Position via runner ctor."""
+        from backtest.position_tracker import BacktestPositionTracker
+
+        config, executor, session, _ = seed_runner_components
+
+        long_tracker = BacktestPositionTracker(
+            direction="long", commission_rate=config.commission_rate,
+        )
+        short_tracker = BacktestPositionTracker(
+            direction="short", commission_rate=config.commission_rate,
+        )
+        # Pre-seed (mirrors what ReplayEngine does in Phase 3 before
+        # constructing the runner).
+        long_tracker.seed_state(self._PositionStateSeed(
+            direction="long",
+            size=Decimal("2"),
+            entry_price=Decimal("25000"),
+            liquidation_price=Decimal("0"),
+        ))
+
+        runner = BacktestRunner(
+            strategy_config=config,
+            executor=executor,
+            session=session,
+            long_tracker=long_tracker,
+            short_tracker=short_tracker,
+        )
+
+        assert runner._long_position is not None
+        assert runner._long_position.size == Decimal("2")
+        assert runner._long_position.liquidation_price == Decimal("0")
+        # Short was not seeded → remains zero on the gridcore side.
+        assert runner._short_position.size == Decimal("0")
+        assert runner._short_position.liquidation_price == Decimal("0")
