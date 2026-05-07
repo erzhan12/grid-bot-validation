@@ -42,6 +42,7 @@ class PositionWriter:
         db: DatabaseFactory,
         batch_size: int = 50,
         flush_interval: float = 10.0,
+        run_id: Optional[str] = None,
     ):
         """Initialize position writer.
 
@@ -49,10 +50,14 @@ class PositionWriter:
             db: DatabaseFactory instance for session management.
             batch_size: Number of snapshots to buffer before bulk insert.
             flush_interval: Maximum seconds between flushes.
+            run_id: Recorder run identifier (feature 0029). Stamped on every
+                emitted ORM row so seed-aware replay can scope queries to
+                one run. None for back-compat / pre-0029 callers.
         """
         self._db = db
         self._batch_size = batch_size
         self._flush_interval = flush_interval
+        self._run_id = run_id
 
         self._buffer: deque[PositionSnapshot] = deque()
         self._last_flush: datetime = datetime.now(UTC)
@@ -200,6 +205,7 @@ class PositionWriter:
 
                     snapshots.append(
                         PositionSnapshot(
+                            run_id=self._run_id,
                             account_id=str(account_id),
                             symbol=pos.get("symbol", ""),
                             exchange_ts=exchange_ts,

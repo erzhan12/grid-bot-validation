@@ -42,6 +42,12 @@ class PositionState:
     maintenance_margin: Decimal = field(default_factory=lambda: Decimal("0"))
     mmr_rate: Decimal = field(default_factory=lambda: Decimal("0"))
 
+    # 0029: seeded directly from PositionSnapshot.liq_price (Bybit's value)
+    # at replay start. Lives until the first _update_risk_multipliers call,
+    # at which point _estimate_liquidation_price overwrites it. Default 0
+    # (the same sentinel `Position.liquidation_price` uses).
+    liquidation_price: Decimal = field(default_factory=lambda: Decimal("0"))
+
 
 class BacktestPositionTracker:
     """Track position and calculate PnL for backtest.

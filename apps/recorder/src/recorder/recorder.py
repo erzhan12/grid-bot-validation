@@ -167,10 +167,16 @@ class Recorder:
             await self._trade_writer.start_auto_flush()
 
         if self._config.account:
+            # 0029: stamp run_id on every wallet/position row so seed-aware
+            # replay can scope its lookups to one recorder run. Order rows
+            # already carry run_id via OrderUpdateEvent.run_id; passing the
+            # kwarg is a no-op for Order/Execution/Trade/Ticker writers and
+            # is only consumed by Wallet/Position writers.
+            run_id_str = str(self._run_id) if self._run_id else None
             self._execution_writer = ExecutionWriter(**writer_kwargs)
             self._order_writer = OrderWriter(**writer_kwargs)
-            self._position_writer = PositionWriter(**writer_kwargs)
-            self._wallet_writer = WalletWriter(**writer_kwargs)
+            self._position_writer = PositionWriter(**writer_kwargs, run_id=run_id_str)
+            self._wallet_writer = WalletWriter(**writer_kwargs, run_id=run_id_str)
             await self._execution_writer.start_auto_flush()
             await self._order_writer.start_auto_flush()
             await self._position_writer.start_auto_flush()
