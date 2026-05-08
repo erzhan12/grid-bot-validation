@@ -191,7 +191,8 @@ class IntentExecutor:
             order_id = result.get("orderId")
             logger.info(
                 f"Placed {intent.side} order: {intent.symbol} "
-                f"qty={intent.qty} price={intent.price} order_id={order_id}"
+                f"qty={intent.qty} price={intent.price} "
+                f"order_id={order_id} link_id={unique_link_id}"
             )
 
             self._auth_failure_count = 0

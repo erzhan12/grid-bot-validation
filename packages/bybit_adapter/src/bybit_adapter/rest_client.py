@@ -481,7 +481,10 @@ class BybitRestClient:
         Reference:
             bbu_reference/bbu2-master/bybit_api_usdt.py:315-329
         """
-        logger.info(f"Placing {order_type} {side} order: {symbol} qty={qty} price={price}")
+        logger.info(
+            f"Placing {order_type} {side} order: {symbol} qty={qty} price={price} "
+            f"link_id={order_link_id}"
+        )
         self._wait_for_rate_limit("order")
 
         params = {
