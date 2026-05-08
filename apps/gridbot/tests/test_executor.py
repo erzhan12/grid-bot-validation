@@ -94,22 +94,30 @@ class TestExecutorPlaceOrder:
     """Tests for execute_place method."""
 
     def test_place_order_success(self, executor, mock_rest_client, place_intent):
-        """Test successful order placement."""
+        """Test successful order placement.
+
+        HOTFIX 2026-05-08: order_link_id carries a `-{millis}` suffix on the
+        wire, so the prefix is asserted separately.
+        """
         result = executor.execute_place(place_intent)
 
         assert result.success is True
         assert result.order_id == "test_order_123"
 
-        mock_rest_client.place_order.assert_called_once_with(
-            symbol="BTCUSDT",
-            side="Buy",
-            order_type="Limit",
-            qty="0.001",
-            price="50000.0",
-            reduce_only=False,
-            position_idx=1,  # long direction
-            order_link_id=place_intent.client_order_id,
-        )
+        mock_rest_client.place_order.assert_called_once()
+        _, kwargs = mock_rest_client.place_order.call_args
+        order_link_id = kwargs.pop("order_link_id")
+        assert kwargs == {
+            "symbol": "BTCUSDT",
+            "side": "Buy",
+            "order_type": "Limit",
+            "qty": "0.001",
+            "price": "50000.0",
+            "reduce_only": False,
+            "position_idx": 1,  # long direction
+        }
+        assert order_link_id.startswith(f"{place_intent.client_order_id}-")
+        assert order_link_id.partition("-")[2].isdigit()
 
     def test_place_order_short_direction(self, executor, mock_rest_client):
         """Test order placement with short direction uses correct position_idx."""
@@ -128,29 +136,37 @@ class TestExecutorPlaceOrder:
         assert result.success is True
         assert result.order_id == "test_order_123"
 
-        mock_rest_client.place_order.assert_called_once_with(
-            symbol="BTCUSDT",
-            side="Sell",
-            order_type="Limit",
-            qty="0.001",
-            price="50000.0",
-            reduce_only=False,
-            position_idx=2,  # short direction
-            order_link_id=intent.client_order_id,
-        )
+        mock_rest_client.place_order.assert_called_once()
+        _, kwargs = mock_rest_client.place_order.call_args
+        order_link_id = kwargs.pop("order_link_id")
+        assert kwargs == {
+            "symbol": "BTCUSDT",
+            "side": "Sell",
+            "order_type": "Limit",
+            "qty": "0.001",
+            "price": "50000.0",
+            "reduce_only": False,
+            "position_idx": 2,  # short direction
+        }
+        assert order_link_id.startswith(f"{intent.client_order_id}-")
+        assert order_link_id.partition("-")[2].isdigit()
 
     def test_execute_place_passes_orderLinkId_from_client_order_id(
         self, executor, mock_rest_client
     ):
-        """Test execute_place passes intent.client_order_id as order_link_id kwarg.
+        """Test execute_place propagates intent.client_order_id as order_link_id prefix.
 
-        This is critical for Feature 0029 (seed-aware replay): the live executor
-        must propagate the deterministic SHA256-based client_order_id to Bybit
-        so private_executions rows have a non-NULL order_link_id that matches
-        the replay's deterministic client_order_id, enabling comparator parity.
+        Feature 0029 (seed-aware replay) requires the deterministic SHA256-based
+        client_order_id to land on Bybit so private_executions rows match the
+        replay's deterministic client_order_id and the comparator can join.
+
+        HOTFIX 2026-05-08 appends `-{millis}` to dodge Bybit ErrCode 110072
+        on re-placements; the deterministic prefix is preserved before the
+        first `-`. The comparator's _extract_client_order_prefix strips this
+        on read for matching.
         """
         # Build an intent and override its (frozen) client_order_id to "abc123"
-        # so we can assert exact propagation regardless of identity hash logic.
+        # so we can assert exact prefix propagation regardless of hash logic.
         base_intent = PlaceLimitIntent.create(
             symbol="BTCUSDT",
             side="Buy",
@@ -166,9 +182,14 @@ class TestExecutorPlaceOrder:
         result = executor.execute_place(intent)
 
         assert result.success is True
-        # Verify the kwarg was forwarded verbatim.
         _, kwargs = mock_rest_client.place_order.call_args
-        assert kwargs.get("order_link_id") == "abc123"
+        order_link_id = kwargs.get("order_link_id")
+        # Prefix is the deterministic intent.client_order_id; suffix is
+        # numeric millisecond timestamp added by the hotfix.
+        prefix, sep, suffix = order_link_id.partition("-")
+        assert prefix == "abc123"
+        assert sep == "-"
+        assert suffix.isdigit()
 
     def test_place_order_failure(self, executor, mock_rest_client, place_intent):
         """Test order placement failure."""

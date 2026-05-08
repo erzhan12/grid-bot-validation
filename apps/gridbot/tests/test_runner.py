@@ -304,6 +304,113 @@ class TestStrategyRunnerOrderTracking:
         for tracked in runner._tracked_orders.values():
             assert tracked.intent.symbol == "BTCUSDT"
 
+    # --- orderLinkId suffix handling (gridbot HOTFIX 2026-05-08) ---
+
+    def test_find_tracked_order_strips_suffix_on_lookup(self, runner, mock_executor):
+        """Fast-path lookup matches a suffixed order_link_id back to the
+        deterministic prefix used as the dict key."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            grid_level=5,
+            direction="long",
+        )
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
+
+        suffixed = f"{intent.client_order_id}-1715170800000"
+        # order_id=None forces fast-path; under the pre-fix code this would
+        # miss the dict and the helper had no fallback path here.
+        tracked = runner._find_tracked_order(suffixed, None)
+
+        assert tracked is not None
+        assert tracked.client_order_id == intent.client_order_id
+
+    def test_find_tracked_order_unsuffixed_still_works(self, runner, mock_executor):
+        """Backward-compat: lookup by the unsuffixed client_order_id still
+        hits, so pre-hotfix events and tests don't regress."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Sell",
+            price=Decimal("51000.0"),
+            qty=Decimal("0.001"),
+            grid_level=15,
+            direction="short",
+        )
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
+
+        tracked = runner._find_tracked_order(intent.client_order_id, None)
+
+        assert tracked is not None
+        assert tracked.client_order_id == intent.client_order_id
+
+    def test_inject_open_orders_keys_by_prefix(self, runner):
+        """Injected orders with suffixed orderLinkId are keyed by prefix,
+        not by the raw suffixed string."""
+        suffixed = "abc1234567890def-1715170800000"
+        orders = [
+            {"orderId": "ex_1", "orderLinkId": suffixed,
+             "price": "49000", "qty": "0.001", "side": "Buy"},
+        ]
+        runner.inject_open_orders(orders)
+
+        assert "abc1234567890def" in runner._tracked_orders
+        assert suffixed not in runner._tracked_orders
+        assert runner._find_tracked_order(suffixed, None).order_id == "ex_1"
+
+    def test_inject_open_orders_empty_orderlinkid_fallback(self, runner):
+        """Explicit empty-string orderLinkId falls back to orderId as the
+        dict key (helper collapses "" to None, so `link_prefix or order_id`
+        picks the order_id branch). Codifies the contract that "" and
+        missing key are treated identically."""
+        orders = [
+            {"orderId": "ex_empty", "orderLinkId": "",
+             "price": "49000", "qty": "0.001", "side": "Buy"},
+        ]
+        runner.inject_open_orders(orders)
+
+        assert "ex_empty" in runner._tracked_orders
+        assert "" not in runner._tracked_orders
+        assert runner._tracked_orders["ex_empty"].order_id == "ex_empty"
+
+    def test_inject_open_orders_collision_after_self_place(
+        self, runner, mock_executor
+    ):
+        """Self-placed order followed by inject_open_orders for the same
+        logical order (post-hotfix suffixed orderLinkId) collides on the
+        prefix and the inject path skips — no duplicate _tracked_orders
+        entries.
+
+        This is the actual restart-path bug class flagged on PR #69:
+        without prefix normalization, the inject path keys by the suffixed
+        form and both entries coexist under different keys.
+        """
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            grid_level=5,
+            direction="long",
+        )
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
+        assert intent.client_order_id in runner._tracked_orders
+        before_count = len(runner._tracked_orders)
+
+        # Bot restarts → REST snapshot returns the same order with the
+        # suffixed orderLinkId Bybit echoes back.
+        suffixed = f"{intent.client_order_id}-1715170800000"
+        orders = [
+            {"orderId": "exch_xyz", "orderLinkId": suffixed,
+             "price": "49000", "qty": "0.001", "side": "Buy"},
+        ]
+        runner.inject_open_orders(orders)
+
+        assert len(runner._tracked_orders) == before_count
+        assert intent.client_order_id in runner._tracked_orders
+        assert suffixed not in runner._tracked_orders
+
     def test_get_tracked_order_count(self, runner):
         """Test getting tracked order counts."""
         counts = runner.get_tracked_order_count()
@@ -572,6 +679,47 @@ class TestStrategyRunnerOrderUpdate:
         runner.on_order_update(event)
 
         assert runner._tracked_orders[intent.client_order_id].status == "filled"
+    def test_on_order_update_strips_suffix_end_to_end(
+        self, runner, mock_executor
+    ):
+        """End-to-end lifecycle: place intent → receive OrderUpdateEvent
+        whose order_link_id carries the post-hotfix suffix → public
+        on_order_update handler routes through _find_tracked_order, which
+        strips the suffix and finds the entry by deterministic prefix.
+
+        Pairs the executor-side suffix contract (test_executor.py) with
+        the runner-side normalization (test_find_tracked_order_*) into a
+        single integration test that exercises the public event path."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            grid_level=5,
+            direction="long",
+        )
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
+
+        # Bybit echoes back the suffixed orderLinkId on the event stream.
+        suffixed = f"{intent.client_order_id}-1715170800000"
+        event = OrderUpdateEvent(
+            event_type=EventType.ORDER_UPDATE,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            order_id="order_123",
+            order_link_id=suffixed,
+            status="Filled",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            leaves_qty=Decimal("0"),
+        )
+
+        runner.on_order_update(event)
+
+        assert runner._tracked_orders[intent.client_order_id].status == "filled"
+
     def test_on_order_update_cancels_tracked(self, runner, mock_executor):
         """Test order update marks tracked order as cancelled."""
         # First place an order

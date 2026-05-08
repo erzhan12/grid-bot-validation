@@ -13,6 +13,32 @@ from decimal import Decimal
 import hashlib
 
 
+def extract_client_order_prefix(order_link_id: str | None) -> str | None:
+    """Inverse of executor's wire-format suffix.
+
+    The live executor (apps/gridbot/src/gridbot/executor.py, HOTFIX
+    2026-05-08) appends `-{int(now_utc_ms)}` to every orderLinkId placed
+    on Bybit so re-placements of the same logical intent don't collide
+    with the cached orderLinkId on Bybit's side (ErrCode 110072
+    "OrderLinkedID is duplicate"). The deterministic prefix produced by
+    PlaceLimitIntent.create remains uniquely identifiable as the substring
+    before the first `-`.
+
+    Consumers that key by `client_order_id` (Runner._tracked_orders, the
+    comparator join key) call this on wire/DB values to normalize back to
+    the deterministic id.
+
+    Backward-compat: a value with no `-` is returned unchanged (covers
+    pre-hotfix orderLinkIds and the order_id fallback path). An empty
+    string collapses to None so callers using
+    `prefix or order_id` cleanly fall back.
+    """
+    if order_link_id is None:
+        return None
+    prefix, _, _ = order_link_id.partition("-")
+    return prefix or None
+
+
 @dataclass(frozen=True)
 class PlaceLimitIntent:
     """

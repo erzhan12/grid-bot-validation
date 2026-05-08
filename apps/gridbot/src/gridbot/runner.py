@@ -28,6 +28,7 @@ from gridcore import (
     OrderUpdateEvent,
     PlaceLimitIntent,
     CancelIntent,
+    extract_client_order_prefix,
     GridStateStore,
     DirectionType,
     calc_position_value,
@@ -695,11 +696,14 @@ class StrategyRunner:
     ) -> Optional[TrackedOrder]:
         """Find a tracked order by client_order_id or exchange order_id.
 
-        Tries _tracked_orders (keyed by client_order_id) first, then
-        scans values for matching exchange order_id.
+        Tries _tracked_orders (keyed by client_order_id) first, then scans
+        values for matching exchange order_id. Strips the post-2026-05-08
+        `-{millis}` suffix from order_link_id so wire-form events match
+        the deterministic prefix used as the dict key.
         """
-        if order_link_id and order_link_id in self._tracked_orders:
-            return self._tracked_orders[order_link_id]
+        prefix = extract_client_order_prefix(order_link_id)
+        if prefix and prefix in self._tracked_orders:
+            return self._tracked_orders[prefix]
         if order_id:
             for t in self._tracked_orders.values():
                 if t.order_id == order_id:
@@ -882,11 +886,15 @@ class StrategyRunner:
                 reduce_only=reduce_only,
             )
 
-            # Prefer orderLinkId as key for backward compatibility: old orders
-            # (placed before this change) still have orderLinkId on the exchange,
-            # so events for those orders arrive with order_link_id set. New orders
-            # won't have one, so we fall back to orderId.
-            client_id = order_link_id or order_id
+            # Prefer orderLinkId prefix as key for backward compatibility:
+            # old orders (placed before this change) still have orderLinkId on
+            # the exchange, so events for those orders arrive with
+            # order_link_id set. Post-2026-05-08 orderLinkIds carry a
+            # `-{millis}` suffix on the wire — strip it so the dict stays
+            # keyed by the deterministic client_order_id prefix. Empty/None
+            # falls back to orderId.
+            link_prefix = extract_client_order_prefix(order_link_id)
+            client_id = link_prefix or order_id
 
             # Guard against key collisions (e.g., orderLinkId equal to some
             # existing orderId, or duplicate injection of the same order).

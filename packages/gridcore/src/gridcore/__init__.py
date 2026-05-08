@@ -7,7 +7,7 @@ applications.
 """
 
 from gridcore.events import Event, EventType, TickerEvent, PublicTradeEvent, ExecutionEvent, OrderUpdateEvent
-from gridcore.intents import PlaceLimitIntent, CancelIntent
+from gridcore.intents import PlaceLimitIntent, CancelIntent, extract_client_order_prefix
 from gridcore.config import GridConfig
 from gridcore.grid import Grid, GridSideType
 from gridcore.engine import GridEngine
@@ -40,6 +40,7 @@ __all__ = [
     "OrderUpdateEvent",
     "PlaceLimitIntent",
     "CancelIntent",
+    "extract_client_order_prefix",
     "GridConfig",
     "Grid",
     "GridSideType",

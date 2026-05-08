@@ -8,7 +8,6 @@ Handles:
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
 
 from bybit_adapter.rest_client import BybitRestClient
 
@@ -73,8 +72,11 @@ class Reconciler:
         """Reconcile state on startup.
 
         Fetches all open limit orders from exchange and injects them into the runner.
-        Since we no longer send orderLinkId to Bybit, all orders for this symbol
-        are assumed to belong to this strategy.
+        We DO send orderLinkId to Bybit (deterministic prefix + millis suffix
+        post-hotfix 2026-05-08), but cannot use orderLinkId presence to filter
+        "ours" — all limit orders for this symbol are assumed to belong to
+        this strategy. See the IMPORTANT block below and
+        config.py:validate_no_shared_symbol for the safety invariant.
 
         Args:
             runner: StrategyRunner to reconcile.
@@ -101,10 +103,14 @@ class Reconciler:
         )
 
         # Inject all open orders into runner.
-        # We no longer send orderLinkId to Bybit, so we can't distinguish
-        # "our" orders from others by orderLinkId presence. All limit orders
-        # for this symbol are assumed to belong to this strategy. Two things
-        # make that assumption safe:
+        # We DO send orderLinkId to Bybit (deterministic prefix from
+        # intent.client_order_id + millis suffix post-2026-05-08), but
+        # we still treat every limit order on this symbol as "ours" rather
+        # than filtering by orderLinkId presence. Two strategies on the same
+        # (account, symbol) would compute the same deterministic prefix
+        # anyway (same hash of (symbol, side, price, direction)), so
+        # orderLinkId-based ownership filtering wouldn't disambiguate them.
+        # Two things make the all-orders-are-ours assumption safe:
         #   (1) Multi-strategy collisions are impossible: GridbotConfig
         #       rejects any configuration with two strategies on the same
         #       (account, symbol) pair at load time (see

@@ -167,6 +167,16 @@ class IntentExecutor:
             # Determine position index based on direction
             position_idx = self._get_position_idx(intent.direction)
 
+            # HOTFIX 2026-05-08: Bybit caches orderLinkId past order lifetime
+            # (~1-2h after cancel/fill), so re-placing the same logical intent
+            # triggers ErrCode 110072 "OrderLinkedID is duplicate" in a tight loop.
+            # Append millisecond timestamp suffix so each placement attempt
+            # carries a unique orderLinkId on the wire while preserving the
+            # deterministic intent.client_order_id prefix for matching/tracking.
+            unique_link_id = (
+                f"{intent.client_order_id}-"
+                f"{int(datetime.now(UTC).timestamp() * 1000)}"
+            )
             result = self._client.place_order(
                 symbol=intent.symbol,
                 side=intent.side,
@@ -175,7 +185,7 @@ class IntentExecutor:
                 price=str(intent.price),
                 reduce_only=intent.reduce_only,
                 position_idx=position_idx,
-                order_link_id=intent.client_order_id,
+                order_link_id=unique_link_id,
             )
 
             order_id = result.get("orderId")
