@@ -359,6 +359,21 @@ class TestStrategyRunnerOrderTracking:
         assert suffixed not in runner._tracked_orders
         assert runner._find_tracked_order(suffixed, None).order_id == "ex_1"
 
+    def test_inject_open_orders_empty_orderlinkid_fallback(self, runner):
+        """Explicit empty-string orderLinkId falls back to orderId as the
+        dict key (helper collapses "" to None, so `link_prefix or order_id`
+        picks the order_id branch). Codifies the contract that "" and
+        missing key are treated identically."""
+        orders = [
+            {"orderId": "ex_empty", "orderLinkId": "",
+             "price": "49000", "qty": "0.001", "side": "Buy"},
+        ]
+        runner.inject_open_orders(orders)
+
+        assert "ex_empty" in runner._tracked_orders
+        assert "" not in runner._tracked_orders
+        assert runner._tracked_orders["ex_empty"].order_id == "ex_empty"
+
     def test_inject_open_orders_collision_after_self_place(
         self, runner, mock_executor
     ):
@@ -664,6 +679,47 @@ class TestStrategyRunnerOrderUpdate:
         runner.on_order_update(event)
 
         assert runner._tracked_orders[intent.client_order_id].status == "filled"
+    def test_on_order_update_strips_suffix_end_to_end(
+        self, runner, mock_executor
+    ):
+        """End-to-end lifecycle: place intent → receive OrderUpdateEvent
+        whose order_link_id carries the post-hotfix suffix → public
+        on_order_update handler routes through _find_tracked_order, which
+        strips the suffix and finds the entry by deterministic prefix.
+
+        Pairs the executor-side suffix contract (test_executor.py) with
+        the runner-side normalization (test_find_tracked_order_*) into a
+        single integration test that exercises the public event path."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            grid_level=5,
+            direction="long",
+        )
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
+
+        # Bybit echoes back the suffixed orderLinkId on the event stream.
+        suffixed = f"{intent.client_order_id}-1715170800000"
+        event = OrderUpdateEvent(
+            event_type=EventType.ORDER_UPDATE,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            order_id="order_123",
+            order_link_id=suffixed,
+            status="Filled",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            leaves_qty=Decimal("0"),
+        )
+
+        runner.on_order_update(event)
+
+        assert runner._tracked_orders[intent.client_order_id].status == "filled"
+
     def test_on_order_update_cancels_tracked(self, runner, mock_executor):
         """Test order update marks tracked order as cancelled."""
         # First place an order
