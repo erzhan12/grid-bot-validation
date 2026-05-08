@@ -9,6 +9,7 @@ dependencies = [
     "grid-db",
     "pyyaml>=6.0",
     "pydantic>=2.0",
+    "python-dotenv>=1.0",
 ]
 
 [tool.uv.sources]

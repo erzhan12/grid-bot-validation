@@ -850,6 +850,7 @@ dependencies = [
     { name = "event-saver" },
     { name = "grid-db" },
     { name = "pydantic" },
+    { name = "python-dotenv" },
     { name = "pyyaml" },
 ]
 
@@ -859,6 +860,7 @@ requires-dist = [
     { name = "event-saver", editable = "apps/event_saver" },
     { name = "grid-db", editable = "shared/db" },
     { name = "pydantic", specifier = ">=2.0" },
+    { name = "python-dotenv", specifier = ">=1.0" },
     { name = "pyyaml", specifier = ">=6.0" },
 ]
 

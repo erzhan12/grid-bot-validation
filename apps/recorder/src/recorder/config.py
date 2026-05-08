@@ -4,10 +4,12 @@ Loads recorder configuration from YAML file with Pydantic validation.
 """
 
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
 import yaml
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field, SecretStr, field_validator
 
 
@@ -106,9 +108,31 @@ def load_config(config_path: Optional[str] = None) -> RecorderConfig:
     if not path.exists():
         raise FileNotFoundError(f"Config file not found: {config_path}")
 
+    # Match gridbot's loader: load .env and expand ${VAR_NAME} placeholders
+    # so the same `api_key: "${BYBIT_API_KEY}"` pattern works in both
+    # gridbot.yaml and recorder.yaml.
+    load_dotenv()
+
     try:
         with open(path) as f:
-            data = yaml.safe_load(f)
+            raw = f.read()
+    except OSError as e:
+        raise ValueError(f"Cannot read config file {config_path}: {e}")
+
+    def _expand_env(match: re.Match) -> str:
+        var_name = match.group(1)
+        value = os.environ.get(var_name)
+        if value is None:
+            raise ValueError(
+                f"Environment variable '{var_name}' not set "
+                f"(referenced in {config_path})"
+            )
+        return value
+
+    expanded = re.sub(r"\$\{(\w+)}", _expand_env, raw)
+
+    try:
+        data = yaml.safe_load(expanded)
     except yaml.YAMLError as e:
         raise ValueError(f"Invalid YAML in {config_path}: {e}")
 

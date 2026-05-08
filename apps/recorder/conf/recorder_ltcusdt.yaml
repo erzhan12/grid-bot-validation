@@ -1,0 +1,28 @@
+# Data Recorder Configuration — Phase 4 of feature 0029
+# LTCUSDT mainnet with private streams (API keys via .env).
+
+symbols:
+  - "LTCUSDT"
+
+# Store in project-root data/ directory
+database_url: "sqlite:///data/recorder_ltcusdt_phase4.db"
+
+# Mainnet
+testnet: false
+
+# Writer settings
+batch_size: 100
+flush_interval: 5.0
+gap_threshold_seconds: 5.0
+health_log_interval: 60   # frequent heartbeat for visibility
+
+# Private streams — REQUIRED for seed-aware replay
+account:
+  api_key: "${BYBIT_API_KEY}"
+  api_secret: "${BYBIT_API_SECRET}"
+
+# When false (default for Phase 4): no `publicTrade.*` WS subscription
+# at all — recorder never receives or writes market trades. Ticker
+# stream is always subscribed regardless of this flag, and Phase 4
+# parity smoke needs only ticker (replay drives off ticker_snapshots).
+capture_public_trades: false
