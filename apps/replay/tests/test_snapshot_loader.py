@@ -463,12 +463,12 @@ class TestLoadActiveOrders:
     ):
         repo = OrderRepository(session)
         repo.bulk_insert([
-            # Has order_link_id → client_id == order_link_id.
+            # Has order_link_id → client_id == order_link_id (prefix).
             Order(
                 run_id=sample_run.run_id,
                 account_id=str(sample_account.account_id),
                 order_id="ORD-LX-1",
-                order_link_id="LX-1",
+                order_link_id="LX1",
                 symbol="BTCUSDT",
                 exchange_ts=base_ts, local_ts=base_ts,
                 status="New", side="Buy",
@@ -504,7 +504,7 @@ class TestLoadActiveOrders:
 
         s1 = by_oid["ORD-LX-1"]
         assert isinstance(s1, ActiveOrderSeed)
-        assert s1.client_id == "LX-1"  # order_link_id wins
+        assert s1.client_id == "LX1"  # order_link_id wins
         assert s1.side == "Buy"
         assert s1.direction == "long"
         assert s1.remaining_qty == Decimal("0.001")
@@ -515,6 +515,42 @@ class TestLoadActiveOrders:
         assert s2.side == "Sell"
         assert s2.direction == "short"
         assert s2.remaining_qty == Decimal("0.001")
+
+    def test_strips_orderlinkid_suffix_post_hotfix(
+        self, session, sample_account, sample_run, base_ts
+    ):
+        """Post-2026-05-08, recorder-DB Order.order_link_id carries a
+        `-{millis}` suffix. The seed must key by the deterministic prefix
+        so replay's re-placed intents (which produce the unsuffixed
+        client_order_id from PlaceLimitIntent.create) match the seeded
+        active order on cancel-on-mismatch and tracking lookups."""
+        repo = OrderRepository(session)
+        repo.bulk_insert([
+            Order(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                order_id="ORD-SFX",
+                order_link_id="cffab542de0a6295-1715170800000",
+                symbol="BTCUSDT",
+                exchange_ts=base_ts, local_ts=base_ts,
+                status="New", side="Buy",
+                price=Decimal("99.8"), qty=Decimal("0.001"),
+                leaves_qty=Decimal("0.001"),
+                reduce_only=False,
+            ),
+        ])
+
+        seeds = load_active_orders(
+            session,
+            sample_run.run_id,
+            str(sample_account.account_id),
+            "BTCUSDT",
+            base_ts + timedelta(seconds=10),
+        )
+
+        assert len(seeds) == 1
+        assert seeds[0].client_id == "cffab542de0a6295"
+        assert seeds[0].exchange_order_id == "ORD-SFX"
 
     def test_reduce_only_null_raises_schema_error(
         self, session, sample_account, sample_run, base_ts

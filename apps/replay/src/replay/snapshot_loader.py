@@ -48,6 +48,7 @@ from grid_db import (
     WalletSnapshotRepository,
 )
 
+from gridcore.intents import extract_client_order_prefix
 from gridcore.persistence import GridStateStore
 
 
@@ -387,7 +388,10 @@ def load_active_orders(
                 f"Order order_id={row.order_id} has unexpected side={row.side!r}; "
                 "expected 'Buy' or 'Sell'"
             )
-        client_id = row.order_link_id or row.order_id
+        # Strip the post-hotfix `-{millis}` suffix from order_link_id so the
+        # seed key matches replay's deterministic client_order_id prefix.
+        # See gridcore.intents.extract_client_order_prefix for rationale.
+        client_id = extract_client_order_prefix(row.order_link_id) or row.order_id
         seeds.append(
             ActiveOrderSeed(
                 client_id=client_id,

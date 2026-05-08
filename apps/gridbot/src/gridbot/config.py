@@ -166,11 +166,16 @@ class GridbotConfig(BaseModel):
     def validate_no_shared_symbol(self):
         """Reject multiple strategies on the same (account, symbol) pair.
 
-        Since orderLinkId is not sent to Bybit, there is no way at runtime
-        to tell which strategy placed a given open order. Two strategies on
-        the same (account, symbol) would cancel each other's orders on every
-        tick via the engine's cancel-on-mismatch pass (see
-        gridcore/engine.py:_place_grid_orders).
+        Even though orderLinkId IS sent to Bybit (deterministic prefix +
+        millis suffix post-2026-05-08), it cannot disambiguate two
+        strategies on the same (account, symbol). The deterministic prefix
+        is a SHA of (symbol, side, price, direction) — both strategies
+        would compute the SAME prefix for the same logical order, and the
+        wire-form suffix only differs across re-placements, not across
+        strategies. So at runtime there is no way to tell which strategy
+        placed a given open order, and two strategies on the same pair
+        would cancel each other's orders on every tick via the engine's
+        cancel-on-mismatch pass (gridcore/engine.py:_place_grid_orders).
 
         bbu2 makes this configuration unrepresentable by construction: its
         amounts[].strat field is a scalar pointing at a single pair_timeframes
@@ -187,13 +192,14 @@ class GridbotConfig(BaseModel):
                 raise ValueError(
                     f"Strategies '{seen[key]}' and '{strategy.strat_id}' share "
                     f"account='{strategy.account}' symbol='{strategy.symbol}'. "
-                    f"This is not allowed: since orderLinkId is not sent to "
-                    f"Bybit, two strategies on the same (account, symbol) "
-                    f"cannot be distinguished at runtime and would cancel "
-                    f"each other's orders every tick. bbu2 makes this "
-                    f"unrepresentable by construction; here we reject it at "
-                    f"config load. Use a different account for the second "
-                    f"strategy."
+                    f"This is not allowed: the deterministic client_order_id "
+                    f"prefix is a SHA of (symbol, side, price, direction), so "
+                    f"two strategies on the same (account, symbol) compute the "
+                    f"same orderLinkId prefix and cannot be distinguished at "
+                    f"runtime — they would cancel each other's orders every "
+                    f"tick. bbu2 makes this unrepresentable by construction; "
+                    f"here we reject it at config load. Use a different "
+                    f"account for the second strategy."
                 )
             seen[key] = strategy.strat_id
         return self
