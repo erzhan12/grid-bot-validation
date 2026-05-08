@@ -15,6 +15,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from grid_db import PrivateExecution, PrivateExecutionRepository
+from gridcore.intents import extract_client_order_prefix
 from gridcore.position import DirectionType, SideType
 
 _ZERO = Decimal("0")
@@ -109,15 +110,18 @@ class LiveTradeLoader:
         # (aggregate). Same client_id + different order_id = ID reuse
         # (separate trades).
         #
-        # 0029: client_id = order_link_id or order_id. Live didn't always send
-        # orderLinkId before cross-cutting #1; rows with NULL order_link_id are
-        # joined via the Bybit-assigned order_id instead. The previous
-        # skip-on-NULL behaviour silently dropped those executions.
+        # 0029: client_id = prefix(order_link_id) or order_id. Live didn't
+        # always send orderLinkId before cross-cutting #1; rows with NULL
+        # order_link_id are joined via the Bybit-assigned order_id instead.
+        # Post-hotfix 2026-05-08, orderLinkId on the wire carries a
+        # `-{millis}` suffix; _extract_client_order_prefix strips it so the
+        # join key matches replay's deterministic prefix.
         grouped: dict[tuple[str, str], list[PrivateExecution]] = defaultdict(list)
         fallback_hits = 0
         for ex in executions:
-            client_id = ex.order_link_id or ex.order_id
-            if not ex.order_link_id:
+            link_prefix = extract_client_order_prefix(ex.order_link_id)
+            client_id = link_prefix or ex.order_id
+            if link_prefix is None:
                 fallback_hits += 1
             grouped[(client_id, ex.order_id)].append(ex)
 

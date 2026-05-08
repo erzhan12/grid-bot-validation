@@ -168,7 +168,7 @@ class TestLiveTradeLoader:
         ts = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
 
         self._add_execution(
-            db, run_id, "e1", "LX-1", "Buy",
+            db, run_id, "e1", "LX1", "Buy",
             Decimal("100000"), Decimal("0.001"), Decimal("0.02"), Decimal("0"),
             ts, order_id="ORD-A",
         )
@@ -178,7 +178,7 @@ class TestLiveTradeLoader:
             trades = loader.load(run_id, ts - timedelta(hours=1), ts + timedelta(hours=1))
 
         assert len(trades) == 1
-        assert trades[0].client_order_id == "LX-1"
+        assert trades[0].client_order_id == "LX1"
 
     def test_loader_falls_back_to_order_id_when_link_id_null(self, db):
         """When order_link_id is NULL, order_id is used as the client_order_id (0029)."""
@@ -400,6 +400,129 @@ class TestLiveTradeLoader:
         assert len(trades) == 1
         assert trades[0].qty == Decimal("0.001")
         assert trades[0].occurrence == 0
+
+    # --- orderLinkId suffix handling (gridbot HOTFIX 2026-05-08) ---
+
+    def test_unsuffixed_order_link_id_unchanged(self, db):
+        """Pre-hotfix orderLinkId (no `-` suffix) is preserved as-is."""
+        run_id = self._seed_data(db)
+        ts = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+        self._add_execution(
+            db, run_id, "e1", "cffab542de0a6295", "Buy",
+            Decimal("100000"), Decimal("0.001"), Decimal("0.02"), Decimal("0"),
+            ts,
+        )
+
+        with db.get_session() as session:
+            loader = LiveTradeLoader(session)
+            trades = loader.load(run_id, ts - timedelta(hours=1), ts + timedelta(hours=1))
+
+        assert len(trades) == 1
+        assert trades[0].client_order_id == "cffab542de0a6295"
+
+    def test_suffixed_order_link_id_strips_to_prefix(self, db):
+        """Post-hotfix suffixed orderLinkId is normalized to its prefix."""
+        run_id = self._seed_data(db)
+        ts = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+        self._add_execution(
+            db, run_id, "e1", "cffab542de0a6295-1715170800000", "Buy",
+            Decimal("100000"), Decimal("0.001"), Decimal("0.02"), Decimal("0"),
+            ts,
+        )
+
+        with db.get_session() as session:
+            loader = LiveTradeLoader(session)
+            trades = loader.load(run_id, ts - timedelta(hours=1), ts + timedelta(hours=1))
+
+        assert len(trades) == 1
+        assert trades[0].client_order_id == "cffab542de0a6295"
+
+    def test_null_order_link_id_logs_fallback(self, db, caplog):
+        """NULL order_link_id falls back to order_id and logs a fallback hit."""
+        import logging
+
+        run_id = self._seed_data(db)
+        ts = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+        self._add_execution(
+            db, run_id, "e1", None, "Buy",
+            Decimal("100000"), Decimal("0.001"), Decimal("0.02"), Decimal("0"),
+            ts, order_id="ORD-FALLBACK",
+        )
+
+        with db.get_session() as session:
+            loader = LiveTradeLoader(session)
+            with caplog.at_level(logging.INFO, logger="comparator.loader"):
+                trades = loader.load(run_id, ts - timedelta(hours=1), ts + timedelta(hours=1))
+
+        assert len(trades) == 1
+        assert trades[0].client_order_id == "ORD-FALLBACK"
+        assert any(
+            "order_id fallback for 1 executions" in record.getMessage()
+            for record in caplog.records
+        )
+
+    def test_suffixed_reuse_same_prefix_different_order_id(self, db):
+        """Two suffixed placements sharing a prefix but different order_ids
+        produce two trades with the same client_order_id and sequential
+        occurrence indices — the ID-reuse path under the hotfix."""
+        run_id = self._seed_data(db)
+        ts = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+        # Older placement first
+        self._add_execution(
+            db, run_id, "e1", "cffab542de0a6295-1000", "Buy",
+            Decimal("100000"), Decimal("0.001"), Decimal("0.02"), Decimal("0"),
+            ts, order_id="ORD-A",
+        )
+        # Newer placement, same logical intent → same prefix, different order
+        self._add_execution(
+            db, run_id, "e2", "cffab542de0a6295-2000", "Buy",
+            Decimal("100100"), Decimal("0.001"), Decimal("0.02"), Decimal("0"),
+            ts + timedelta(seconds=1), order_id="ORD-B",
+        )
+
+        with db.get_session() as session:
+            loader = LiveTradeLoader(session)
+            trades = loader.load(run_id, ts - timedelta(hours=1), ts + timedelta(hours=1))
+
+        assert len(trades) == 2
+        assert all(t.client_order_id == "cffab542de0a6295" for t in trades)
+        # Sort ensures deterministic occurrence assignment by (timestamp, ...)
+        sorted_trades = sorted(trades, key=lambda t: t.timestamp)
+        assert sorted_trades[0].occurrence == 0
+        assert sorted_trades[1].occurrence == 1
+
+    def test_suffixed_partial_fills_same_order_id_aggregated(self, db):
+        """Two suffixed rows with the SAME suffixed orderLinkId and SAME
+        order_id are partial fills of one placement and aggregate to one
+        trade (VWAP price, summed qty/fee)."""
+        run_id = self._seed_data(db)
+        ts = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+        suffixed = "cffab542de0a6295-1715170800000"
+        self._add_execution(
+            db, run_id, "e1", suffixed, "Buy",
+            Decimal("100000"), Decimal("0.0005"), Decimal("0.01"), Decimal("0"),
+            ts, order_id="ORD-SHARED",
+        )
+        self._add_execution(
+            db, run_id, "e2", suffixed, "Buy",
+            Decimal("100002"), Decimal("0.0005"), Decimal("0.01"), Decimal("0"),
+            ts + timedelta(seconds=1), order_id="ORD-SHARED",
+        )
+
+        with db.get_session() as session:
+            loader = LiveTradeLoader(session)
+            trades = loader.load(run_id, ts - timedelta(hours=1), ts + timedelta(hours=1))
+
+        assert len(trades) == 1
+        t = trades[0]
+        assert t.client_order_id == "cffab542de0a6295"
+        assert t.qty == Decimal("0.001")
+        assert t.fee == Decimal("0.02")
+        # VWAP: (100000 * 0.0005 + 100002 * 0.0005) / 0.001 = 100001
+        assert t.price == Decimal("100001")
+        assert t.occurrence == 0
 
 
 # --- BacktestTradeLoader ---
