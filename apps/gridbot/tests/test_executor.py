@@ -1,5 +1,6 @@
 """Tests for gridbot executor module."""
 
+from dataclasses import replace
 from decimal import Decimal
 from unittest.mock import Mock, MagicMock
 
@@ -190,6 +191,30 @@ class TestExecutorPlaceOrder:
         assert prefix == "abc123"
         assert sep == "-"
         assert suffix.isdigit()
+
+    def test_execute_place_reuses_intent_order_link_id(self, executor, mock_rest_client):
+        """Retries of the same placement lifecycle keep the same wire id."""
+        base_intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.001"),
+            grid_level=10,
+            direction="long",
+            reduce_only=False,
+        )
+        intent = replace(
+            base_intent,
+            client_order_id="abc123",
+            order_link_id="abc123-1715170800000",
+        )
+
+        result = executor.execute_place(intent)
+
+        assert result.success is True
+        assert result.order_link_id == "abc123-1715170800000"
+        _, kwargs = mock_rest_client.place_order.call_args
+        assert kwargs["order_link_id"] == "abc123-1715170800000"
 
     def test_place_order_failure(self, executor, mock_rest_client, place_intent):
         """Test order placement failure."""

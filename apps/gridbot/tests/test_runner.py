@@ -273,6 +273,32 @@ class TestStrategyRunnerOrderTracking:
         counts = runner.get_tracked_order_count()
         assert counts["placed"] == 1  # second skipped
 
+    def test_inject_open_orders_recovers_failed_placement_collision(self, runner):
+        """Order sync upgrades a failed same-prefix placement instead of skipping it."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy", price=Decimal("49000.0"),
+            qty=Decimal("0.001"), grid_level=5, direction="long",
+        )
+        runner._tracked_orders[intent.client_order_id] = TrackedOrder(
+            client_order_id=intent.client_order_id,
+            intent=intent,
+            status="failed",
+        )
+
+        runner.inject_open_orders([
+            {
+                "orderId": "exchange_1",
+                "orderLinkId": f"{intent.client_order_id}-1715170800000",
+                "price": "49000.0",
+                "qty": "0.001",
+                "side": "Buy",
+            },
+        ])
+
+        tracked = runner._tracked_orders[intent.client_order_id]
+        assert tracked.status == "placed"
+        assert tracked.order_id == "exchange_1"
+
     def test_inject_open_orders_skips_symbol_mismatch(self, runner):
         """Orders with a symbol different from config are skipped."""
         orders = [
@@ -344,6 +370,28 @@ class TestStrategyRunnerOrderTracking:
 
         assert tracked is not None
         assert tracked.client_order_id == intent.client_order_id
+
+    def test_failed_placement_reattempt_reuses_order_link_id(self, runner, mock_executor):
+        """Immediate reattempts keep the original wire id to avoid duplicates."""
+        mock_executor.execute_place.return_value = OrderResult(
+            success=False, error="Connection timeout"
+        )
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            grid_level=5,
+            direction="long",
+        )
+
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
+        first_intent = mock_executor.execute_place.call_args.args[0]
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
+        second_intent = mock_executor.execute_place.call_args.args[0]
+
+        assert first_intent.order_link_id is not None
+        assert second_intent.order_link_id == first_intent.order_link_id
 
     def test_inject_open_orders_keys_by_prefix(self, runner):
         """Injected orders with suffixed orderLinkId are keyed by prefix,
@@ -939,7 +987,12 @@ class TestStrategyRunnerFailureCallback:
 
         runner._execute_place_intent(intent, EMPTY_LIMITS)
 
-        callback.assert_called_once_with(intent, "Network error")
+        callback.assert_called_once()
+        failed_intent, error = callback.call_args.args
+        assert error == "Network error"
+        assert failed_intent.client_order_id == intent.client_order_id
+        assert failed_intent.order_link_id is not None
+        assert failed_intent.order_link_id.startswith(f"{intent.client_order_id}-")
 
 
 class TestQtyResolution:

@@ -8,7 +8,7 @@ handles actually placing/canceling orders.
 This separation ensures the strategy remains pure and testable.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 import hashlib
 
@@ -55,6 +55,10 @@ class PlaceLimitIntent:
     client_order_id: str  # Auto-generated UUID for matching
     grid_level: int       # Grid level index for comparison reports
     direction: str        # 'long' or 'short'
+    order_link_id: str | None = field(default=None, compare=False)
+    # Wire-form orderLinkId used for a concrete placement attempt. Execution
+    # layers may set this to keep retries idempotent while preserving
+    # client_order_id as the deterministic strategy identity.
 
     # Parameters that determine order identity for deduplication
     # Excludes: qty (execution layer determines), reduce_only (order flag), grid_level (tracking only)

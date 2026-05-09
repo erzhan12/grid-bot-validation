@@ -38,7 +38,7 @@ from gridcore import (
 )
 
 from gridbot.config import StrategyConfig
-from gridbot.executor import IntentExecutor
+from gridbot.executor import IntentExecutor, make_unique_order_link_id
 from gridbot.notifier import Notifier
 
 
@@ -786,6 +786,21 @@ class StrategyRunner:
                 )
                 return
 
+        previous_failed = self._tracked_orders.get(intent.client_order_id)
+        if intent.order_link_id is None:
+            retry_link_id = (
+                previous_failed.intent.order_link_id
+                if previous_failed
+                and previous_failed.status == "failed"
+                and previous_failed.intent is not None
+                else None
+            )
+            intent = replace(
+                intent,
+                order_link_id=retry_link_id
+                or make_unique_order_link_id(intent.client_order_id),
+            )
+
         # Track order
         tracked = TrackedOrder(
             client_order_id=intent.client_order_id,
@@ -899,6 +914,13 @@ class StrategyRunner:
             # Guard against key collisions (e.g., orderLinkId equal to some
             # existing orderId, or duplicate injection of the same order).
             if client_id in self._tracked_orders:
+                existing = self._tracked_orders[client_id]
+                if existing.status in ("pending", "failed") and existing.order_id is None:
+                    existing.order_id = order_id
+                    existing.intent = intent
+                    existing.status = "placed"
+                    injected += 1
+                    continue
                 logger.warning(
                     f"{self.strat_id}: Skipping injected order {order_id} — "
                     f"key collision on client_id={client_id}"
