@@ -30,6 +30,7 @@ class OrderResult:
 
     success: bool
     order_id: Optional[str] = None
+    order_link_id: Optional[str] = None
     error: Optional[str] = None
     timestamp: datetime = None
 
@@ -51,13 +52,18 @@ class CancelResult:
             self.timestamp = datetime.now(UTC)
 
 
+def make_unique_order_link_id(client_order_id: str) -> str:
+    """Build the wire-form Bybit orderLinkId for one placement lifecycle."""
+    return f"{client_order_id}-{int(datetime.now(UTC).timestamp() * 1000)}"
+
+
 class IntentExecutor:
     """Executes trading intents against Bybit API.
 
     Converts PlaceLimitIntent and CancelIntent objects from gridcore
     into actual API calls to Bybit.
 
-    In shadow mode, logs intents without executing them.
+    In shadow mode, logs intents without executing.
 
     Example:
         client = BybitRestClient(api_key="...", api_secret="...", testnet=True)
@@ -163,6 +169,7 @@ class IntentExecutor:
                 order_id=f"shadow_{intent.client_order_id}",
             )
 
+        unique_link_id = intent.order_link_id
         try:
             # Determine position index based on direction
             position_idx = self._get_position_idx(intent.direction)
@@ -170,13 +177,9 @@ class IntentExecutor:
             # HOTFIX 2026-05-08: Bybit caches orderLinkId past order lifetime
             # (~1-2h after cancel/fill), so re-placing the same logical intent
             # triggers ErrCode 110072 "OrderLinkedID is duplicate" in a tight loop.
-            # Append millisecond timestamp suffix so each placement attempt
-            # carries a unique orderLinkId on the wire while preserving the
-            # deterministic intent.client_order_id prefix for matching/tracking.
-            unique_link_id = (
-                f"{intent.client_order_id}-"
-                f"{int(datetime.now(UTC).timestamp() * 1000)}"
-            )
+            # Reuse intent.order_link_id when the runner is retrying the same
+            # placement lifecycle; otherwise create a fresh suffix.
+            unique_link_id = unique_link_id or make_unique_order_link_id(intent.client_order_id)
             result = self._client.place_order(
                 symbol=intent.symbol,
                 side=intent.side,
@@ -196,12 +199,20 @@ class IntentExecutor:
             )
 
             self._auth_failure_count = 0
-            return OrderResult(success=True, order_id=order_id)
+            return OrderResult(
+                success=True,
+                order_id=order_id,
+                order_link_id=unique_link_id,
+            )
 
         except Exception as e:
             logger.error(f"Failed to place order: {e}")
             self._handle_error(str(e))
-            return OrderResult(success=False, error=str(e))
+            return OrderResult(
+                success=False,
+                order_link_id=unique_link_id,
+                error=str(e),
+            )
 
     def execute_cancel(self, intent: CancelIntent) -> CancelResult:
         """Execute a cancel order intent.
