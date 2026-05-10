@@ -8,7 +8,7 @@ handles actually placing/canceling orders.
 This separation ensures the strategy remains pure and testable.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 import hashlib
 
@@ -46,6 +46,12 @@ class PlaceLimitIntent:
 
     The strategy emits this intent when it wants to place a new limit order
     at a specific grid level.
+
+    ``order_link_id`` is execution-layer wire metadata for a concrete
+    placement lifecycle. It is ``None`` when emitted by the strategy; live
+    runner code assigns it via ``dataclasses.replace`` so retries reuse the
+    same Bybit orderLinkId while ``client_order_id`` remains the deterministic
+    strategy identity.
     """
     symbol: str
     side: str            # 'Buy' or 'Sell'
@@ -55,6 +61,7 @@ class PlaceLimitIntent:
     client_order_id: str  # Auto-generated UUID for matching
     grid_level: int       # Grid level index for comparison reports
     direction: str        # 'long' or 'short'
+    order_link_id: str | None = field(default=None, compare=False)
 
     # Parameters that determine order identity for deduplication
     # Excludes: qty (execution layer determines), reduce_only (order flag), grid_level (tracking only)

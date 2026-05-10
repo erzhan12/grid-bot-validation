@@ -1,5 +1,6 @@
 """Tests for gridbot strategy runner module."""
 
+from dataclasses import replace
 from datetime import datetime, timedelta, UTC
 from decimal import Decimal
 from unittest.mock import Mock, MagicMock
@@ -11,6 +12,7 @@ from gridcore.intents import PlaceLimitIntent, CancelIntent
 
 from gridbot.config import StrategyConfig
 from gridbot.executor import IntentExecutor, OrderResult, CancelResult
+from gridbot.retry_queue import RetryQueue
 from gridbot.runner import StrategyRunner, TrackedOrder
 
 EMPTY_LIMITS: dict[str, list[dict]] = {'long': [], 'short': []}
@@ -273,6 +275,92 @@ class TestStrategyRunnerOrderTracking:
         counts = runner.get_tracked_order_count()
         assert counts["placed"] == 1  # second skipped
 
+    def test_inject_open_orders_upgrades_failed_order_and_cancels_retry(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """Reconcile upgrades ambiguous failures and cancels queued retries."""
+        retry_queue = RetryQueue(executor_func=mock_executor.execute_place)
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+            on_intent_failed=lambda intent, error: retry_queue.add(intent, error),
+            on_retry_cancel_for_prefix=lambda prefix: retry_queue.cancel_for_prefix(prefix),
+        )
+        runner._wallet_balance = Decimal("10000")
+        mock_executor.execute_place.return_value = OrderResult(
+            success=False,
+            error="Connection timeout",
+        )
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            grid_level=5,
+            direction="long",
+        )
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
+        tracked = runner._tracked_orders[intent.client_order_id]
+        failed_wire_id = tracked.intent.order_link_id
+
+        assert tracked.status == "failed"
+        assert retry_queue.size == 1
+
+        exchange_link_id = f"{intent.client_order_id}-1715170809999"
+        runner.inject_open_orders([
+            {
+                "orderId": "exchange_1",
+                "orderLinkId": exchange_link_id,
+                "price": "49000.0",
+                "qty": "0.001",
+                "side": "Buy",
+                "reduceOnly": False,
+            },
+        ])
+
+        tracked = runner._tracked_orders[intent.client_order_id]
+        assert tracked.status == "placed"
+        assert tracked.order_id == "exchange_1"
+        assert tracked.intent.order_link_id == exchange_link_id
+        assert tracked.intent.qty == intent.qty
+        assert tracked.intent.grid_level == intent.grid_level
+        assert tracked.intent.direction == intent.direction
+        assert tracked.intent.order_link_id != failed_wire_id
+        assert retry_queue.size == 0
+
+        mock_executor.execute_place.reset_mock()
+        retry_queue.process_due()
+        mock_executor.execute_place.assert_not_called()
+
+    def test_inject_open_orders_upgrade_skips_when_existing_intent_missing(
+        self, runner, caplog
+    ):
+        """Defensive path does not reconstruct intent from open-order payload."""
+        prefix = "abc1234567890def"
+        runner._tracked_orders[prefix] = TrackedOrder(
+            client_order_id=prefix,
+            status="failed",
+            intent=None,
+        )
+
+        with caplog.at_level("WARNING"):
+            runner.inject_open_orders([
+                {
+                    "orderId": "exchange_1",
+                    "orderLinkId": f"{prefix}-1715170800000",
+                    "price": "49000.0",
+                    "qty": "0.001",
+                    "side": "Buy",
+                    "reduceOnly": False,
+                },
+            ])
+
+        tracked = runner._tracked_orders[prefix]
+        assert tracked.status == "failed"
+        assert tracked.order_id is None
+        assert "open-order upgrade skipped" in caplog.text
+
     def test_inject_open_orders_skips_symbol_mismatch(self, runner):
         """Orders with a symbol different from config are skipped."""
         orders = [
@@ -438,9 +526,16 @@ class TestStrategyRunnerExecution:
 
         runner._execute_place_intent(intent, EMPTY_LIMITS)
 
-        mock_executor.execute_place.assert_called_once_with(intent)
+        mock_executor.execute_place.assert_called_once()
+        assigned = mock_executor.execute_place.call_args.args[0]
+        assert assigned is not intent
+        assert assigned.client_order_id == intent.client_order_id
+        assert assigned.order_link_id is not None
+        assert assigned.order_link_id.startswith(f"{intent.client_order_id}-")
+        assert intent.order_link_id is None
         assert intent.client_order_id in runner._tracked_orders
         assert runner._tracked_orders[intent.client_order_id].status == "placed"
+        assert runner._tracked_orders[intent.client_order_id].intent == assigned
     def test_execute_place_intent_failure(self, runner, mock_executor):
         """Test failed order placement."""
         mock_executor.execute_place.return_value = OrderResult(
@@ -459,6 +554,116 @@ class TestStrategyRunnerExecution:
         runner._execute_place_intent(intent, EMPTY_LIMITS)
 
         assert runner._tracked_orders[intent.client_order_id].status == "failed"
+        tracked_intent = runner._tracked_orders[intent.client_order_id].intent
+        assert tracked_intent.order_link_id is not None
+        assert intent.order_link_id is None
+
+    def test_failed_reemission_reuses_previous_wire_id(
+        self, runner, mock_executor, monkeypatch
+    ):
+        """Fresh engine re-emission after failure does not mint a new suffix."""
+        minted: list[str] = []
+
+        def fake_make_order_link_id(client_order_id):
+            link_id = f"{client_order_id}-mint-{len(minted)}"
+            minted.append(link_id)
+            return link_id
+
+        monkeypatch.setattr("gridbot.runner.make_order_link_id", fake_make_order_link_id)
+        mock_executor.execute_place.return_value = OrderResult(
+            success=False,
+            error="Connection timeout",
+        )
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            grid_level=5,
+            direction="long",
+        )
+
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
+        first_assigned = mock_executor.execute_place.call_args.args[0]
+        fresh_reemission = replace(intent)
+        runner._execute_place_intent(fresh_reemission, EMPTY_LIMITS)
+        second_assigned = mock_executor.execute_place.call_args.args[0]
+
+        assert minted == [first_assigned.order_link_id]
+        assert second_assigned is not first_assigned
+        assert second_assigned.order_link_id == first_assigned.order_link_id
+        assert fresh_reemission.order_link_id is None
+
+    def test_cancelled_reemission_mints_fresh_wire_id(
+        self, runner, mock_executor, monkeypatch
+    ):
+        """New placement after cancel starts a new wire-id lifecycle."""
+        minted: list[str] = []
+
+        def fake_make_order_link_id(client_order_id):
+            link_id = f"{client_order_id}-mint-{len(minted)}"
+            minted.append(link_id)
+            return link_id
+
+        monkeypatch.setattr("gridbot.runner.make_order_link_id", fake_make_order_link_id)
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            grid_level=5,
+            direction="long",
+        )
+
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
+        first_assigned = mock_executor.execute_place.call_args.args[0]
+        runner._tracked_orders[intent.client_order_id].mark_cancelled()
+
+        fresh_reemission = replace(intent)
+        runner._execute_place_intent(fresh_reemission, EMPTY_LIMITS)
+        second_assigned = mock_executor.execute_place.call_args.args[0]
+
+        assert minted == [
+            first_assigned.order_link_id,
+            second_assigned.order_link_id,
+        ]
+        assert second_assigned.order_link_id != first_assigned.order_link_id
+        assert fresh_reemission.order_link_id is None
+
+    def test_retry_queue_receives_and_retries_assigned_wire_id(
+        self, strategy_config, mock_executor
+    ):
+        """Failed assigned intent keeps the same wire id through RetryQueue."""
+        retry_executor = Mock(return_value=OrderResult(success=True, order_id="retry_1"))
+        retry_queue = RetryQueue(
+            executor_func=retry_executor,
+            initial_backoff_seconds=0.0,
+        )
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            on_intent_failed=lambda intent, error: retry_queue.add(intent, error),
+        )
+        mock_executor.execute_place.return_value = OrderResult(
+            success=False,
+            error="Connection timeout",
+        )
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            grid_level=5,
+            direction="long",
+        )
+
+        runner._execute_place_intent(intent, EMPTY_LIMITS)
+        assigned = mock_executor.execute_place.call_args.args[0]
+        retry_queue.process_due()
+
+        retry_executor.assert_called_once()
+        retried = retry_executor.call_args.args[0]
+        assert retried.order_link_id == assigned.order_link_id
     def test_execute_place_intent_duplicate_skipped(self, runner, mock_executor):
         """Test duplicate order placement is skipped."""
         intent = PlaceLimitIntent.create(
@@ -939,7 +1144,13 @@ class TestStrategyRunnerFailureCallback:
 
         runner._execute_place_intent(intent, EMPTY_LIMITS)
 
-        callback.assert_called_once_with(intent, "Network error")
+        callback.assert_called_once()
+        failed_intent, error = callback.call_args.args
+        assert error == "Network error"
+        assert failed_intent is not intent
+        assert failed_intent.client_order_id == intent.client_order_id
+        assert failed_intent.order_link_id is not None
+        assert intent.order_link_id is None
 
 
 class TestQtyResolution:
@@ -3514,4 +3725,3 @@ class TestStateStoreWiring:
     def test_on_grid_change_no_store_is_noop(self, strategy_config, mock_executor):
         runner = StrategyRunner(strategy_config=strategy_config, executor=mock_executor)
         runner._on_grid_change([{"side": "Wait", "price": 100.0}] * 5)
-

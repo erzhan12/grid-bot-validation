@@ -1,5 +1,6 @@
 """Tests for gridbot retry queue module."""
 
+from dataclasses import replace
 import time
 from datetime import datetime, timedelta, UTC
 from decimal import Decimal
@@ -138,6 +139,74 @@ class TestRetryQueueBasic:
         count = queue.clear()
         assert count == 2
         assert queue.size == 0
+
+    def test_cancel_for_prefix_matches_client_order_id_primary(self, place_intent):
+        """cancel_for_prefix removes place retries by strategy identity."""
+        queue = RetryQueue(executor_func=Mock())
+        assigned = replace(
+            place_intent,
+            order_link_id=f"{place_intent.client_order_id}-1715170800000",
+        )
+        queue.add(assigned, "Error")
+
+        removed = queue.cancel_for_prefix(place_intent.client_order_id)
+
+        assert removed == 1
+        assert queue.size == 0
+        assert queue.cancel_for_prefix(place_intent.client_order_id) == 0
+
+    def test_cancel_for_prefix_matches_link_prefix_fallback(self, place_intent):
+        """Fallback removes defensive mismatches by normalized wire id prefix."""
+        queue = RetryQueue(executor_func=Mock())
+        intent = replace(
+            place_intent,
+            client_order_id="different",
+            order_link_id="abc1234567890def-1715170800000",
+        )
+        queue.add(intent, "Error")
+
+        removed = queue.cancel_for_prefix("abc1234567890def")
+
+        assert removed == 1
+        assert queue.size == 0
+
+    def test_cancel_for_prefix_ignores_cancel_intents(
+        self, place_intent, cancel_intent
+    ):
+        """CancelIntent has no placement prefix and is never removed."""
+        queue = RetryQueue(executor_func=Mock())
+        assigned = replace(
+            place_intent,
+            order_link_id=f"{place_intent.client_order_id}-1715170800000",
+        )
+        queue.add(cancel_intent, "Cancel error")
+        queue.add(assigned, "Place error")
+
+        removed = queue.cancel_for_prefix(place_intent.client_order_id)
+
+        assert removed == 1
+        assert queue.size == 1
+        assert queue._queue[0].intent == cancel_intent
+
+    def test_add_warns_for_place_without_assigned_link_id(
+        self, place_intent, caplog
+    ):
+        """Direct callers bypassing runner assignment are visible in logs."""
+        queue = RetryQueue(executor_func=Mock())
+
+        with caplog.at_level("WARNING"):
+            queue.add(place_intent, "Error")
+
+        assert "enqueued without assigned order_link_id" in caplog.text
+
+    def test_add_does_not_warn_for_cancel_intent(self, cancel_intent, caplog):
+        """CancelIntent has no order_link_id and should not warn."""
+        queue = RetryQueue(executor_func=Mock())
+
+        with caplog.at_level("WARNING"):
+            queue.add(cancel_intent, "Error")
+
+        assert "enqueued without assigned order_link_id" not in caplog.text
 
 
 class TestRetryQueueProcessing:

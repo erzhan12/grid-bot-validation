@@ -673,6 +673,7 @@ class Orchestrator:
             instrument_info=instrument_info,
             state_store=self._state_store,
             on_intent_failed=lambda intent, error: retry_queue.add(intent, error),
+            on_retry_cancel_for_prefix=lambda prefix: retry_queue.cancel_for_prefix(prefix),
             on_unknown_order=self._request_immediate_order_sync,
             notifier=self._notifier,
         )

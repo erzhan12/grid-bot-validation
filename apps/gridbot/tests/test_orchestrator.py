@@ -1821,6 +1821,60 @@ class TestOrchestratorRetryDispatcher:
         executor.execute_place.assert_called_once_with(place)
         executor.execute_cancel.assert_not_called()
 
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_reconcile_upgrade_cancels_retry_queue_via_wiring(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """_init_strategy wires runner reconcile-upgrade to RetryQueue cancellation."""
+        from dataclasses import replace
+
+        from gridcore.intents import PlaceLimitIntent
+        from gridbot.runner import TrackedOrder
+
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+
+        runner = orchestrator._runners["btcusdt_test"]
+        retry_queue = orchestrator._retry_queues["btcusdt_test"]
+        retry_queue.cancel_for_prefix = MagicMock(wraps=retry_queue.cancel_for_prefix)
+
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            grid_level=5,
+            direction="long",
+        )
+        assigned = replace(
+            intent,
+            order_link_id=f"{intent.client_order_id}-1715170800000",
+        )
+        runner._tracked_orders[intent.client_order_id] = TrackedOrder(
+            client_order_id=intent.client_order_id,
+            intent=assigned,
+            status="failed",
+        )
+        retry_queue.add(assigned, "Connection timeout")
+
+        runner.inject_open_orders([
+            {
+                "orderId": "exchange_1",
+                "orderLinkId": f"{intent.client_order_id}-1715170809999",
+                "price": "49000.0",
+                "qty": "0.001",
+                "side": "Buy",
+                "reduceOnly": False,
+            },
+        ])
+
+        retry_queue.cancel_for_prefix.assert_called_once_with(intent.client_order_id)
+        assert retry_queue.size == 0
+
 
 class TestOrchestratorExceptionHandling:
     """Tests for exception handling in WebSocket callbacks."""

@@ -11,7 +11,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, UTC
 from typing import Callable, Optional
 
-from gridcore.intents import PlaceLimitIntent, CancelIntent
+from gridcore.intents import (
+    CancelIntent,
+    PlaceLimitIntent,
+    extract_client_order_prefix,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -110,6 +114,13 @@ class RetryQueue:
             intent: The failed intent.
             error: Error message from the failure.
         """
+        if isinstance(intent, PlaceLimitIntent) and intent.order_link_id is None:
+            logger.warning(
+                "PlaceLimitIntent enqueued without assigned order_link_id "
+                f"(prefix={intent.client_order_id}); executor will fall back "
+                "to fresh suffix"
+            )
+
         item = RetryItem(
             intent=intent,
             attempt_count=1,  # First attempt already happened
@@ -137,6 +148,23 @@ class RetryQueue:
                 self._queue.pop(i)
                 return True
         return False
+
+    def cancel_for_prefix(self, prefix: str) -> int:
+        """Cancel queued place retries matching a strategy client-order prefix."""
+        kept: list[RetryItem] = []
+        removed = 0
+
+        for item in self._queue:
+            intent = item.intent
+            if isinstance(intent, PlaceLimitIntent):
+                link_prefix = extract_client_order_prefix(intent.order_link_id)
+                if intent.client_order_id == prefix or link_prefix == prefix:
+                    removed += 1
+                    continue
+            kept.append(item)
+
+        self._queue = kept
+        return removed
 
     def clear(self) -> int:
         """Clear all items from the queue.

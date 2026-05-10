@@ -13,6 +13,7 @@ from typing import Callable, Optional
 from bybit_adapter.rest_client import BybitRestClient
 from gridcore.intents import PlaceLimitIntent, CancelIntent
 from gridcore.position import DirectionType
+from gridbot.order_link_id import make_order_link_id
 
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ class OrderResult:
 
     success: bool
     order_id: Optional[str] = None
+    order_link_id: Optional[str] = None
     error: Optional[str] = None
     timestamp: datetime = None
 
@@ -152,15 +154,21 @@ class IntentExecutor:
         Returns:
             OrderResult with success status and order_id if successful.
         """
+        unique_link_id = intent.order_link_id or make_order_link_id(
+            intent.client_order_id
+        )
+
         if self._shadow_mode:
             logger.info(
                 f"[SHADOW] Would place {intent.side} order: "
                 f"{intent.symbol} qty={intent.qty} price={intent.price} "
-                f"reduce_only={intent.reduce_only} client_id={intent.client_order_id}"
+                f"reduce_only={intent.reduce_only} "
+                f"client_id={intent.client_order_id} link_id={unique_link_id}"
             )
             return OrderResult(
                 success=True,
                 order_id=f"shadow_{intent.client_order_id}",
+                order_link_id=unique_link_id,
             )
 
         try:
@@ -170,13 +178,8 @@ class IntentExecutor:
             # HOTFIX 2026-05-08: Bybit caches orderLinkId past order lifetime
             # (~1-2h after cancel/fill), so re-placing the same logical intent
             # triggers ErrCode 110072 "OrderLinkedID is duplicate" in a tight loop.
-            # Append millisecond timestamp suffix so each placement attempt
-            # carries a unique orderLinkId on the wire while preserving the
-            # deterministic intent.client_order_id prefix for matching/tracking.
-            unique_link_id = (
-                f"{intent.client_order_id}-"
-                f"{int(datetime.now(UTC).timestamp() * 1000)}"
-            )
+            # The runner assigns one wire id per placement lifecycle so retries
+            # remain idempotent; direct callers fall back to the generated id above.
             result = self._client.place_order(
                 symbol=intent.symbol,
                 side=intent.side,
@@ -196,12 +199,20 @@ class IntentExecutor:
             )
 
             self._auth_failure_count = 0
-            return OrderResult(success=True, order_id=order_id)
+            return OrderResult(
+                success=True,
+                order_id=order_id,
+                order_link_id=unique_link_id,
+            )
 
         except Exception as e:
             logger.error(f"Failed to place order: {e}")
             self._handle_error(str(e))
-            return OrderResult(success=False, error=str(e))
+            return OrderResult(
+                success=False,
+                order_link_id=unique_link_id,
+                error=str(e),
+            )
 
     def execute_cancel(self, intent: CancelIntent) -> CancelResult:
         """Execute a cancel order intent.
