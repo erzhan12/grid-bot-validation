@@ -60,6 +60,28 @@ _FLOAT_TO_DECIMAL = {
 # trigger. See docs/features/0025_PLAN.md.
 _SAME_ORDER_TIME_WINDOW_SEC = 5.0
 
+# Dedup TTL for SAME ORDER trigger pairs: once an order_id pair has been
+# adjudicated (or is in flight), suppress retriggers on the same pair for
+# this window. Sized to comfortably exceed the 3 h 24 min retrigger gap
+# observed in the 2026-05-09/10 incident; short enough not to outlive a
+# normal operator shift. See docs/features/0031_PLAN.md.
+_SAME_ORDER_DEDUP_TTL_SEC = 21600.0  # 6 hours
+
+
+@dataclass
+class _SameOrderDedupEntry:
+    """SAME ORDER pair adjudication record kept in `_same_order_dedup_cache`.
+
+    Stores all SAME ORDER pair adjudications, not only phantom ones — the
+    name is deliberately neutral so future readers do not "optimise" by
+    skipping non-phantom entries (the regression that REAL_DUPLICATE-aware
+    handling exists to prevent).
+    """
+
+    first_seen_ts: datetime
+    last_seen_ts: datetime
+    verdict: str  # "WS_GLITCH_SUSPECTED" | "REAL_DUPLICATE" | "UNKNOWN"
+
 
 @dataclass
 class TrackedOrder:
@@ -188,11 +210,23 @@ class StrategyRunner:
         self._recent_executions_long: deque[dict] = deque(maxlen=2)
         self._recent_executions_short: deque[dict] = deque(maxlen=2)
         self._same_order_error: bool = False
-        # Track which (order_id, order_id) pairs we already cross-checked
-        # against REST after a SAME ORDER trigger, to avoid hammering the API
-        # on the flapping error state. Entries here are frozenset of two
-        # order_ids; small set, never trimmed (resets on bot restart).
-        self._diagnosed_same_order_pairs: set[frozenset[str]] = set()
+        # Verdict-aware dedup of SAME ORDER trigger pairs. Keyed by
+        # frozenset of the two exchange order_ids in the pair. Used both to
+        # rate-limit the REST cross-check and to suppress retriggers within
+        # _SAME_ORDER_DEDUP_TTL_SEC (with verdict-specific handling of the
+        # soft-block flag — see _check_same_orders_side and
+        # _diagnostic_rest_check_executions). Lazily expired on lookup.
+        self._same_order_dedup_cache: dict[frozenset[str], _SameOrderDedupEntry] = {}
+        # One-shot flag: set inside `_diagnostic_rest_check_executions` when
+        # the current ExecutionEvent has been REST-classified as a phantom
+        # (verdict=WS_GLITCH_SUSPECTED). `on_execution` resets it at entry
+        # and, when set, returns BEFORE feeding the event to
+        # `self._engine.on_event(...)` and BEFORE `_execute_intents(...)`.
+        # Reasoning: REST has authoritatively confirmed this fill did not
+        # happen on the exchange, so the engine must not mutate grid state
+        # as if it had — otherwise downstream ticks/executions re-derive
+        # intents from a position view that diverges from reality.
+        self._drop_phantom_event_for_current_call: bool = False
 
     @property
     def strat_id(self) -> str:
@@ -353,27 +387,62 @@ class StrategyRunner:
             Exception: Re-raised after logging so orchestrator can handle notification.
         """
         try:
-            # Update tracked order status
+            # Reset the per-event phantom drop flag. _check_same_orders may
+            # set it to True via _diagnostic_rest_check_executions when this
+            # event is the WS_GLITCH-confirmed phantom side of a SAME ORDER
+            # pair; in that case we drop the event before it reaches the
+            # engine AND before mutating tracked-order status (see below).
+            self._drop_phantom_event_for_current_call = False
+
+            # Look up tracked order WITHOUT mutating its status yet. The
+            # mark_filled() call is deferred until after _check_same_orders
+            # has had a chance to classify the event. If REST proves this is
+            # a phantom (WS_GLITCH_SUSPECTED), the underlying exchange order
+            # is still resting — we must not flip the tracked status to
+            # "filled", or get_limit_orders() would drop it from the live
+            # in-memory view (it filters status not in {"placed"}; runner.py:324)
+            # and the reconciler would see a stale local book.
             tracked = self._find_tracked_order(event.order_link_id, event.order_id)
-            if tracked:
-                tracked.mark_filled()
-                logger.info(
-                    f"{self.strat_id}: Order filled: {event.symbol} {event.side} "
-                    f"qty={event.qty} price={event.price}"
-                )
-            else:
+            if tracked is None:
                 logger.debug(
                     f"{self.strat_id}: Received execution for untracked order "
                     f"order_id={event.order_id} order_link_id={event.order_link_id!r}"
                 )
 
-            # Check for same-order error (bbu2-style safety check)
+            # Check for same-order error (bbu2-style safety check). May
+            # auto-clear `_same_order_error` and set
+            # `_drop_phantom_event_for_current_call` if REST classifies the
+            # pair as WS_GLITCH_SUSPECTED.
             self._check_same_orders(event)
+
+            # Drop confirmed phantom events before they reach the engine
+            # AND before mutating tracked-order state (feature 0031). REST
+            # has authoritatively confirmed the fill did not happen on the
+            # exchange; passing it to `self._engine.on_event(event)` would
+            # corrupt grid/position state, and `tracked.mark_filled()`
+            # would corrupt the local open-order view. The "update grid
+            # state regardless of error" convention does not apply here —
+            # we have a verdict, not just an error.
+            if self._drop_phantom_event_for_current_call:
+                logger.debug(
+                    f"{self.strat_id}: dropping phantom ExecutionEvent "
+                    f"order_id={event.order_id} (WS_GLITCH_SUSPECTED) "
+                    f"before engine.on_event and mark_filled"
+                )
+                return []
+
+            # Verdict was not WS_GLITCH_SUSPECTED — proceed normally.
+            if tracked is not None:
+                tracked.mark_filled()
+                logger.info(
+                    f"{self.strat_id}: Order filled: {event.symbol} {event.side} "
+                    f"qty={event.qty} price={event.price}"
+                )
 
             # Pass to engine (update grid state regardless of error)
             intents = self._engine.on_event(event)
 
-            # Only execute intents if no same-order error
+            # Only execute intents if no same-order error.
             if intents and not self._same_order_error:
                 limit_orders = self.get_limit_orders()
                 self._execute_intents(intents, limit_orders)
@@ -1086,7 +1155,60 @@ class StrategyRunner:
                         delta_sec = abs((cur_ts - prev_ts).total_seconds())
                         if delta_sec > _SAME_ORDER_TIME_WINDOW_SEC:
                             return
-                # Different order IDs at same price = DUPLICATE ERROR
+                # Different order IDs at same price = DUPLICATE candidate.
+                # Compute the dedup pair key early and gate the loud path on
+                # verdict-aware cache lookup (feature 0031): the same pair
+                # within _SAME_ORDER_DEDUP_TTL_SEC is suppressed to a single
+                # DEBUG line; soft-block state for REAL_DUPLICATE entries is
+                # explicitly re-established because _check_same_orders just
+                # reset _same_order_error to False at the top of this call.
+                pair_key = frozenset((current["order_id"], previous["order_id"]))
+                now = datetime.now(UTC)
+
+                # Lazy expiry of stale entries; keeps the cache bounded.
+                self._same_order_dedup_cache = {
+                    k: e for k, e in self._same_order_dedup_cache.items()
+                    if (now - e.last_seen_ts).total_seconds() < _SAME_ORDER_DEDUP_TTL_SEC
+                }
+
+                existing = self._same_order_dedup_cache.get(pair_key)
+                if existing is not None and existing.verdict in (
+                    "WS_GLITCH_SUSPECTED",
+                    "REAL_DUPLICATE",
+                ):
+                    age_sec = (now - existing.first_seen_ts).total_seconds()
+                    logger.debug(
+                        f"{self.strat_id}: duplicate SAME ORDER pair suppressed "
+                        f"within TTL — pair=({current['order_id']}, {previous['order_id']}) "
+                        f"price={current['price']} side={current['side']} "
+                        f"age={age_sec:.0f}s verdict={existing.verdict}"
+                    )
+                    existing.last_seen_ts = now
+                    if existing.verdict == "WS_GLITCH_SUSPECTED":
+                        # Cache-hit on a known phantom: signal `on_execution`
+                        # to drop the current event before mark_filled and
+                        # engine.on_event. Without this, the dedup branch
+                        # would silence the alert but still let the engine
+                        # and tracked-order state mutate on a fill REST has
+                        # already proved fake.
+                        self._drop_phantom_event_for_current_call = True
+                    elif existing.verdict == "REAL_DUPLICATE":
+                        # Re-establish the soft-block. _check_same_orders
+                        # unconditionally resets _same_order_error to False
+                        # at the top of every call; without this re-set the
+                        # dedup gate would silently lift a legitimately-
+                        # latched block on each retrigger. Do NOT set the
+                        # phantom-drop flag — the event is real (REST saw
+                        # the fill); mark_filled and engine.on_event must
+                        # run normally.
+                        self._same_order_error = True
+                    return
+                # UNKNOWN cache entry (REST cross-check earlier failed and never
+                # produced a verdict) falls through to the full first-trigger
+                # path below — the operator should get a fresh, loud ALERT and
+                # a fresh cross-check attempt.
+
+                # First-trigger path (cache miss or UNKNOWN fall-through).
                 # Diagnostic dump: include closed_size, order_link_id, and
                 # tracked-order reduce_only (looked up via _tracked_orders)
                 # for both fills. This determines whether it's a real
@@ -1122,16 +1244,22 @@ class StrategyRunner:
                         error_key=f"same_order_{self.strat_id}",
                     )
 
-                # Diagnostic REST cross-check (rate-limited to once per
-                # order_id pair so the flap doesn't hammer the API). Verifies
-                # whether Bybit-side actually has two distinct fills, or the
-                # WS stream duplicated a single fill event. The latter would
-                # mean SAME ORDER is a WS-glitch false positive, not a real
-                # grid duplicate.
-                pair_key = frozenset((current["order_id"], previous["order_id"]))
-                if pair_key not in self._diagnosed_same_order_pairs:
-                    self._diagnosed_same_order_pairs.add(pair_key)
-                    self._diagnostic_rest_check_executions(current, previous)
+                # Insert (or refresh) cache entry as UNKNOWN before the REST
+                # cross-check so a same-event burst (incident saw 5 ERRORs in 1
+                # second on the same pair) is suppressed by the dedup gate on
+                # events 2..N. The cross-check writes the resolved verdict back.
+                self._same_order_dedup_cache[pair_key] = _SameOrderDedupEntry(
+                    first_seen_ts=existing.first_seen_ts if existing is not None else now,
+                    last_seen_ts=now,
+                    verdict="UNKNOWN",
+                )
+
+                # Diagnostic REST cross-check verifies whether Bybit-side
+                # actually has two distinct fills, or the WS stream duplicated
+                # a single fill event. The latter would mean SAME ORDER is a
+                # WS-glitch false positive, not a real grid duplicate; in that
+                # case the cross-check auto-clears the soft-block.
+                self._diagnostic_rest_check_executions(current, previous)
                 return
 
     def _diagnostic_rest_check_executions(self, current: dict, previous: dict) -> None:
@@ -1150,6 +1278,7 @@ class StrategyRunner:
         Failures here are logged as ERROR but never raised — diagnostic is
         best-effort, never breaks the main loop.
         """
+        pair_key = frozenset((current["order_id"], previous["order_id"]))
         try:
             # Access the rest_client through the executor. This is a
             # diagnostic-only path; a proper API addition can come later.
@@ -1174,7 +1303,43 @@ class StrategyRunner:
                 f"previous order_id={prev_id} → {len(prev_matches)} REST matches "
                 f"[{[(m.get('execId'), m.get('execPrice'), m.get('execQty'), m.get('orderLinkId'), m.get('execType')) for m in prev_matches[:3]]}]"
             )
+
+            # Write resolved verdict back into the dedup cache so subsequent
+            # retriggers on the same pair hit the verdict-aware gate (feature
+            # 0031). The first-trigger path inserted an UNKNOWN entry; if the
+            # entry is missing (defensive: should not happen), insert a fresh
+            # one.
+            now = datetime.now(UTC)
+            existing = self._same_order_dedup_cache.get(pair_key)
+            if existing is not None:
+                existing.verdict = verdict
+                existing.last_seen_ts = now
+            else:
+                self._same_order_dedup_cache[pair_key] = _SameOrderDedupEntry(
+                    first_seen_ts=now, last_seen_ts=now, verdict=verdict,
+                )
+
+            # Auto-clear the soft-block when REST confirms there is no real
+            # duplicate. INFO-level only, no notifier — Notifier.alert always
+            # logs at ERROR (notifier.py:67) and a recovery line must not be
+            # ERROR-level. REAL_DUPLICATE leaves the block latched.
+            if verdict == "WS_GLITCH_SUSPECTED":
+                logger.info(
+                    f"{self.strat_id}: SAME ORDER soft-block auto-cleared "
+                    f"(WS glitch confirmed by REST cross-check; verdict={verdict})"
+                )
+                self.reset_same_order_error()
+                # Mark the in-flight ExecutionEvent as a confirmed phantom so
+                # `on_execution` returns BEFORE `engine.on_event(event)`. The
+                # auto-clear would otherwise both un-gate placement AND let
+                # the engine record a fake fill, contaminating downstream
+                # tick/execution decisions.
+                self._drop_phantom_event_for_current_call = True
         except Exception as e:
+            # Cross-check failed — leave the cache entry as UNKNOWN so a
+            # subsequent occurrence falls through to the full first-trigger
+            # path. The soft-block stays latched (safer than auto-clearing
+            # without a verdict).
             logger.error(
                 f"{self.strat_id}: SAME ORDER REST cross-check failed "
                 f"(diagnostic only, ignoring): {e}", exc_info=True,
