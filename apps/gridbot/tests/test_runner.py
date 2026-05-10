@@ -2511,6 +2511,628 @@ class TestSameOrderDetection:
         assert len(runner._recent_executions_short) == 1
 
 
+class TestSameOrderDedupAndAutoRecovery:
+    """Feature 0031: dedup of SAME ORDER pair retriggers and soft-block
+    auto-recovery on `WS_GLITCH_SUSPECTED` REST cross-check verdict.
+
+    See docs/features/0031_PLAN.md.
+    """
+
+    def _stub_rest_executions(self, runner, executions=None, exc=None):
+        """Wire executor._client.get_executions to return executions or raise."""
+        client = MagicMock()
+        if exc is not None:
+            client.get_executions.side_effect = exc
+        else:
+            client.get_executions.return_value = (executions or [], None)
+        runner._executor._client = client
+        return client
+
+    def _rest_match(self, order_id):
+        return {
+            "orderId": order_id,
+            "execId": f"exec-{order_id}",
+            "execPrice": "50000",
+            "execQty": "0.1",
+            "orderLinkId": f"link-{order_id}",
+            "execType": "Trade",
+        }
+
+    def _make_exec(self, order_id, t, exec_id=None, price="50000.0", side="Buy"):
+        return ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=t,
+            local_ts=t,
+            exec_id=exec_id or f"e-{order_id}",
+            order_id=order_id,
+            order_link_id=f"link-{order_id}",
+            side=side,
+            price=Decimal(price),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("0"),
+            leaves_qty=Decimal("0"),
+            closed_size=Decimal("0"),
+        )
+
+    def _trigger_pair(self, runner, t0, ids=("oa", "ob")):
+        """Drive two ExecutionEvents with the given order_id pair so the
+        side-check pair is `frozenset(ids)`. Returns (event_a, event_b)."""
+        ev_a = self._make_exec(ids[0], t0)
+        ev_b = self._make_exec(ids[1], t0 + timedelta(seconds=1))
+        runner._check_same_orders(ev_a)
+        runner._check_same_orders(ev_b)
+        return ev_a, ev_b
+
+    # --- Phase 2: REST verdict effect on soft-block --------------------------
+
+    def test_rest_verdict_ws_glitch_clears_soft_block(self, runner, caplog):
+        """`WS_GLITCH_SUSPECTED` triggers reset_same_order_error and INFO log,
+        no notifier call on the recovery path."""
+        import logging
+
+        notifier = Mock()
+        runner._notifier = notifier
+        # REST returns only one of the two order_ids → one match for prev,
+        # zero for current → verdict=WS_GLITCH_SUSPECTED (current cur_matches=0
+        # AND prev_matches=1 → not REAL_DUPLICATE).
+        # The pair is (oa, ob); side-check compares (cur=ob, prev=oa).
+        self._stub_rest_executions(runner, executions=[self._rest_match("oa")])
+
+        with caplog.at_level(logging.INFO, logger="gridbot.runner"):
+            self._trigger_pair(runner, datetime.now(UTC))
+
+        assert runner.same_order_error is False
+        assert len(runner._recent_executions_long) == 0
+        assert len(runner._recent_executions_short) == 0
+        assert any(
+            "soft-block auto-cleared" in r.message and r.levelname == "INFO"
+            for r in caplog.records
+        )
+        # Original first-trigger ALERT was emitted, but no recovery alert.
+        assert notifier.alert.call_count == 1
+        # Cache entry now carries WS_GLITCH_SUSPECTED.
+        pair_key = frozenset(("oa", "ob"))
+        assert runner._same_order_dedup_cache[pair_key].verdict == "WS_GLITCH_SUSPECTED"
+
+    def test_rest_verdict_real_duplicate_keeps_soft_block(self, runner, caplog):
+        """REAL_DUPLICATE keeps the block latched, no auto-clear log,
+        cache entry verdict updated to REAL_DUPLICATE."""
+        import logging
+
+        notifier = Mock()
+        runner._notifier = notifier
+        self._stub_rest_executions(
+            runner, executions=[self._rest_match("oa"), self._rest_match("ob")]
+        )
+
+        with caplog.at_level(logging.INFO, logger="gridbot.runner"):
+            self._trigger_pair(runner, datetime.now(UTC))
+
+        assert runner.same_order_error is True
+        assert all(
+            "soft-block auto-cleared" not in r.message for r in caplog.records
+        )
+        assert notifier.alert.call_count == 1
+        pair_key = frozenset(("oa", "ob"))
+        assert runner._same_order_dedup_cache[pair_key].verdict == "REAL_DUPLICATE"
+
+    def test_rest_cross_check_exception_keeps_soft_block(self, runner, caplog):
+        """REST raising leaves the cache entry as UNKNOWN; soft-block stays."""
+        import logging
+
+        notifier = Mock()
+        runner._notifier = notifier
+        self._stub_rest_executions(runner, exc=RuntimeError("boom"))
+
+        with caplog.at_level(logging.INFO, logger="gridbot.runner"):
+            self._trigger_pair(runner, datetime.now(UTC))
+
+        assert runner.same_order_error is True
+        assert all(
+            "soft-block auto-cleared" not in r.message for r in caplog.records
+        )
+        pair_key = frozenset(("oa", "ob"))
+        assert runner._same_order_dedup_cache[pair_key].verdict == "UNKNOWN"
+
+    # --- Phase 1: dedup gate behavior ----------------------------------------
+
+    def test_same_order_ws_glitch_repeat_within_ttl_is_suppressed(self, runner, caplog):
+        """Second occurrence of the same WS_GLITCH pair emits only DEBUG; one
+        ERROR log and one notifier alert across both invocations."""
+        import logging
+
+        notifier = Mock()
+        runner._notifier = notifier
+        self._stub_rest_executions(runner, executions=[self._rest_match("oa")])
+
+        t0 = datetime.now(UTC)
+        with caplog.at_level(logging.DEBUG, logger="gridbot.runner"):
+            self._trigger_pair(runner, t0)
+
+            # After auto-clear, buffers are empty. Re-form the pair with two
+            # more events using the SAME order_ids — pair_key matches the
+            # cached entry.
+            t1 = t0 + timedelta(seconds=2)
+            runner._check_same_orders(self._make_exec("oa", t1))
+            runner._check_same_orders(self._make_exec("ob", t1 + timedelta(seconds=1)))
+
+        same_order_errors = [
+            r for r in caplog.records if "SAME ORDER ERROR" in r.message
+        ]
+        suppressed = [
+            r for r in caplog.records
+            if "duplicate SAME ORDER pair suppressed" in r.message
+        ]
+        assert len(same_order_errors) == 1, "exactly one ERROR across both triggers"
+        assert len(suppressed) >= 1, "second trigger emits DEBUG suppression"
+        assert notifier.alert.call_count == 1
+        assert runner.same_order_error is False
+
+    def test_same_order_real_duplicate_repeat_within_ttl_keeps_block_without_alert(
+        self, runner, caplog,
+    ):
+        """REGRESSION: dedup gate must re-establish `_same_order_error=True` on
+        REAL_DUPLICATE retriggers (because `_check_same_orders` resets the flag
+        at the top of every call). Otherwise the block silently drops."""
+        import logging
+
+        notifier = Mock()
+        runner._notifier = notifier
+        self._stub_rest_executions(
+            runner, executions=[self._rest_match("oa"), self._rest_match("ob")]
+        )
+
+        t0 = datetime.now(UTC)
+        with caplog.at_level(logging.DEBUG, logger="gridbot.runner"):
+            self._trigger_pair(runner, t0)
+            assert runner.same_order_error is True  # block latched
+
+            # Drive the same pair again WITHIN TTL. _check_same_orders will
+            # reset the flag at the top of the call; the dedup gate must
+            # re-establish it.
+            t1 = t0 + timedelta(seconds=10)
+            runner._check_same_orders(self._make_exec("oa", t1))
+            runner._check_same_orders(self._make_exec("ob", t1 + timedelta(seconds=1)))
+
+        same_order_errors = [
+            r for r in caplog.records if "SAME ORDER ERROR" in r.message
+        ]
+        suppressed = [
+            r for r in caplog.records
+            if "duplicate SAME ORDER pair suppressed" in r.message
+        ]
+        assert len(same_order_errors) == 1, "exactly one ERROR across both triggers"
+        assert len(suppressed) >= 1, "second trigger emits DEBUG suppression"
+        assert notifier.alert.call_count == 1, "no second ALERT"
+        # Critical assertion: block is still latched after the dedup-suppressed
+        # retrigger.
+        assert runner.same_order_error is True
+
+    def test_same_order_dedup_re_fires_after_ttl_expires(self, runner, caplog):
+        """After the TTL window, the cache entry is dropped on lazy expiry and
+        the same pair fires the full first-trigger path again."""
+        import logging
+        from gridbot.runner import _SAME_ORDER_DEDUP_TTL_SEC
+
+        notifier = Mock()
+        runner._notifier = notifier
+        self._stub_rest_executions(runner, executions=[self._rest_match("oa")])
+
+        t0 = datetime.now(UTC)
+        self._trigger_pair(runner, t0)
+        assert notifier.alert.call_count == 1
+
+        # Backdate the cached entry past TTL.
+        pair_key = frozenset(("oa", "ob"))
+        entry = runner._same_order_dedup_cache[pair_key]
+        entry.last_seen_ts = t0 - timedelta(seconds=_SAME_ORDER_DEDUP_TTL_SEC + 60)
+        entry.first_seen_ts = entry.last_seen_ts
+
+        # Re-trigger with same order_ids. Lazy expiry drops the entry, full
+        # first-trigger path runs again.
+        t2 = datetime.now(UTC)
+        with caplog.at_level(logging.ERROR, logger="gridbot.runner"):
+            runner._check_same_orders(self._make_exec("oa", t2))
+            runner._check_same_orders(
+                self._make_exec("ob", t2 + timedelta(seconds=1))
+            )
+
+        same_order_errors = [
+            r for r in caplog.records if "SAME ORDER ERROR" in r.message
+        ]
+        # caplog accumulates: 1 from initial trigger + 1 from post-TTL re-trigger.
+        assert len(same_order_errors) == 2, "fresh ERROR after TTL"
+        assert notifier.alert.call_count == 2, "fresh ALERT after TTL"
+
+    def test_same_order_dedup_distinct_pairs_independent(self, runner):
+        """Pair A in cache must not suppress detection on a different pair B."""
+        notifier = Mock()
+        runner._notifier = notifier
+        self._stub_rest_executions(runner, executions=[self._rest_match("oa")])
+
+        t0 = datetime.now(UTC)
+        # Pair A
+        self._trigger_pair(runner, t0, ids=("oa", "ob"))
+        # Buffers cleared by auto-clear; pair B uses different order_ids and
+        # different price to avoid hedge-pair classification interference.
+        self._stub_rest_executions(runner, executions=[self._rest_match("oc")])
+        t1 = t0 + timedelta(seconds=10)
+        runner._check_same_orders(self._make_exec("oc", t1, price="51000.0"))
+        runner._check_same_orders(
+            self._make_exec("od", t1 + timedelta(seconds=1), price="51000.0")
+        )
+
+        # Both pairs were adjudicated and live in the cache.
+        assert frozenset(("oa", "ob")) in runner._same_order_dedup_cache
+        assert frozenset(("oc", "od")) in runner._same_order_dedup_cache
+        assert notifier.alert.call_count == 2, "both pairs alerted on first trigger"
+
+    def test_same_order_dedup_cache_lazy_expiry_bounds_memory(self, runner):
+        """Lazy expiry drops entries whose last_seen_ts is older than the TTL
+        when a fresh detection runs."""
+        from gridbot.runner import (
+            _SAME_ORDER_DEDUP_TTL_SEC,
+            _SameOrderDedupEntry,
+        )
+
+        notifier = Mock()
+        runner._notifier = notifier
+        # Pre-populate a stale entry under an unrelated pair_key.
+        stale_key = frozenset(("stale_a", "stale_b"))
+        stale_ts = datetime.now(UTC) - timedelta(
+            seconds=_SAME_ORDER_DEDUP_TTL_SEC + 600,
+        )
+        runner._same_order_dedup_cache[stale_key] = _SameOrderDedupEntry(
+            first_seen_ts=stale_ts,
+            last_seen_ts=stale_ts,
+            verdict="WS_GLITCH_SUSPECTED",
+        )
+
+        # Drive a fresh detection on a new pair → triggers lazy expiry.
+        self._stub_rest_executions(runner, executions=[self._rest_match("oa")])
+        self._trigger_pair(runner, datetime.now(UTC))
+
+        assert stale_key not in runner._same_order_dedup_cache
+        assert frozenset(("oa", "ob")) in runner._same_order_dedup_cache
+
+    def test_unknown_verdict_falls_through_to_full_trigger(self, runner, caplog):
+        """A cached UNKNOWN entry (cross-check earlier failed) must fall
+        through to the full first-trigger path on the next occurrence."""
+        import logging
+
+        notifier = Mock()
+        runner._notifier = notifier
+
+        # First attempt: REST raises → cache verdict stays UNKNOWN.
+        self._stub_rest_executions(runner, exc=RuntimeError("boom"))
+        t0 = datetime.now(UTC)
+        self._trigger_pair(runner, t0)
+        pair_key = frozenset(("oa", "ob"))
+        assert runner._same_order_dedup_cache[pair_key].verdict == "UNKNOWN"
+        assert notifier.alert.call_count == 1
+
+        # Second attempt within TTL with a working REST stub. Buffer was not
+        # cleared (REST exception did not auto-clear), so manually reset to
+        # let new events reform the pair without short-circuiting on
+        # exchange_ts > 5s.
+        runner._recent_executions_long.clear()
+        runner._recent_executions_short.clear()
+        runner._same_order_error = False
+        self._stub_rest_executions(runner, executions=[self._rest_match("oa")])
+        t1 = t0 + timedelta(seconds=10)
+        with caplog.at_level(logging.ERROR, logger="gridbot.runner"):
+            runner._check_same_orders(self._make_exec("oa", t1))
+            runner._check_same_orders(
+                self._make_exec("ob", t1 + timedelta(seconds=1))
+            )
+
+        same_order_errors = [
+            r for r in caplog.records if "SAME ORDER ERROR" in r.message
+        ]
+        # caplog accumulates: 1 from first attempt (UNKNOWN) + 1 from second.
+        assert len(same_order_errors) == 2, "UNKNOWN fell through to full path"
+        assert notifier.alert.call_count == 2, "fresh ALERT on UNKNOWN fall-through"
+        # Now the cross-check succeeded and updated verdict.
+        assert (
+            runner._same_order_dedup_cache[pair_key].verdict
+            == "WS_GLITCH_SUSPECTED"
+        )
+
+    def test_burst_of_five_same_order_events_emits_one_alert(self, runner, caplog):
+        """Incident replay: 5 SAME ORDER events on the same pair within ~1s,
+        REST verdict=WS_GLITCH_SUSPECTED. Expect exactly one ERROR + one
+        ALERT + one REST cross-check; bot recovers."""
+        import logging
+
+        notifier = Mock()
+        runner._notifier = notifier
+        client = self._stub_rest_executions(
+            runner, executions=[self._rest_match("oa")]
+        )
+
+        t0 = datetime.now(UTC)
+        # Alternate order_ids so the buffer pair = frozenset({oa, ob}) on
+        # every detection cycle (matching the WS-replay pattern observed in
+        # production where the same two events were emitted repeatedly).
+        ids_sequence = ["oa", "ob", "oa", "ob", "oa"]
+        with caplog.at_level(logging.DEBUG, logger="gridbot.runner"):
+            for i, oid in enumerate(ids_sequence):
+                runner._check_same_orders(
+                    self._make_exec(oid, t0 + timedelta(milliseconds=200 * i))
+                )
+
+        same_order_errors = [
+            r for r in caplog.records if "SAME ORDER ERROR" in r.message
+        ]
+        assert len(same_order_errors) == 1
+        assert notifier.alert.call_count == 1
+        assert client.get_executions.call_count == 1
+        assert runner.same_order_error is False
+
+    def test_on_execution_drops_phantom_event_before_engine(self, runner):
+        """E2E (review feedback for feature 0031 P1, escalated): a phantom
+        ExecutionEvent confirmed by REST cross-check (verdict=WS_GLITCH_SUSPECTED)
+        must NOT reach `engine.on_event(event)` and must NOT trigger
+        `_execute_intents`. Letting the engine see a fake fill would
+        corrupt grid/position state and contaminate downstream events."""
+        notifier = Mock()
+        runner._notifier = notifier
+        self._stub_rest_executions(runner, executions=[self._rest_match("oa")])
+
+        placement = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("50100.0"),
+            qty=Decimal("0.1"),
+            grid_level=2,
+            direction="long",
+        )
+        runner._engine = MagicMock()
+        runner._engine.on_event.return_value = [placement]
+        runner._execute_intents = MagicMock()
+
+        t0 = datetime.now(UTC)
+        ev_a = self._make_exec("oa", t0)
+        # First fill: real, no SAME ORDER trigger; reaches the engine.
+        runner.on_execution(ev_a)
+        assert any(
+            call.args and getattr(call.args[0], "exec_id", None) == ev_a.exec_id
+            for call in runner._engine.on_event.call_args_list
+        ), "real event must still reach engine.on_event"
+
+        # Second fill: phantom side. SAME ORDER fires; REST → WS_GLITCH →
+        # auto-clear; on_execution returns BEFORE engine.on_event for this
+        # event AND _execute_intents is not called.
+        runner._engine.on_event.reset_mock()
+        runner._execute_intents.reset_mock()
+        ev_b = self._make_exec("ob", t0 + timedelta(seconds=1))
+        runner.on_execution(ev_b)
+
+        assert runner.same_order_error is False
+        runner._execute_intents.assert_not_called()
+        # Critical assertion: engine did NOT see the phantom event.
+        for call in runner._engine.on_event.call_args_list:
+            assert getattr(call.args[0], "exec_id", None) != ev_b.exec_id, (
+                "engine.on_event must NOT be called for phantom event"
+            )
+
+    def test_on_execution_phantom_does_not_mark_tracked_order_filled(
+        self, runner,
+    ):
+        """E2E (review feedback for feature 0031 P1, second escalation):
+        when an ExecutionEvent is REST-classified as WS_GLITCH_SUSPECTED, the
+        underlying exchange order is still resting. The runner must NOT call
+        `tracked.mark_filled()` on it — otherwise `get_limit_orders()` would
+        drop the order from the live in-memory view (it filters
+        status not in {"placed"} at runner.py:324), causing the reconciler
+        to operate on a stale book."""
+        notifier = Mock()
+        runner._notifier = notifier
+        # REST returns only oa's fill → verdict=WS_GLITCH_SUSPECTED for the
+        # ob (current) event in the side-check.
+        self._stub_rest_executions(runner, executions=[self._rest_match("oa")])
+
+        intent_a = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy",
+            price=Decimal("50000.0"), qty=Decimal("0.1"),
+            grid_level=1, direction="long",
+        )
+        intent_b = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy",
+            price=Decimal("50000.0"), qty=Decimal("0.1"),
+            grid_level=1, direction="long",
+        )
+        # Two tracked orders both currently `placed`. Distinct client IDs
+        # simulate the same scenario as the existing dup-bug regression test.
+        runner._tracked_orders["link-oa"] = TrackedOrder(
+            client_order_id="link-oa", order_id="oa",
+            intent=intent_a, status="placed",
+        )
+        runner._tracked_orders["link-ob"] = TrackedOrder(
+            client_order_id="link-ob", order_id="ob",
+            intent=intent_b, status="placed",
+        )
+
+        t0 = datetime.now(UTC)
+        # First event (oa): real fill. tracked-oa should be marked filled.
+        runner.on_execution(self._make_exec("oa", t0))
+        assert runner._tracked_orders["link-oa"].status == "filled"
+
+        # Second event (ob): SAME ORDER fires, REST → WS_GLITCH → drop.
+        # tracked-ob must remain `placed`.
+        runner.on_execution(self._make_exec("ob", t0 + timedelta(seconds=1)))
+
+        assert runner._tracked_orders["link-ob"].status == "placed", (
+            "phantom event must NOT mark its tracked order filled"
+        )
+        # And the order is still visible in the live limit-orders view.
+        limit_orders = runner.get_limit_orders()
+        long_order_ids = [o["orderId"] for o in limit_orders["long"]]
+        assert "ob" in long_order_ids, (
+            "phantom-event tracked order must still appear in get_limit_orders()"
+        )
+
+    def test_on_execution_cached_ws_glitch_repeat_drops_phantom(self, runner):
+        """E2E (review feedback for feature 0031 P1, third escalation):
+        a repeat of the same WS_GLITCH-classified pair (cache-hit dedup
+        branch) must also drop the phantom event end-to-end. Without
+        setting `_drop_phantom_event_for_current_call` in the cache-hit
+        branch, the dedup gate silences the alert but the event still
+        flows into `tracked.mark_filled()` and `engine.on_event(event)` —
+        precisely the corruption the cache is supposed to prevent."""
+        notifier = Mock()
+        runner._notifier = notifier
+        self._stub_rest_executions(runner, executions=[self._rest_match("oa")])
+
+        intent_a = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy",
+            price=Decimal("50000.0"), qty=Decimal("0.1"),
+            grid_level=1, direction="long",
+        )
+        intent_b = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy",
+            price=Decimal("50000.0"), qty=Decimal("0.1"),
+            grid_level=1, direction="long",
+        )
+        runner._tracked_orders["link-oa"] = TrackedOrder(
+            client_order_id="link-oa", order_id="oa",
+            intent=intent_a, status="placed",
+        )
+        runner._tracked_orders["link-ob"] = TrackedOrder(
+            client_order_id="link-ob", order_id="ob",
+            intent=intent_b, status="placed",
+        )
+
+        placement = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy",
+            price=Decimal("50100.0"), qty=Decimal("0.1"),
+            grid_level=2, direction="long",
+        )
+        runner._engine = MagicMock()
+        runner._engine.on_event.return_value = [placement]
+        runner._execute_intents = MagicMock()
+
+        t0 = datetime.now(UTC)
+        # First occurrence — full first-trigger path. ev_ob is dropped.
+        runner.on_execution(self._make_exec("oa", t0))
+        runner.on_execution(self._make_exec("ob", t0 + timedelta(seconds=1)))
+        pair_key = frozenset(("oa", "ob"))
+        assert (
+            runner._same_order_dedup_cache[pair_key].verdict
+            == "WS_GLITCH_SUSPECTED"
+        )
+
+        # Re-form the same pair within TTL. Auto-clear emptied buffers, so
+        # both events are needed to reconstruct the side-check pair. The
+        # phantom is ev_ob (REST has no match for "ob"); ev_oa replay is
+        # NOT the phantom from REST's perspective and is allowed to flow
+        # through normally — that part is a separate, fundamental gap
+        # (single-event WS replays without a paired event cannot be
+        # detected via SAME ORDER), out of scope for this feature.
+        t1 = t0 + timedelta(seconds=10)
+        ev_oa_replay = self._make_exec("oa", t1)
+        ev_ob_replay = self._make_exec("ob", t1 + timedelta(seconds=1))
+        runner._engine.on_event.reset_mock()
+        runner.on_execution(ev_oa_replay)
+        # Snapshot _execute_intents call count after ev_oa replay so we can
+        # detect any *additional* call attributable to ev_ob.
+        execute_calls_before_ob = runner._execute_intents.call_count
+
+        runner.on_execution(ev_ob_replay)
+
+        # Phantom-side replay (ev_ob) must not reach engine or executor.
+        for call in runner._engine.on_event.call_args_list:
+            assert (
+                getattr(call.args[0], "exec_id", None) != ev_ob_replay.exec_id
+            ), (
+                "cached WS_GLITCH retrigger phantom must NOT reach "
+                "engine.on_event"
+            )
+        assert runner._execute_intents.call_count == execute_calls_before_ob, (
+            "no additional _execute_intents call attributable to phantom replay"
+        )
+        assert runner._tracked_orders["link-ob"].status == "placed", (
+            "phantom-side tracked order must remain placed on cached repeat"
+        )
+
+    def test_on_execution_phantom_drop_flag_resets_between_events(self, runner):
+        """The one-shot `_drop_phantom_event_for_current_call` flag must
+        reset at the top of every `on_execution` call so a non-phantom event
+        following a phantom one is processed normally — engine sees it AND
+        placements run."""
+        notifier = Mock()
+        runner._notifier = notifier
+        self._stub_rest_executions(runner, executions=[self._rest_match("oa")])
+
+        placement = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("50100.0"),
+            qty=Decimal("0.1"),
+            grid_level=2,
+            direction="long",
+        )
+        runner._engine = MagicMock()
+        runner._engine.on_event.return_value = [placement]
+        runner._execute_intents = MagicMock()
+
+        t0 = datetime.now(UTC)
+        runner.on_execution(self._make_exec("oa", t0))
+        runner.on_execution(self._make_exec("ob", t0 + timedelta(seconds=1)))
+        # ev_b was phantom-dropped. The flag must now be reset.
+
+        runner._engine.on_event.reset_mock()
+        runner._execute_intents.reset_mock()
+        t2 = t0 + timedelta(minutes=1)
+        ev_c = self._make_exec("oc", t2, price="51000.0")
+        runner.on_execution(ev_c)
+
+        # Subsequent non-phantom event reaches engine AND triggers placement.
+        assert runner._engine.on_event.called
+        runner._execute_intents.assert_called_once()
+        assert runner._drop_phantom_event_for_current_call is False
+
+    def test_dedup_then_real_duplicate_on_different_pair_fires_normally(
+        self, runner, caplog,
+    ):
+        """Pair A cached as WS_GLITCH (suppressed); pair B (fresh order_ids)
+        within TTL fires the full first-trigger path."""
+        import logging
+
+        notifier = Mock()
+        runner._notifier = notifier
+
+        # Pair A → WS_GLITCH auto-clear.
+        self._stub_rest_executions(runner, executions=[self._rest_match("oa")])
+        t0 = datetime.now(UTC)
+        self._trigger_pair(runner, t0, ids=("oa", "ob"))
+        assert runner.same_order_error is False
+
+        # Pair B fresh (different order_ids). Use a different price so the
+        # pair B fills do not share the same long-buffer slot as pair A
+        # leftovers.
+        self._stub_rest_executions(
+            runner, executions=[self._rest_match("oc"), self._rest_match("od")]
+        )
+        t1 = t0 + timedelta(seconds=10)
+        with caplog.at_level(logging.ERROR, logger="gridbot.runner"):
+            runner._check_same_orders(self._make_exec("oc", t1, price="51000.0"))
+            runner._check_same_orders(
+                self._make_exec("od", t1 + timedelta(seconds=1), price="51000.0")
+            )
+
+        # Pair B fired: ERROR + ALERT, REAL_DUPLICATE verdict re-arms block.
+        # caplog accumulates: 1 from pair A first-trigger + 1 from pair B.
+        same_order_errors = [
+            r for r in caplog.records if "SAME ORDER ERROR" in r.message
+        ]
+        assert len(same_order_errors) == 2
+        assert notifier.alert.call_count == 2
+        assert runner.same_order_error is True
+
+
 class TestRunnerAuthCooldown:
     """Tests for runner skipping intents during auth cooldown."""
     def test_skips_intents_when_auth_cooldown_active(self, strategy_config):
