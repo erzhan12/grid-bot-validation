@@ -200,15 +200,23 @@ class TestExecutorRESTPayloadMapping:
 
         assert result.success
         assert result.order_id == "real_order_1"
-        mock_rest.place_order.assert_called_once_with(
-            symbol="BTCUSDT",
-            side=intent.side,
-            order_type="Limit",
-            qty=str(intent.qty),
-            price=str(intent.price),
-            reduce_only=intent.reduce_only,
-            position_idx=1 if intent.direction == "long" else 2,
-        )
+        mock_rest.place_order.assert_called_once()
+        call_kwargs = mock_rest.place_order.call_args.kwargs
+        assert call_kwargs == {
+            "symbol": "BTCUSDT",
+            "side": intent.side,
+            "order_type": "Limit",
+            "qty": str(intent.qty),
+            "price": str(intent.price),
+            "reduce_only": intent.reduce_only,
+            "position_idx": 1 if intent.direction == "long" else 2,
+            "order_link_id": result.order_link_id,
+        }
+        assert result.order_link_id is not None
+        prefix, sep, suffix = result.order_link_id.partition("-")
+        assert prefix == intent.client_order_id
+        assert sep == "-"
+        assert suffix.isdigit()
 
     def test_cancel_intent_maps_to_rest_params(self, grid_config, btcusdt_tick_size):
         """CancelIntent fields map correctly to cancel_order kwargs."""
