@@ -72,8 +72,8 @@ class Reconciler:
         """Reconcile state on startup.
 
         Fetches all open limit orders from exchange and injects them into the runner.
-        We DO send orderLinkId to Bybit (deterministic prefix + millis suffix
-        post-hotfix 2026-05-08), but cannot use orderLinkId presence to filter
+        We DO send orderLinkId to Bybit (deterministic prefix + millis suffix,
+        preserved across retries since feature 0032), but cannot use orderLinkId presence to filter
         "ours" — all limit orders for this symbol are assumed to belong to
         this strategy. See the IMPORTANT block below and
         config.py:validate_no_shared_symbol for the safety invariant.
@@ -104,7 +104,8 @@ class Reconciler:
 
         # Inject all open orders into runner.
         # We DO send orderLinkId to Bybit (deterministic prefix from
-        # intent.client_order_id + millis suffix post-2026-05-08), but
+        # intent.client_order_id + millis suffix, preserved across retries
+        # since feature 0032), but
         # we still treat every limit order on this symbol as "ours" rather
         # than filtering by orderLinkId presence. Two strategies on the same
         # (account, symbol) would compute the same deterministic prefix
@@ -212,4 +213,3 @@ class Reconciler:
             result.errors.append(str(e))
 
         return result
-

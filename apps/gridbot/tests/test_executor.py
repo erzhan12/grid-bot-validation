@@ -1,5 +1,6 @@
 """Tests for gridbot executor module."""
 
+from dataclasses import replace
 from decimal import Decimal
 from unittest.mock import Mock, MagicMock
 
@@ -118,6 +119,7 @@ class TestExecutorPlaceOrder:
         }
         assert order_link_id.startswith(f"{place_intent.client_order_id}-")
         assert order_link_id.partition("-")[2].isdigit()
+        assert result.order_link_id == order_link_id
 
     def test_place_order_short_direction(self, executor, mock_rest_client):
         """Test order placement with short direction uses correct position_idx."""
@@ -150,6 +152,7 @@ class TestExecutorPlaceOrder:
         }
         assert order_link_id.startswith(f"{intent.client_order_id}-")
         assert order_link_id.partition("-")[2].isdigit()
+        assert result.order_link_id == order_link_id
 
     def test_execute_place_passes_orderLinkId_from_client_order_id(
         self, executor, mock_rest_client
@@ -176,7 +179,6 @@ class TestExecutorPlaceOrder:
             direction="long",
             reduce_only=False,
         )
-        from dataclasses import replace
         intent = replace(base_intent, client_order_id="abc123")
 
         result = executor.execute_place(intent)
@@ -190,6 +192,23 @@ class TestExecutorPlaceOrder:
         assert prefix == "abc123"
         assert sep == "-"
         assert suffix.isdigit()
+        assert result.order_link_id == order_link_id
+
+    def test_execute_place_reuses_preset_order_link_id(
+        self, executor, mock_rest_client, place_intent
+    ):
+        """Runner-assigned orderLinkId is used verbatim on the wire."""
+        intent = replace(
+            place_intent,
+            order_link_id=f"{place_intent.client_order_id}-1715170800000",
+        )
+
+        result = executor.execute_place(intent)
+
+        assert result.success is True
+        assert result.order_link_id == intent.order_link_id
+        _, kwargs = mock_rest_client.place_order.call_args
+        assert kwargs["order_link_id"] == intent.order_link_id
 
     def test_place_order_failure(self, executor, mock_rest_client, place_intent):
         """Test order placement failure."""
@@ -199,6 +218,8 @@ class TestExecutorPlaceOrder:
 
         assert result.success is False
         assert "API error" in result.error
+        assert result.order_link_id is not None
+        assert result.order_link_id.startswith(f"{place_intent.client_order_id}-")
 
     def test_place_order_shadow_mode(self, shadow_executor, mock_rest_client, place_intent):
         """Test order placement in shadow mode."""
@@ -206,6 +227,23 @@ class TestExecutorPlaceOrder:
 
         assert result.success is True
         assert result.order_id.startswith("shadow_")
+        assert result.order_link_id is not None
+        assert result.order_link_id.startswith(f"{place_intent.client_order_id}-")
+        mock_rest_client.place_order.assert_not_called()
+
+    def test_place_order_shadow_mode_reuses_preset_link_id(
+        self, shadow_executor, mock_rest_client, place_intent
+    ):
+        """Shadow mode reports the same wire id live mode would have used."""
+        intent = replace(
+            place_intent,
+            order_link_id=f"{place_intent.client_order_id}-1715170800000",
+        )
+
+        result = shadow_executor.execute_place(intent)
+
+        assert result.success is True
+        assert result.order_link_id == intent.order_link_id
         mock_rest_client.place_order.assert_not_called()
 
 

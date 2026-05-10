@@ -40,6 +40,7 @@ from gridcore import (
 from gridbot.config import StrategyConfig
 from gridbot.executor import IntentExecutor
 from gridbot.notifier import Notifier
+from gridbot.order_link_id import make_order_link_id
 
 
 logger = logging.getLogger(__name__)
@@ -143,6 +144,7 @@ class StrategyRunner:
         on_intent_failed: Optional[Callable[[PlaceLimitIntent | CancelIntent, str], None]] = None,
         on_unknown_order: Optional[Callable[[str], None]] = None,
         notifier: Optional[Notifier] = None,
+        on_retry_cancel_for_prefix: Optional[Callable[[str], int]] = None,
     ):
         """Initialize strategy runner.
 
@@ -155,6 +157,8 @@ class StrategyRunner:
             on_unknown_order: Callback when WS reports a New order we don't track
                 (for fast-tracking the next order-sync sweep).
             notifier: Alert notifier for same-order error Telegram alerts.
+            on_retry_cancel_for_prefix: Optional callback to cancel queued
+                placement retries after reconcile proves the order was accepted.
         """
         self._config = strategy_config
         self._executor = executor
@@ -162,6 +166,7 @@ class StrategyRunner:
         self._on_intent_failed = on_intent_failed
         self._on_unknown_order = on_unknown_order
         self._notifier = notifier
+        self._on_retry_cancel_for_prefix = on_retry_cancel_for_prefix
 
         # Qty computation
         self._instrument_info = instrument_info
@@ -830,6 +835,18 @@ class StrategyRunner:
 
         return position_size > (intent.qty + reduce_only_qty)
 
+    @staticmethod
+    def _assign_wire_link_id(
+        intent: PlaceLimitIntent,
+        *,
+        existing_order_link_id: Optional[str] = None,
+    ) -> PlaceLimitIntent:
+        """Return an intent carrying the wire orderLinkId for this placement."""
+        if intent.order_link_id is not None:
+            return intent
+        wire_id = existing_order_link_id or make_order_link_id(intent.client_order_id)
+        return replace(intent, order_link_id=wire_id)
+
     def _execute_place_intent(self, intent: PlaceLimitIntent, limits: dict[str, list[dict]]) -> None:
         """Execute a place order intent."""
         # Resolve qty (engine emits qty=0, we fill it in)
@@ -846,6 +863,8 @@ class StrategyRunner:
             )
             return
 
+        reusable_order_link_id = None
+
         # Check for duplicate
         if intent.client_order_id in self._tracked_orders:
             tracked = self._tracked_orders[intent.client_order_id]
@@ -854,24 +873,35 @@ class StrategyRunner:
                     f"{self.strat_id}: Skipping duplicate order {intent.client_order_id}"
                 )
                 return
+            if (
+                tracked.status == "failed"
+                and tracked.intent is not None
+                and tracked.intent.order_link_id is not None
+            ):
+                reusable_order_link_id = tracked.intent.order_link_id
+
+        assigned = self._assign_wire_link_id(
+            intent,
+            existing_order_link_id=reusable_order_link_id,
+        )
 
         # Track order
         tracked = TrackedOrder(
-            client_order_id=intent.client_order_id,
-            intent=intent,
+            client_order_id=assigned.client_order_id,
+            intent=assigned,
             status="pending",
         )
-        self._tracked_orders[intent.client_order_id] = tracked
+        self._tracked_orders[assigned.client_order_id] = tracked
 
         # Execute
-        result = self._executor.execute_place(intent)
+        result = self._executor.execute_place(assigned)
 
         if result.success:
             tracked.mark_placed(result.order_id)
         else:
             tracked.mark_failed()
             if self._on_intent_failed:
-                self._on_intent_failed(intent, result.error)
+                self._on_intent_failed(assigned, result.error)
 
     def _execute_cancel_intent(self, intent: CancelIntent) -> None:
         """Execute a cancel order intent."""
@@ -968,6 +998,37 @@ class StrategyRunner:
             # Guard against key collisions (e.g., orderLinkId equal to some
             # existing orderId, or duplicate injection of the same order).
             if client_id in self._tracked_orders:
+                existing = self._tracked_orders[client_id]
+                if existing.status in ("pending", "failed"):
+                    if existing.intent is None:
+                        logger.warning(
+                            f"{self.strat_id}: open-order upgrade skipped: "
+                            f"tracked order has no intent (prefix={client_id})"
+                        )
+                        continue
+
+                    # Bybit should echo our wire id; fallback keeps the prior
+                    # assigned id if an older/direct exchange payload omits it.
+                    exchange_link_id = order_link_id or existing.intent.order_link_id
+                    upgraded_intent = replace(
+                        existing.intent,
+                        order_link_id=exchange_link_id,
+                    )
+                    prev_state = existing.status
+                    existing.intent = upgraded_intent
+                    existing.mark_placed(order_id)
+                    removed = (
+                        self._on_retry_cancel_for_prefix(client_id)
+                        if self._on_retry_cancel_for_prefix
+                        else 0
+                    )
+                    logger.info(
+                        f"{self.strat_id}: tracked order upgraded from {prev_state} "
+                        f"via reconcile (prefix={client_id}, order_id={order_id}, "
+                        f"link_id={exchange_link_id}, retry_cancelled={removed})"
+                    )
+                    injected += 1
+                    continue
                 logger.warning(
                     f"{self.strat_id}: Skipping injected order {order_id} — "
                     f"key collision on client_id={client_id}"
@@ -1344,4 +1405,3 @@ class StrategyRunner:
                 f"{self.strat_id}: SAME ORDER REST cross-check failed "
                 f"(diagnostic only, ignoring): {e}", exc_info=True,
             )
-

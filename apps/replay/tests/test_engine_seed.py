@@ -134,7 +134,7 @@ def seeded_db(db, seed_ts, snapshot_ts):
                 run_id="seed-run",
                 account_id="acc-1",
                 order_id="ORD-SEED-1",
-                order_link_id="LX-SEED-1",
+                order_link_id="abcdef0123456789-1715170800000",
                 symbol=SYMBOL,
                 exchange_ts=snapshot_ts,
                 local_ts=snapshot_ts,
@@ -251,7 +251,7 @@ class TestReplayEngineSeedingPipeline:
         assert grid_seed is not None
         assert len(grid_seed.grid) == 4
         assert len(order_seeds) == 1
-        assert order_seeds[0].client_id == "LX-SEED-1"
+        assert order_seeds[0].client_id == "abcdef0123456789"
 
         # Build session + runner the same way run() does.
         from backtest.config import BacktestStrategyConfig
@@ -302,13 +302,13 @@ class TestReplayEngineSeedingPipeline:
         order_manager = runner.order_manager
         assert "ORD-SEED-1" in order_manager.active_orders
         seeded_order = order_manager.active_orders["ORD-SEED-1"]
-        assert seeded_order.client_order_id == "LX-SEED-1"
+        assert seeded_order.client_order_id == "abcdef0123456789"
         assert seeded_order.side == "Buy"
         assert seeded_order.direction == "long"
         assert seeded_order.price == Decimal("99000")
         assert seeded_order.qty == Decimal("0.1")
         assert seeded_order.reduce_only is False
-        assert "LX-SEED-1" in order_manager._client_order_ids
+        assert "abcdef0123456789" in order_manager._client_order_ids
 
         # Grid seed → GridEngine.grid was restored from the seeded levels.
         # Grid.restore_grid keeps the level list intact.
