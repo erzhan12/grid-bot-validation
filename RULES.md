@@ -1642,12 +1642,12 @@ Replay engine that reads recorded mainnet data from the recorder's database, fee
    - Replay engine is a thin orchestrator wiring these together
 
 3. **Replay Fill Simulator Modes**
-   - `strict_cross` (default): existing conservative model. BUY fills only below limit; SELL fills only above limit.
+   - `strict_cross`: conservative trade-tape model. BUY fills only below limit; SELL fills only above limit. Used as `BacktestEngine` default and as opt-in for replay backward-compat baseline.
    - `trade_through_at_limit`: last-price model that includes exact limit touches (`<=` / `>=`).
-   - `book_touch`: replay parity mode using recorded L1 (`ask1 <= limit` for BUY, `bid1 >= limit` for SELL), falling back to `trade_through_at_limit` for legacy bare-price callers.
-   - `BacktestEngine` still instantiates the default `strict_cross` mode; replay config can opt into other modes via `fill_simulator.mode`.
+   - `book_touch` (**replay default**): parity mode using recorded L1 (`ask1 <= limit` for BUY, `bid1 >= limit` for SELL), falling back to `trade_through_at_limit` for legacy bare-price callers.
+   - Default split: `apps/replay` defaults to `book_touch` (recorder always has L1; closes the at-limit-fill gap — feature 0033 Phase 4 smoke: 91.3% → 97.8% match_rate); `BacktestEngine` keeps `strict_cross` because forward backtest data sources may lack L1.
    - `BacktestOrderManager.check_fills(TickerEvent(...))` is always scoped to the ticker's own symbol; the legacy bare-Decimal path preserves all-symbol scanning when no `symbol` filter is supplied.
-   - Rationale: production backtests keep conservative semantics while recorder parity smoke can use the richer bid/ask already stored in `ticker_snapshots`.
+   - Rationale: production backtests keep conservative semantics; replay parity smoke benefits from the richer bid/ask already stored in `ticker_snapshots`.
 
 4. **Config Shape: Root-Level Replay Parameters**
    - `initial_balance`, `enable_funding`, `wind_down_mode` live at **root level** of `ReplayConfig`, NOT nested under `strategy`

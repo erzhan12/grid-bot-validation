@@ -158,8 +158,14 @@ class FillSimulatorConfig(BaseModel):
     """Replay fill simulator configuration."""
 
     mode: Literal["strict_cross", "trade_through_at_limit", "book_touch"] = Field(
-        default="strict_cross",
-        description="Fill simulator mode for replay.",
+        default="book_touch",
+        description=(
+            "Fill simulator mode for replay. Default is 'book_touch' because "
+            "the recorder always supplies L1 bid/ask and book_touch closes "
+            "the at-limit-fill gap that strict_cross misses (feature 0033 "
+            "Phase 4 smoke: match_rate 91.3% -> 97.8%). Override to "
+            "'strict_cross' for backward-compat parity runs."
+        ),
     )
 
 

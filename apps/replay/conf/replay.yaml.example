@@ -20,10 +20,11 @@ strategy:
   commission_rate: 0.0002
 
 # Optional fill simulator mode:
-#   strict_cross (default, conservative), trade_through_at_limit, or book_touch.
-#   Use book_touch for recorder parity smoke when ticker_snapshots include L1 bid/ask.
+#   book_touch (default, uses recorded L1 bid/ask for parity with live exchange),
+#   trade_through_at_limit, or strict_cross (conservative, trade-tape only).
+#   Override to strict_cross to reproduce pre-0033 baseline.
 # fill_simulator:
-#   mode: strict_cross
+#   mode: book_touch
 
 initial_balance: 10000
 enable_funding: true
