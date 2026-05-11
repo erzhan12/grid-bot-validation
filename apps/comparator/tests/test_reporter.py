@@ -142,6 +142,94 @@ class TestComparatorReporter:
 
         assert "equity_comparison" not in paths
 
+    def test_export_position_comparison_writes_expected_columns(
+        self, sample_match_result, tmp_path,
+    ):
+        """0034: export_position_comparison writes the documented columns."""
+        from grid_db.models import PositionSnapshot
+        from comparator.position_metrics import PositionComparator
+
+        metrics = calculate_metrics(sample_match_result)
+        ts = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+        def _snap(side, source):
+            return PositionSnapshot(
+                run_id="r", account_id="a", symbol="BTCUSDT",
+                exchange_ts=ts, local_ts=ts, side=side,
+                size=Decimal("1"), entry_price=Decimal("100"),
+                liq_price=Decimal("90"), unrealised_pnl=Decimal("0"),
+                source=source, mark_price=Decimal("101"),
+                position_im=Decimal("10"), position_mm=Decimal("0.5"),
+                cum_realised_pnl=Decimal("5"),
+            )
+
+        pairs = PositionComparator().pair_and_compare(
+            [_snap("Buy", "live")], [_snap("Buy", "backtest")],
+        )
+        reporter = ComparatorReporter(
+            sample_match_result, metrics, position_pairs=pairs,
+        )
+        out = tmp_path / "position_comparison.csv"
+        reporter.export_position_comparison(out)
+
+        with open(out) as f:
+            reader = csv.DictReader(f)
+            header = reader.fieldnames
+            rows = list(reader)
+        assert "im_delta" in header
+        assert "mm_delta" in header
+        assert "liq_delta" in header
+        assert "unrealised_delta" in header
+        assert "cum_realised_delta" in header
+        assert len(rows) == 1
+        assert rows[0]["side"] == "Buy"
+
+    def test_export_all_includes_position_comparison_when_pairs_present(
+        self, sample_match_result, tmp_path,
+    ):
+        """0034: export_all adds position_comparison.csv when pairs exist."""
+        from grid_db.models import PositionSnapshot
+        from comparator.position_metrics import PositionComparator
+
+        metrics = calculate_metrics(sample_match_result)
+        ts = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+        snap = PositionSnapshot(
+            run_id="r", account_id="a", symbol="BTCUSDT",
+            exchange_ts=ts, local_ts=ts, side="Buy",
+            size=Decimal("1"), entry_price=Decimal("100"),
+            liq_price=Decimal("90"), unrealised_pnl=Decimal("0"),
+            source="live", mark_price=Decimal("101"),
+            position_im=Decimal("10"), position_mm=Decimal("0.5"),
+            cum_realised_pnl=Decimal("5"),
+        )
+        snap_bt = PositionSnapshot(
+            run_id="r", account_id="a", symbol="BTCUSDT",
+            exchange_ts=ts, local_ts=ts, side="Buy",
+            size=Decimal("1"), entry_price=Decimal("100"),
+            liq_price=Decimal("90"), unrealised_pnl=Decimal("0"),
+            source="backtest", mark_price=Decimal("101"),
+            position_im=Decimal("10"), position_mm=Decimal("0.5"),
+            cum_realised_pnl=Decimal("5"),
+        )
+        pairs = PositionComparator().pair_and_compare([snap], [snap_bt])
+        reporter = ComparatorReporter(
+            sample_match_result, metrics, position_pairs=pairs,
+        )
+        paths = reporter.export_all(tmp_path)
+        assert "position_comparison" in paths
+        assert paths["position_comparison"].exists()
+
+    def test_export_all_omits_position_comparison_when_no_pairs(
+        self, sample_match_result, tmp_path,
+    ):
+        """0034: export_all omits position_comparison.csv when no matched pairs."""
+        metrics = calculate_metrics(sample_match_result)
+        reporter = ComparatorReporter(
+            sample_match_result, metrics, position_pairs=[],
+        )
+        paths = reporter.export_all(tmp_path)
+        assert "position_comparison" not in paths
+
     def test_export_matched_trades_with_reused_ids(self, make_trade, ts, tmp_path):
         """Reused client_order_id rows each get their correct delta in CSV."""
         # Two matched pairs with the same client_order_id but different occurrences

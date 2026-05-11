@@ -170,6 +170,7 @@ def main(argv=None) -> int:
             match_result=result.match_result,
             metrics=result.metrics,
             metadata={"fill_mode": result.fill_mode.value},
+            position_pairs=result.position_pairs,
         )
         exported = reporter.export_all(output_dir)
         summary_path = output_dir / "summary.json"

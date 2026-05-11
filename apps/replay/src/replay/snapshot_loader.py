@@ -84,12 +84,20 @@ class PositionStateSeed:
     ``DirectionType`` string values). ``leverage`` is NOT seeded —
     ``PositionSnapshot`` does not store it; replay reads leverage from
     its strategy config at tracker init time.
+
+    ``cum_realised_pnl`` (0034) is the Bybit ``cumRealisedPnl`` value at
+    ``at_ts`` — the cumulative realized PnL since position open. Seeded
+    into the tracker so backtest ``cum_realised_pnl`` parity is measured
+    against the same absolute baseline as live, not against a zero-start.
+    Defaults to ``Decimal('0')`` for snapshots with ``NULL`` telemetry or
+    pre-0034 recorder DBs.
     """
 
     direction: str
     size: Decimal
     entry_price: Decimal
     liquidation_price: Decimal
+    cum_realised_pnl: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -294,12 +302,18 @@ def load_position_snapshots(
         size=buy_snap.size,
         entry_price=buy_snap.entry_price,
         liquidation_price=buy_snap.liq_price if buy_snap.liq_price is not None else Decimal("0"),
+        cum_realised_pnl=(
+            buy_snap.cum_realised_pnl if buy_snap.cum_realised_pnl is not None else Decimal("0")
+        ),
     )
     short_seed = PositionStateSeed(
         direction="short",
         size=sell_snap.size,
         entry_price=sell_snap.entry_price,
         liquidation_price=sell_snap.liq_price if sell_snap.liq_price is not None else Decimal("0"),
+        cum_realised_pnl=(
+            sell_snap.cum_realised_pnl if sell_snap.cum_realised_pnl is not None else Decimal("0")
+        ),
     )
     return long_seed, short_seed
 

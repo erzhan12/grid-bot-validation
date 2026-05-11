@@ -1519,3 +1519,127 @@ class TestTickerSnapshotRepository:
         assert latest is not None
         assert latest.last_price == Decimal("51000.00")
         assert latest.exchange_ts.replace(tzinfo=None) == ts2.replace(tzinfo=None)
+
+
+class TestPositionSnapshotSourceFiltering0034:
+    """Feature 0034 — source-filtered reads on PositionSnapshotRepository."""
+
+    def _make_snap(self, account_id, ts, source, run_id=None, side="Buy"):
+        from grid_db import PositionSnapshot
+        from decimal import Decimal
+        return PositionSnapshot(
+            run_id=run_id,
+            account_id=str(account_id),
+            symbol="BTCUSDT",
+            exchange_ts=ts,
+            local_ts=ts,
+            side=side,
+            size=Decimal("1"),
+            entry_price=Decimal("100"),
+            liq_price=Decimal("90"),
+            unrealised_pnl=Decimal("0"),
+            source=source,
+            mark_price=Decimal("101"),
+            position_im=Decimal("10"),
+            position_mm=Decimal("0.5"),
+            cum_realised_pnl=Decimal("5"),
+        )
+
+    def test_bulk_insert_round_trips_new_columns(self, session, sample_account):
+        from grid_db import PositionSnapshotRepository, PositionSnapshot
+        from decimal import Decimal
+
+        ts = datetime.now(UTC)
+        repo = PositionSnapshotRepository(session)
+        repo.bulk_insert([self._make_snap(sample_account.account_id, ts, "backtest")])
+
+        loaded = session.query(PositionSnapshot).one()
+        assert loaded.source == "backtest"
+        assert loaded.mark_price == Decimal("101")
+        assert loaded.position_im == Decimal("10")
+        assert loaded.position_mm == Decimal("0.5")
+        assert loaded.cum_realised_pnl == Decimal("5")
+
+    def test_get_latest_by_account_symbol_defaults_live(self, session, sample_account):
+        from grid_db import PositionSnapshotRepository
+        import time
+        repo = PositionSnapshotRepository(session)
+        ts1 = datetime.now(UTC)
+        time.sleep(0.01)
+        ts2 = datetime.now(UTC)
+        repo.bulk_insert([
+            self._make_snap(sample_account.account_id, ts1, "live"),
+            self._make_snap(sample_account.account_id, ts2, "backtest"),
+        ])
+        latest = repo.get_latest_by_account_symbol(
+            str(sample_account.account_id), "BTCUSDT",
+        )
+        assert latest is not None
+        assert latest.source == "live"
+
+    def test_get_latest_by_account_symbol_explicit_backtest(self, session, sample_account):
+        from grid_db import PositionSnapshotRepository
+        import time
+        repo = PositionSnapshotRepository(session)
+        ts1 = datetime.now(UTC)
+        time.sleep(0.01)
+        ts2 = datetime.now(UTC)
+        repo.bulk_insert([
+            self._make_snap(sample_account.account_id, ts1, "live"),
+            self._make_snap(sample_account.account_id, ts2, "backtest"),
+        ])
+        latest = repo.get_latest_by_account_symbol(
+            str(sample_account.account_id), "BTCUSDT", source="backtest",
+        )
+        assert latest is not None
+        assert latest.source == "backtest"
+
+    def test_get_latest_by_account_symbol_source_none_union(self, session, sample_account):
+        from grid_db import PositionSnapshotRepository
+        import time
+        repo = PositionSnapshotRepository(session)
+        ts1 = datetime.now(UTC)
+        time.sleep(0.01)
+        ts2 = datetime.now(UTC)
+        repo.bulk_insert([
+            self._make_snap(sample_account.account_id, ts1, "live"),
+            self._make_snap(sample_account.account_id, ts2, "backtest"),
+        ])
+        latest = repo.get_latest_by_account_symbol(
+            str(sample_account.account_id), "BTCUSDT", source=None,
+        )
+        assert latest is not None
+        # union by timestamp → ts2 wins
+        assert latest.source == "backtest"
+
+    def test_get_latest_before_filters_source(self, session, sample_user, sample_account, sample_strategy):
+        """get_latest_before with explicit run_id filters by source."""
+        from grid_db import PositionSnapshotRepository, Run
+
+        # get_latest_before requires a run_id; create a Run record for FK.
+        run = Run(
+            run_id="r1",
+            user_id=sample_user.user_id,
+            run_type="live",
+            account_id=str(sample_account.account_id),
+            strategy_id=sample_strategy.strategy_id,
+            start_ts=datetime.now(UTC),
+        )
+        session.add(run)
+        session.commit()
+
+        repo = PositionSnapshotRepository(session)
+        ts = datetime.now(UTC)
+        repo.bulk_insert([
+            self._make_snap(sample_account.account_id, ts, "live", run_id="r1"),
+            self._make_snap(sample_account.account_id, ts, "backtest", run_id="r1"),
+        ])
+        # default = live
+        result = repo.get_latest_before("r1", str(sample_account.account_id), "BTCUSDT", "Buy", ts)
+        assert result is not None
+        assert result.source == "live"
+        result = repo.get_latest_before(
+            "r1", str(sample_account.account_id), "BTCUSDT", "Buy", ts, source="backtest"
+        )
+        assert result is not None
+        assert result.source == "backtest"

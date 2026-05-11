@@ -223,6 +223,30 @@ class PositionWriter:
                                 if pos.get("unrealisedPnl")
                                 else None
                             ),
+                            # 0034: position telemetry parity columns.
+                            # `source` is recorder-side metadata not present
+                            # on the Bybit payload — do NOT copy into raw_json.
+                            source="live",
+                            mark_price=(
+                                Decimal(str(pos.get("markPrice")))
+                                if pos.get("markPrice")
+                                else None
+                            ),
+                            position_im=(
+                                Decimal(str(pos.get("positionIM")))
+                                if pos.get("positionIM")
+                                else None
+                            ),
+                            position_mm=(
+                                Decimal(str(pos.get("positionMM")))
+                                if pos.get("positionMM")
+                                else None
+                            ),
+                            cum_realised_pnl=(
+                                Decimal(str(pos.get("cumRealisedPnl")))
+                                if pos.get("cumRealisedPnl")
+                                else None
+                            ),
                             raw_json=pos,
                         )
                     )

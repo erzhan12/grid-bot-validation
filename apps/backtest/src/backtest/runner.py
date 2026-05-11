@@ -7,9 +7,10 @@ The runner is responsible for:
 """
 
 import logging
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from gridcore import (
     GridEngine,
@@ -26,7 +27,17 @@ from gridcore import (
     apply_early_imbalance,
 )
 from gridcore.instrument_info import InstrumentInfo
-from gridcore.pnl import calc_position_value, calc_margin_ratio, calc_maintenance_margin, MMTiers, MM_TIERS, MM_TIERS_DEFAULT
+from gridcore.pnl import (
+    calc_position_value,
+    calc_margin_ratio,
+    calc_maintenance_margin,
+    calc_initial_margin,
+    calc_unrealised_pnl,
+    MMTiers,
+    MM_TIERS,
+    MM_TIERS_DEFAULT,
+)
+from grid_db.models import PositionSnapshot
 
 from backtest.config import BacktestStrategyConfig
 from backtest.executor import BacktestExecutor
@@ -173,8 +184,21 @@ class BacktestRunner:
         # Last price seen (needed for multiplier recalculation)
         self._last_price: Optional[Decimal] = None
 
+        # 0034: track Bybit-style mark separately so the emitted
+        # PositionSnapshot.mark_price is semantically the mark price (matches
+        # the recorder), not last_price. Falls back to event.price at the
+        # emission site when no ticker mark is available.
+        self._last_mark_price: Optional[Decimal] = None
+
         # Track whether grid has been built
         self._grid_built = False
+
+        # 0034: position telemetry parity emission hook. Replay engine wires
+        # a synchronous writer here. Standalone backtest leaves it None and
+        # emits nothing — keeps existing call sites unchanged.
+        self.position_snapshot_callback: Optional[
+            Callable[[PositionSnapshot], None]
+        ] = None
 
     def _copy_seeded_state_to_positions(self) -> None:
         """Mirror seeded tracker state into gridcore.Position instances.
@@ -322,6 +346,9 @@ class BacktestRunner:
             List of intents generated from fills.
         """
         self._last_price = event.last_price
+        # 0034: cache the ticker mark so backtest snapshots store the mark
+        # in PositionSnapshot.mark_price (matches recorder semantics).
+        self._last_mark_price = event.mark_price
         intents: list[PlaceLimitIntent | CancelIntent] = []
 
         # Check for fills
@@ -526,6 +553,86 @@ class BacktestRunner:
             and self._short_position is not None
         ):
             self._update_risk_multipliers(float(self._last_price))
+
+        # 0034: emit a parity-checkable position snapshot for the just-mutated
+        # direction. Done AFTER _update_risk_multipliers so any multiplier-
+        # driven liq_price update is reflected in the same row.
+        # Use the ticker mark (matches Bybit/recorder semantics for the
+        # mark_price column), not last_price. Fall back to event.price only
+        # when no ticker mark has been seen yet.
+        if self.position_snapshot_callback is not None:
+            mark_price = (
+                self._last_mark_price
+                if self._last_mark_price is not None
+                else event.price
+            )
+            snap = self._emit_position_snapshot(direction, event.exchange_ts, mark_price)
+            self.position_snapshot_callback(snap)
+
+    def _emit_position_snapshot(
+        self,
+        direction: str,
+        timestamp: datetime,
+        mark_price: Decimal,
+    ) -> PositionSnapshot:
+        """Build a parity-checkable position snapshot for the just-mutated direction.
+
+        ``direction`` (LONG/SHORT) — NOT fill side. In hedge mode a close-long
+        fill arrives as Sell but the snapshot row stays side='Buy'. Passing
+        fill side here would flip the snapshot's side column on every close
+        fill and break pairing.
+
+        Margin amounts come from ``calc_initial_margin`` / ``calc_maintenance_margin``
+        (both return tuples — first element is the amount). Unrealized PnL is
+        computed via ``calc_unrealised_pnl`` so the short-side sign is correct
+        (the naive ``(mark-entry)*size`` formula is wrong for shorts).
+
+        ``run_id`` / ``account_id`` are NOT set here — the caller (writer)
+        owns those fields per the run context.
+        """
+        tracker = (
+            self._long_tracker
+            if direction == DirectionType.LONG
+            else self._short_tracker
+        )
+        snap_side = "Buy" if direction == DirectionType.LONG else "Sell"
+
+        size = tracker.state.size
+        entry_price = tracker.state.avg_entry_price
+
+        if size > 0 and entry_price > 0:
+            position_value = calc_position_value(size, entry_price)
+            unrealised = calc_unrealised_pnl(direction, entry_price, mark_price, size)
+            position_im, _imr = calc_initial_margin(
+                position_value, self._leverage, self.symbol, tiers=self._mm_tiers
+            )
+            position_mm, _mmr = calc_maintenance_margin(
+                position_value, self.symbol, tiers=self._mm_tiers
+            )
+            liq_price = self._estimate_liquidation_price(
+                entry_price, direction, position_value, self._session.current_balance,
+            )
+        else:
+            unrealised = Decimal("0")
+            position_im = Decimal("0")
+            position_mm = Decimal("0")
+            liq_price = Decimal("0")
+
+        return PositionSnapshot(
+            # run_id / account_id / source filled by the writer.
+            symbol=self.symbol,
+            exchange_ts=timestamp,
+            local_ts=timestamp,
+            side=snap_side,
+            size=size,
+            entry_price=entry_price,
+            liq_price=liq_price,
+            unrealised_pnl=unrealised,
+            mark_price=mark_price,
+            position_im=position_im,
+            position_mm=position_mm,
+            cum_realised_pnl=tracker.state.cum_realised_pnl,
+        )
 
     def _build_position_state(
         self,

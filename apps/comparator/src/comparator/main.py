@@ -257,8 +257,47 @@ def run(
             else:
                 logger.warning("Run %s not found, skipping equity comparison", config.run_id)
 
-    # Report (equity data passed to reporter for inclusion in export_all)
-    reporter = ComparatorReporter(match_result, metrics, equity_data=resampled_equity)
+    # 0034: Position telemetry comparison. Independent of equity — runs
+    # whenever both live and backtest snapshots exist for this run. The
+    # un-migrated-DB case raises here (loud failure, not silent skip).
+    from comparator.position_loader import load_position_snapshots
+    from comparator.position_metrics import PositionComparator
+
+    with db.get_session() as session:
+        live_snaps = load_position_snapshots(
+            session,
+            run_id=config.run_id,
+            symbol=config.symbol,
+            source="live",
+            start_ts=config.start_ts,
+            end_ts=config.end_ts,
+        )
+        bt_snaps = load_position_snapshots(
+            session,
+            run_id=config.run_id,
+            symbol=config.symbol,
+            source="backtest",
+            start_ts=config.start_ts,
+            end_ts=config.end_ts,
+        )
+
+    if live_snaps and bt_snaps:
+        pc = PositionComparator()
+        position_pairs = pc.pair_and_compare(live_snaps, bt_snaps)
+        pc.fold_metrics_into(metrics, position_pairs)
+    else:
+        position_pairs = []
+        logger.info(
+            "Position comparison skipped: live_snaps=%d, bt_snaps=%d",
+            len(live_snaps), len(bt_snaps),
+        )
+
+    # Report (equity data and position pairs passed to reporter for export_all)
+    reporter = ComparatorReporter(
+        match_result, metrics,
+        equity_data=resampled_equity,
+        position_pairs=position_pairs,
+    )
     reporter.print_summary()
     paths = reporter.export_all(config.output_dir)
 

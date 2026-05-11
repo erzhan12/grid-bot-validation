@@ -1546,3 +1546,149 @@ class TestSeedAwareConstruction:
         # Short was not seeded → remains zero on the gridcore side.
         assert runner._short_position.size == Decimal("0")
         assert runner._short_position.liquidation_price == Decimal("0")
+
+
+class TestPositionSnapshotEmission:
+    """Feature 0034 — backtest emits parity-checkable PositionSnapshots."""
+
+    @pytest.fixture
+    def runner(self, sample_strategy_config, session):
+        fill_simulator = TradeThroughFillSimulator()
+        order_manager = BacktestOrderManager(
+            fill_simulator=fill_simulator,
+            commission_rate=sample_strategy_config.commission_rate,
+        )
+        executor = BacktestExecutor(order_manager=order_manager, qty_calculator=None)
+        return BacktestRunner(
+            strategy_config=sample_strategy_config,
+            executor=executor,
+            session=session,
+        )
+
+    def test_emits_after_long_fill(self, runner, sample_timestamp):
+        # Manually drive a fill via the long tracker, then emit.
+        runner.long_tracker.process_fill(
+            side="Buy", qty=Decimal("0.01"), price=Decimal("100"),
+        )
+        runner._last_price = Decimal("101")
+        snap = runner._emit_position_snapshot(
+            DirectionType.LONG, sample_timestamp, Decimal("101"),
+        )
+        assert snap.side == "Buy"
+        assert snap.size == Decimal("0.01")
+        assert snap.entry_price == Decimal("100")
+        # Unrealized = (101 - 100) * 0.01 = 0.01
+        assert snap.unrealised_pnl == Decimal("0.01")
+        assert snap.cum_realised_pnl == Decimal("0")  # opening fill
+        assert snap.mark_price == Decimal("101")
+
+    def test_emits_after_short_fill_correct_sign(self, runner, sample_timestamp):
+        runner.short_tracker.process_fill(
+            side="Sell", qty=Decimal("0.01"), price=Decimal("100"),
+        )
+        snap = runner._emit_position_snapshot(
+            DirectionType.SHORT, sample_timestamp, Decimal("90"),
+        )
+        assert snap.side == "Sell"
+        # Short: (entry - mark) * size = (100 - 90) * 0.01 = 0.1 (positive!)
+        assert snap.unrealised_pnl == Decimal("0.1")
+
+    def test_cum_realised_pnl_accumulates(self, runner, sample_timestamp):
+        # Open at 100, close at 110 → realized = 10 * 0.01 = 0.1
+        runner.long_tracker.process_fill("Buy", Decimal("0.01"), Decimal("100"))
+        runner.long_tracker.process_fill("Sell", Decimal("0.01"), Decimal("110"))
+        snap = runner._emit_position_snapshot(
+            DirectionType.LONG, sample_timestamp, Decimal("110"),
+        )
+        assert snap.cum_realised_pnl == Decimal("0.1")
+
+        # Second cycle adds another 0.1
+        runner.long_tracker.process_fill("Buy", Decimal("0.01"), Decimal("100"))
+        runner.long_tracker.process_fill("Sell", Decimal("0.01"), Decimal("110"))
+        snap2 = runner._emit_position_snapshot(
+            DirectionType.LONG, sample_timestamp, Decimal("110"),
+        )
+        assert snap2.cum_realised_pnl == Decimal("0.2")
+
+    def test_no_callback_no_emission(self, runner, sample_ticker_event):
+        """Default callback=None → no error, no emission."""
+        assert runner.position_snapshot_callback is None
+        # Process a tick that builds grid + might fill — should not raise.
+        runner.process_tick(sample_ticker_event)
+
+    def test_seeded_cum_realised_pnl_initial(self):
+        from backtest.position_tracker import BacktestPositionTracker
+        from dataclasses import dataclass
+
+        @dataclass
+        class _Seed:
+            size: Decimal
+            entry_price: Decimal
+            liquidation_price: Decimal
+            cum_realised_pnl: Decimal
+
+        tracker = BacktestPositionTracker(direction="long")
+        tracker.seed_state(_Seed(
+            size=Decimal("1"),
+            entry_price=Decimal("100"),
+            liquidation_price=Decimal("0"),
+            cum_realised_pnl=Decimal("42.5"),
+        ))
+        assert tracker.state.cum_realised_pnl == Decimal("42.5")
+        # And realized_pnl (window-scoped) is zeroed
+        assert tracker.state.realized_pnl == Decimal("0")
+
+    def test_emission_uses_ticker_mark_not_last_price(
+        self, sample_strategy_config, session, sample_timestamp,
+    ):
+        """Regression: emitted snapshot.mark_price must equal ticker.mark_price,
+        not ticker.last_price. The PositionSnapshot.mark_price column holds
+        Bybit's markPrice on the live side; if backtest writes last_price
+        there, the comparator's apples-to-apples recomputation drifts.
+        """
+        captured: list = []
+
+        fill_simulator = TradeThroughFillSimulator(mode=FillMode.BOOK_TOUCH)
+        order_manager = BacktestOrderManager(
+            fill_simulator=fill_simulator,
+            commission_rate=sample_strategy_config.commission_rate,
+        )
+        executor = BacktestExecutor(order_manager=order_manager, qty_calculator=None)
+        runner = BacktestRunner(
+            strategy_config=sample_strategy_config,
+            executor=executor,
+            session=session,
+        )
+        runner.position_snapshot_callback = captured.append
+
+        # Place a buy order that will fill when bid touches it.
+        order_manager.place_order(
+            client_order_id="mark-vs-last",
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("100.0"),
+            qty=Decimal("0.1"),
+            direction="long",
+            grid_level=0,
+            timestamp=sample_timestamp,
+        )
+
+        # Ticker where last_price diverges from mark_price.
+        tick = TickerEvent(
+            event_type=EventType.TICKER,
+            symbol="BTCUSDT",
+            exchange_ts=sample_timestamp,
+            local_ts=sample_timestamp,
+            last_price=Decimal("99.0"),   # below order → fills
+            mark_price=Decimal("103.5"),  # deliberately different
+            bid1_price=Decimal("100.0"),
+            ask1_price=Decimal("99.5"),
+            funding_rate=Decimal("0"),
+        )
+        runner.process_fills(tick)
+
+        assert len(captured) == 1, "expected exactly one snapshot emission"
+        assert captured[0].mark_price == Decimal("103.5"), (
+            "snapshot.mark_price should reflect ticker.mark_price, "
+            f"not last_price (got {captured[0].mark_price})"
+        )

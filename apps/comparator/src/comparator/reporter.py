@@ -13,6 +13,7 @@ from typing import Optional, Union
 
 from comparator.matcher import MatchResult
 from comparator.metrics import ValidationMetrics
+from comparator.position_metrics import PositionComparisonPair
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +34,13 @@ class ComparatorReporter:
         metrics: ValidationMetrics,
         equity_data: list[ResampledRow] | None = None,
         metadata: dict[str, str] | None = None,
+        position_pairs: list[PositionComparisonPair] | None = None,
     ):
         self._match_result = match_result
         self._metrics = metrics
         self._equity_data = equity_data
         self._metadata = metadata or {}
+        self._position_pairs = position_pairs or []
 
     def _ensure_path(self, path: Union[str, Path]) -> Path:
         """Convert to Path and create parent directories."""
@@ -198,6 +201,19 @@ class ComparatorReporter:
             ("equity_max_divergence", str(m.equity_max_divergence)),
             ("equity_mean_divergence", str(m.equity_mean_divergence)),
             ("equity_correlation", f"{m.equity_correlation:.6f}"),
+            # 0034: position telemetry parity metrics.
+            ("position_im_mean_abs_delta", str(m.position_im_mean_abs_delta)),
+            ("position_im_max_abs_delta", str(m.position_im_max_abs_delta)),
+            ("position_mm_mean_abs_delta", str(m.position_mm_mean_abs_delta)),
+            ("position_mm_max_abs_delta", str(m.position_mm_max_abs_delta)),
+            ("liq_price_mean_abs_delta", str(m.liq_price_mean_abs_delta)),
+            ("liq_price_max_abs_delta", str(m.liq_price_max_abs_delta)),
+            ("unrealised_pnl_mean_abs_delta", str(m.unrealised_pnl_mean_abs_delta)),
+            ("unrealised_pnl_max_abs_delta", str(m.unrealised_pnl_max_abs_delta)),
+            ("cum_realised_pnl_final_delta", str(m.cum_realised_pnl_final_delta)),
+            ("position_pairs_compared", str(m.position_pairs_compared)),
+            ("position_pairs_unmatched_bt", str(m.position_pairs_unmatched_bt)),
+            ("position_pairs_missing_telemetry", str(m.position_pairs_missing_telemetry)),
         ]
 
         with open(path, "w", newline="") as f:
@@ -239,6 +255,77 @@ class ComparatorReporter:
 
         logger.info("Exported equity comparison (%d points) to %s", len(self._equity_data), path)
 
+    def export_position_comparison(self, path: Union[str, Path]) -> None:
+        """Export per-pair position telemetry deltas to CSV (0034).
+
+        Columns mirror the plan: per-side, live and backtest sides plus
+        the recomputed unrealized PnL (apples-to-apples against
+        live.mark_price) and absolute deltas.
+        """
+        path = self._ensure_path(path)
+
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "side",
+                "live_ts",
+                "backtest_ts",
+                "live_size",
+                "bt_size",
+                "live_entry",
+                "bt_entry",
+                "mark_price",
+                "live_im",
+                "bt_im",
+                "im_delta",
+                "live_mm",
+                "bt_mm",
+                "mm_delta",
+                "live_liq",
+                "bt_liq",
+                "liq_delta",
+                "live_unrealised_recomp",
+                "bt_unrealised_recomp",
+                "unrealised_delta",
+                "live_cum_realised",
+                "bt_cum_realised",
+                "cum_realised_delta",
+            ])
+
+            for pair in self._position_pairs:
+                if pair.live is None:
+                    continue  # unmatched-bt sentinel; counted but not emitted
+                live = pair.live
+                bt = pair.backtest
+                writer.writerow([
+                    pair.side,
+                    live.exchange_ts.isoformat(),
+                    bt.exchange_ts.isoformat(),
+                    str(live.size),
+                    str(bt.size),
+                    str(live.entry_price),
+                    str(bt.entry_price),
+                    str(live.mark_price) if live.mark_price is not None else "",
+                    str(live.position_im) if live.position_im is not None else "",
+                    str(bt.position_im) if bt.position_im is not None else "",
+                    str(pair.position_im_delta) if pair.position_im_delta is not None else "",
+                    str(live.position_mm) if live.position_mm is not None else "",
+                    str(bt.position_mm) if bt.position_mm is not None else "",
+                    str(pair.position_mm_delta) if pair.position_mm_delta is not None else "",
+                    str(live.liq_price) if live.liq_price is not None else "",
+                    str(bt.liq_price) if bt.liq_price is not None else "",
+                    str(pair.liq_price_delta) if pair.liq_price_delta is not None else "",
+                    str(pair.unrealised_pnl_recomputed_live) if pair.unrealised_pnl_recomputed_live is not None else "",
+                    str(pair.unrealised_pnl_recomputed_bt) if pair.unrealised_pnl_recomputed_bt is not None else "",
+                    str(pair.unrealised_pnl_delta) if pair.unrealised_pnl_delta is not None else "",
+                    str(live.cum_realised_pnl) if live.cum_realised_pnl is not None else "",
+                    str(bt.cum_realised_pnl) if bt.cum_realised_pnl is not None else "",
+                    str(pair.cum_realised_pnl_delta) if pair.cum_realised_pnl_delta is not None else "",
+                ])
+
+        emitted = sum(1 for p in self._position_pairs if p.live is not None)
+        logger.info("Exported %d position pairs to %s", emitted, path)
+
     def export_all(self, output_dir: Union[str, Path]) -> dict[str, Path]:
         """Export all reports to a directory.
 
@@ -262,6 +349,15 @@ class ComparatorReporter:
             equity_path = output_dir / "equity_comparison.csv"
             self.export_equity(equity_path)
             paths["equity_comparison"] = equity_path
+
+        # 0034: emit position_comparison.csv only when at least one paired
+        # row exists. Migrated DB with no backtest rows yet → no file
+        # (this is the only intentional silent path; un-migrated DBs raise
+        # at load time in position_loader.py).
+        if any(p.live is not None for p in self._position_pairs):
+            position_path = output_dir / "position_comparison.csv"
+            self.export_position_comparison(position_path)
+            paths["position_comparison"] = position_path
 
         return paths
 
@@ -322,6 +418,20 @@ class ComparatorReporter:
             f"    Max divergence: {m.equity_max_divergence}",
             f"    Mean divergence:{m.equity_mean_divergence}",
             f"    Correlation:    {m.equity_correlation:.4f}",
+            "",
+            "  POSITION TELEMETRY",
+            f"    Pairs compared:        {m.position_pairs_compared}",
+            f"    Unmatched (bt):        {m.position_pairs_unmatched_bt}",
+            f"    Missing telemetry:     {m.position_pairs_missing_telemetry}",
+            f"    IM mean |delta|:       {m.position_im_mean_abs_delta}",
+            f"    IM max |delta|:        {m.position_im_max_abs_delta}",
+            f"    MM mean |delta|:       {m.position_mm_mean_abs_delta}",
+            f"    MM max |delta|:        {m.position_mm_max_abs_delta}",
+            f"    Liq price mean:        {m.liq_price_mean_abs_delta}",
+            f"    Liq price max:         {m.liq_price_max_abs_delta}",
+            f"    Unrealised mean:       {m.unrealised_pnl_mean_abs_delta}",
+            f"    Unrealised max:        {m.unrealised_pnl_max_abs_delta}",
+            f"    Cum realised final:    {m.cum_realised_pnl_final_delta}",
             "",
             "=" * 60,
         ]

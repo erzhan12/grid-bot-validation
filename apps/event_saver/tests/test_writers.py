@@ -772,6 +772,58 @@ class TestPositionWriter:
             await writer.flush()
             assert len(writer._buffer) == 0
 
+    @pytest.mark.asyncio
+    async def test_parses_0034_telemetry_fields(self, mock_db):
+        """0034: markPrice/positionIM/positionMM/cumRealisedPnl land in the right cols."""
+        from decimal import Decimal
+
+        writer = PositionWriter(db=mock_db, batch_size=100)
+        messages = [{
+            "data": [{
+                "symbol": "LTCUSDT",
+                "side": "Buy",
+                "size": "1.0",
+                "entryPrice": "100.0",
+                "liqPrice": "90.0",
+                "unrealisedPnl": "1.0",
+                "markPrice": "101.0",
+                "positionIM": "10.5",
+                "positionMM": "0.55",
+                "cumRealisedPnl": "12.34",
+                "updatedTime": "1700000000000",
+            }]
+        }]
+        await writer.write(uuid4(), messages)
+        snap = writer._buffer[0]
+        assert snap.source == "live"
+        assert snap.mark_price == Decimal("101.0")
+        assert snap.position_im == Decimal("10.5")
+        assert snap.position_mm == Decimal("0.55")
+        assert snap.cum_realised_pnl == Decimal("12.34")
+
+    @pytest.mark.asyncio
+    async def test_backward_compat_missing_0034_fields(self, mock_db):
+        """Rows missing new fields parse cleanly with None telemetry."""
+        writer = PositionWriter(db=mock_db, batch_size=100)
+        messages = [{
+            "data": [{
+                "symbol": "LTCUSDT",
+                "side": "Buy",
+                "size": "1.0",
+                "entryPrice": "100.0",
+                "liqPrice": "90.0",
+                "unrealisedPnl": "1.0",
+                "updatedTime": "1700000000000",
+            }]
+        }]
+        await writer.write(uuid4(), messages)
+        snap = writer._buffer[0]
+        assert snap.mark_price is None
+        assert snap.position_im is None
+        assert snap.position_mm is None
+        assert snap.cum_realised_pnl is None
+        assert snap.source == "live"
+
 
 class TestWalletWriter:
     """Test WalletWriter buffering and bulk insert."""

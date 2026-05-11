@@ -48,6 +48,13 @@ class PositionState:
     # (the same sentinel `Position.liquidation_price` uses).
     liquidation_price: Decimal = field(default_factory=lambda: Decimal("0"))
 
+    # 0034: Bybit-style running total of realized PnL since position open.
+    # Distinct from ``realized_pnl`` above, which is window-scoped (zeroed
+    # in ``seed_state`` to start replay accounting fresh). This field is
+    # seeded from ``PositionSnapshot.cum_realised_pnl`` and is NOT zeroed
+    # in ``seed_state`` — it represents the absolute exchange-side total.
+    cum_realised_pnl: Decimal = field(default_factory=lambda: Decimal("0"))
+
 
 class BacktestPositionTracker:
     """Track position and calculate PnL for backtest.
@@ -123,6 +130,13 @@ class BacktestPositionTracker:
         self.state.realized_pnl = Decimal("0")
         self.state.commission_paid = Decimal("0")
         self.state.funding_paid = Decimal("0")
+        # 0034: copy the cumulative running total from the seed so the
+        # backtest's cum_realised_pnl stays in lockstep with live's
+        # absolute Bybit-side total. Defaults to 0 when the seed object
+        # lacks the attribute (legacy seeds).
+        self.state.cum_realised_pnl = getattr(
+            seed, "cum_realised_pnl", Decimal("0")
+        )
 
     def process_fill(
         self,
@@ -151,9 +165,16 @@ class BacktestPositionTracker:
         is_opening = self._is_opening_fill(side)
 
         if is_opening:
-            return self._add_to_position(qty, price)
+            realized = self._add_to_position(qty, price)
         else:
-            return self._reduce_position(qty, price)
+            realized = self._reduce_position(qty, price)
+
+        # 0034: maintain Bybit-style running total of realized PnL since
+        # position open. Window-scoped `realized_pnl` lives on `state` and
+        # is zeroed by seed_state; `cum_realised_pnl` is NOT zeroed and
+        # carries the absolute total used for parity comparison.
+        self.state.cum_realised_pnl += realized
+        return realized
 
     def _is_opening_fill(self, side: str) -> bool:
         """Determine if fill opens/adds to position or reduces it.
