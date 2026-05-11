@@ -19,7 +19,6 @@ still emits per-pair deltas for the other fields and increments
 from __future__ import annotations
 
 import logging
-import statistics
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Optional
@@ -187,7 +186,13 @@ class PositionComparator:
         )
 
         def _agg(field_name: str) -> tuple[Decimal, Decimal]:
-            """Mean abs / max abs over matched pairs, skipping None per-field."""
+            """Mean abs / max abs over matched pairs, skipping None per-field.
+
+            Pure Decimal arithmetic — no float roundtrip — so cumulative
+            rounding from many small deltas stays exact. Important because
+            `position_im` / `position_mm` deltas can be 1e-8 USDT per pair
+            and the acceptance gate is set at 0.05 USDT total.
+            """
             vals = [
                 abs(getattr(p, field_name))
                 for p in matched
@@ -195,7 +200,7 @@ class PositionComparator:
             ]
             if not vals:
                 return Decimal("0"), Decimal("0")
-            mean = Decimal(str(statistics.mean([float(v) for v in vals])))
+            mean = sum(vals, Decimal("0")) / Decimal(len(vals))
             return mean, max(vals)
 
         metrics.position_im_mean_abs_delta, metrics.position_im_max_abs_delta = _agg(
