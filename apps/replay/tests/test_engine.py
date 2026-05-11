@@ -10,6 +10,7 @@ from gridcore import TickerEvent, EventType
 from grid_db import Run, User, BybitAccount, Strategy
 
 from backtest.data_provider import InMemoryDataProvider
+from backtest.fill_simulator import FillMode
 
 from replay.config import ReplayConfig, ReplayStrategyConfig
 from replay.engine import ReplayEngine, ReplayResult
@@ -89,6 +90,11 @@ class TestReplayEngine:
         assert result.session is not None
         assert result.metrics is not None
         assert result.match_result is not None
+        assert result.run_id == "test-run-id"
+        assert result.symbol == "BTCUSDT"
+        assert result.start_ts == replay_config.start_ts
+        assert result.end_ts == replay_config.end_ts
+        assert result.fill_mode == FillMode.STRICT_CROSS
 
     @patch("replay.engine.InstrumentInfoProvider")
     def test_replay_empty_data(self, mock_provider_cls, db, replay_config):

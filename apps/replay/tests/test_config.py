@@ -3,7 +3,12 @@
 import pytest
 from decimal import Decimal
 from pydantic import ValidationError
-from replay.config import load_config, ReplayConfig, ReplayStrategyConfig
+from replay.config import (
+    FillSimulatorConfig,
+    ReplayConfig,
+    ReplayStrategyConfig,
+    load_config,
+)
 
 
 class TestReplayStrategyConfig:
@@ -49,6 +54,7 @@ class TestReplayConfig:
         assert config.output_dir == "results/replay"
         assert config.price_tolerance == Decimal("0")
         assert config.qty_tolerance == Decimal("0.001")
+        assert config.fill_simulator.mode == "strict_cross"
 
     def test_initial_balance_string(self):
         config = ReplayConfig(
@@ -65,6 +71,44 @@ class TestReplayConfig:
             initial_balance=5000,
         )
         assert config.initial_balance == Decimal("5000")
+
+    def test_fill_simulator_omitted_defaults_to_strict_cross(self):
+        config = ReplayConfig(
+            symbol="BTCUSDT",
+            strategy=ReplayStrategyConfig(tick_size=Decimal("0.1")),
+        )
+
+        assert config.fill_simulator == FillSimulatorConfig(mode="strict_cross")
+
+    def test_fill_simulator_empty_block_defaults_to_strict_cross(self):
+        config = ReplayConfig(
+            symbol="BTCUSDT",
+            strategy=ReplayStrategyConfig(tick_size=Decimal("0.1")),
+            fill_simulator={},
+        )
+
+        assert config.fill_simulator.mode == "strict_cross"
+
+    @pytest.mark.parametrize(
+        "mode",
+        ["strict_cross", "trade_through_at_limit", "book_touch"],
+    )
+    def test_fill_simulator_explicit_modes(self, mode):
+        config = ReplayConfig(
+            symbol="BTCUSDT",
+            strategy=ReplayStrategyConfig(tick_size=Decimal("0.1")),
+            fill_simulator={"mode": mode},
+        )
+
+        assert config.fill_simulator.mode == mode
+
+    def test_fill_simulator_invalid_mode_rejected(self):
+        with pytest.raises(ValidationError):
+            ReplayConfig(
+                symbol="BTCUSDT",
+                strategy=ReplayStrategyConfig(tick_size=Decimal("0.1")),
+                fill_simulator={"mode": "invalid"},
+            )
 
 
 class TestLoadConfig:

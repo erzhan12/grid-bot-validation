@@ -7,7 +7,7 @@ import os
 from decimal import Decimal
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -154,6 +154,15 @@ class SeedConfig(BaseModel):
         return self
 
 
+class FillSimulatorConfig(BaseModel):
+    """Replay fill simulator configuration."""
+
+    mode: Literal["strict_cross", "trade_through_at_limit", "book_touch"] = Field(
+        default="strict_cross",
+        description="Fill simulator mode for replay.",
+    )
+
+
 class ReplayConfig(BaseModel):
     """Root configuration for replay engine."""
 
@@ -185,6 +194,10 @@ class ReplayConfig(BaseModel):
     seed: SeedConfig = Field(
         default_factory=SeedConfig,
         description="Seed-from-recorder configuration (feature 0029); off by default.",
+    )
+    fill_simulator: FillSimulatorConfig = Field(
+        default_factory=FillSimulatorConfig,
+        description="Fill simulator configuration.",
     )
 
     # Backtest parameters

@@ -63,6 +63,26 @@ class TestComparatorReporter:
         assert metrics_dict["matched_count"] == "2"
         assert "match_rate" in metrics_dict
         assert "pnl_correlation" in metrics_dict
+        assert "meta.fill_mode" not in metrics_dict
+
+    def test_export_metrics_includes_metadata(self, sample_match_result, tmp_path):
+        """Metrics CSV includes optional metadata with meta. prefix."""
+        metrics = calculate_metrics(sample_match_result)
+        reporter = ComparatorReporter(
+            sample_match_result,
+            metrics,
+            metadata={"fill_mode": "book_touch"},
+        )
+        path = tmp_path / "metrics.csv"
+
+        reporter.export_metrics(path)
+
+        with open(path) as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+
+        metrics_dict = {r["metric"]: r["value"] for r in rows}
+        assert metrics_dict["meta.fill_mode"] == "book_touch"
 
     def test_export_all(self, reporter, tmp_path):
         """export_all creates all expected files."""

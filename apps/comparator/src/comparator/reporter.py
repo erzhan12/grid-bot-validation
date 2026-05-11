@@ -27,10 +27,12 @@ class ComparatorReporter:
         match_result: MatchResult,
         metrics: ValidationMetrics,
         equity_data: list[ResampledRow] | None = None,
+        metadata: dict[str, str] | None = None,
     ):
         self._match_result = match_result
         self._metrics = metrics
         self._equity_data = equity_data
+        self._metadata = metadata or {}
 
     def _ensure_path(self, path: Union[str, Path]) -> Path:
         """Convert to Path and create parent directories."""
@@ -187,6 +189,8 @@ class ComparatorReporter:
             writer.writerow(["metric", "value"])
             for metric, value in rows:
                 writer.writerow([metric, value])
+            for key, value in sorted(self._metadata.items()):
+                writer.writerow([f"meta.{key}", value])
 
         logger.info("Exported validation metrics to %s", path)
 

@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import sys
 from datetime import datetime
@@ -164,11 +165,28 @@ def main(argv=None) -> int:
 
         # Export comparison reports
         output_dir = Path(config.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
         reporter = ComparatorReporter(
             match_result=result.match_result,
             metrics=result.metrics,
+            metadata={"fill_mode": result.fill_mode.value},
         )
         exported = reporter.export_all(output_dir)
+        summary_path = output_dir / "summary.json"
+        with open(summary_path, "w") as f:
+            json.dump(
+                {
+                    "run_id": result.run_id,
+                    "fill_mode": result.fill_mode.value,
+                    "start_ts": result.start_ts.isoformat(),
+                    "end_ts": result.end_ts.isoformat(),
+                    "symbol": result.symbol,
+                },
+                f,
+                indent=2,
+            )
+            f.write("\n")
+        exported["summary"] = summary_path
         reporter.print_summary()
 
         for report_type, path in exported.items():
