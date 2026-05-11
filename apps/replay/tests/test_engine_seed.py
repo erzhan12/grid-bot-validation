@@ -235,7 +235,7 @@ class TestReplayEngineSeedingPipeline:
         engine = ReplayEngine(config=replay_config, db=seeded_db)
 
         # Mirror the run() call sequence: resolve run → load seed → build runner.
-        run_id, _start, _end = engine._resolve_run(replay_config)
+        run_id, _account_id, _start, _end = engine._resolve_run(replay_config)
         assert run_id == "seed-run"
 
         wallet_seed, long_seed, short_seed, grid_seed, order_seeds = engine._load_seed(

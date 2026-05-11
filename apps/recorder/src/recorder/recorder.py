@@ -441,6 +441,32 @@ class Recorder:
                                     if pos.get("unrealisedPnl") not in (None, "")
                                     else None
                                 ),
+                                # 0034: position telemetry parity columns.
+                                # mark_price guard matches the WS path
+                                # (position_writer.py): only None/"" → NULL.
+                                # A genuine 0 mark is rare but valid and
+                                # must be preserved for parity recomputation.
+                                source="live",
+                                mark_price=(
+                                    Decimal(str(pos.get("markPrice")))
+                                    if pos.get("markPrice") not in (None, "")
+                                    else None
+                                ),
+                                position_im=(
+                                    Decimal(str(pos.get("positionIM")))
+                                    if pos.get("positionIM") not in (None, "")
+                                    else None
+                                ),
+                                position_mm=(
+                                    Decimal(str(pos.get("positionMM")))
+                                    if pos.get("positionMM") not in (None, "")
+                                    else None
+                                ),
+                                cum_realised_pnl=(
+                                    Decimal(str(pos.get("cumRealisedPnl")))
+                                    if pos.get("cumRealisedPnl") not in (None, "")
+                                    else None
+                                ),
                                 raw_json=pos,
                             )
                         )
@@ -463,6 +489,12 @@ class Recorder:
                         entry_price=Decimal("0"),
                         liq_price=None,
                         unrealised_pnl=None,
+                        # 0034: zero-row stays NULL for telemetry; source=live.
+                        source="live",
+                        mark_price=None,
+                        position_im=None,
+                        position_mm=None,
+                        cum_realised_pnl=None,
                         raw_json=None,
                     )
                 )

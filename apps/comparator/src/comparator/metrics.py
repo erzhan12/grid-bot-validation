@@ -87,6 +87,22 @@ class ValidationMetrics:
     # Per-trade deltas (for detailed export)
     trade_deltas: list[TradeDelta] = field(default_factory=list)
 
+    # 0034: position telemetry parity (live vs backtest position snapshots).
+    # Sign convention: backtest minus live. Positive = backtest over-estimates.
+    # NULL telemetry fields are skipped per-field, never treated as zero.
+    position_im_mean_abs_delta: Decimal = field(default_factory=lambda: Decimal("0"))
+    position_im_max_abs_delta: Decimal = field(default_factory=lambda: Decimal("0"))
+    position_mm_mean_abs_delta: Decimal = field(default_factory=lambda: Decimal("0"))
+    position_mm_max_abs_delta: Decimal = field(default_factory=lambda: Decimal("0"))
+    liq_price_mean_abs_delta: Decimal = field(default_factory=lambda: Decimal("0"))
+    liq_price_max_abs_delta: Decimal = field(default_factory=lambda: Decimal("0"))
+    unrealised_pnl_mean_abs_delta: Decimal = field(default_factory=lambda: Decimal("0"))
+    unrealised_pnl_max_abs_delta: Decimal = field(default_factory=lambda: Decimal("0"))
+    cum_realised_pnl_final_delta: Decimal = field(default_factory=lambda: Decimal("0"))
+    position_pairs_compared: int = 0
+    position_pairs_unmatched_bt: int = 0
+    position_pairs_missing_telemetry: int = 0
+
 
 def _compute_trade_delta(pair: MatchedTrade) -> TradeDelta:
     """Compute delta between a matched pair."""

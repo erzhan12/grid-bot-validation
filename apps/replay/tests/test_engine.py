@@ -72,7 +72,7 @@ class TestReplayEngine:
     """Tests for ReplayEngine."""
 
     @patch("replay.engine.InstrumentInfoProvider")
-    def test_replay_produces_result(self, mock_provider_cls, db, replay_config, ticker_events):
+    def test_replay_produces_result(self, mock_provider_cls, db, seeded_run_account, replay_config, ticker_events):
         """Replay with price movement produces a ReplayResult."""
         # Mock instrument info
         mock_info = MagicMock()
@@ -97,7 +97,7 @@ class TestReplayEngine:
         assert result.fill_mode == FillMode.BOOK_TOUCH
 
     @patch("replay.engine.InstrumentInfoProvider")
-    def test_replay_empty_data(self, mock_provider_cls, db, replay_config):
+    def test_replay_empty_data(self, mock_provider_cls, db, seeded_run_account, replay_config):
         """Replay with no data produces empty result."""
         mock_info = MagicMock()
         mock_info.qty_step = Decimal("0.001")
@@ -116,7 +116,7 @@ class TestReplayEngine:
         assert result.metrics.total_backtest_trades == 0
 
     @patch("replay.engine.InstrumentInfoProvider")
-    def test_replay_session_has_equity_curve(self, mock_provider_cls, db, replay_config, ticker_events):
+    def test_replay_session_has_equity_curve(self, mock_provider_cls, db, seeded_run_account, replay_config, ticker_events):
         """Session equity curve is populated during replay."""
         mock_info = MagicMock()
         mock_info.qty_step = Decimal("0.001")
@@ -325,7 +325,7 @@ class TestWindDown:
     """Tests for wind-down behavior."""
 
     @patch("replay.engine.InstrumentInfoProvider")
-    def test_leave_open_preserves_positions(self, mock_provider_cls, db, replay_config, ticker_events):
+    def test_leave_open_preserves_positions(self, mock_provider_cls, db, seeded_run_account, replay_config, ticker_events):
         """leave_open mode does not create wind-down trades."""
         mock_info = MagicMock()
         mock_info.qty_step = Decimal("0.001")
@@ -344,7 +344,7 @@ class TestWindDown:
         assert len(wind_down_trades) == 0
 
     @patch("replay.engine.InstrumentInfoProvider")
-    def test_close_all_creates_wind_down_trades(self, mock_provider_cls, db, replay_config, ticker_events):
+    def test_close_all_creates_wind_down_trades(self, mock_provider_cls, db, seeded_run_account, replay_config, ticker_events):
         """close_all mode creates wind-down trades for open positions."""
         mock_info = MagicMock()
         mock_info.qty_step = Decimal("0.001")
@@ -362,3 +362,117 @@ class TestWindDown:
         if any(t for t in result.session.trades if "wind_down" not in t.client_order_id):
             wind_down_trades = [t for t in result.session.trades if "wind_down" in t.client_order_id]
             assert len(wind_down_trades) > 0
+
+
+class TestPositionTelemetryWriter0034:
+    """Feature 0034 — replay writes backtest position_snapshots to DB."""
+
+    @patch("replay.engine.InstrumentInfoProvider")
+    def test_writes_backtest_source_rows(
+        self, mock_provider_cls, db, seeded_run_account, replay_config, ticker_events,
+    ):
+        """End-to-end: replay produces position_snapshots with source='backtest'."""
+        from grid_db.models import PositionSnapshot
+
+        mock_info = MagicMock()
+        mock_info.qty_step = Decimal("0.001")
+        mock_info.tick_size = Decimal("0.1")
+        mock_info.round_qty = lambda q: max(Decimal("0.001"), q.quantize(Decimal("0.001")))
+        mock_provider_cls.return_value.get.return_value = mock_info
+
+        engine = ReplayEngine(config=replay_config, db=db)
+        provider = InMemoryDataProvider(ticker_events)
+        result = engine.run(data_provider=provider)
+
+        with db.get_session() as session:
+            bt_rows = (
+                session.query(
+                    PositionSnapshot.source,
+                    PositionSnapshot.run_id,
+                    PositionSnapshot.account_id,
+                )
+                .filter(PositionSnapshot.source == "backtest")
+                .all()
+            )
+
+        # Either there were fills (rows exist) or no fills (no rows). When
+        # rows exist, each must carry the resolved account_id from Run.
+        if result.session.trades:
+            assert len(bt_rows) > 0
+            for source, run_id, account_id in bt_rows:
+                assert source == "backtest"
+                assert run_id == "test-run-id"
+                assert account_id == seeded_run_account.account_id
+
+    @patch("replay.engine.InstrumentInfoProvider")
+    def test_wind_down_emits_snapshot(
+        self, mock_provider_cls, db, seeded_run_account, replay_config, ticker_events,
+    ):
+        """Wind-down close_all path emits a backtest snapshot for each direction closed."""
+        from grid_db.models import PositionSnapshot
+
+        mock_info = MagicMock()
+        mock_info.qty_step = Decimal("0.001")
+        mock_info.tick_size = Decimal("0.1")
+        mock_info.round_qty = lambda q: max(Decimal("0.001"), q.quantize(Decimal("0.001")))
+        mock_provider_cls.return_value.get.return_value = mock_info
+
+        replay_config.wind_down_mode = "close_all"
+        engine = ReplayEngine(config=replay_config, db=db)
+        provider = InMemoryDataProvider(ticker_events)
+        result = engine.run(data_provider=provider)
+
+        wind_down_trades = [
+            t for t in result.session.trades if "wind_down" in t.client_order_id
+        ]
+        if not wind_down_trades:
+            pytest.skip("No positions to wind down in this ticker fixture.")
+
+        # Each wind-down trade should have a matching backtest snapshot
+        # written at its timestamp (engine._wind_down explicitly emits).
+        with db.get_session() as session:
+            bt_row_count = (
+                session.query(PositionSnapshot)
+                .filter(PositionSnapshot.source == "backtest")
+                .count()
+            )
+        assert bt_row_count >= len(wind_down_trades)
+
+    @patch("replay.engine.InstrumentInfoProvider")
+    def test_raises_on_null_run_account_id(
+        self, mock_provider_cls, db, seeded_run_account, replay_config,
+    ):
+        """Plan-mandated: a resolved run with NULL account_id must fail loudly.
+
+        The current schema enforces ``Run.account_id NOT NULL``, so to exercise
+        the protective path we mock ``_resolve_run`` to return ``account_id=None``
+        — the same shape a legacy pre-0029 DB row would have produced.
+        Without this safeguard a broken pre-migration run would look identical
+        to a healthy zero-data run.
+        """
+        from backtest.config import BacktestStrategyConfig
+        from backtest.session import BacktestSession
+
+        mock_info = MagicMock()
+        mock_info.qty_step = Decimal("0.001")
+        mock_info.tick_size = Decimal("0.1")
+        mock_info.round_qty = lambda q: max(Decimal("0.001"), q.quantize(Decimal("0.001")))
+        mock_provider_cls.return_value.get.return_value = mock_info
+
+        engine = ReplayEngine(config=replay_config, db=db)
+        strategy_config = BacktestStrategyConfig(
+            strat_id="replay_btcusdt",
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            grid_count=20,
+            grid_step=0.2,
+            amount="x0.001",
+            commission_rate=Decimal("0.0002"),
+            enable_risk_multipliers=False,
+        )
+        session = BacktestSession(initial_balance=Decimal("10000"))
+        with pytest.raises(ValueError, match="has no account_id"):
+            engine._init_runner(
+                strategy_config, session,
+                run_id="test-run-id", account_id=None,
+            )

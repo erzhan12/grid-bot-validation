@@ -10,7 +10,7 @@ Orchestrates:
 
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Optional
 
@@ -21,6 +21,7 @@ from sqlalchemy import func
 from grid_db import (
     DatabaseFactory,
     PositionSnapshot,
+    PositionSnapshotRepository,
     Run,
     RunRepository,
     WalletSnapshot,
@@ -49,6 +50,10 @@ from comparator import (
     MatchResult,
     ValidationMetrics,
 )
+from comparator.position_loader import (
+    load_position_snapshots as load_position_snapshot_rows,
+)
+from comparator.position_metrics import PositionComparator
 
 from replay.config import ReplayConfig, SeedConfig
 from replay.snapshot_loader import (
@@ -73,6 +78,58 @@ logger = logging.getLogger(__name__)
 _SEED_PRE_CHECK_MARGIN = timedelta(seconds=5)
 
 
+class _BatchPositionSnapshotWriter:
+    """Synchronous writer for backtest position snapshots (0034).
+
+    Buffers snapshots emitted by ``BacktestRunner._emit_position_snapshot``
+    and flushes in bulk at end-of-run. Synchronous because replay is
+    single-threaded — no auto-flush loop, no asyncio coupling.
+
+    Stamps ``run_id``, ``account_id``, and ``source='backtest'`` on every
+    row. The runner only fills the symbol/side/size/entry/etc.
+    """
+
+    def __init__(
+        self,
+        db: DatabaseFactory,
+        run_id: str,
+        account_id: str,
+        source: str = "backtest",
+        flush_batch_size: int = 500,
+    ):
+        self._db = db
+        self._run_id = run_id
+        self._account_id = account_id
+        self._source = source
+        self._flush_batch_size = flush_batch_size
+        self._buffer: list[PositionSnapshot] = []
+        self._total_written = 0
+
+    def write(self, snapshot: PositionSnapshot) -> None:
+        """Stamp run-context fields and buffer for flush."""
+        snapshot.run_id = self._run_id
+        snapshot.account_id = self._account_id
+        snapshot.source = self._source
+        self._buffer.append(snapshot)
+        if len(self._buffer) >= self._flush_batch_size:
+            self.flush()
+
+    def flush(self) -> int:
+        """Bulk-insert any buffered snapshots; returns rowcount."""
+        if not self._buffer:
+            return 0
+        with self._db.get_session() as session:
+            repo = PositionSnapshotRepository(session)
+            inserted = repo.bulk_insert(self._buffer)
+        self._total_written += inserted
+        self._buffer.clear()
+        return inserted
+
+    @property
+    def total_written(self) -> int:
+        return self._total_written
+
+
 @dataclass
 class ReplayResult:
     """Result of a replay run."""
@@ -85,6 +142,9 @@ class ReplayResult:
     start_ts: datetime
     end_ts: datetime
     fill_mode: FillMode
+    # 0034: paired live/backtest position snapshots for the CSV export.
+    # Empty list when no pairs found OR comparator not run.
+    position_pairs: list = field(default_factory=list)
 
 
 class ReplayEngine:
@@ -121,8 +181,8 @@ class ReplayEngine:
         """
         config = self._config
 
-        # 1. Resolve run_id and time range
-        run_id, start_ts, end_ts = self._resolve_run(config)
+        # 1. Resolve run_id, account_id and time range
+        run_id, account_id, start_ts, end_ts = self._resolve_run(config)
         fill_mode = FillMode(config.fill_simulator.mode)
 
         logger.info(
@@ -166,6 +226,8 @@ class ReplayEngine:
             grid_seed=grid_seed,
             order_seeds=order_seeds,
             fill_mode=fill_mode,
+            run_id=run_id,
+            account_id=account_id,
         )
 
         if config.seed.enabled:
@@ -241,6 +303,16 @@ class ReplayEngine:
         if config.wind_down_mode == WindDownMode.CLOSE_ALL and last_price > 0:
             self._wind_down(runner, session, last_price, last_timestamp)
 
+        # 6b. 0034: flush buffered backtest position snapshots so the
+        # comparator (and the pair_and_compare call below) can read them.
+        position_writer = getattr(runner, "_position_writer", None)
+        if position_writer is not None:
+            position_writer.flush()
+            logger.info(
+                "Position telemetry: wrote %d backtest snapshots to DB",
+                position_writer.total_written,
+            )
+
         # 7. Finalize session
         final_unrealized = (
             runner.long_tracker.calculate_unrealized_pnl(last_price)
@@ -276,6 +348,42 @@ class ReplayEngine:
             qty_tolerance=config.qty_tolerance,
         )
 
+        # 11. 0034: pair live/backtest position snapshots and fold telemetry
+        # parity metrics into the same ValidationMetrics object.
+        position_pairs: list = []
+        with self._db.get_session() as db_session:
+            live_snaps = load_position_snapshot_rows(
+                db_session,
+                run_id=run_id,
+                symbol=config.symbol,
+                source="live",
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+            bt_snaps = load_position_snapshot_rows(
+                db_session,
+                run_id=run_id,
+                symbol=config.symbol,
+                source="backtest",
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+        if live_snaps and bt_snaps:
+            pc = PositionComparator()
+            position_pairs = pc.pair_and_compare(live_snaps, bt_snaps)
+            pc.fold_metrics_into(metrics, position_pairs)
+            logger.info(
+                "Position telemetry: %d pairs compared, %d unmatched bt, %d missing telemetry",
+                metrics.position_pairs_compared,
+                metrics.position_pairs_unmatched_bt,
+                metrics.position_pairs_missing_telemetry,
+            )
+        else:
+            logger.info(
+                "Position telemetry: skipped (live_snaps=%d, bt_snaps=%d)",
+                len(live_snaps), len(bt_snaps),
+            )
+
         return ReplayResult(
             session=session,
             metrics=metrics,
@@ -285,13 +393,16 @@ class ReplayEngine:
             start_ts=start_ts,
             end_ts=end_ts,
             fill_mode=fill_mode,
+            position_pairs=position_pairs,
         )
 
     def _resolve_run(self, config: ReplayConfig):
-        """Resolve run_id and time range from config or database.
+        """Resolve run_id, account_id and time range from config or database.
 
         Returns:
-            Tuple of (run_id, start_ts, end_ts).
+            Tuple of (run_id, account_id, start_ts, end_ts). ``account_id``
+            is the ``Run.account_id`` column — used by the 0034 position
+            telemetry writer. May be ``None`` on legacy pre-0029 runs.
         """
         run_id = config.run_id
 
@@ -308,6 +419,7 @@ class ReplayEngine:
                     )
                 # Extract values while still in session scope
                 run_id = run.run_id
+                run_account_id = run.account_id
                 run_start = run.start_ts
                 run_end = run.end_ts
 
@@ -315,19 +427,21 @@ class ReplayEngine:
 
             start_ts = config.start_ts or run_start
             end_ts = config.end_ts or run_end
+            account_id = run_account_id
         else:
             start_ts = config.start_ts
             end_ts = config.end_ts
-            # Fetch Run row if either timestamp is missing
-            if start_ts is None or end_ts is None:
-                with self._db.get_session() as session:
-                    run = session.get(Run, run_id)
-                    if run is None:
-                        raise ValueError(f"Run '{run_id}' not found in database")
-                    if start_ts is None:
-                        start_ts = run.start_ts
-                    if end_ts is None:
-                        end_ts = run.end_ts
+            # 0034: always load the Run row so account_id is available, even
+            # when both timestamps were supplied in the config. One PK lookup.
+            with self._db.get_session() as session:
+                run = session.get(Run, run_id)
+                if run is None:
+                    raise ValueError(f"Run '{run_id}' not found in database")
+                if start_ts is None:
+                    start_ts = run.start_ts
+                if end_ts is None:
+                    end_ts = run.end_ts
+                account_id = run.account_id
 
         # Handle active runs (end_ts still None → use utcnow)
         if end_ts is None:
@@ -343,7 +457,7 @@ class ReplayEngine:
                 f"Invalid time range: start_ts ({start_ts}) must be before end_ts ({end_ts})"
             )
 
-        return run_id, start_ts, end_ts
+        return run_id, account_id, start_ts, end_ts
 
     def _init_runner(
         self,
@@ -354,6 +468,8 @@ class ReplayEngine:
         grid_seed: Optional[GridStateSeed] = None,
         order_seeds: Optional[list[ActiveOrderSeed]] = None,
         fill_mode: FillMode = FillMode.STRICT_CROSS,
+        run_id: Optional[str] = None,
+        account_id: Optional[str] = None,
     ) -> BacktestRunner:
         """Initialize a BacktestRunner for the replay.
 
@@ -415,7 +531,7 @@ class ReplayEngine:
         if short_seed is not None:
             short_tracker.seed_state(short_seed)
 
-        return BacktestRunner(
+        runner = BacktestRunner(
             strategy_config=strategy_config,
             executor=executor,
             session=session,
@@ -425,6 +541,33 @@ class ReplayEngine:
             restored_grid=grid_seed.grid if grid_seed is not None else None,
             seeded_active_orders=order_seeds,
         )
+
+        # 0034: wire the position telemetry writer. Replay always emits to
+        # the recorder DB so the comparator can read both live and backtest
+        # rows from the same table (filtered by `source`).
+        if run_id is not None:
+            if account_id is None:
+                # Pre-0029 legacy data: Run.account_id is NULL. Don't
+                # silently fall back — surface the issue so the operator
+                # re-records with the current writer. A broken pre-0029
+                # run would otherwise look identical to a healthy empty
+                # data run (comparator would just see zero backtest rows).
+                raise ValueError(
+                    f"Run {run_id} has no account_id; cannot emit backtest "
+                    "position snapshots. Re-record after the 0029+0034 "
+                    "migrations to populate Run.account_id."
+                )
+            position_writer = _BatchPositionSnapshotWriter(
+                db=self._db,
+                run_id=run_id,
+                account_id=account_id,
+                source="backtest",
+            )
+            runner.position_snapshot_callback = position_writer.write
+            # Stash on runner so the engine can call .flush() at end-of-run.
+            runner._position_writer = position_writer  # type: ignore[attr-defined]
+
+        return runner
 
     def _load_seed(
         self,
@@ -618,3 +761,21 @@ class ReplayEngine:
                 strat_id=runner.strat_id,
             )
             session.record_trade(trade)
+
+            # 0034: wind_down bypasses runner._process_fill, so emit the
+            # snapshot explicitly. Without this, backtest cum_realised_pnl
+            # drifts behind live by the close-out PnL.
+            # Use the runner's cached ticker mark (same semantics as
+            # _process_fill's emission) so the mark_price column matches
+            # the recorder. Fall back to last_price only when no ticker
+            # mark was seen during the run.
+            if runner.position_snapshot_callback is not None and last_timestamp is not None:
+                mark = (
+                    runner._last_mark_price
+                    if runner._last_mark_price is not None
+                    else last_price
+                )
+                snap = runner._emit_position_snapshot(
+                    direction, last_timestamp, mark,
+                )
+                runner.position_snapshot_callback(snap)

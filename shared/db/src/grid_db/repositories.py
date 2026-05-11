@@ -969,6 +969,12 @@ class PositionSnapshotRepository(BaseRepository[PositionSnapshot]):
                 "entry_price": s.entry_price,
                 "liq_price": s.liq_price,
                 "unrealised_pnl": s.unrealised_pnl,
+                # 0034: position telemetry parity columns.
+                "source": s.source if s.source is not None else "live",
+                "mark_price": s.mark_price,
+                "position_im": s.position_im,
+                "position_mm": s.position_mm,
+                "cum_realised_pnl": s.cum_realised_pnl,
                 "raw_json": s.raw_json,
             }
             for s in snapshots
@@ -984,25 +990,28 @@ class PositionSnapshotRepository(BaseRepository[PositionSnapshot]):
         self,
         account_id: str,
         symbol: str,
+        source: Optional[str] = "live",
     ) -> Optional[PositionSnapshot]:
         """Get the most recent position snapshot for an account/symbol.
 
         Args:
             account_id: Account ID.
             symbol: Trading symbol.
+            source: Snapshot source filter (0034). Defaults to ``'live'`` so
+                legacy callers never silently mix in backtest rows. Pass
+                ``'backtest'`` to read backtest rows, or ``None`` to read the
+                union (rare — used by the comparator).
 
         Returns:
             Latest PositionSnapshot or None.
         """
-        return (
-            self.session.query(PositionSnapshot)
-            .filter(
-                PositionSnapshot.account_id == account_id,
-                PositionSnapshot.symbol == symbol,
-            )
-            .order_by(PositionSnapshot.exchange_ts.desc())
-            .first()
+        query = self.session.query(PositionSnapshot).filter(
+            PositionSnapshot.account_id == account_id,
+            PositionSnapshot.symbol == symbol,
         )
+        if source is not None:
+            query = query.filter(PositionSnapshot.source == source)
+        return query.order_by(PositionSnapshot.exchange_ts.desc()).first()
 
     def get_latest_before(
         self,
@@ -1011,6 +1020,7 @@ class PositionSnapshotRepository(BaseRepository[PositionSnapshot]):
         symbol: str,
         side: str,
         at_ts: datetime,
+        source: Optional[str] = "live",
     ) -> Optional[PositionSnapshot]:
         """Get the latest snapshot for a run/account/symbol/side at-or-before at_ts.
 
@@ -1024,22 +1034,23 @@ class PositionSnapshotRepository(BaseRepository[PositionSnapshot]):
             symbol: Trading symbol.
             side: 'Buy' (long) or 'Sell' (short) — Bybit hedge-mode convention.
             at_ts: Inclusive upper bound on ``exchange_ts``.
+            source: Snapshot source filter (0034). Defaults to ``'live'``.
+                Pass ``'backtest'`` for backtest rows or ``None`` for the
+                union.
 
         Returns:
             Latest matching PositionSnapshot, or None if no row exists.
         """
-        return (
-            self.session.query(PositionSnapshot)
-            .filter(
-                PositionSnapshot.run_id == run_id,
-                PositionSnapshot.account_id == account_id,
-                PositionSnapshot.symbol == symbol,
-                PositionSnapshot.side == side,
-                PositionSnapshot.exchange_ts <= at_ts,
-            )
-            .order_by(PositionSnapshot.exchange_ts.desc())
-            .first()
+        query = self.session.query(PositionSnapshot).filter(
+            PositionSnapshot.run_id == run_id,
+            PositionSnapshot.account_id == account_id,
+            PositionSnapshot.symbol == symbol,
+            PositionSnapshot.side == side,
+            PositionSnapshot.exchange_ts <= at_ts,
         )
+        if source is not None:
+            query = query.filter(PositionSnapshot.source == source)
+        return query.order_by(PositionSnapshot.exchange_ts.desc()).first()
 
 
 class WalletSnapshotRepository(BaseRepository[WalletSnapshot]):

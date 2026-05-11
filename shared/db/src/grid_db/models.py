@@ -15,6 +15,7 @@ from sqlalchemy import (
     String,
     Text,
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Numeric,
@@ -384,15 +385,28 @@ class PositionSnapshot(Base):
     entry_price: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
     liq_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8))
     unrealised_pnl: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8))
+    # 0034: position telemetry parity (live vs backtest).
+    source: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="live", server_default="live"
+    )
+    mark_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8))
+    position_im: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8))
+    position_mm: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8))
+    cum_realised_pnl: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8))
     raw_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
 
     __table_args__ = (
         Index("ix_position_snapshots_account_ts", "account_id", "exchange_ts"),
-        # 0029: supports PositionSnapshotRepository.get_latest_before
-        # (run_id, account_id, symbol, side, at_ts).
+        # 0034: replaces 0029 index with source column so live/backtest reads
+        # remain single-scan. Equality predicates precede range predicate
+        # (exchange_ts).
         Index(
-            "ix_position_snapshots_run_account_symbol_side_ts",
-            "run_id", "account_id", "symbol", "side", "exchange_ts",
+            "ix_position_snapshots_run_account_symbol_side_source_ts",
+            "run_id", "account_id", "symbol", "side", "source", "exchange_ts",
+        ),
+        CheckConstraint(
+            "source IN ('live', 'backtest')",
+            name="ck_position_snapshots_source",
         ),
     )
 

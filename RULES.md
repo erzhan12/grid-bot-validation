@@ -1986,6 +1986,13 @@ Reads recorded data, feeds through GridEngine + simulated order book, compares a
 - `RunRepository.get_latest_by_type()` has `statuses` filter (default: completed + running)
 - `datetime.fromisoformat()` requires Python 3.11+ for full timezone support
 - Config search: `--config` → `REPLAY_CONFIG_PATH` env → `conf/replay.yaml` → `replay.yaml`
+- **Position telemetry parity (feature 0034)**: backtest emits `position_snapshots` rows with `source='backtest'` on every fill (including wind-down close-outs). Comparator pairs them per-side with `source='live'` rows (monotonic two-pointer, 5s tolerance, one-to-one consume invariant) and recomputes unrealized PnL from `live.mark_price` so the delta is apples-to-apples. Twelve metrics added to `ValidationMetrics`; `position_comparison.csv` emitted when at least one pair exists. Un-migrated DBs raise loudly at load time — do NOT silently mask as zero-pair.
+
+### Position telemetry repository contract (feature 0034)
+
+- `PositionSnapshotRepository` read methods accept a `source: str | None = 'live'` parameter. **When adding a new read method, default to `'live'`** so legacy callers never silently mix in backtest rows. Pass `'backtest'` for backtest rows or `None` for the union (the comparator is the only legitimate `None` caller).
+- `position_snapshots` has a CHECK constraint `source IN ('live', 'backtest')` (Postgres) plus a B-tree index `(run_id, account_id, symbol, side, source, exchange_ts)`. Equality predicates precede the `exchange_ts` range — do not reorder.
+- One-off SQL migration for existing DBs: `scripts/migrate_0034_position_telemetry.py --database-url ...`. Fresh DBs get the columns via `Base.metadata.create_all()`.
 
 ---
 
