@@ -265,7 +265,10 @@ class BacktestOrderManager:
         """
         if market is None:
             if current_price is None:
-                raise ValueError("market is required")
+                raise ValueError(
+                    "Either 'market' (TickerEvent or Decimal) or 'current_price' "
+                    "keyword argument is required"
+                )
             market = current_price
 
         if isinstance(market, TickerEvent):

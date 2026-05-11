@@ -324,3 +324,26 @@ class TestFillModeMatrix:
 
         assert buy_result.should_fill is False
         assert sell_result.should_fill is False
+
+    def test_invalid_fill_mode_string_raises_with_valid_options(self):
+        """Construction with an unknown mode lists the valid options."""
+        with pytest.raises(ValueError, match="Valid modes: strict_cross"):
+            TradeThroughFillSimulator(mode="not_a_mode")
+
+    def test_book_touch_rejects_invalid_side(self):
+        """book_touch raises on side values outside SideType."""
+        simulator = TradeThroughFillSimulator(mode=FillMode.BOOK_TOUCH)
+        order = SimulatedOrder(
+            order_id="1",
+            client_order_id="c1",
+            symbol="LTCUSDT",
+            side="Invalid",
+            price=Decimal("58.60"),
+            qty=Decimal("0.1"),
+            direction="long",
+            grid_level=0,
+        )
+        ticker = _ticker(Decimal("58.60"), Decimal("58.60"), Decimal("58.60"))
+
+        with pytest.raises(ValueError, match="Invalid order side"):
+            simulator.check_fill(order, ticker)

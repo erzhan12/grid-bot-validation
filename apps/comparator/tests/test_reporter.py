@@ -216,3 +216,36 @@ class TestComparatorReporter:
         assert len(rows) == 2
         assert rows[0]["occurrence"] == "0"
         assert rows[1]["occurrence"] == "1"
+
+
+class TestCsvInjectionSanitization:
+    """Metadata values that look like spreadsheet formulas must be neutered."""
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ("=cmd|'/c calc'!A1", "'=cmd|'/c calc'!A1"),
+            ("+SUM(A1:A2)", "'+SUM(A1:A2)"),
+            ("-1+1", "'-1+1"),
+            ("@SUM(A1)", "'@SUM(A1)"),
+            ("strict_cross", "strict_cross"),  # unchanged
+            ("", ""),  # empty stays empty
+        ],
+    )
+    def test_meta_value_sanitization(
+        self, sample_match_result, tmp_path, raw, expected
+    ):
+        metrics = calculate_metrics(sample_match_result)
+        reporter = ComparatorReporter(
+            sample_match_result, metrics, metadata={"injected": raw}
+        )
+
+        path = tmp_path / "metrics.csv"
+        reporter.export_metrics(path)
+
+        with open(path) as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+
+        metrics_dict = {r["metric"]: r["value"] for r in rows}
+        assert metrics_dict["meta.injected"] == expected

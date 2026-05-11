@@ -22,6 +22,11 @@ ResampledRow = tuple[datetime, Optional[Decimal], Optional[Decimal]]
 class ComparatorReporter:
     """Export comparison results to CSV and console."""
 
+    # Characters that spreadsheet apps (Excel, Sheets, LibreOffice) interpret
+    # as formula triggers when a cell value starts with them. Prefixing with
+    # a single quote forces the cell to be read as a literal string.
+    _CSV_INJECTION_TRIGGERS = ("=", "+", "-", "@")
+
     def __init__(
         self,
         match_result: MatchResult,
@@ -39,6 +44,17 @@ class ComparatorReporter:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
+
+    def _sanitize_csv_value(self, value: str) -> str:
+        """Defuse spreadsheet formula injection on cell values.
+
+        Spreadsheet apps interpret a cell starting with =, +, -, @ as a
+        formula. Prefix such values with a single quote so they're read as
+        literal text instead.
+        """
+        if value and value[0] in self._CSV_INJECTION_TRIGGERS:
+            return f"'{value}"
+        return value
 
     def export_matched_trades(self, path: Union[str, Path]) -> None:
         """Export matched trade pairs with deltas to CSV."""
@@ -190,7 +206,7 @@ class ComparatorReporter:
             for metric, value in rows:
                 writer.writerow([metric, value])
             for key, value in sorted(self._metadata.items()):
-                writer.writerow([f"meta.{key}", value])
+                writer.writerow([f"meta.{key}", self._sanitize_csv_value(value)])
 
         logger.info("Exported validation metrics to %s", path)
 

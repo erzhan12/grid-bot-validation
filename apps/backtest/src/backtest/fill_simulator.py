@@ -56,7 +56,13 @@ class TradeThroughFillSimulator:
     """
 
     def __init__(self, mode: FillMode = FillMode.STRICT_CROSS):
-        self._mode = FillMode(mode)
+        try:
+            self._mode = FillMode(mode)
+        except ValueError as exc:
+            valid = ", ".join(m.value for m in FillMode)
+            raise ValueError(
+                f"Invalid fill mode {mode!r}. Valid modes: {valid}"
+            ) from exc
 
     @property
     def mode(self) -> FillMode:
@@ -176,10 +182,12 @@ class TradeThroughFillSimulator:
             if snapshot.ask1_price is None:
                 return self._should_fill_at_limit(side, limit_price, snapshot.last_price)
             return snapshot.ask1_price <= limit_price
-
-        if snapshot.bid1_price is None:
-            return self._should_fill_at_limit(side, limit_price, snapshot.last_price)
-        return snapshot.bid1_price >= limit_price
+        elif side == SideType.SELL:
+            if snapshot.bid1_price is None:
+                return self._should_fill_at_limit(side, limit_price, snapshot.last_price)
+            return snapshot.bid1_price >= limit_price
+        else:
+            raise ValueError(f"Invalid order side: {side!r}")
 
     def get_fill_price(self, order: "SimulatedOrder") -> Decimal:
         """Get fill price for an order.
