@@ -13,7 +13,7 @@ from gridcore.pnl import calc_maintenance_margin
 
 from backtest.runner import BacktestRunner
 from backtest.config import BacktestStrategyConfig
-from backtest.fill_simulator import TradeThroughFillSimulator
+from backtest.fill_simulator import FillMode, TradeThroughFillSimulator
 from backtest.order_manager import BacktestOrderManager
 from backtest.executor import BacktestExecutor
 from backtest.session import BacktestSession
@@ -98,6 +98,53 @@ class TestBacktestRunner:
 
         # Should have recorded a trade
         assert len(runner._session.trades) >= 1
+
+    def test_book_touch_fills_on_ask_touch_without_last_penetration(
+        self,
+        sample_strategy_config,
+        session,
+        sample_timestamp,
+    ):
+        """Runner passes full ticker data to the fill simulator."""
+        fill_simulator = TradeThroughFillSimulator(mode=FillMode.BOOK_TOUCH)
+        order_manager = BacktestOrderManager(
+            fill_simulator=fill_simulator,
+            commission_rate=sample_strategy_config.commission_rate,
+        )
+        executor = BacktestExecutor(order_manager=order_manager, qty_calculator=None)
+        runner = BacktestRunner(
+            strategy_config=sample_strategy_config,
+            executor=executor,
+            session=session,
+        )
+        order_manager.place_order(
+            client_order_id="book-touch-buy",
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("58.60"),
+            qty=Decimal("0.1"),
+            direction="long",
+            grid_level=0,
+            timestamp=sample_timestamp,
+        )
+        tick = TickerEvent(
+            event_type=EventType.TICKER,
+            symbol="BTCUSDT",
+            exchange_ts=sample_timestamp,
+            local_ts=sample_timestamp,
+            last_price=Decimal("58.61"),
+            mark_price=Decimal("58.61"),
+            bid1_price=Decimal("58.59"),
+            ask1_price=Decimal("58.60"),
+            funding_rate=Decimal("0"),
+        )
+
+        post_fill_intents = runner.process_fills(tick)
+
+        assert len(session.trades) == 1
+        assert session.trades[0].price == Decimal("58.60")
+        assert order_manager.total_active_orders == 0
+        assert post_fill_intents == []
 
     def test_apply_funding(self, runner, sample_ticker_event):
         """Funding is applied to positions."""

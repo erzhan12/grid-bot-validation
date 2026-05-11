@@ -1,12 +1,12 @@
 """Tests for order manager."""
 
-from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
 
-from backtest.order_manager import BacktestOrderManager, SimulatedOrder
-from backtest.fill_simulator import TradeThroughFillSimulator
+from gridcore import EventType, TickerEvent
+
+from backtest.fill_simulator import FillMode, TradeThroughFillSimulator
 
 
 class TestBacktestOrderManager:
@@ -258,6 +258,123 @@ class TestBacktestOrderManager:
         assert len(fills) == 1
         assert fills[0].symbol == "BTCUSDT"
         assert order_manager.total_active_orders == 1  # ETHUSDT still active
+
+    def test_check_fills_ticker_event_scopes_to_event_symbol(
+        self,
+        order_manager,
+        sample_timestamp,
+    ):
+        """TickerEvent input only checks orders for the event symbol."""
+        order_manager.place_order(
+            client_order_id="btc",
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("100000"),
+            qty=Decimal("0.1"),
+            direction="long",
+            grid_level=0,
+            timestamp=sample_timestamp,
+        )
+        order_manager.place_order(
+            client_order_id="eth",
+            symbol="ETHUSDT",
+            side="Buy",
+            price=Decimal("100000"),
+            qty=Decimal("0.1"),
+            direction="long",
+            grid_level=0,
+            timestamp=sample_timestamp,
+        )
+        ticker = TickerEvent(
+            event_type=EventType.TICKER,
+            symbol="BTCUSDT",
+            exchange_ts=sample_timestamp,
+            local_ts=sample_timestamp,
+            last_price=Decimal("99000"),
+            mark_price=Decimal("99000"),
+            bid1_price=Decimal("98999"),
+            ask1_price=Decimal("99001"),
+            funding_rate=Decimal("0"),
+        )
+
+        fills = order_manager.check_fills(ticker)
+
+        assert len(fills) == 1
+        assert fills[0].symbol == "BTCUSDT"
+        assert order_manager.get_order_by_client_id("eth").status == "pending"
+
+    def test_check_fills_ticker_event_ignores_symbol_override(
+        self,
+        order_manager,
+        sample_timestamp,
+    ):
+        """TickerEvent input is always scoped to the event symbol."""
+        order_manager.place_order(
+            client_order_id="btc",
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("100000"),
+            qty=Decimal("0.1"),
+            direction="long",
+            grid_level=0,
+            timestamp=sample_timestamp,
+        )
+        order_manager.place_order(
+            client_order_id="eth",
+            symbol="ETHUSDT",
+            side="Buy",
+            price=Decimal("3000"),
+            qty=Decimal("0.1"),
+            direction="long",
+            grid_level=0,
+            timestamp=sample_timestamp,
+        )
+        ticker = TickerEvent(
+            event_type=EventType.TICKER,
+            symbol="BTCUSDT",
+            exchange_ts=sample_timestamp,
+            local_ts=sample_timestamp,
+            last_price=Decimal("99000"),
+            mark_price=Decimal("99000"),
+            bid1_price=Decimal("98999"),
+            ask1_price=Decimal("99001"),
+            funding_rate=Decimal("0"),
+        )
+
+        fills = order_manager.check_fills(ticker, symbol="ETHUSDT")
+
+        assert len(fills) == 1
+        assert fills[0].symbol == "BTCUSDT"
+        assert order_manager.get_order_by_client_id("eth").status == "pending"
+
+    def test_check_fills_decimal_requires_timestamp(self, order_manager):
+        """Legacy bare-Decimal fill checks need an explicit timestamp."""
+        with pytest.raises(ValueError, match="timestamp is required"):
+            order_manager.check_fills(Decimal("99000"))
+
+    def test_book_touch_falls_back_through_order_manager_bare_decimal(
+        self,
+        order_manager,
+        sample_timestamp,
+    ):
+        """BOOK_TOUCH degrades to at-limit semantics for bare Decimal input."""
+        order_manager.fill_simulator = TradeThroughFillSimulator(mode=FillMode.BOOK_TOUCH)
+        order_manager.place_order(
+            client_order_id="ltc",
+            symbol="LTCUSDT",
+            side="Buy",
+            price=Decimal("58.60"),
+            qty=Decimal("0.1"),
+            direction="long",
+            grid_level=0,
+            timestamp=sample_timestamp,
+        )
+
+        fills = order_manager.check_fills(Decimal("58.60"), timestamp=sample_timestamp)
+
+        assert len(fills) == 1
+        assert fills[0].price == Decimal("58.60")
+        assert fills[0].side == "Buy"
 
     def test_fill_includes_commission(self, order_manager, sample_timestamp):
         """Execution event includes calculated commission."""

@@ -8,9 +8,9 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, overload
 
-from gridcore import ExecutionEvent, EventType
+from gridcore import ExecutionEvent, EventType, TickerEvent
 
 from backtest.fill_simulator import TradeThroughFillSimulator
 
@@ -134,11 +134,10 @@ class BacktestOrderManager:
 
         Subsequent ``check_fills`` calls iterate ``self.active_orders``
         and run the fill simulator on every order;
-        ``TradeThroughFillSimulator._should_fill`` reads only ``side``
-        / ``price`` / ``current_price`` (with strict ``<`` for Buy and
-        strict ``>`` for Sell — see ``fill_simulator.py``), so seeded
-        orders are eligible for fills as soon as price crosses the
-        limit strictly.
+        ``TradeThroughFillSimulator`` reads the configured market input
+        according to its fill mode (strict cross by default), so seeded
+        orders are eligible for fills under the same semantics as newly
+        placed simulated orders.
 
         ``grid_level`` is set to ``0`` for every seeded order: live
         active orders carry no level metadata, and the simulator does
@@ -216,36 +215,87 @@ class BacktestOrderManager:
                 return self.cancel_order(order_id, timestamp)
         return False
 
+    @overload
     def check_fills(
         self,
+        market: TickerEvent,
+        timestamp: Optional[datetime] = None,
+        symbol: Optional[str] = None,
+    ) -> list[ExecutionEvent]: ...
+
+    @overload
+    def check_fills(
+        self,
+        market: Decimal,
+        timestamp: datetime,
+        symbol: Optional[str] = None,
+    ) -> list[ExecutionEvent]: ...
+
+    @overload
+    def check_fills(
+        self,
+        *,
         current_price: Decimal,
         timestamp: datetime,
         symbol: Optional[str] = None,
+    ) -> list[ExecutionEvent]: ...
+
+    def check_fills(
+        self,
+        market: TickerEvent | Decimal | None = None,
+        timestamp: Optional[datetime] = None,
+        symbol: Optional[str] = None,
+        *,
+        current_price: Optional[Decimal] = None,
     ) -> list[ExecutionEvent]:
         """Check all active orders for fills.
 
         Args:
-            current_price: Current market price
-            timestamp: Current timestamp
-            symbol: Optional symbol filter
+            market: Current ticker event, or legacy bare market price.
+            timestamp: Fill timestamp. Defaults to ``market.exchange_ts`` for
+                TickerEvent input; required for legacy Decimal input.
+            symbol: Optional symbol filter. TickerEvent input is always scoped
+                to ``market.symbol``; Decimal input preserves the legacy
+                all-symbol scan when symbol is omitted.
+            current_price: Deprecated keyword-only alias for legacy bare
+                Decimal callers. Prefer ``market`` for new code.
 
         Returns:
             List of ExecutionEvent for filled orders
         """
+        if market is None:
+            if current_price is None:
+                raise ValueError(
+                    "Either 'market' (TickerEvent or Decimal) or 'current_price' "
+                    "keyword argument is required"
+                )
+            market = current_price
+
+        if isinstance(market, TickerEvent):
+            fill_timestamp = timestamp or market.exchange_ts
+            symbol_filter = market.symbol
+        else:
+            if timestamp is None:
+                raise ValueError(
+                    "timestamp is required when checking fills with a bare Decimal price"
+                )
+            fill_timestamp = timestamp
+            symbol_filter = symbol
+
         fills: list[ExecutionEvent] = []
 
         for order_id, order in list(self.active_orders.items()):
             # Skip if symbol filter specified and doesn't match
-            if symbol is not None and order.symbol != symbol:
+            if symbol_filter is not None and order.symbol != symbol_filter:
                 continue
 
-            fill_result = self.fill_simulator.check_fill(order, current_price)
+            fill_result = self.fill_simulator.check_fill(order, market)
 
             if fill_result.should_fill:
                 # Move from active to filled
                 self.active_orders.pop(order_id)
                 order.status = "filled"
-                order.filled_ts = timestamp
+                order.filled_ts = fill_timestamp
                 self.filled_orders.append(order)
                 # Allow client_order_id to be reused
                 self._client_order_ids.discard(order.client_order_id)
@@ -257,8 +307,8 @@ class BacktestOrderManager:
                 exec_event = ExecutionEvent(
                     event_type=EventType.EXECUTION,
                     symbol=order.symbol,
-                    exchange_ts=timestamp,
-                    local_ts=timestamp,
+                    exchange_ts=fill_timestamp,
+                    local_ts=fill_timestamp,
                     exec_id=f"exec_{uuid.uuid4().hex[:8]}",
                     order_id=order.order_id,
                     order_link_id=order.client_order_id,

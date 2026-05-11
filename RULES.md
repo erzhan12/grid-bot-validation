@@ -1641,13 +1641,21 @@ Replay engine that reads recorded mainnet data from the recorder's database, fee
    - `ComparatorReporter` (comparator) — CSV + console report
    - Replay engine is a thin orchestrator wiring these together
 
-3. **Config Shape: Root-Level Replay Parameters**
+3. **Replay Fill Simulator Modes**
+   - `strict_cross` (default): existing conservative model. BUY fills only below limit; SELL fills only above limit.
+   - `trade_through_at_limit`: last-price model that includes exact limit touches (`<=` / `>=`).
+   - `book_touch`: replay parity mode using recorded L1 (`ask1 <= limit` for BUY, `bid1 >= limit` for SELL), falling back to `trade_through_at_limit` for legacy bare-price callers.
+   - `BacktestEngine` still instantiates the default `strict_cross` mode; replay config can opt into other modes via `fill_simulator.mode`.
+   - `BacktestOrderManager.check_fills(TickerEvent(...))` is always scoped to the ticker's own symbol; the legacy bare-Decimal path preserves all-symbol scanning when no `symbol` filter is supplied.
+   - Rationale: production backtests keep conservative semantics while recorder parity smoke can use the richer bid/ask already stored in `ticker_snapshots`.
+
+4. **Config Shape: Root-Level Replay Parameters**
    - `initial_balance`, `enable_funding`, `wind_down_mode` live at **root level** of `ReplayConfig`, NOT nested under `strategy`
    - They are backtest/replay parameters, not grid-strategy parameters
    - `strategy:` block only contains grid config (tick_size, grid_count, grid_step, amount, commission_rate)
    - File: `apps/replay/src/replay/config.py`
 
-4. **Run Resolution (`_resolve_run()`)**
+5. **Run Resolution (`_resolve_run()`)**
    - Auto-discover: queries `RunRepository.get_latest_by_type("recording")` — filters to `("completed", "running")` status by default
    - Explicit `run_id`: looks up Run row from DB if timestamps are missing (no hard-fail)
    - Active runs (`end_ts=None`): falls back to `datetime.now(timezone.utc)` instead of failing

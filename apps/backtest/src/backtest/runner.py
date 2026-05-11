@@ -326,9 +326,7 @@ class BacktestRunner:
 
         # Check for fills
         fills = self._executor.order_manager.check_fills(
-            current_price=event.last_price,
-            timestamp=event.exchange_ts,
-            symbol=event.symbol,
+            market=event,
         )
 
         # Process fills

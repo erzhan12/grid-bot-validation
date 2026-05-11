@@ -328,6 +328,9 @@ seed:
   grid_state_path: "db/grid_anchor.phase4.json"
   wallet_coin: "USDT"
 
+fill_simulator:
+  mode: book_touch
+
 # Fallback when seed-wallet returns None (shouldn't happen if Step 4
 # succeeded with a non-empty wallet on the account)
 initial_balance: "10000"

@@ -34,7 +34,7 @@ from backtest.config import BacktestStrategyConfig, WindDownMode
 from backtest.data_provider import HistoricalDataProvider, InMemoryDataProvider
 from backtest.engine import FundingSimulator
 from backtest.executor import BacktestExecutor
-from backtest.fill_simulator import TradeThroughFillSimulator
+from backtest.fill_simulator import FillMode, TradeThroughFillSimulator
 from backtest.instrument_info import InstrumentInfoProvider
 from backtest.order_manager import BacktestOrderManager
 from backtest.position_tracker import BacktestPositionTracker
@@ -80,6 +80,11 @@ class ReplayResult:
     session: BacktestSession
     metrics: ValidationMetrics
     match_result: MatchResult
+    run_id: str
+    symbol: str
+    start_ts: datetime
+    end_ts: datetime
+    fill_mode: FillMode
 
 
 class ReplayEngine:
@@ -118,10 +123,11 @@ class ReplayEngine:
 
         # 1. Resolve run_id and time range
         run_id, start_ts, end_ts = self._resolve_run(config)
+        fill_mode = FillMode(config.fill_simulator.mode)
 
         logger.info(
             f"Replay: symbol={config.symbol}, run_id={run_id}, "
-            f"range={start_ts} to {end_ts}"
+            f"range={start_ts} to {end_ts}, fill_mode={fill_mode.value}"
         )
 
         # 2. Build backtest components
@@ -159,6 +165,7 @@ class ReplayEngine:
             short_seed=short_seed,
             grid_seed=grid_seed,
             order_seeds=order_seeds,
+            fill_mode=fill_mode,
         )
 
         if config.seed.enabled:
@@ -273,6 +280,11 @@ class ReplayEngine:
             session=session,
             metrics=metrics,
             match_result=match_result,
+            run_id=run_id,
+            symbol=config.symbol,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            fill_mode=fill_mode,
         )
 
     def _resolve_run(self, config: ReplayConfig):
@@ -341,6 +353,7 @@ class ReplayEngine:
         short_seed: Optional[PositionStateSeed] = None,
         grid_seed: Optional[GridStateSeed] = None,
         order_seeds: Optional[list[ActiveOrderSeed]] = None,
+        fill_mode: FillMode = FillMode.STRICT_CROSS,
     ) -> BacktestRunner:
         """Initialize a BacktestRunner for the replay.
 
@@ -365,6 +378,7 @@ class ReplayEngine:
                 to ``BacktestRunner`` as ``seeded_active_orders``, which
                 pre-loads the ``BacktestOrderManager`` so they participate
                 in fill checks on the first tick.
+            fill_mode: Fill simulator mode for the replay runner.
         """
         instrument_info = self._instrument_provider.get(strategy_config.symbol)
         logger.info(
@@ -372,7 +386,7 @@ class ReplayEngine:
             f"qty_step={instrument_info.qty_step}, tick_size={instrument_info.tick_size}"
         )
 
-        fill_simulator = TradeThroughFillSimulator()
+        fill_simulator = TradeThroughFillSimulator(mode=fill_mode)
         order_manager = BacktestOrderManager(
             fill_simulator=fill_simulator,
             commission_rate=strategy_config.commission_rate,
