@@ -1,10 +1,12 @@
 """Tests for PrivateCollector."""
 
+import asyncio
 import pytest
-from datetime import datetime
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
+from bybit_adapter.ws_client import ConnectionState
 from event_saver.collectors.private_collector import PrivateCollector, AccountContext
 from gridcore.events import ExecutionEvent, OrderUpdateEvent
 
@@ -93,19 +95,25 @@ class TestLifecycle:
             MockWS.return_value = mock_ws
 
             await collector.start()
+            try:
+                assert collector.is_running() is True
+                mock_ws.connect.assert_called_once()
+            finally:
+                await collector.stop()
 
-            assert collector.is_running() is True
-            mock_ws.connect.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_start_uses_correct_testnet_flag(self, collector, context):
         with patch("event_saver.collectors.private_collector.PrivateWebSocketClient") as MockWS:
             MockWS.return_value = MagicMock()
             await collector.start()
+            try:
+                call_kwargs = MockWS.call_args[1]
+                assert call_kwargs["testnet"] is True
+                assert call_kwargs["api_key"] == "test_key"
+            finally:
+                await collector.stop()
 
-            call_kwargs = MockWS.call_args[1]
-            assert call_kwargs["testnet"] is True
-            assert call_kwargs["api_key"] == "test_key"
 
     @pytest.mark.asyncio
     async def test_start_disables_private_message_gap_watchdog(self, collector):
@@ -115,9 +123,11 @@ class TestLifecycle:
         with patch("event_saver.collectors.private_collector.PrivateWebSocketClient") as MockWS:
             MockWS.return_value = MagicMock()
             await collector.start()
-
-            call_kwargs = MockWS.call_args[1]
-            assert call_kwargs["message_gap_watchdog_enabled"] is False
+            try:
+                call_kwargs = MockWS.call_args[1]
+                assert call_kwargs["message_gap_watchdog_enabled"] is False
+            finally:
+                await collector.stop()
 
     @pytest.mark.asyncio
     async def test_start_does_not_spawn_private_heartbeat_thread(self, collector):
@@ -152,11 +162,13 @@ class TestLifecycle:
         with patch("event_saver.collectors.private_collector.PrivateWebSocketClient") as MockWS:
             MockWS.return_value = MagicMock()
             await collector.start()
+            try:
+                MockWS.reset_mock()
+                await collector.start()
 
-            MockWS.reset_mock()
-            await collector.start()
-
-            MockWS.assert_not_called()
+                MockWS.assert_not_called()
+            finally:
+                await collector.stop()
 
     @pytest.mark.asyncio
     async def test_stop_disconnects(self, collector):
@@ -174,6 +186,38 @@ class TestLifecycle:
     @pytest.mark.asyncio
     async def test_stop_noop_if_not_running(self, collector):
         await collector.stop()
+
+    @pytest.mark.asyncio
+    async def test_private_ws_health_resets_dead_socket_and_reconciles(self, context, on_gap):
+        disconnected_at = datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC)
+        collector = PrivateCollector(
+            context=context,
+            on_gap_detected=on_gap,
+            ws_health_check_interval=0.01,
+        )
+
+        with patch("event_saver.collectors.private_collector.PrivateWebSocketClient") as MockWS:
+            mock_ws = MagicMock()
+            socket_alive_results = iter([False])
+            mock_ws.is_socket_alive.side_effect = (
+                lambda: next(socket_alive_results, True)
+            )
+            mock_ws.get_connection_state.return_value = ConnectionState(
+                last_message_ts=disconnected_at,
+                is_connected=True,
+            )
+            MockWS.return_value = mock_ws
+
+            await collector.start()
+            try:
+                await asyncio.sleep(0.05)
+            finally:
+                await collector.stop()
+
+            mock_ws.reset.assert_called_once()
+            on_gap.assert_called_once()
+            assert on_gap.call_args[0][0] == disconnected_at
+            assert on_gap.call_args[0][1] >= disconnected_at
 
     def test_get_connection_state_none_without_client(self, collector):
         assert collector.get_connection_state() is None

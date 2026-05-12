@@ -753,9 +753,9 @@ See `docs/features/0003_LOW_PRIORITY_CLEANUP.md` for detailed documentation.
 
 **Feature 0035 — private WS message-gap watchdog disabled on recorder side**:
 - **Parity with gridbot feature 0026**: pybit ping/pong frames bypass business-event handler, so the 30s message-gap watchdog produces false-positive disconnects on a healthy quiet private WS. Recorder now passes `message_gap_watchdog_enabled=False` to `PrivateWebSocketClient`, matching `gridbot.orchestrator._init_account`.
-- **Side effect**: `PrivateCollector._handle_disconnect` and the `on_gap_detected` callback wired through `_handle_reconnect` become dormant — the watchdog was their sole trigger. Kept wired for symmetry / reversibility (same call as gridbot).
-- **Gap**: Recorder has no TCP-level health probe equivalent to gridbot's `_ws_health_check_once` (feature 0024). After 0035 the recorder relies entirely on pybit's internal reconnect for private WS recovery. A separate future feature can port the probe.
-- File: `apps/event_saver/src/event_saver/collectors/private_collector.py:128-139`
+- **Recorder recovery path**: `PrivateCollector` must keep its own TCP-level health loop (`_ws_health_check_loop` / `_ws_health_check_once`) while the message-gap watchdog is disabled. On a dead private socket it captures the last message timestamp, calls `PrivateWebSocketClient.reset()`, then invokes `_handle_reconnect()` so the existing `on_gap_detected` -> `GapReconciler.reconcile_executions()` path backfills missed executions.
+- **Do not remove the health loop when disabling the watchdog**: Without either the watchdog or TCP probe, private `on_gap_detected` becomes unreachable and real private WS outages silently skip REST reconciliation, risking missing execution rows.
+- File: `apps/event_saver/src/event_saver/collectors/private_collector.py`
 
 ### Test Commands
 ```bash
