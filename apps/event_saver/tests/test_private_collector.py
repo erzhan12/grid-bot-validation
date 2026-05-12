@@ -127,11 +127,23 @@ class TestLifecycle:
         # test_ws_client.py::test_private_watchdog_disabled_skips_heartbeat_thread
         # but goes through the recorder's collector path so a regression in
         # private_collector.py is caught here too.
-        with patch("bybit_adapter.ws_client.WebSocket"):
+        with patch("bybit_adapter.ws_client.WebSocket") as MockWebSocket:
+            mock_ws = MagicMock()
+            MockWebSocket.return_value = mock_ws
+
             await collector.start()
             try:
                 assert collector._ws_client is not None
+                # Heartbeat thread must not be started when the watchdog is off.
                 assert collector._ws_client._heartbeat_thread is None
+                # connect() did not short-circuit before the gate — connection
+                # is logically up and all four stream subscriptions were
+                # registered with the (mocked) pybit session.
+                assert collector._ws_client.is_connected() is True
+                mock_ws.execution_stream.assert_called_once()
+                mock_ws.order_stream.assert_called_once()
+                mock_ws.position_stream.assert_called_once()
+                mock_ws.wallet_stream.assert_called_once()
             finally:
                 await collector.stop()
 
