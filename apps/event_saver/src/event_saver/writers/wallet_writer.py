@@ -14,6 +14,26 @@ from grid_db import DatabaseFactory, WalletSnapshot, WalletSnapshotRepository
 logger = logging.getLogger(__name__)
 
 
+def _decimal_or_zero(value: object) -> Decimal:
+    """Coerce a Bybit numeric field to Decimal, mapping missing/empty to zero.
+
+    Bybit private wallet payloads can carry ``""`` for ``walletBalance`` /
+    ``availableToWithdraw`` on unused dust coins in a mainnet UTA account.
+    A plain ``Decimal(str(""))`` raises ``decimal.InvalidOperation``, which
+    the broad ``except`` in ``_messages_to_models`` then drops along with
+    every later coin in the same update. Map both ``None`` and ``""`` to
+    ``Decimal("0")``; let real numeric strings parse normally; let truly
+    malformed values still raise so the caller's warning path still fires.
+
+    The predicate is ``value in (None, "")`` rather than truthiness so a
+    legitimate ``"0"`` round-trips via the direct ``Decimal(str(...))``
+    path and is not coerced via the fallback.
+    """
+    if value in (None, ""):
+        return Decimal("0")
+    return Decimal(str(value))
+
+
 class WalletWriter:
     """Buffers and bulk-inserts wallet balance snapshots.
 
@@ -211,11 +231,11 @@ class WalletWriter:
                                 exchange_ts=exchange_ts,
                                 local_ts=local_ts,
                                 coin=coin_data.get("coin", ""),
-                                wallet_balance=Decimal(
-                                    str(coin_data.get("walletBalance", "0"))
+                                wallet_balance=_decimal_or_zero(
+                                    coin_data.get("walletBalance")
                                 ),
-                                available_balance=Decimal(
-                                    str(coin_data.get("availableToWithdraw", "0"))
+                                available_balance=_decimal_or_zero(
+                                    coin_data.get("availableToWithdraw")
                                 ),
                                 raw_json=coin_data,
                             )

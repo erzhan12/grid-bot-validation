@@ -2054,6 +2054,7 @@ All risk config thresholds (`max_margin=8`, `min_total_margin=0.15`) are ratios.
 17. **`asyncio.CancelledError`**: Is `BaseException`, passes through `except Exception`
 18. **Logging style**: Use `%s`-style in hot-path loops; f-strings elsewhere acceptable
 19. **PlaceLimitIntent constructor**: Requires `qty` and `grid_level` positional args
+20. **`Decimal("")` raises `decimal.InvalidOperation`**: Bybit may send empty strings for unused/dust numeric fields on mainnet UTA (e.g. `walletBalance`, `availableToWithdraw`). `d.get(key, "0")` only handles *missing* keys, not present-but-empty. For non-nullable Decimal columns use a `_decimal_or_zero(value)` helper (predicate `value in (None, "")`, fallback `Decimal("0")`); for nullable columns use the 0034 recorder pattern `Decimal(str(v)) if v not in (None, "") else None`. See `apps/event_saver/src/event_saver/writers/wallet_writer.py:17-34` and `apps/recorder/src/recorder/recorder.py:450-453`. Truthiness checks (`if v:`) are wrong here because they conflate legitimate `"0"` with empty.
 
 ## Dynamic Risk Limit Tiers (Feature/dynamic risk limit tiers)
 
