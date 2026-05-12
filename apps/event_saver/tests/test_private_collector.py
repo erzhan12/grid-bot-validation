@@ -120,6 +120,22 @@ class TestLifecycle:
             assert call_kwargs["message_gap_watchdog_enabled"] is False
 
     @pytest.mark.asyncio
+    async def test_start_does_not_spawn_private_heartbeat_thread(self, collector):
+        # Feature 0035 defense-in-depth: prove end-to-end through the real
+        # PrivateWebSocketClient that the watchdog gate is honoured — the
+        # heartbeat thread must not start when the flag is False. Mirrors
+        # test_ws_client.py::test_private_watchdog_disabled_skips_heartbeat_thread
+        # but goes through the recorder's collector path so a regression in
+        # private_collector.py is caught here too.
+        with patch("bybit_adapter.ws_client.WebSocket"):
+            await collector.start()
+            try:
+                assert collector._ws_client is not None
+                assert collector._ws_client._heartbeat_thread is None
+            finally:
+                await collector.stop()
+
+    @pytest.mark.asyncio
     async def test_start_twice_warns(self, collector):
         with patch("event_saver.collectors.private_collector.PrivateWebSocketClient") as MockWS:
             MockWS.return_value = MagicMock()
