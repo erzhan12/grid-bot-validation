@@ -135,6 +135,7 @@ class PrivateCollector:
             on_wallet=self._handle_wallet if self._on_wallet else None,
             on_disconnect=self._handle_disconnect,
             on_reconnect=self._handle_reconnect,
+            message_gap_watchdog_enabled=False,
         )
 
         self._ws_client.connect()

@@ -108,6 +108,18 @@ class TestLifecycle:
             assert call_kwargs["api_key"] == "test_key"
 
     @pytest.mark.asyncio
+    async def test_start_disables_private_message_gap_watchdog(self, collector):
+        # Feature 0035 — mirrors gridbot feature 0026: the message-gap watchdog
+        # produces false-positive disconnects on a healthy quiet private WS
+        # because pybit's ping/pong frames bypass the business-event handler.
+        with patch("event_saver.collectors.private_collector.PrivateWebSocketClient") as MockWS:
+            MockWS.return_value = MagicMock()
+            await collector.start()
+
+            call_kwargs = MockWS.call_args[1]
+            assert call_kwargs["message_gap_watchdog_enabled"] is False
+
+    @pytest.mark.asyncio
     async def test_start_twice_warns(self, collector):
         with patch("event_saver.collectors.private_collector.PrivateWebSocketClient") as MockWS:
             MockWS.return_value = MagicMock()
