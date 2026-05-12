@@ -19,7 +19,7 @@ from event_saver.writers import TradeWriter, ExecutionWriter
 from event_saver.writers.ticker_writer import TickerWriter
 from event_saver.writers.order_writer import OrderWriter
 from event_saver.writers.position_writer import PositionWriter
-from event_saver.writers.wallet_writer import WalletWriter
+from event_saver.writers.wallet_writer import WalletWriter, _decimal_or_zero
 
 
 @pytest.fixture
@@ -941,3 +941,161 @@ class TestWalletWriter:
 
             await writer.flush()
             assert len(writer._buffer) == 0
+
+    def test_decimal_or_zero_helper(self):
+        """0036: helper maps None/'' to Decimal('0'), passes real values through."""
+        from decimal import InvalidOperation
+
+        assert _decimal_or_zero(None) == Decimal("0")
+        assert _decimal_or_zero("") == Decimal("0")
+        assert _decimal_or_zero("1.5") == Decimal("1.5")
+        # Legit "0" round-trips via direct path, not via fallback.
+        assert _decimal_or_zero("0") == Decimal("0")
+        # Truly malformed values still raise so the caller's broad except
+        # still drops the row and emits its existing warning.
+        with pytest.raises(InvalidOperation):
+            _decimal_or_zero("not-a-number")
+
+    @pytest.mark.asyncio
+    async def test_empty_string_wallet_balance_writes_zero(self, mock_db, caplog):
+        """0036: walletBalance='' writes Decimal('0') and emits no parse warning."""
+        import logging
+
+        writer = WalletWriter(db=mock_db, batch_size=100)
+        messages = [
+            {
+                "data": [
+                    {
+                        "accountType": "UNIFIED",
+                        "coin": [
+                            {
+                                "coin": "BTC",
+                                "walletBalance": "",
+                                "availableToWithdraw": "",
+                            }
+                        ],
+                        "updateTime": "1700000000000",
+                    }
+                ]
+            }
+        ]
+
+        with caplog.at_level(logging.WARNING, logger="event_saver.writers.wallet_writer"):
+            await writer.write(uuid4(), messages)
+
+        assert len(writer._buffer) == 1
+        snap = writer._buffer[0]
+        assert snap.coin == "BTC"
+        assert snap.wallet_balance == Decimal("0")
+        assert snap.available_balance == Decimal("0")
+        assert not any(
+            "Error parsing wallet snapshot" in r.message for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_wallet_balance_writes_zero(self, mock_db):
+        """0036: missing walletBalance key still writes Decimal('0')."""
+        writer = WalletWriter(db=mock_db, batch_size=100)
+        messages = [
+            {
+                "data": [
+                    {
+                        "accountType": "UNIFIED",
+                        "coin": [
+                            {
+                                "coin": "USDC",
+                            }
+                        ],
+                        "updateTime": "1700000000000",
+                    }
+                ]
+            }
+        ]
+
+        await writer.write(uuid4(), messages)
+
+        assert len(writer._buffer) == 1
+        snap = writer._buffer[0]
+        assert snap.wallet_balance == Decimal("0")
+        assert snap.available_balance == Decimal("0")
+
+    @pytest.mark.asyncio
+    async def test_malformed_wallet_balance_drops_row_and_warns(self, mock_db, caplog):
+        """0036: 'not-a-number' walletBalance drops row and warns exactly once."""
+        import logging
+
+        writer = WalletWriter(db=mock_db, batch_size=100)
+        messages = [
+            {
+                "data": [
+                    {
+                        "accountType": "UNIFIED",
+                        "coin": [
+                            {
+                                "coin": "FOO",
+                                "walletBalance": "not-a-number",
+                                "availableToWithdraw": "1.0",
+                            }
+                        ],
+                        "updateTime": "1700000000000",
+                    }
+                ]
+            }
+        ]
+
+        with caplog.at_level(logging.WARNING, logger="event_saver.writers.wallet_writer"):
+            await writer.write(uuid4(), messages)
+
+        assert len(writer._buffer) == 0
+        warnings = [
+            r for r in caplog.records if "Error parsing wallet snapshot" in r.message
+        ]
+        assert len(warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_mixed_payload_blast_radius(self, mock_db, caplog):
+        """0036: bad coin drops itself and later coins in the same update.
+
+        Coins appended before the bad one survive because the try/except
+        wraps the per-wallet_data block but snapshots.append runs inside
+        the inner coin loop. This pins the known blast radius until the
+        broader 0037 per-coin isolation fix lands.
+        """
+        import logging
+
+        writer = WalletWriter(db=mock_db, batch_size=100)
+        messages = [
+            {
+                "data": [
+                    {
+                        "accountType": "UNIFIED",
+                        "coin": [
+                            {
+                                "coin": "USDT",
+                                "walletBalance": "10000.00",
+                                "availableToWithdraw": "9500.00",
+                            },
+                            {
+                                "coin": "FOO",
+                                "walletBalance": "not-a-number",
+                                "availableToWithdraw": "1.0",
+                            },
+                            {
+                                "coin": "BAR",
+                                "walletBalance": "1.0",
+                                "availableToWithdraw": "1.0",
+                            },
+                        ],
+                        "updateTime": "1700000000000",
+                    }
+                ]
+            }
+        ]
+
+        with caplog.at_level(logging.WARNING, logger="event_saver.writers.wallet_writer"):
+            await writer.write(uuid4(), messages)
+
+        # USDT (before bad coin) survives. FOO raises; BAR is collateral
+        # damage from the current try/except scope.
+        assert len(writer._buffer) == 1
+        assert writer._buffer[0].coin == "USDT"
