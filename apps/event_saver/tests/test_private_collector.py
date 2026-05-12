@@ -108,6 +108,46 @@ class TestLifecycle:
             assert call_kwargs["api_key"] == "test_key"
 
     @pytest.mark.asyncio
+    async def test_start_disables_private_message_gap_watchdog(self, collector):
+        # Feature 0035 — mirrors gridbot feature 0026: the message-gap watchdog
+        # produces false-positive disconnects on a healthy quiet private WS
+        # because pybit's ping/pong frames bypass the business-event handler.
+        with patch("event_saver.collectors.private_collector.PrivateWebSocketClient") as MockWS:
+            MockWS.return_value = MagicMock()
+            await collector.start()
+
+            call_kwargs = MockWS.call_args[1]
+            assert call_kwargs["message_gap_watchdog_enabled"] is False
+
+    @pytest.mark.asyncio
+    async def test_start_does_not_spawn_private_heartbeat_thread(self, collector):
+        # Feature 0035 defense-in-depth: prove end-to-end through the real
+        # PrivateWebSocketClient that the watchdog gate is honoured — the
+        # heartbeat thread must not start when the flag is False. Mirrors
+        # test_ws_client.py::test_private_watchdog_disabled_skips_heartbeat_thread
+        # but goes through the recorder's collector path so a regression in
+        # private_collector.py is caught here too.
+        with patch("bybit_adapter.ws_client.WebSocket") as MockWebSocket:
+            mock_ws = MagicMock()
+            MockWebSocket.return_value = mock_ws
+
+            await collector.start()
+            try:
+                assert collector._ws_client is not None
+                # Heartbeat thread must not be started when the watchdog is off.
+                assert collector._ws_client._heartbeat_thread is None
+                # connect() did not short-circuit before the gate — connection
+                # is logically up and all four stream subscriptions were
+                # registered with the (mocked) pybit session.
+                assert collector._ws_client.is_connected() is True
+                mock_ws.execution_stream.assert_called_once()
+                mock_ws.order_stream.assert_called_once()
+                mock_ws.position_stream.assert_called_once()
+                mock_ws.wallet_stream.assert_called_once()
+            finally:
+                await collector.stop()
+
+    @pytest.mark.asyncio
     async def test_start_twice_warns(self, collector):
         with patch("event_saver.collectors.private_collector.PrivateWebSocketClient") as MockWS:
             MockWS.return_value = MagicMock()
