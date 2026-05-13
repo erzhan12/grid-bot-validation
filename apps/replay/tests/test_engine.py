@@ -8,6 +8,7 @@ import pytest
 
 from gridcore import TickerEvent, EventType
 from grid_db import Run, User, BybitAccount, Strategy
+from grid_db.models import PositionSnapshot
 
 from backtest.data_provider import InMemoryDataProvider
 from backtest.fill_simulator import FillMode
@@ -476,3 +477,88 @@ class TestPositionTelemetryWriter0034:
                 strategy_config, session,
                 run_id="test-run-id", account_id=None,
             )
+
+
+class TestPositionPairsSurviveSessionClose:
+    """Regression for feature 0038: DetachedInstanceError in position pairing.
+
+    Before the fix, `ReplayEngine.run` loaded `PositionSnapshot` ORM rows
+    inside a `with db.get_session()` block but called
+    `PositionComparator.pair_and_compare` (and the downstream attribute
+    reads) AFTER the block exited. The session manager's exit-time
+    `commit()` expired every attribute on the loaded instances; the next
+    attribute read raised `DetachedInstanceError`.
+    """
+
+    @patch("replay.engine.InstrumentInfoProvider")
+    def test_position_pairs_accessible_after_run(
+        self, mock_provider_cls, db, seeded_run_account, replay_config, ticker_events,
+    ):
+        """Column attributes on returned pairs must remain readable.
+
+        Seeds one live/backtest pair at matching exchange_ts so step 11
+        produces a non-empty `result.position_pairs`. Asserting any column
+        attribute access on the pair (`.live.side`, `.backtest.entry_price`)
+        is sufficient — the regression is a thrown `DetachedInstanceError`,
+        not a wrong value.
+        """
+        mock_info = MagicMock()
+        mock_info.qty_step = Decimal("0.001")
+        mock_info.tick_size = Decimal("0.1")
+        mock_info.round_qty = lambda q: max(Decimal("0.001"), q.quantize(Decimal("0.001")))
+        mock_provider_cls.return_value.get.return_value = mock_info
+
+        snap_ts = replay_config.start_ts + timedelta(minutes=1)
+        with db.get_session() as session:
+            session.add(PositionSnapshot(
+                run_id="test-run-id",
+                account_id=seeded_run_account.account_id,
+                symbol="BTCUSDT",
+                exchange_ts=snap_ts,
+                local_ts=snap_ts,
+                side="Buy",
+                size=Decimal("0.001"),
+                entry_price=Decimal("100000"),
+                liq_price=Decimal("0"),
+                unrealised_pnl=Decimal("0"),
+                source="live",
+                mark_price=Decimal("100000"),
+                position_im=Decimal("0"),
+                position_mm=Decimal("0"),
+                cum_realised_pnl=Decimal("0"),
+            ))
+            session.add(PositionSnapshot(
+                run_id="test-run-id",
+                account_id=seeded_run_account.account_id,
+                symbol="BTCUSDT",
+                exchange_ts=snap_ts,
+                local_ts=snap_ts,
+                side="Buy",
+                size=Decimal("0.001"),
+                entry_price=Decimal("100000"),
+                liq_price=Decimal("0"),
+                unrealised_pnl=Decimal("0"),
+                source="backtest",
+                mark_price=Decimal("100000"),
+                position_im=Decimal("0"),
+                position_mm=Decimal("0"),
+                cum_realised_pnl=Decimal("0"),
+            ))
+            session.commit()
+
+        engine = ReplayEngine(config=replay_config, db=db)
+        provider = InMemoryDataProvider(ticker_events)
+
+        result = engine.run(data_provider=provider)
+
+        assert len(result.position_pairs) > 0, (
+            "Seeded a matching live/backtest pair; expected pair_and_compare "
+            "to produce at least one pair."
+        )
+        pair = result.position_pairs[0]
+        # If the regression returns, these attribute reads raise
+        # sqlalchemy.orm.exc.DetachedInstanceError before reaching the assert.
+        assert pair.live.side == "Buy"
+        assert pair.backtest.side == "Buy"
+        assert pair.live.entry_price == Decimal("100000")
+        assert pair.backtest.entry_price == Decimal("100000")
