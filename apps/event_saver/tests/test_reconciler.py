@@ -247,7 +247,7 @@ class TestReconcileExecutions:
 
         # Mock the BybitRestClient constructor
         mock_client = MagicMock()
-        mock_client.get_executions_all.return_value = []
+        mock_client.get_executions_all.return_value = ([], False)
 
         # Patch BybitRestClient constructor, PrivateExecutionRepository, and asyncio.to_thread
         with unittest.mock.patch('event_saver.reconciler.PrivateExecutionRepository', return_value=mock_repo), \
@@ -268,6 +268,62 @@ class TestReconcileExecutions:
 
         # Verify reconciliation completed (would return 0 for empty list)
         assert count == 0
+        mock_client.get_executions_all.assert_called_once()
+        assert mock_client.get_executions_all.call_args.kwargs["return_truncated"] is True
+
+    @pytest.mark.asyncio
+    async def test_truncated_rest_response_is_not_persisted(
+        self, mock_db, mock_rest_client
+    ):
+        """Do not mark a gap complete by writing a partial execution page set."""
+        reconciler = GapReconciler(
+            db=mock_db,
+            rest_client=mock_rest_client,
+            gap_threshold_seconds=5.0,
+        )
+
+        gap_start = datetime.now(UTC)
+        gap_end = gap_start + timedelta(seconds=10)
+
+        mock_session = MagicMock()
+        mock_repo = MagicMock()
+        mock_repo.get_last_execution_ts.return_value = None
+        mock_db.get_session.return_value.__enter__.return_value = mock_session
+        mock_db.get_session.return_value.__exit__.return_value = None
+
+        async def mock_to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        mock_client = MagicMock()
+        mock_client.get_executions_all.return_value = (
+            [{"execId": "partial", "category": "linear", "execType": "Trade"}],
+            True,
+        )
+
+        with unittest.mock.patch(
+            "event_saver.reconciler.PrivateExecutionRepository",
+            return_value=mock_repo,
+        ), unittest.mock.patch(
+            "event_saver.reconciler.asyncio.to_thread",
+            side_effect=mock_to_thread,
+        ), unittest.mock.patch(
+            "event_saver.reconciler.BybitRestClient",
+            return_value=mock_client,
+        ):
+            count = await reconciler.reconcile_executions(
+                user_id=uuid4(),
+                account_id=uuid4(),
+                run_id=uuid4(),
+                symbol="BTCUSDT",
+                gap_start=gap_start,
+                gap_end=gap_end,
+                api_key="test_key",
+                api_secret="test_secret",
+                testnet=True,
+            )
+
+        assert count == 0
+        mock_repo.bulk_insert.assert_not_called()
 
 
 class TestTradesConversion:

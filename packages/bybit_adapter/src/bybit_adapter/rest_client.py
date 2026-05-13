@@ -214,7 +214,8 @@ class BybitRestClient:
         start_time: Optional[int] = None,
         end_time: Optional[int] = None,
         max_pages: int = 10,
-    ) -> list[dict]:
+        return_truncated: bool = False,
+    ) -> list[dict] | tuple[list[dict], bool]:
         """Fetch all executions with automatic pagination.
 
         Args:
@@ -222,9 +223,13 @@ class BybitRestClient:
             start_time: Start time in milliseconds (optional)
             end_time: End time in milliseconds (optional)
             max_pages: Maximum number of pages to fetch (safety limit)
+            return_truncated: When True, return ``(executions, truncated)``.
 
         Returns:
-            List of all executions across pages
+            List of all executions across pages by default. When
+            ``return_truncated=True``, returns a tuple where ``truncated`` is
+            True if the safety limit was reached while Bybit still advertised
+            another page.
 
         Raises:
             Exception: If API call fails
@@ -249,7 +254,13 @@ class BybitRestClient:
             if not cursor:
                 break
 
-        logger.info(f"Fetched {len(all_executions)} total executions across {page} pages")
+        truncated = page >= max_pages and cursor is not None
+        logger.info(
+            f"Fetched {len(all_executions)} total executions across {page} pages "
+            f"(truncated={truncated})"
+        )
+        if return_truncated:
+            return all_executions, truncated
         return all_executions
 
     def get_order_history(

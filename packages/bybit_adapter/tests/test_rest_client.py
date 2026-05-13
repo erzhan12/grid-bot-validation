@@ -183,6 +183,35 @@ class TestGetExecutionsAll:
         assert len(result) == 3
         assert mock_session.get_executions.call_count == 3
 
+    def test_return_truncated_flag_when_max_pages_reached(self, client, mock_session):
+        mock_session.get_executions.return_value = _ok_response(
+            {"list": [{"execId": "e"}], "nextPageCursor": "more"}
+        )
+
+        result, truncated = client.get_executions_all(
+            symbol="BTCUSDT",
+            max_pages=3,
+            return_truncated=True,
+        )
+
+        assert len(result) == 3
+        assert truncated is True
+        assert mock_session.get_executions.call_count == 3
+
+    def test_return_truncated_false_when_cursor_exhausted(self, client, mock_session):
+        mock_session.get_executions.side_effect = [
+            _ok_response({"list": [{"execId": "e1"}], "nextPageCursor": "cursor2"}),
+            _ok_response({"list": [{"execId": "e2"}], "nextPageCursor": ""}),
+        ]
+
+        result, truncated = client.get_executions_all(
+            symbol="BTCUSDT",
+            return_truncated=True,
+        )
+
+        assert result == [{"execId": "e1"}, {"execId": "e2"}]
+        assert truncated is False
+
     def test_passes_time_range(self, client, mock_session):
         mock_session.get_executions.return_value = _ok_response(
             {"list": [], "nextPageCursor": ""}

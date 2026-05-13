@@ -572,6 +572,10 @@ await saver.run_until_shutdown()
    - event_saver: 46 tests (config, writers, reconciler)
    - Run separately to avoid conftest conflicts: `uv run pytest packages/bybit_adapter/tests -v`
 
+5. **Private execution gap backfills**
+   - `BybitRestClient.get_executions_all(..., return_truncated=True)` exposes whether Bybit still had another page when the safety limit was reached.
+   - `GapReconciler.reconcile_executions()` must treat truncated private execution windows as incomplete and must not bulk-insert partial rows; otherwise later `last_execution_ts` lookups can make the missing middle of the gap look reconciled.
+
 ### Critical Pitfalls Fixed (2026-01-08)
 
 **IMPORTANT**: When initializing components in event_saver, avoid these errors:
