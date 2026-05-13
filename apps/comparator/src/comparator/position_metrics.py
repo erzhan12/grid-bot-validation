@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import timedelta
 from decimal import Decimal
 from typing import Optional
 
@@ -128,11 +129,11 @@ class PositionComparator:
         live_snapshots: list[PositionSnapshot],
         bt_snapshots: list[PositionSnapshot],
     ) -> list[PositionComparisonPair]:
-        """Pair backtest snapshots with the next live snapshot within tolerance.
+        """Pair backtest snapshots with the first live snapshot within tolerance.
 
         Per-side monotonic two-pointer with explicit consume step: each
         live row is claimed by at most one backtest row. Bt rows that
-        do not find a live row within ``pair_tolerance_s`` increment
+        do not find a live row within ``+/-pair_tolerance_s`` increment
         ``position_pairs_unmatched_bt`` (counted by ``fold_metrics_into``).
         """
         pairs: list[PositionComparisonPair] = []
@@ -149,21 +150,24 @@ class PositionComparator:
     ) -> list[PositionComparisonPair]:
         out: list[PositionComparisonPair] = []
         live_idx = 0
+        tolerance = timedelta(seconds=self._tolerance_s)
         for bt_row in bt:
             bt_ts = bt_row.exchange_ts
-            # Advance live_idx to the first live row with ts >= bt_ts.
-            while live_idx < len(live) and live[live_idx].exchange_ts < bt_ts:
+            lower_bound = bt_ts - tolerance
+            upper_bound = bt_ts + tolerance
+
+            # Drop stale live rows that cannot match this or any future bt row.
+            while live_idx < len(live) and live[live_idx].exchange_ts < lower_bound:
                 live_idx += 1
             if live_idx >= len(live):
-                # No future live row to claim — bt unmatched.
+                # No unclaimed live row remains — bt unmatched.
                 out.append(_unmatched_bt_marker(bt_row))
                 continue
+
             live_row = live[live_idx]
-            gap = (live_row.exchange_ts - bt_ts).total_seconds()
-            if gap > self._tolerance_s:
-                # Within tolerance check failed; bt unmatched. Do NOT
-                # advance live_idx — the next bt row may legitimately
-                # claim this live row.
+            if live_row.exchange_ts > upper_bound:
+                # No live row inside the bidirectional tolerance window. Do
+                # not advance live_idx; the next bt row may claim this live row.
                 out.append(_unmatched_bt_marker(bt_row))
                 continue
             out.append(_build_pair(live_row, bt_row))
