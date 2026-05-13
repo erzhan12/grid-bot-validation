@@ -110,7 +110,9 @@ schedules `reconcile_executions` per symbol via
   block forever and so will the recorder's shutdown path. Low likelihood;
   worth knowing for SIGTERM behavior. If observed, wrap the await with
   `asyncio.wait_for(..., timeout=...)` and fall back to canceling /
-  abandoning the task.
+  abandoning the task. **Addressed by Feature 0039** — `reset()` and
+  `disconnect()` now run on a daemon thread bounded by `asyncio.wait_for`,
+  with abandonment-aware shutdown.
 - **N2 — `contextlib.suppress(asyncio.CancelledError)` in `stop()` is
   defensive only.** The new design removed the explicit `cancel()` call, so
   the loop should now exit cleanly via the stop event. Keeping `suppress`

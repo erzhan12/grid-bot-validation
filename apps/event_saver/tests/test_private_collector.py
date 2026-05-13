@@ -1,6 +1,7 @@
 """Tests for PrivateCollector."""
 
 import asyncio
+import logging
 import threading
 import pytest
 from datetime import UTC, datetime
@@ -8,7 +9,11 @@ from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 from bybit_adapter.ws_client import ConnectionState
-from event_saver.collectors.private_collector import PrivateCollector, AccountContext
+from event_saver.collectors.private_collector import (
+    PrivateCollector,
+    AccountContext,
+    _run_in_daemon_thread,
+)
 from gridcore.events import ExecutionEvent, OrderUpdateEvent
 
 
@@ -493,3 +498,267 @@ class TestMisc:
         collector.update_run_id(new_run_id)
 
         assert context.run_id == new_run_id
+
+
+# ---------------------------------------------------------------------------
+# WS reset / disconnect timeout (Feature 0039)
+# ---------------------------------------------------------------------------
+
+
+class TestWsResetTimeout:
+    @pytest.mark.asyncio
+    async def test_private_ws_health_reset_timeout_skips_reconcile(
+        self, context, on_gap, caplog
+    ):
+        disconnected_at = datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC)
+        collector = PrivateCollector(
+            context=context,
+            on_gap_detected=on_gap,
+            ws_reset_timeout=0.05,
+        )
+        allow_reset_finish = threading.Event()
+
+        def reset() -> None:
+            assert allow_reset_finish.wait(timeout=2.0)
+
+        mock_ws = MagicMock()
+        mock_ws.is_socket_alive.return_value = False
+        mock_ws.get_connection_state.return_value = ConnectionState(
+            last_message_ts=disconnected_at,
+            is_connected=True,
+        )
+        mock_ws.reset.side_effect = reset
+        collector._running = True
+        collector._ws_client = mock_ws
+
+        try:
+            with caplog.at_level(logging.ERROR):
+                await collector._ws_health_check_once()
+
+            on_gap.assert_not_called()
+            assert collector._ws_reset_abandoned is True
+            assert any(
+                "timed out" in record.getMessage().lower()
+                and str(context.account_id) in record.getMessage()
+                for record in caplog.records
+            )
+        finally:
+            allow_reset_finish.set()
+
+    @pytest.mark.asyncio
+    async def test_stop_skips_disconnect_after_reset_timeout(self, context, on_gap):
+        ws_reset_timeout = 0.05
+        ws_disconnect_timeout = 0.05
+        disconnected_at = datetime(2025, 1, 1, 0, 0, 0, tzinfo=UTC)
+        collector = PrivateCollector(
+            context=context,
+            on_gap_detected=on_gap,
+            ws_reset_timeout=ws_reset_timeout,
+            ws_disconnect_timeout=ws_disconnect_timeout,
+        )
+        reset_started = threading.Event()
+        allow_reset_finish = threading.Event()
+
+        def reset() -> None:
+            reset_started.set()
+            assert allow_reset_finish.wait(timeout=2.0)
+
+        mock_ws = MagicMock()
+        mock_ws.is_socket_alive.return_value = False
+        mock_ws.get_connection_state.return_value = ConnectionState(
+            last_message_ts=disconnected_at,
+            is_connected=True,
+        )
+        mock_ws.reset.side_effect = reset
+        collector._running = True
+        collector._ws_client = mock_ws
+        collector._ws_health_stop_event = asyncio.Event()
+        collector._ws_health_task = asyncio.create_task(
+            collector._ws_health_check_once()
+        )
+
+        try:
+            assert await asyncio.to_thread(reset_started.wait, 2.0)
+
+            # Drive stop() while worker is STILL parked.
+            await asyncio.wait_for(
+                collector.stop(),
+                timeout=ws_reset_timeout + ws_disconnect_timeout + 0.5,
+            )
+
+            # Assert abandonment BEFORE releasing the event.
+            assert mock_ws.disconnect.call_count == 0
+            assert collector._ws_client is None
+            assert collector._ws_reset_abandoned is True
+        finally:
+            allow_reset_finish.set()
+
+    @pytest.mark.asyncio
+    async def test_subsequent_health_check_does_not_touch_abandoned_client(
+        self, context
+    ):
+        # Regression for review P1: after a reset timeout, the abandoned pybit
+        # worker is still holding PrivateWebSocketClient._lock. is_socket_alive
+        # acquires that same lock, so the next health tick must not call any
+        # lock-taking method on the client — otherwise the event loop blocks
+        # exactly when SIGTERM needs it.
+        collector = PrivateCollector(context=context)
+        collector._running = True
+
+        lock_held = threading.Event()
+        release_lock = threading.Event()
+
+        def is_socket_alive_blocks():
+            lock_held.set()
+            assert release_lock.wait(timeout=2.0)
+            return False
+
+        mock_ws = MagicMock()
+        mock_ws.is_socket_alive.side_effect = is_socket_alive_blocks
+        collector._ws_client = mock_ws
+        collector._ws_reset_abandoned = True
+
+        try:
+            # If the guard is missing, is_socket_alive will block forever and
+            # wait_for will fire.
+            await asyncio.wait_for(collector._ws_health_check_once(), timeout=0.2)
+
+            assert mock_ws.is_socket_alive.call_count == 0
+            assert mock_ws.reset.call_count == 0
+        finally:
+            release_lock.set()
+
+    @pytest.mark.asyncio
+    async def test_start_after_timed_out_stop_clears_abandoned_flag(self, context):
+        collector = PrivateCollector(context=context)
+        collector._ws_reset_abandoned = True
+
+        with patch(
+            "event_saver.collectors.private_collector.PrivateWebSocketClient"
+        ) as MockWS:
+            mock_ws = MagicMock()
+            MockWS.return_value = mock_ws
+
+            await collector.start()
+            try:
+                assert collector._ws_reset_abandoned is False
+            finally:
+                await collector.stop()
+
+            mock_ws.disconnect.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_bounds_disconnect_when_no_prior_reset_timeout(
+        self, context, caplog
+    ):
+        ws_disconnect_timeout = 0.05
+        collector = PrivateCollector(
+            context=context,
+            ws_disconnect_timeout=ws_disconnect_timeout,
+        )
+        allow_disconnect_finish = threading.Event()
+
+        def disconnect() -> None:
+            assert allow_disconnect_finish.wait(timeout=2.0)
+
+        mock_ws = MagicMock()
+        mock_ws.disconnect.side_effect = disconnect
+        collector._running = True
+        collector._ws_client = mock_ws
+
+        try:
+            with caplog.at_level(logging.WARNING):
+                await asyncio.wait_for(
+                    collector.stop(),
+                    timeout=ws_disconnect_timeout + 0.5,
+                )
+
+            assert collector._ws_client is None
+            assert any(
+                "disconnect" in record.getMessage().lower()
+                and "timed out" in record.getMessage().lower()
+                for record in caplog.records
+            )
+        finally:
+            allow_disconnect_finish.set()
+
+
+class TestRunInDaemonThread:
+    @pytest.mark.asyncio
+    async def test_uses_daemon_true(self):
+        captured: dict = {}
+        original_thread = threading.Thread
+
+        def fake_thread(*args, **kwargs):
+            captured.update(kwargs)
+            return original_thread(*args, **kwargs)
+
+        done = threading.Event()
+
+        def fn() -> None:
+            done.set()
+
+        with patch(
+            "event_saver.collectors.private_collector.threading.Thread",
+            side_effect=fake_thread,
+        ):
+            fut = _run_in_daemon_thread(fn)
+            await fut
+
+        assert captured.get("daemon") is True
+        assert done.is_set()
+
+    @pytest.mark.asyncio
+    async def test_completion_after_cancel_does_not_raise(self):
+        loop = asyncio.get_running_loop()
+        exception_records: list[dict] = []
+        loop.set_exception_handler(lambda _loop, ctx: exception_records.append(ctx))
+
+        gate = threading.Event()
+
+        def fn() -> None:
+            assert gate.wait(timeout=2.0)
+
+        fut = _run_in_daemon_thread(fn)
+        fut.cancel()
+        # Wait for cancellation to propagate.
+        await asyncio.sleep(0.01)
+
+        try:
+            gate.set()
+            # Yield so the daemon thread's call_soon_threadsafe completer runs.
+            await asyncio.sleep(0.05)
+
+            assert exception_records == []
+        finally:
+            loop.set_exception_handler(None)
+
+    def test_completion_after_loop_closed_does_not_raise(self):
+        loop = asyncio.new_event_loop()
+        gate = threading.Event()
+        threads_before = {t.ident for t in threading.enumerate()}
+        try:
+            asyncio.set_event_loop(loop)
+
+            def fn() -> None:
+                assert gate.wait(timeout=2.0)
+
+            async def spawn():
+                return _run_in_daemon_thread(fn)
+
+            loop.run_until_complete(spawn())
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
+
+        # Loop is now closed; daemon thread is still parked on the gate.
+        worker = next(
+            (t for t in threading.enumerate() if t.ident not in threads_before),
+            None,
+        )
+        assert worker is not None
+        assert worker.daemon is True
+
+        gate.set()
+        worker.join(timeout=2.0)
+        assert worker.is_alive() is False
