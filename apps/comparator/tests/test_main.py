@@ -16,6 +16,7 @@ from grid_db import (
     Run,
     WalletSnapshot,
 )
+from grid_db.models import PositionSnapshot
 
 from gridcore.position import DirectionType, SideType
 
@@ -609,3 +610,79 @@ class TestRun:
             rows = {r["metric"]: r["value"] for r in csv_mod.DictReader(f)}
         # ETH trade filtered out, so no phantom backtest-only count from it
         assert rows["backtest_only_count"] == "0"
+
+    def test_run_position_telemetry_survives_session_close(self, db, tmp_path):
+        """Regression for feature 0038: pairing must not raise after session close.
+
+        Before the fix, `comparator.main.run` loaded `PositionSnapshot` ORM
+        rows inside a `with db.get_session()` block but called
+        `PositionComparator.pair_and_compare` AFTER the block exited.
+        SQLAlchemy's exit-time commit() expired every attribute on the
+        loaded rows; the first attribute read raised
+        `DetachedInstanceError` and propagated out of `run(...)` because
+        `run()` does not catch exceptions itself.
+
+        The CSV `position_comparison.csv` must be written with at least
+        one data row. Either failure mode (raised exception OR missing
+        CSV) catches the regression.
+        """
+        ts = self._seed_live_data(db)
+        ts_naive = ts.replace(tzinfo=None)
+
+        # Seed matching live/backtest position snapshots
+        with db.get_session() as session:
+            session.add(PositionSnapshot(
+                run_id="run_1", account_id="acc1", symbol="BTCUSDT",
+                exchange_ts=ts_naive, local_ts=ts_naive,
+                side="Buy", size=Decimal("0.001"),
+                entry_price=Decimal("100000"),
+                liq_price=Decimal("0"), unrealised_pnl=Decimal("0"),
+                source="live",
+                mark_price=Decimal("100000"),
+                position_im=Decimal("0"), position_mm=Decimal("0"),
+                cum_realised_pnl=Decimal("0"),
+            ))
+            session.add(PositionSnapshot(
+                run_id="run_1", account_id="acc1", symbol="BTCUSDT",
+                exchange_ts=ts_naive, local_ts=ts_naive,
+                side="Buy", size=Decimal("0.001"),
+                entry_price=Decimal("100000"),
+                liq_price=Decimal("0"), unrealised_pnl=Decimal("0"),
+                source="backtest",
+                mark_price=Decimal("100000"),
+                position_im=Decimal("0"), position_mm=Decimal("0"),
+                cum_realised_pnl=Decimal("0"),
+            ))
+
+        config = ComparatorConfig(
+            run_id="run_1",
+            database_url="sqlite:///:memory:",
+            start_ts=ts_naive - timedelta(hours=1),
+            end_ts=ts_naive + timedelta(hours=2),
+            symbol="BTCUSDT",
+            output_dir=str(tmp_path),
+        )
+        bt_trades = [
+            NormalizedTrade(
+                client_order_id="order_a", symbol="BTCUSDT", side=SideType.BUY,
+                price=Decimal("100000"), qty=Decimal("0.001"),
+                fee=Decimal("0.02"), realized_pnl=Decimal("0"),
+                timestamp=ts_naive, source="backtest", direction=DirectionType.LONG,
+            ),
+        ]
+
+        with patch("comparator.main.DatabaseFactory", return_value=db):
+            # If the regression returns, this raises DetachedInstanceError
+            # — `run()` does not catch exceptions itself.
+            result = run(config, bt_trades)
+
+        assert result == 0
+        position_csv = tmp_path / "position_comparison.csv"
+        assert position_csv.exists()
+        # At least one data row beyond the header.
+        with open(position_csv) as f:
+            lines = f.readlines()
+        assert len(lines) >= 2, (
+            f"position_comparison.csv has {len(lines)} lines; expected ≥2 "
+            "(header + at least one pair)."
+        )

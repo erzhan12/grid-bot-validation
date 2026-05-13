@@ -349,7 +349,12 @@ class ReplayEngine:
         )
 
         # 11. 0034: pair live/backtest position snapshots and fold telemetry
-        # parity metrics into the same ValidationMetrics object.
+        # parity metrics into the same ValidationMetrics object. 0038:
+        # pairing and telemetry fold must run INSIDE the session so attribute
+        # access (`.side`, `.exchange_ts`, telemetry columns) happens while
+        # rows are still attached; `expunge_all()` then detaches the rows so
+        # `commit()`'s expiration sweep on __exit__ leaves them readable for
+        # downstream consumers (ComparatorReporter CSV export).
         position_pairs: list = []
         with self._db.get_session() as db_session:
             live_snaps = load_position_snapshot_rows(
@@ -368,21 +373,22 @@ class ReplayEngine:
                 start_ts=start_ts,
                 end_ts=end_ts,
             )
-        if live_snaps and bt_snaps:
-            pc = PositionComparator()
-            position_pairs = pc.pair_and_compare(live_snaps, bt_snaps)
-            pc.fold_metrics_into(metrics, position_pairs)
-            logger.info(
-                "Position telemetry: %d pairs compared, %d unmatched bt, %d missing telemetry",
-                metrics.position_pairs_compared,
-                metrics.position_pairs_unmatched_bt,
-                metrics.position_pairs_missing_telemetry,
-            )
-        else:
-            logger.info(
-                "Position telemetry: skipped (live_snaps=%d, bt_snaps=%d)",
-                len(live_snaps), len(bt_snaps),
-            )
+            if live_snaps and bt_snaps:
+                pc = PositionComparator()
+                position_pairs = pc.pair_and_compare(live_snaps, bt_snaps)
+                pc.fold_metrics_into(metrics, position_pairs)
+                logger.info(
+                    "Position telemetry: %d pairs compared, %d unmatched bt, %d missing telemetry",
+                    metrics.position_pairs_compared,
+                    metrics.position_pairs_unmatched_bt,
+                    metrics.position_pairs_missing_telemetry,
+                )
+            else:
+                logger.info(
+                    "Position telemetry: skipped (live_snaps=%d, bt_snaps=%d)",
+                    len(live_snaps), len(bt_snaps),
+                )
+            db_session.expunge_all()
 
         return ReplayResult(
             session=session,

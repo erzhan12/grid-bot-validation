@@ -263,6 +263,11 @@ def run(
     from comparator.position_loader import load_position_snapshots
     from comparator.position_metrics import PositionComparator
 
+    # 0038: pairing and telemetry fold must run INSIDE the session so
+    # attribute access happens while rows are still attached;
+    # `expunge_all()` then detaches the rows so commit()'s expiration
+    # sweep on __exit__ leaves them readable for ComparatorReporter's
+    # CSV export below.
     with db.get_session() as session:
         live_snaps = load_position_snapshots(
             session,
@@ -281,16 +286,17 @@ def run(
             end_ts=config.end_ts,
         )
 
-    if live_snaps and bt_snaps:
-        pc = PositionComparator()
-        position_pairs = pc.pair_and_compare(live_snaps, bt_snaps)
-        pc.fold_metrics_into(metrics, position_pairs)
-    else:
-        position_pairs = []
-        logger.info(
-            "Position comparison skipped: live_snaps=%d, bt_snaps=%d",
-            len(live_snaps), len(bt_snaps),
-        )
+        if live_snaps and bt_snaps:
+            pc = PositionComparator()
+            position_pairs = pc.pair_and_compare(live_snaps, bt_snaps)
+            pc.fold_metrics_into(metrics, position_pairs)
+        else:
+            position_pairs = []
+            logger.info(
+                "Position comparison skipped: live_snaps=%d, bt_snaps=%d",
+                len(live_snaps), len(bt_snaps),
+            )
+        session.expunge_all()
 
     # Report (equity data and position pairs passed to reporter for export_all)
     reporter = ComparatorReporter(
