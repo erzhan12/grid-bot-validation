@@ -242,6 +242,7 @@ make test-integration
 - **SHORT position bug**: Reference code had incorrect liq risk logic (`<` instead of `>`). Higher ratio = closer to liquidation for shorts.
 - **Position.size**: Stored on `Position` object, updated in `StrategyRunner.on_position_update()` from both REST and WS paths. Used by `_is_good_to_place()` to validate reduce-only orders.
 - **Unknown market price**: REST/WS position updates can arrive before the first ticker. Pass `last_close=None` (or a queued ticker price if available), never `0.0`; `StrategyRunner.on_position_update()` updates wallet/position sizes but skips risk multiplier recalculation until a real positive price exists.
+- **`increase_same_position_on_low_margin` (feature 0040)**: YAML-wired in **gridbot only** via `StrategyConfig` → `RiskConfig` in `apps/gridbot/src/gridbot/runner.py`. Gates `Position._adjust_position_for_low_margin` (open-interval `0.94 < position_ratio < 1.05` AND `total_margin < min_total_margin`): `True` → boost own side `×2`; `False` (default) → suppress opposite side `×0.5`. Continuous boost (not one-shot) while the guard condition holds. **Deliberate divergence**: `apps/backtest` and `apps/pnl_checker` still construct `RiskConfig` with the 4-arg pattern and default the flag to `False`, so any YAML with the flag `true` makes live/backtest semantics diverge until a follow-up wires both apps. See `docs/features/0040_PLAN.md` "Out of scope".
 
 ### Pre-placement Validation (`_is_good_to_place`)
 

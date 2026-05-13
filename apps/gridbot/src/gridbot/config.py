@@ -52,6 +52,13 @@ class StrategyConfig(BaseModel):
     min_liq_ratio: float = Field(default=0.8, description="Minimum liquidation ratio")
     max_liq_ratio: float = Field(default=1.2, description="Maximum liquidation ratio")
     min_total_margin: float = Field(default=0.15, description="Minimum total margin")
+    increase_same_position_on_low_margin: bool = Field(
+        default=False,
+        description=(
+            "When equal positions AND total_margin < min_total_margin: "
+            "True = boost own side (x2), False = reduce opposite side (x0.5)"
+        ),
+    )
 
     # Mode
     shadow_mode: bool = Field(default=False, description="Log intents without executing")
