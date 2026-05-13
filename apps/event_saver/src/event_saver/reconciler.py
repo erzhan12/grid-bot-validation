@@ -249,7 +249,6 @@ class GapReconciler:
 
             # Create authenticated REST client for this account
             # (cannot use shared client with empty credentials)
-            from bybit_adapter.rest_client import BybitRestClient
             authenticated_client = BybitRestClient(
                 api_key=api_key,
                 api_secret=api_secret,
