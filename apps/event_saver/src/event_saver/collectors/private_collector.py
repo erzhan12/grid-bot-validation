@@ -1,8 +1,10 @@
 """Collect private account data (executions, orders, positions, wallet)."""
 
+import asyncio
+import contextlib
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Callable, Optional
 from uuid import UUID
 
@@ -12,6 +14,8 @@ from gridcore.events import ExecutionEvent, OrderUpdateEvent
 
 
 logger = logging.getLogger(__name__)
+
+_PRIVATE_WS_HEALTH_CHECK_INTERVAL = 10.0
 
 
 @dataclass
@@ -79,6 +83,7 @@ class PrivateCollector:
         on_position: Optional[Callable[[dict], None]] = None,
         on_wallet: Optional[Callable[[dict], None]] = None,
         on_gap_detected: Optional[Callable[[datetime, datetime], None]] = None,
+        ws_health_check_interval: float = _PRIVATE_WS_HEALTH_CHECK_INTERVAL,
     ):
         """Initialize private collector for an account.
 
@@ -89,6 +94,7 @@ class PrivateCollector:
             on_position: Callback for position snapshots (raw dict).
             on_wallet: Callback for wallet snapshots (raw dict).
             on_gap_detected: Callback when gap is detected (start, end).
+            ws_health_check_interval: TCP socket health-check interval in seconds.
         """
         self.context = context
         self._on_execution = on_execution
@@ -108,6 +114,9 @@ class PrivateCollector:
         self._ws_client: Optional[PrivateWebSocketClient] = None
         self._running = False
         self._symbols_set = set(context.symbols) if context.symbols else set()
+        self._ws_health_check_interval = ws_health_check_interval
+        self._ws_health_task: Optional[asyncio.Task[None]] = None
+        self._ws_health_stop_event: Optional[asyncio.Event] = None
 
     async def start(self) -> None:
         """Start collecting private data for this account.
@@ -139,6 +148,8 @@ class PrivateCollector:
         )
 
         self._ws_client.connect()
+        self._ws_health_stop_event = asyncio.Event()
+        self._ws_health_task = asyncio.create_task(self._ws_health_check_loop())
         logger.info(f"PrivateCollector started for account {self.context.account_id}")
 
     async def stop(self) -> None:
@@ -151,6 +162,15 @@ class PrivateCollector:
 
         logger.info(f"Stopping PrivateCollector for account {self.context.account_id}")
         self._running = False
+
+        if self._ws_health_stop_event:
+            self._ws_health_stop_event.set()
+
+        if self._ws_health_task:
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._ws_health_task
+            self._ws_health_task = None
+            self._ws_health_stop_event = None
 
         if self._ws_client:
             self._ws_client.disconnect()
@@ -167,6 +187,54 @@ class PrivateCollector:
         if self._ws_client:
             return self._ws_client.get_connection_state()
         return None
+
+    async def _ws_health_check_loop(self) -> None:
+        """Reset dead private sockets and trigger REST reconciliation."""
+        while self._running:
+            stop_event = self._ws_health_stop_event
+            if stop_event is None:
+                return
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(),
+                    timeout=self._ws_health_check_interval,
+                )
+                return
+            except TimeoutError:
+                pass
+            await self._ws_health_check_once()
+
+    async def _ws_health_check_once(self) -> None:
+        """Perform one TCP-level private WebSocket health check."""
+        client = self._ws_client
+        if not self._running or client is None:
+            return
+
+        try:
+            if client.is_socket_alive():
+                return
+
+            state = client.get_connection_state()
+            disconnected_at = (
+                state.last_message_ts
+                or state.disconnected_at
+                or datetime.now(UTC)
+            )
+            self._handle_disconnect(disconnected_at)
+
+            logger.warning(
+                "Private WebSocket socket dead for account %s; resetting",
+                self.context.account_id,
+            )
+            await asyncio.to_thread(client.reset)
+            self._handle_reconnect(disconnected_at, datetime.now(UTC))
+        except Exception as e:
+            logger.error(
+                "Private WebSocket health check failed for account %s: %s",
+                self.context.account_id,
+                e,
+                exc_info=True,
+            )
 
     def update_run_id(self, run_id: Optional[UUID]) -> None:
         """Update the run_id for subsequent events.
