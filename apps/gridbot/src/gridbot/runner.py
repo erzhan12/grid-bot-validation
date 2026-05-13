@@ -198,6 +198,9 @@ class StrategyRunner:
             max_liq_ratio=strategy_config.max_liq_ratio,
             max_margin=strategy_config.max_margin,
             min_total_margin=strategy_config.min_total_margin,
+            increase_same_position_on_low_margin=(
+                strategy_config.increase_same_position_on_low_margin
+            ),
         )
         self._long_position, self._short_position = Position.create_linked_pair(risk_config)
 

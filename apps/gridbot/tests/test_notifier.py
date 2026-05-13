@@ -2,7 +2,7 @@
 
 import time
 from datetime import datetime, UTC, timedelta
-from unittest.mock import Mock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 

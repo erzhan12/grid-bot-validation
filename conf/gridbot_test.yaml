@@ -13,6 +13,9 @@ strategies:
     grid_step: 0.3
     amount: "x0.001"
     max_margin: 5.0
+    # Continuous own-side x2 boost while equal positions AND total_margin < 3.
+    min_total_margin: 3
+    increase_same_position_on_low_margin: true
     shadow_mode: false  # start with shadow mode to avoid real orders
 
 database_url: "${DATABASE_URL}"

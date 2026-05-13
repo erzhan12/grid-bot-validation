@@ -166,6 +166,39 @@ class TestStrategyRunnerProperties:
         )
         assert runner.shadow_mode is True
 
+    def test_low_margin_equal_position_boost_config_wired_true(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """StrategyConfig flag is passed to both linked Position risk configs."""
+        strategy_config = strategy_config.model_copy(
+            update={"increase_same_position_on_low_margin": True}
+        )
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+        )
+
+        assert (
+            runner._long_position.risk_config.increase_same_position_on_low_margin
+            is True
+        )
+        assert (
+            runner._short_position.risk_config.increase_same_position_on_low_margin
+            is True
+        )
+
+    def test_low_margin_equal_position_boost_config_defaults_false(self, runner):
+        """Default StrategyConfig flag keeps both linked Position risk configs off."""
+        assert (
+            runner._long_position.risk_config.increase_same_position_on_low_margin
+            is False
+        )
+        assert (
+            runner._short_position.risk_config.increase_same_position_on_low_margin
+            is False
+        )
+
 
 class TestStrategyRunnerTicker:
     """Tests for ticker event processing."""

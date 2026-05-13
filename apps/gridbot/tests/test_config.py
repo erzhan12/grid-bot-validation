@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import yaml
+from pydantic import ValidationError
 
 from gridbot.config import (
     AccountConfig,
@@ -59,6 +60,38 @@ class TestStrategyConfig:
         assert strategy.grid_count == 50  # default
         assert strategy.grid_step == 0.2  # default
         assert strategy.shadow_mode is False  # default
+
+    def test_increase_same_position_on_low_margin_defaults_false(self):
+        """Test low-margin equal-position boost flag defaults off."""
+        strategy = StrategyConfig(
+            strat_id="btc_main",
+            account="main",
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+        )
+        assert strategy.increase_same_position_on_low_margin is False
+
+    def test_increase_same_position_on_low_margin_explicit_true(self):
+        """Test low-margin equal-position boost flag can be enabled."""
+        strategy = StrategyConfig(
+            strat_id="btc_main",
+            account="main",
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            increase_same_position_on_low_margin=True,
+        )
+        assert strategy.increase_same_position_on_low_margin is True
+
+    def test_increase_same_position_on_low_margin_invalid_type(self):
+        """Test non-coercible boost flag values are rejected."""
+        with pytest.raises(ValidationError):
+            StrategyConfig(
+                strat_id="btc_main",
+                account="main",
+                symbol="BTCUSDT",
+                tick_size=Decimal("0.1"),
+                increase_same_position_on_low_margin=[],
+            )
 
     def test_tick_size_from_string(self):
         """Test tick_size parsed from string."""
@@ -262,6 +295,7 @@ class TestLoadConfig:
                     "tick_size": "0.1",
                     "grid_count": 50,
                     "grid_step": 0.2,
+                    "increase_same_position_on_low_margin": True,
                 }
             ],
             "database_url": "sqlite:///test.db",
@@ -277,6 +311,7 @@ class TestLoadConfig:
             assert config.accounts[0].name == "test"
             assert len(config.strategies) == 1
             assert config.strategies[0].tick_size == Decimal("0.1")
+            assert config.strategies[0].increase_same_position_on_low_margin is True
             assert config.database_url == "sqlite:///test.db"
         finally:
             Path(config_path).unlink()
