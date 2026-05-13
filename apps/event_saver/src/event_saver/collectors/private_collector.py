@@ -3,9 +3,10 @@
 import asyncio
 import contextlib
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 from uuid import UUID
 
 from bybit_adapter.ws_client import PrivateWebSocketClient, ConnectionState
@@ -16,6 +17,52 @@ from gridcore.events import ExecutionEvent, OrderUpdateEvent
 logger = logging.getLogger(__name__)
 
 _PRIVATE_WS_HEALTH_CHECK_INTERVAL = 10.0
+_PRIVATE_WS_RESET_TIMEOUT = 30.0
+_PRIVATE_WS_DISCONNECT_TIMEOUT = 5.0
+
+
+def _run_in_daemon_thread(
+    fn: Callable[[], Any], *, name: Optional[str] = None
+) -> "asyncio.Future[Any]":
+    """Run ``fn`` on a dedicated daemon thread; return a future bound to the loop.
+
+    Used to wrap blocking pybit calls (``reset`` / ``disconnect``) so they can
+    be bounded by ``asyncio.wait_for`` and **abandoned** on timeout without
+    leaking into ``concurrent.futures.thread._python_exit`` at interpreter
+    shutdown (which would join the worker and re-introduce the hang).
+
+    Cancellation-safety: if ``wait_for`` cancels the future before the thread
+    returns, the completer guards on ``fut.done()`` so a late-returning worker
+    does not raise ``InvalidStateError`` on the loop. If the loop has been
+    closed by the time the worker returns, ``call_soon_threadsafe`` raises
+    ``RuntimeError`` which we swallow — the daemon thread exits quietly.
+    """
+    loop = asyncio.get_running_loop()
+    fut: "asyncio.Future[Any]" = loop.create_future()
+
+    def _complete(result: Any = None, exc: Optional[BaseException] = None) -> None:
+        if fut.done():
+            return
+        if exc is not None:
+            fut.set_exception(exc)
+        else:
+            fut.set_result(result)
+
+    def _target() -> None:
+        try:
+            result = fn()
+            exc: Optional[BaseException] = None
+        except BaseException as e:  # noqa: BLE001 — route to future
+            result = None
+            exc = e
+        try:
+            loop.call_soon_threadsafe(_complete, result, exc)
+        except RuntimeError:
+            # Loop already closed; daemon thread just exits.
+            pass
+
+    threading.Thread(target=_target, name=name, daemon=True).start()
+    return fut
 
 
 @dataclass
@@ -84,6 +131,8 @@ class PrivateCollector:
         on_wallet: Optional[Callable[[dict], None]] = None,
         on_gap_detected: Optional[Callable[[datetime, datetime], None]] = None,
         ws_health_check_interval: float = _PRIVATE_WS_HEALTH_CHECK_INTERVAL,
+        ws_reset_timeout: float = _PRIVATE_WS_RESET_TIMEOUT,
+        ws_disconnect_timeout: float = _PRIVATE_WS_DISCONNECT_TIMEOUT,
     ):
         """Initialize private collector for an account.
 
@@ -95,6 +144,12 @@ class PrivateCollector:
             on_wallet: Callback for wallet snapshots (raw dict).
             on_gap_detected: Callback when gap is detected (start, end).
             ws_health_check_interval: TCP socket health-check interval in seconds.
+            ws_reset_timeout: Bound on the blocking ``client.reset()`` call from
+                the TCP health loop. On timeout the worker is abandoned and
+                ``_handle_reconnect`` is skipped (no REST reconciliation on an
+                unconfirmed reset).
+            ws_disconnect_timeout: Bound on ``client.disconnect()`` during
+                ``stop()`` so shutdown stays responsive when pybit is wedged.
         """
         self.context = context
         self._on_execution = on_execution
@@ -115,8 +170,11 @@ class PrivateCollector:
         self._running = False
         self._symbols_set = set(context.symbols) if context.symbols else set()
         self._ws_health_check_interval = ws_health_check_interval
+        self._ws_reset_timeout = ws_reset_timeout
+        self._ws_disconnect_timeout = ws_disconnect_timeout
         self._ws_health_task: Optional[asyncio.Task[None]] = None
         self._ws_health_stop_event: Optional[asyncio.Event] = None
+        self._ws_reset_abandoned = False
 
     async def start(self) -> None:
         """Start collecting private data for this account.
@@ -146,6 +204,9 @@ class PrivateCollector:
             on_reconnect=self._handle_reconnect,
             message_gap_watchdog_enabled=False,
         )
+        # Fresh client; defensively clear any abandoned-flag inherited from a
+        # previous timed-out stop() so this collector is not crippled.
+        self._ws_reset_abandoned = False
 
         self._ws_client.connect()
         self._ws_health_stop_event = asyncio.Event()
@@ -172,8 +233,30 @@ class PrivateCollector:
             self._ws_health_task = None
             self._ws_health_stop_event = None
 
-        if self._ws_client:
-            self._ws_client.disconnect()
+        client = self._ws_client
+        if client is not None:
+            if self._ws_reset_abandoned:
+                logger.warning(
+                    "Skipping private WS disconnect for account %s — prior "
+                    "reset timed out and pybit is still parked; the worker "
+                    "thread is leaked until the process exits",
+                    self.context.account_id,
+                )
+            else:
+                try:
+                    await asyncio.wait_for(
+                        _run_in_daemon_thread(
+                            client.disconnect, name="ws-disconnect"
+                        ),
+                        timeout=self._ws_disconnect_timeout,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        "Private WS disconnect timed out after %.1fs for "
+                        "account %s; clearing client and continuing",
+                        self._ws_disconnect_timeout,
+                        self.context.account_id,
+                    )
             self._ws_client = None
 
         logger.info(f"PrivateCollector stopped for account {self.context.account_id}")
@@ -210,6 +293,14 @@ class PrivateCollector:
         if not self._running or client is None:
             return
 
+        if self._ws_reset_abandoned:
+            # A previous reset() timed out and the worker is still parked
+            # inside pybit holding PrivateWebSocketClient._lock. is_socket_alive
+            # also acquires that lock, so touching the client here would block
+            # the event loop and reintroduce the SIGTERM hang this feature is
+            # meant to fix. Stay out until start()/stop() resets the flag.
+            return
+
         try:
             if client.is_socket_alive():
                 return
@@ -226,7 +317,22 @@ class PrivateCollector:
                 "Private WebSocket socket dead for account %s; resetting",
                 self.context.account_id,
             )
-            await asyncio.to_thread(client.reset)
+            try:
+                await asyncio.wait_for(
+                    _run_in_daemon_thread(client.reset, name="ws-reset"),
+                    timeout=self._ws_reset_timeout,
+                )
+            except TimeoutError:
+                self._ws_reset_abandoned = True
+                logger.error(
+                    "Private WS reset timed out after %.1fs for account %s; "
+                    "abandoning worker thread and skipping REST gap "
+                    "reconciliation (reset unconfirmed)",
+                    self._ws_reset_timeout,
+                    self.context.account_id,
+                )
+                return
+            self._ws_reset_abandoned = False
             self._handle_reconnect(disconnected_at, datetime.now(UTC))
         except Exception as e:
             logger.error(
