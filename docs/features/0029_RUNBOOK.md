@@ -300,7 +300,17 @@ cp db/grid_anchor.json db/grid_anchor.phase4.json
 
 ## Step 8 — Replay config
 
-`apps/replay/conf/replay_ltcusdt_phase4.yaml`:
+The working copy `apps/replay/conf/replay_ltcusdt_phase4.yaml` is
+gitignored because `run_id` / timestamps / `account_id` change every
+recorder run. Copy from the tracked template and fill the placeholders:
+
+```bash
+cp apps/replay/conf/replay_ltcusdt_phase4.yaml.example \
+   apps/replay/conf/replay_ltcusdt_phase4.yaml
+```
+
+Final content (replace the four `<paste …>` placeholders with the values
+captured in Step 7):
 
 ```yaml
 database_url: "sqlite:///data/recorder_ltcusdt_phase4.db"

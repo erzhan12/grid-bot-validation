@@ -1,0 +1,51 @@
+# Phase 4 (LTCUSDT seed-aware replay) — config template.
+#
+# Per-recording values change every time recorder is restarted (run_id,
+# start_ts, end_ts, account_id), so the working copy at
+# `apps/replay/conf/replay_ltcusdt_phase4.yaml` is gitignored. To use:
+#
+#   cp apps/replay/conf/replay_ltcusdt_phase4.yaml.example \
+#      apps/replay/conf/replay_ltcusdt_phase4.yaml
+#   $EDITOR apps/replay/conf/replay_ltcusdt_phase4.yaml   # fill the placeholders
+#
+# See `docs/features/0029_RUNBOOK.md` Step 7 for how to capture RUN_ID,
+# SEED_AT_TS, END_TS, ACCOUNT_ID from a fresh recorder run.
+
+database_url: "sqlite:///data/recorder_ltcusdt_phase4.db"
+run_id: "<paste $RUN_ID>"
+
+symbol: "LTCUSDT"
+start_ts: "<paste $SEED_AT_TS>"
+end_ts:   "<paste $END_TS>"
+
+strategy:
+  tick_size: "0.1"
+  grid_count: 20
+  grid_step: 0.3
+  amount: "x0.001"
+  commission_rate: "0.0002"
+  enable_risk_multipliers: true
+  early_imbalance_multiplier: 1.0   # match live default
+
+# Seed block — the 0029 contract
+seed:
+  enabled: true
+  at_ts: "<paste $SEED_AT_TS>"
+  account_id: "<paste $ACCOUNT_ID>"
+  strat_id: "ltcusdt_test"
+  grid_state_path: "db/grid_anchor.phase4.json"
+  wallet_coin: "USDT"
+
+fill_simulator:
+  mode: book_touch
+
+# Fallback when seed-wallet returns None.
+initial_balance: "10000"
+
+enable_funding: true
+funding_rate: "0.0001"
+wind_down_mode: "leave_open"
+
+output_dir: "results/replay_ltcusdt_phase4"
+price_tolerance: 0
+qty_tolerance: "0.001"
