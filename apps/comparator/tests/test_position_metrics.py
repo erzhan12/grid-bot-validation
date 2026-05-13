@@ -66,6 +66,24 @@ def test_pair_within_tolerance(base_ts):
     assert pairs[0].backtest is bt[0]
 
 
+def test_pair_live_before_backtest_within_tolerance(base_ts):
+    """Live may arrive before replay's simulated fill time and still pair."""
+    bt_ts = base_ts.replace(hour=12, minute=30, second=26, microsecond=112000)
+    live_ts = base_ts.replace(hour=12, minute=30, second=26, microsecond=73000)
+    live = [_snap("Buy", live_ts, source="live")]
+    bt = [_snap("Buy", bt_ts, source="backtest")]
+
+    pairs = PositionComparator().pair_and_compare(live, bt)
+
+    metrics = ValidationMetrics()
+    PositionComparator().fold_metrics_into(metrics, pairs)
+    assert len(pairs) == 1
+    assert pairs[0].live is live[0]
+    assert pairs[0].backtest is bt[0]
+    assert metrics.position_pairs_compared == 1
+    assert metrics.position_pairs_unmatched_bt == 0
+
+
 def test_pair_outside_tolerance_unmatched(base_ts):
     """Bt with no live in tolerance window counts as unmatched, no consume."""
     live = [_snap("Buy", base_ts + timedelta(seconds=PAIR_TOLERANCE_S + 5), source="live")]
