@@ -501,7 +501,7 @@ async def main():
     # Load configuration
     config = EventSaverConfig()
 
-    logger.info(f"Event Saver Configuration:")
+    logger.info("Event Saver Configuration:")
     logger.info(f"  Symbols: {config.get_symbols()}")
     logger.info(f"  Testnet: {config.testnet}")
     logger.info(f"  Batch size: {config.batch_size}")

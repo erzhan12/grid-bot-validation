@@ -693,8 +693,8 @@ See `docs/features/0003_LOW_PRIORITY_CLEANUP.md` for detailed documentation.
    - File: `apps/event_saver/src/event_saver/reconciler.py:203-210`
 
 4. **Private Reconciliation Pagination**
-   - **Issue**: Only fetched first 100 executions, ignored `next_cursor`
-   - **Fix**: Use `get_executions_all()` with pagination loop (max 10 pages)
+   - **Issue**: Only fetched first 100 executions, ignored `next_cursor`; later pagination could silently persist a truncated backfill and advance past missing executions
+   - **Fix**: Use `get_executions_all()` with pagination loop (max 100 pages), request `return_truncated=True`, and refuse to persist when the REST backfill is truncated
    - File: `apps/event_saver/src/event_saver/reconciler.py:217-227`
 
 5. **REST Calls Blocking Event Loop**
