@@ -4,34 +4,15 @@ import asyncio
 import logging
 from collections import deque
 from datetime import datetime, UTC
-from decimal import Decimal
+from decimal import InvalidOperation
 from typing import Optional
 from uuid import UUID
 
 from grid_db import DatabaseFactory, WalletSnapshot, WalletSnapshotRepository
+from grid_db._decimal import WALLET_ACCOUNT_JSON_KEYS, decimal_or_zero
 
 
 logger = logging.getLogger(__name__)
-
-
-def _decimal_or_zero(value: object) -> Decimal:
-    """Coerce a Bybit numeric field to Decimal, mapping missing/empty to zero.
-
-    Bybit private wallet payloads can carry ``""`` for ``walletBalance`` /
-    ``availableToWithdraw`` on unused dust coins in a mainnet UTA account.
-    A plain ``Decimal(str(""))`` raises ``decimal.InvalidOperation``, which
-    the broad ``except`` in ``_messages_to_models`` then drops along with
-    every later coin in the same update. Map both ``None`` and ``""`` to
-    ``Decimal("0")``; let real numeric strings parse normally; let truly
-    malformed values still raise so the caller's warning path still fires.
-
-    The predicate is ``value in (None, "")`` rather than truthiness so a
-    legitimate ``"0"`` round-trips via the direct ``Decimal(str(...))``
-    path and is not coerced via the fallback.
-    """
-    if value in (None, ""):
-        return Decimal("0")
-    return Decimal(str(value))
 
 
 class WalletWriter:
@@ -220,10 +201,46 @@ class WalletWriter:
                     # Parse timestamp
                     update_time_ms = int(wallet_data.get("updateTime", 0))
                     exchange_ts = datetime.fromtimestamp(update_time_ms / 1000, tz=UTC)
+                except Exception as e:
+                    logger.warning(f"Error parsing wallet snapshot timestamp: {e}")
+                    continue
 
-                    # Parse coin balances
-                    coins = wallet_data.get("coin", [])
-                    for coin_data in coins:
+                account_raw = {
+                    key: wallet_data.get(key)
+                    for key in WALLET_ACCOUNT_JSON_KEYS
+                    if key in wallet_data
+                }
+                try:
+                    total_equity = decimal_or_zero(wallet_data.get("totalEquity"))
+                    total_available_balance = decimal_or_zero(
+                        wallet_data.get("totalAvailableBalance")
+                    )
+                    total_margin_balance = decimal_or_zero(
+                        wallet_data.get("totalMarginBalance")
+                    )
+                    account_im_rate = decimal_or_zero(wallet_data.get("accountIMRate"))
+                    account_mm_rate = decimal_or_zero(wallet_data.get("accountMMRate"))
+                except (InvalidOperation, TypeError) as e:
+                    # Only catch parse-shaped errors: malformed decimal strings
+                    # (`"NaN"`, `"abc"`) or unexpected value types. Anything
+                    # else (AttributeError, KeyError, etc.) is a real bug and
+                    # should propagate so the outer wallet_data try/except can
+                    # log it as a top-level parse failure.
+                    logger.warning(
+                        f"Error parsing wallet account fields; storing coin rows without 0042 account fields: {e}"
+                    )
+                    total_equity = None
+                    total_available_balance = None
+                    total_margin_balance = None
+                    account_im_rate = None
+                    account_mm_rate = None
+
+                # Parse coin balances. Per-coin try/except so a single
+                # malformed row (e.g. "NaN" walletBalance) does not drop the
+                # remaining coins in this update — matches recorder.py REST
+                # path semantics.
+                for coin_data in wallet_data.get("coin", []):
+                    try:
                         snapshots.append(
                             WalletSnapshot(
                                 run_id=self._run_id,
@@ -231,18 +248,25 @@ class WalletWriter:
                                 exchange_ts=exchange_ts,
                                 local_ts=local_ts,
                                 coin=coin_data.get("coin", ""),
-                                wallet_balance=_decimal_or_zero(
+                                wallet_balance=decimal_or_zero(
                                     coin_data.get("walletBalance")
                                 ),
-                                available_balance=_decimal_or_zero(
+                                available_balance=decimal_or_zero(
                                     coin_data.get("availableToWithdraw")
                                 ),
-                                raw_json=coin_data,
+                                total_equity=total_equity,
+                                total_available_balance=total_available_balance,
+                                total_margin_balance=total_margin_balance,
+                                account_im_rate=account_im_rate,
+                                account_mm_rate=account_mm_rate,
+                                raw_json={**coin_data, "_account": account_raw},
                             )
                         )
-                except Exception as e:
-                    logger.warning(f"Error parsing wallet snapshot: {e}")
-                    continue
+                    except Exception as e:
+                        logger.warning(
+                            f"Skipped malformed wallet coin row: {e}"
+                        )
+                        continue
 
         return snapshots
 

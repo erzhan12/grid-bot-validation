@@ -1032,6 +1032,11 @@ class TestWalletSnapshotRepository:
                 local_ts=datetime.now(UTC),
                 wallet_balance=Decimal("10000.00"),
                 available_balance=Decimal("9500.00"),
+                total_equity=Decimal("15000.50"),
+                total_available_balance=Decimal("14000.25"),
+                total_margin_balance=Decimal("14900.75"),
+                account_im_rate=Decimal("0.01000000"),
+                account_mm_rate=Decimal("0.00500000"),
             ),
         ]
         count = repo.bulk_insert(models)
@@ -1042,6 +1047,11 @@ class TestWalletSnapshotRepository:
         assert len(wallets) == 1
         assert wallets[0].coin == "USDT"
         assert wallets[0].wallet_balance == Decimal("10000.00")
+        assert wallets[0].total_equity == Decimal("15000.50")
+        assert wallets[0].total_available_balance == Decimal("14000.25")
+        assert wallets[0].total_margin_balance == Decimal("14900.75")
+        assert wallets[0].account_im_rate == Decimal("0.01000000")
+        assert wallets[0].account_mm_rate == Decimal("0.00500000")
 
     def test_get_latest_by_account_coin(self, session, sample_account):
         """Test retrieval of most recent wallet balance."""
@@ -1340,7 +1350,6 @@ class TestSeedAwareReplayRepositoryMethods:
         from grid_db import OrderRepository, Order
         from grid_db.models import Run
         from decimal import Decimal
-        from datetime import timedelta
 
         prior_run = Run(
             user_id=sample_user.user_id,

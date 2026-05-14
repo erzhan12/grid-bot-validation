@@ -697,7 +697,8 @@ class BacktestRunner:
         - Long:  liq = (qty * entry - available + MM) / qty
         - Short: liq = (qty * entry + available - MM) / qty
 
-        Where available = wallet_balance (entire balance available as margin).
+        Where available = wallet_balance. In 0042-seeded replay this is Bybit
+        UTA account-level totalAvailableBalance, not per-coin walletBalance.
 
         Reference: Bybit help-center ``Liquidation-Price-USDT-Contract``,
         bbu_backtest ``bybit_calculations.py:185-197``.

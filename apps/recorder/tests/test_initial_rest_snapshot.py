@@ -136,6 +136,13 @@ class TestInitialRestSnapshot:
             wallet_response={
                 "list": [
                     {
+                        "accountType": "UNIFIED",
+                        "marginMode": "REGULAR_MARGIN",
+                        "totalEquity": "15000.50",
+                        "totalAvailableBalance": "14000.25",
+                        "totalMarginBalance": "14900.75",
+                        "accountIMRate": "0.01000000",
+                        "accountMMRate": "0.00500000",
                         "coin": [
                             {
                                 "coin": "USDT",
@@ -172,6 +179,23 @@ class TestInitialRestSnapshot:
             usdt_row = next(r for r in rows if r.coin == "USDT")
             assert usdt_row.wallet_balance == usdt_row.wallet_balance.__class__("10000.5")
             assert usdt_row.available_balance == usdt_row.available_balance.__class__("9500.25")
+            assert usdt_row.total_equity == usdt_row.total_equity.__class__("15000.50")
+            assert usdt_row.total_available_balance == usdt_row.total_available_balance.__class__("14000.25")
+            assert usdt_row.total_margin_balance == usdt_row.total_margin_balance.__class__("14900.75")
+            assert usdt_row.account_im_rate == usdt_row.account_im_rate.__class__("0.01000000")
+            assert usdt_row.account_mm_rate == usdt_row.account_mm_rate.__class__("0.00500000")
+            assert usdt_row.raw_json["_account"] == {
+                "accountType": "UNIFIED",
+                "marginMode": "REGULAR_MARGIN",
+                "totalEquity": "15000.50",
+                "totalAvailableBalance": "14000.25",
+                "totalMarginBalance": "14900.75",
+                "accountIMRate": "0.01000000",
+                "accountMMRate": "0.00500000",
+            }
+
+            btc_row = next(r for r in rows if r.coin == "BTC")
+            assert btc_row.total_available_balance == usdt_row.total_available_balance
 
         await recorder.stop()
 

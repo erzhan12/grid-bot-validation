@@ -322,6 +322,25 @@ class TestBacktestRunnerRiskMultipliers:
         expected = (qty * entry + wallet - mm) / qty
         assert liq == expected
 
+    def test_estimate_liq_price_short_uses_available_balance_semantics(
+        self, risk_runner
+    ):
+        """0042: larger UTA available balance raises short cross-margin liq."""
+        entry = Decimal("100")
+        pv = Decimal("1000")
+        low_available = Decimal("50")
+        uta_available = Decimal("100")
+
+        low_liq = risk_runner._estimate_liquidation_price(
+            entry, DirectionType.SHORT, pv, low_available
+        )
+        uta_liq = risk_runner._estimate_liquidation_price(
+            entry, DirectionType.SHORT, pv, uta_available
+        )
+
+        qty = pv / entry
+        assert uta_liq - low_liq == (uta_available - low_available) / qty
+
     def test_estimate_liq_price_tiered_large_position(self, risk_runner):
         """Large position uses tiered MM from cache in cross-margin formula."""
         entry = Decimal("100000")

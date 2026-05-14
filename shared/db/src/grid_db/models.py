@@ -437,6 +437,21 @@ class WalletSnapshot(Base):
     coin: Mapped[str] = mapped_column(String(20), nullable=False)  # e.g., 'USDT'
     wallet_balance: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
     available_balance: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
+    # 0042: account-level UTA wallet metrics from the wallet account object.
+    # Nullable because legacy recorder builds only stored per-coin fields.
+    total_equity: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8), nullable=True)
+    total_available_balance: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(20, 8), nullable=True
+    )
+    total_margin_balance: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(20, 8), nullable=True
+    )
+    account_im_rate: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(20, 8), nullable=True
+    )
+    account_mm_rate: Mapped[Optional[Decimal]] = mapped_column(
+        Numeric(20, 8), nullable=True
+    )
     raw_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
 
     __table_args__ = (

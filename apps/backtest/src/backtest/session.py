@@ -84,6 +84,14 @@ class BacktestSession:
     """In-memory storage for backtest results.
 
     Tracks trades, equity curve, and calculates performance metrics.
+
+    In standalone backtests, ``initial_balance`` is the configured starting
+    balance. In replay seeded from 0042 wallet snapshots, ``initial_balance``
+    and ``current_balance`` represent Bybit UTA account-level
+    ``totalAvailableBalance`` plus simulated PnL/fees/funding, not the legacy
+    per-coin USDT ``walletBalance``. Backtest liquidation math, order margin
+    gating, wallet-fraction sizing, margin logs, and risk multipliers all
+    consume that UTA available-balance baseline via ``current_balance``.
     """
 
     def __init__(
@@ -95,7 +103,9 @@ class BacktestSession:
 
         Args:
             session_id: Unique session identifier (generated if None)
-            initial_balance: Starting wallet balance
+            initial_balance: Starting available-balance baseline. In replay
+                seeded from feature 0042, this is account-level UTA
+                ``totalAvailableBalance``.
         """
         self.session_id = session_id or uuid.uuid4().hex
         self.initial_balance = initial_balance

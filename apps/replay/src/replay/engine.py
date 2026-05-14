@@ -60,10 +60,11 @@ from replay.snapshot_loader import (
     ActiveOrderSeed,
     GridStateSeed,
     PositionStateSeed,
+    WalletSeed,
     load_active_orders,
     load_grid_state,
     load_position_snapshots,
-    load_wallet_snapshot,
+    load_wallet_seed_full,
 )
 
 
@@ -216,7 +217,11 @@ class ReplayEngine:
             order_seeds,
         ) = self._load_seed(config, run_id)
 
-        initial_balance = wallet_seed if wallet_seed is not None else config.initial_balance
+        initial_balance = (
+            wallet_seed.total_available_balance
+            if wallet_seed is not None
+            else config.initial_balance
+        )
         session = BacktestSession(initial_balance=initial_balance)
         runner = self._init_runner(
             strategy_config,
@@ -233,11 +238,13 @@ class ReplayEngine:
         if config.seed.enabled:
             logger.info(
                 "Seeded run_id=%s: long.size=%s, short.size=%s, "
-                "anchor_or_grid_levels=%s, balance=%s, active_orders=%s",
+                "anchor_or_grid_levels=%s, coin_balance=%s, "
+                "total_available_balance=%s, active_orders=%s",
                 run_id,
                 long_seed.size if long_seed is not None else Decimal("0"),
                 short_seed.size if short_seed is not None else Decimal("0"),
                 len(grid_seed.grid) if grid_seed is not None else 0,
+                wallet_seed.coin_balance if wallet_seed is not None else None,
                 initial_balance,
                 len(order_seeds) if order_seeds is not None else 0,
             )
@@ -482,8 +489,9 @@ class ReplayEngine:
         Args:
             strategy_config: Backtest strategy config (already projected
                 from ``ReplayConfig``).
-            session: Pre-constructed ``BacktestSession`` — when seeding,
-                its ``initial_balance`` is the wallet snapshot.
+            session: Pre-constructed ``BacktestSession`` — when 0042 wallet
+                seed data is present, its ``initial_balance`` is account-level
+                UTA ``total_available_balance``.
             long_seed: Optional long-direction position seed; when present
                 AND non-zero, ``BacktestPositionTracker.seed_state`` is
                 called before the runner gets the tracker. Skipping the
@@ -580,7 +588,7 @@ class ReplayEngine:
         config: ReplayConfig,
         run_id: str,
     ) -> tuple[
-        Optional[Decimal],
+        Optional[WalletSeed],
         Optional[PositionStateSeed],
         Optional[PositionStateSeed],
         Optional[GridStateSeed],
@@ -602,8 +610,8 @@ class ReplayEngine:
         2. Loads grid state from the shared ``GridStateStore`` JSON file
            (returns ``None`` on no-entry / legacy / step-or-count
            mismatch — replay then falls back to fresh-build).
-        3. Loads position pair, wallet balance, and active orders inside
-           a single DB session.
+        3. Loads position pair, full 0042 wallet seed, and active orders
+           inside a single DB session.
 
         Args:
             config: Full replay config (read for ``seed`` and ``symbol``).
@@ -640,7 +648,7 @@ class ReplayEngine:
                 config.symbol,
                 seed.at_ts,
             )
-            wallet_seed = load_wallet_snapshot(
+            wallet_seed = load_wallet_seed_full(
                 db_session,
                 run_id,
                 seed.account_id,
