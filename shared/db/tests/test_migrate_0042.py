@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import NoSuchTableError
 
 
 _MIGRATION_PATH = (
@@ -151,5 +152,5 @@ class TestMigrate0042:
         table. This documents that callers must run the recorder once
         first (or `create_tables`) before applying 0042.
         """
-        with pytest.raises(Exception):
+        with pytest.raises(NoSuchTableError):
             _load_migration().migrate(sqlite_url)

@@ -229,10 +229,12 @@ class WalletWriter:
                     account_im_rate = None
                     account_mm_rate = None
 
-                # Parse coin balances
-                coins = wallet_data.get("coin", [])
-                try:
-                    for coin_data in coins:
+                # Parse coin balances. Per-coin try/except so a single
+                # malformed row (e.g. "NaN" walletBalance) does not drop the
+                # remaining coins in this update — matches recorder.py REST
+                # path semantics.
+                for coin_data in wallet_data.get("coin", []):
+                    try:
                         snapshots.append(
                             WalletSnapshot(
                                 run_id=self._run_id,
@@ -254,9 +256,11 @@ class WalletWriter:
                                 raw_json={**coin_data, "_account": account_raw},
                             )
                         )
-                except Exception as e:
-                    logger.warning(f"Error parsing wallet snapshot: {e}")
-                    continue
+                    except Exception as e:
+                        logger.warning(
+                            f"Skipped malformed wallet coin row: {e}"
+                        )
+                        continue
 
         return snapshots
 
