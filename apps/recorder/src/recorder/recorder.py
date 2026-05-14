@@ -28,6 +28,7 @@ from grid_db import (
     WalletSnapshot,
     WalletSnapshotRepository,
 )
+from grid_db._decimal import decimal_or_zero
 from gridcore.events import PublicTradeEvent, ExecutionEvent, OrderUpdateEvent, TickerEvent
 
 from event_saver.collectors import PublicCollector, PrivateCollector, AccountContext
@@ -53,6 +54,15 @@ logger = logging.getLogger(__name__)
 _RECORDER_USER_ID = UUID("00000000-0000-0000-0000-000000000001")
 _RECORDER_ACCOUNT_ID = UUID("00000000-0000-0000-0000-000000000002")
 _RECORDER_STRATEGY_ID = UUID("00000000-0000-0000-0000-000000000003")
+_WALLET_ACCOUNT_RAW_JSON_KEYS = (
+    "accountType",
+    "marginMode",
+    "totalEquity",
+    "totalAvailableBalance",
+    "totalMarginBalance",
+    "accountIMRate",
+    "accountMMRate",
+)
 
 
 class Recorder:
@@ -339,8 +349,30 @@ class Recorder:
         accounts = result.get("list") or []
         snapshots: list[WalletSnapshot] = []
         for acct in accounts:
+            try:
+                account_raw = {
+                    key: acct.get(key)
+                    for key in _WALLET_ACCOUNT_RAW_JSON_KEYS
+                    if key in acct
+                }
+                total_equity = decimal_or_zero(acct.get("totalEquity"))
+                total_available_balance = decimal_or_zero(
+                    acct.get("totalAvailableBalance")
+                )
+                total_margin_balance = decimal_or_zero(acct.get("totalMarginBalance"))
+                account_im_rate = decimal_or_zero(acct.get("accountIMRate"))
+                account_mm_rate = decimal_or_zero(acct.get("accountMMRate"))
+            except Exception as e:
+                logger.warning(
+                    f"Initial snapshot: skipped malformed wallet account row: {e}"
+                )
+                continue
+
             for coin_data in acct.get("coin") or []:
                 try:
+                    coin_available = coin_data.get("availableToWithdraw")
+                    if coin_available in (None, "") and "availableBalance" in coin_data:
+                        coin_available = coin_data.get("availableBalance")
                     snapshots.append(
                         WalletSnapshot(
                             run_id=run_id,
@@ -348,17 +380,16 @@ class Recorder:
                             exchange_ts=snapshot_ts,
                             local_ts=snapshot_ts,
                             coin=coin_data.get("coin", ""),
-                            wallet_balance=Decimal(
-                                str(coin_data.get("walletBalance") or "0")
+                            wallet_balance=decimal_or_zero(
+                                coin_data.get("walletBalance")
                             ),
-                            available_balance=Decimal(
-                                str(
-                                    coin_data.get("availableToWithdraw")
-                                    or coin_data.get("availableBalance")
-                                    or "0"
-                                )
-                            ),
-                            raw_json=coin_data,
+                            available_balance=decimal_or_zero(coin_available),
+                            total_equity=total_equity,
+                            total_available_balance=total_available_balance,
+                            total_margin_balance=total_margin_balance,
+                            account_im_rate=account_im_rate,
+                            account_mm_rate=account_mm_rate,
+                            raw_json={**coin_data, "_account": account_raw},
                         )
                     )
                 except Exception as e:

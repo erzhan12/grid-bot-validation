@@ -6,7 +6,7 @@ into plain seed dataclasses ready for the replay engine to inject into a
 just adapts the persistence layer to the seed contract documented in
 ``docs/features/0029_PLAN.md``.
 
-Four loaders, one per seed dimension:
+Seed loaders, one per seed dimension:
 
 * :func:`load_grid_state` — wraps :class:`GridStateStore` with a tolerant
   ``None``-on-mismatch fallback that mirrors live's behaviour at
@@ -15,8 +15,10 @@ Four loaders, one per seed dimension:
   pair. Both-absent maps to ``(zero, zero)`` (caught upstream by Phase 4
   pre-check); one-side-only is a corrupt run and raises
   :class:`SeedDataQualityError`.
-* :func:`load_wallet_snapshot` — returns ``Optional[Decimal]`` so the
-  caller decides the blank-fallback amount.
+* :func:`load_wallet_seed_full` — returns UTA account-level wallet seed fields
+  for feature 0042 liquidation parity.
+* :func:`load_wallet_snapshot` — legacy per-coin helper, kept indefinitely for
+  callers that only need ``wallet_balance``.
 * :func:`load_active_orders` — ``[]`` is a valid clean-account result;
   per-row ``reduce_only IS NULL`` raises :class:`SeedSchemaError`.
 
@@ -98,6 +100,25 @@ class PositionStateSeed:
     entry_price: Decimal
     liquidation_price: Decimal
     cum_realised_pnl: Decimal = Decimal("0")
+
+
+@dataclass(frozen=True)
+class WalletSeed:
+    """Wallet seed with both legacy per-coin and UTA account-level fields.
+
+    ``coin_balance`` is the legacy per-coin ``coin[].walletBalance`` for the
+    requested coin. ``total_available_balance`` is Bybit's account-level UTA
+    available balance in USD and is the value replay now feeds into
+    ``BacktestSession.initial_balance`` for liquidation-price parity.
+    Account IM/MM rates are raw Bybit decimal ratios, not percentages.
+    """
+
+    coin_balance: Decimal
+    total_available_balance: Decimal
+    total_equity: Decimal
+    total_margin_balance: Decimal
+    account_im_rate: Decimal
+    account_mm_rate: Decimal
 
 
 @dataclass(frozen=True)
@@ -350,6 +371,42 @@ def load_wallet_snapshot(
     return snap.wallet_balance
 
 
+def load_wallet_seed_full(
+    db_session: Session,
+    run_id: str,
+    account_id: str,
+    at_ts: datetime,
+    coin: str = "USDT",
+) -> Optional[WalletSeed]:
+    """Load the latest 0042 wallet seed for a run/account/coin.
+
+    Returns ``None`` when no snapshot exists or when the snapshot is from a
+    legacy/migrated DB row with ``total_available_balance IS NULL``. That keeps
+    replay's existing fallback-to-config contract intact for old recorder data.
+    """
+    repo = WalletSnapshotRepository(db_session)
+    snap = repo.get_latest_before(run_id, account_id, coin, at_ts)
+    if snap is None or snap.total_available_balance is None:
+        return None
+
+    return WalletSeed(
+        coin_balance=snap.wallet_balance,
+        total_available_balance=snap.total_available_balance,
+        total_equity=snap.total_equity if snap.total_equity is not None else Decimal("0"),
+        total_margin_balance=(
+            snap.total_margin_balance
+            if snap.total_margin_balance is not None
+            else Decimal("0")
+        ),
+        account_im_rate=(
+            snap.account_im_rate if snap.account_im_rate is not None else Decimal("0")
+        ),
+        account_mm_rate=(
+            snap.account_mm_rate if snap.account_mm_rate is not None else Decimal("0")
+        ),
+    )
+
+
 def load_active_orders(
     db_session: Session,
     run_id: str,
@@ -425,6 +482,7 @@ def load_active_orders(
 __all__ = [
     "GridStateSeed",
     "PositionStateSeed",
+    "WalletSeed",
     "ActiveOrderSeed",
     "SeedError",
     "SeedSchemaError",
@@ -432,6 +490,7 @@ __all__ = [
     "SeedDataQualityError",
     "load_grid_state",
     "load_position_snapshots",
+    "load_wallet_seed_full",
     "load_wallet_snapshot",
     "load_active_orders",
 ]

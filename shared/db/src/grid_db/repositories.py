@@ -1081,6 +1081,11 @@ class WalletSnapshotRepository(BaseRepository[WalletSnapshot]):
                 "coin": s.coin,
                 "wallet_balance": s.wallet_balance,
                 "available_balance": s.available_balance,
+                "total_equity": s.total_equity,
+                "total_available_balance": s.total_available_balance,
+                "total_margin_balance": s.total_margin_balance,
+                "account_im_rate": s.account_im_rate,
+                "account_mm_rate": s.account_mm_rate,
                 "raw_json": s.raw_json,
             }
             for s in snapshots

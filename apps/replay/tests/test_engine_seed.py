@@ -127,6 +127,11 @@ def seeded_db(db, seed_ts, snapshot_ts):
                 coin="USDT",
                 wallet_balance=Decimal("12345.67"),
                 available_balance=Decimal("12000.00"),
+                total_equity=Decimal("15000.50"),
+                total_available_balance=Decimal("14000.25"),
+                total_margin_balance=Decimal("14900.75"),
+                account_im_rate=Decimal("0.01000000"),
+                account_mm_rate=Decimal("0.00500000"),
             ),
         ])
         OrderRepository(session).bulk_insert([
@@ -243,7 +248,8 @@ class TestReplayEngineSeedingPipeline:
         )
 
         # Seed payload survived loading.
-        assert wallet_seed == Decimal("12345.67")
+        assert wallet_seed.coin_balance == Decimal("12345.67")
+        assert wallet_seed.total_available_balance == Decimal("14000.25")
         assert long_seed.size == Decimal("1.5")
         assert long_seed.entry_price == Decimal("100000")
         assert long_seed.liquidation_price == Decimal("90000")
@@ -269,7 +275,7 @@ class TestReplayEngineSeedingPipeline:
             commission_rate=replay_config.strategy.commission_rate,
             enable_risk_multipliers=replay_config.strategy.enable_risk_multipliers,
         )
-        session = BacktestSession(initial_balance=wallet_seed)
+        session = BacktestSession(initial_balance=wallet_seed.total_available_balance)
         runner = engine._init_runner(
             strategy_config,
             session,
@@ -280,7 +286,7 @@ class TestReplayEngineSeedingPipeline:
         )
 
         # Wallet → BacktestSession.initial_balance.
-        assert session.initial_balance == Decimal("12345.67")
+        assert session.initial_balance == Decimal("14000.25")
 
         # Position seeds → trackers.
         assert runner.long_tracker.state.size == Decimal("1.5")
@@ -313,6 +319,37 @@ class TestReplayEngineSeedingPipeline:
         # Grid seed → GridEngine.grid was restored from the seeded levels.
         # Grid.restore_grid keeps the level list intact.
         assert len(runner.engine.grid.grid) == 4
+
+    def test_null_0042_wallet_fields_fall_back_to_config_balance(
+        self, seeded_db, replay_config, mock_instrument,
+    ):
+        """Legacy migrated wallet rows do not override config.initial_balance."""
+        with seeded_db.get_session() as session:
+            wallet = session.query(WalletSnapshot).filter_by(run_id="seed-run").one()
+            wallet.total_available_balance = None
+            session.commit()
+
+        engine = ReplayEngine(config=replay_config, db=seeded_db)
+        run_id, _account_id, _start, _end = engine._resolve_run(replay_config)
+        wallet_seed, long_seed, short_seed, grid_seed, order_seeds = engine._load_seed(
+            replay_config, run_id,
+        )
+
+        assert wallet_seed is None
+
+        from backtest.session import BacktestSession
+
+        initial_balance = (
+            wallet_seed.total_available_balance
+            if wallet_seed is not None
+            else replay_config.initial_balance
+        )
+        session = BacktestSession(initial_balance=initial_balance)
+        assert session.initial_balance == replay_config.initial_balance
+        assert long_seed is not None
+        assert short_seed is not None
+        assert grid_seed is not None
+        assert order_seeds is not None
 
 
 # ---------------------------------------------------------------------------

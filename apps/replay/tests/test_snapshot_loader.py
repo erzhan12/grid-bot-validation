@@ -29,9 +29,11 @@ from replay.snapshot_loader import (
     PositionStateSeed,
     SeedDataQualityError,
     SeedSchemaError,
+    WalletSeed,
     load_active_orders,
     load_grid_state,
     load_position_snapshots,
+    load_wallet_seed_full,
     load_wallet_snapshot,
 )
 
@@ -438,6 +440,74 @@ class TestLoadWalletSnapshot:
             base_ts,
         )
         assert balance is None
+
+
+# ---------------------------------------------------------------------------
+# load_wallet_seed_full
+# ---------------------------------------------------------------------------
+
+
+class TestLoadWalletSeedFull:
+    def test_happy_path_returns_wallet_seed(
+        self, session, sample_account, sample_run, base_ts
+    ):
+        repo = WalletSnapshotRepository(session)
+        repo.bulk_insert([
+            WalletSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                exchange_ts=base_ts,
+                local_ts=base_ts,
+                coin="USDT",
+                wallet_balance=Decimal("12345.67"),
+                available_balance=Decimal("12000.00"),
+                total_equity=Decimal("15000.50"),
+                total_available_balance=Decimal("14000.25"),
+                total_margin_balance=Decimal("14900.75"),
+                account_im_rate=Decimal("0.01000000"),
+                account_mm_rate=Decimal("0.00500000"),
+            ),
+        ])
+
+        seed = load_wallet_seed_full(
+            session,
+            sample_run.run_id,
+            str(sample_account.account_id),
+            base_ts + timedelta(seconds=1),
+        )
+
+        assert isinstance(seed, WalletSeed)
+        assert seed.coin_balance == Decimal("12345.67")
+        assert seed.total_available_balance == Decimal("14000.25")
+        assert seed.total_equity == Decimal("15000.50")
+        assert seed.total_margin_balance == Decimal("14900.75")
+        assert seed.account_im_rate == Decimal("0.01000000")
+        assert seed.account_mm_rate == Decimal("0.00500000")
+
+    def test_null_total_available_balance_returns_none(
+        self, session, sample_account, sample_run, base_ts
+    ):
+        repo = WalletSnapshotRepository(session)
+        repo.bulk_insert([
+            WalletSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                exchange_ts=base_ts,
+                local_ts=base_ts,
+                coin="USDT",
+                wallet_balance=Decimal("12345.67"),
+                available_balance=Decimal("12000.00"),
+            ),
+        ])
+
+        seed = load_wallet_seed_full(
+            session,
+            sample_run.run_id,
+            str(sample_account.account_id),
+            base_ts + timedelta(seconds=1),
+        )
+
+        assert seed is None
 
 
 # ---------------------------------------------------------------------------
