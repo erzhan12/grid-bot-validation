@@ -4,6 +4,7 @@ import asyncio
 import logging
 from collections import deque
 from datetime import datetime, UTC
+from decimal import InvalidOperation
 from typing import Optional
 from uuid import UUID
 
@@ -219,7 +220,12 @@ class WalletWriter:
                     )
                     account_im_rate = decimal_or_zero(wallet_data.get("accountIMRate"))
                     account_mm_rate = decimal_or_zero(wallet_data.get("accountMMRate"))
-                except Exception as e:
+                except (InvalidOperation, TypeError) as e:
+                    # Only catch parse-shaped errors: malformed decimal strings
+                    # (`"NaN"`, `"abc"`) or unexpected value types. Anything
+                    # else (AttributeError, KeyError, etc.) is a real bug and
+                    # should propagate so the outer wallet_data try/except can
+                    # log it as a top-level parse failure.
                     logger.warning(
                         f"Error parsing wallet account fields; storing coin rows without 0042 account fields: {e}"
                     )
