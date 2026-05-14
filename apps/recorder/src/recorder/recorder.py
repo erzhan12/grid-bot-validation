@@ -28,7 +28,7 @@ from grid_db import (
     WalletSnapshot,
     WalletSnapshotRepository,
 )
-from grid_db._decimal import decimal_or_zero
+from grid_db._decimal import WALLET_ACCOUNT_JSON_KEYS, decimal_or_zero
 from gridcore.events import PublicTradeEvent, ExecutionEvent, OrderUpdateEvent, TickerEvent
 
 from event_saver.collectors import PublicCollector, PrivateCollector, AccountContext
@@ -54,15 +54,6 @@ logger = logging.getLogger(__name__)
 _RECORDER_USER_ID = UUID("00000000-0000-0000-0000-000000000001")
 _RECORDER_ACCOUNT_ID = UUID("00000000-0000-0000-0000-000000000002")
 _RECORDER_STRATEGY_ID = UUID("00000000-0000-0000-0000-000000000003")
-_WALLET_ACCOUNT_RAW_JSON_KEYS = (
-    "accountType",
-    "marginMode",
-    "totalEquity",
-    "totalAvailableBalance",
-    "totalMarginBalance",
-    "accountIMRate",
-    "accountMMRate",
-)
 
 
 class Recorder:
@@ -352,7 +343,7 @@ class Recorder:
             try:
                 account_raw = {
                     key: acct.get(key)
-                    for key in _WALLET_ACCOUNT_RAW_JSON_KEYS
+                    for key in WALLET_ACCOUNT_JSON_KEYS
                     if key in acct
                 }
                 total_equity = decimal_or_zero(acct.get("totalEquity"))
@@ -370,6 +361,10 @@ class Recorder:
 
             for coin_data in acct.get("coin") or []:
                 try:
+                    # UTA v5 returns `availableToWithdraw`; legacy UTA 1.0 and
+                    # some non-USDT coins on cross-margin still surface only
+                    # `availableBalance`. Prefer the v5 field, fall back to
+                    # the legacy field when v5 is absent or empty.
                     coin_available = coin_data.get("availableToWithdraw")
                     if coin_available in (None, "") and "availableBalance" in coin_data:
                         coin_available = coin_data.get("availableBalance")

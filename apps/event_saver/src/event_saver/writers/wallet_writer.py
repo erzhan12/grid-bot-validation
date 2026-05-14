@@ -8,21 +8,10 @@ from typing import Optional
 from uuid import UUID
 
 from grid_db import DatabaseFactory, WalletSnapshot, WalletSnapshotRepository
-from grid_db._decimal import decimal_or_zero
+from grid_db._decimal import WALLET_ACCOUNT_JSON_KEYS, decimal_or_zero
 
 
 logger = logging.getLogger(__name__)
-
-
-_ACCOUNT_RAW_JSON_KEYS = (
-    "accountType",
-    "marginMode",
-    "totalEquity",
-    "totalAvailableBalance",
-    "totalMarginBalance",
-    "accountIMRate",
-    "accountMMRate",
-)
 
 
 class WalletWriter:
@@ -217,7 +206,7 @@ class WalletWriter:
 
                 account_raw = {
                     key: wallet_data.get(key)
-                    for key in _ACCOUNT_RAW_JSON_KEYS
+                    for key in WALLET_ACCOUNT_JSON_KEYS
                     if key in wallet_data
                 }
                 try:

@@ -1,6 +1,17 @@
-"""Decimal coercion helpers shared by recorder and writer code."""
+"""Wallet-payload helpers shared by recorder and writer code."""
 
 from decimal import Decimal
+
+
+WALLET_ACCOUNT_JSON_KEYS: tuple[str, ...] = (
+    "accountType",
+    "marginMode",
+    "totalEquity",
+    "totalAvailableBalance",
+    "totalMarginBalance",
+    "accountIMRate",
+    "accountMMRate",
+)
 
 
 def decimal_or_zero(value: object) -> Decimal:

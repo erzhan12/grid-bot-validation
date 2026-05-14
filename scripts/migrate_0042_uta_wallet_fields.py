@@ -44,6 +44,10 @@ def migrate(database_url: str) -> None:
         for col_name, col_def in NEW_COLUMNS:
             if _column_exists(conn, "wallet_snapshots", col_name):
                 continue
+            # Direct f-string DDL: `col_name` / `col_def` are repo-local
+            # constants (no user input), so there is no injection surface.
+            # SQLAlchemy's typed DDL (Column/MetaData) is overkill for a
+            # one-off ADD COLUMN and would diverge from migrate_0034.
             conn.execute(
                 text(f"ALTER TABLE wallet_snapshots ADD COLUMN {col_name} {col_def}")
             )
