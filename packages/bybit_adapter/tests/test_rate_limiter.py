@@ -1,6 +1,4 @@
 """Tests for RateLimiter sliding window implementation."""
-
-import pytest
 from datetime import datetime, timedelta, UTC
 from unittest.mock import patch
 

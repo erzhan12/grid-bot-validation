@@ -1,7 +1,5 @@
 """Tests for EventSaverConfig."""
 
-import pytest
-
 from event_saver.config import EventSaverConfig
 
 

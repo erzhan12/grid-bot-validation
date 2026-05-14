@@ -19,6 +19,8 @@ from grid_db import (
 
 logger = logging.getLogger(__name__)
 
+_PRIVATE_EXECUTION_RECONCILE_MAX_PAGES = 100
+
 
 class GapReconciler:
     """Detects and fills gaps in captured data using REST API.
@@ -247,7 +249,6 @@ class GapReconciler:
 
             # Create authenticated REST client for this account
             # (cannot use shared client with empty credentials)
-            from bybit_adapter.rest_client import BybitRestClient
             authenticated_client = BybitRestClient(
                 api_key=api_key,
                 api_secret=api_secret,
@@ -260,13 +261,27 @@ class GapReconciler:
 
             # Run synchronous REST call in thread to avoid blocking event loop
             # Use get_executions_all to handle pagination automatically
-            executions_data = await asyncio.to_thread(
+            executions_data, truncated = await asyncio.to_thread(
                 authenticated_client.get_executions_all,
                 symbol=symbol,
                 start_time=start_ms,
                 end_time=end_ms,
-                max_pages=10,  # Safety limit
+                max_pages=_PRIVATE_EXECUTION_RECONCILE_MAX_PAGES,
+                return_truncated=True,
             )
+
+            if truncated:
+                logger.error(
+                    "Execution reconciliation for %s account %s was truncated "
+                    "after %d pages; refusing to persist a partial backfill for "
+                    "%s to %s",
+                    symbol,
+                    account_id,
+                    _PRIVATE_EXECUTION_RECONCILE_MAX_PAGES,
+                    datetime.fromtimestamp(start_ms / 1000, tz=UTC),
+                    datetime.fromtimestamp(end_ms / 1000, tz=UTC),
+                )
+                return 0
 
             if not executions_data:
                 logger.debug(f"No executions returned from REST API for {symbol}")

@@ -1,6 +1,4 @@
 """Tests for BybitNormalizer event conversion."""
-
-import pytest
 from datetime import datetime, UTC
 from decimal import Decimal
 from uuid import uuid4

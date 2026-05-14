@@ -1,7 +1,7 @@
 """Collect public market data (ticker + trades) for multiple symbols."""
 
 import logging
-from datetime import datetime, UTC
+from datetime import datetime
 from typing import Callable, Optional
 
 from bybit_adapter.ws_client import PublicWebSocketClient, ConnectionState
