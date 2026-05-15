@@ -704,7 +704,7 @@ See `docs/features/0003_LOW_PRIORITY_CLEANUP.md` for detailed documentation.
 
 6. **Reconciliation Algorithm Enhancement**
    - **Issue**: Didn't query DB for `last_persisted_ts`, only used gap timestamps
-   - **Fix**: Query `PublicTradeRepository.get_last_trade_ts()` and `PrivateExecutionRepository.get_last_execution_ts()` before reconciliation
+   - **Fix**: Query `PublicTradeRepository.get_last_trade_ts()` and `PrivateExecutionRepository.get_last_execution_ts()` before reconciliation, but private execution reconciliation must cap the REST start at `gap_start`; post-gap live writes can otherwise advance the account-wide latest timestamp past the outage and skip the missed executions
    - Files: `apps/event_saver/src/event_saver/reconciler.py:116-131, 218-229`
 
 7. **Order Persistence Implementation**

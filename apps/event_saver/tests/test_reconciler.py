@@ -274,6 +274,59 @@ class TestReconcileExecutions:
         assert call_kwargs["return_truncated"] is True
 
     @pytest.mark.asyncio
+    async def test_reconcile_start_is_capped_at_gap_start(
+        self, mock_db, mock_rest_client
+    ):
+        """Post-gap live writes must not cause the REST backfill to skip the gap."""
+        reconciler = GapReconciler(
+            db=mock_db,
+            rest_client=mock_rest_client,
+            gap_threshold_seconds=5.0,
+        )
+
+        gap_start = datetime.now(UTC)
+        gap_end = gap_start + timedelta(seconds=10)
+
+        mock_session = MagicMock()
+        mock_repo = MagicMock()
+        mock_repo.get_last_execution_ts.return_value = gap_end + timedelta(seconds=30)
+        mock_db.get_session.return_value.__enter__.return_value = mock_session
+        mock_db.get_session.return_value.__exit__.return_value = None
+
+        async def mock_to_thread(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        mock_client = MagicMock()
+        mock_client.get_executions_all.return_value = ([], False)
+
+        with unittest.mock.patch(
+            "event_saver.reconciler.PrivateExecutionRepository",
+            return_value=mock_repo,
+        ), unittest.mock.patch(
+            "event_saver.reconciler.asyncio.to_thread",
+            side_effect=mock_to_thread,
+        ), unittest.mock.patch(
+            "event_saver.reconciler.BybitRestClient",
+            return_value=mock_client,
+        ):
+            count = await reconciler.reconcile_executions(
+                user_id=uuid4(),
+                account_id=uuid4(),
+                run_id=uuid4(),
+                symbol="BTCUSDT",
+                gap_start=gap_start,
+                gap_end=gap_end,
+                api_key="test_key",
+                api_secret="test_secret",
+                testnet=True,
+            )
+
+        assert count == 0
+        call_kwargs = mock_client.get_executions_all.call_args.kwargs
+        assert call_kwargs["start_time"] == int(gap_start.timestamp() * 1000)
+        assert call_kwargs["end_time"] == int(gap_end.timestamp() * 1000)
+
+    @pytest.mark.asyncio
     async def test_truncated_rest_response_is_not_persisted(
         self, mock_db, mock_rest_client, caplog
     ):
