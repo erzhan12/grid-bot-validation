@@ -239,8 +239,15 @@ class GapReconciler:
                 repo = PrivateExecutionRepository(session)
                 last_persisted_ts = repo.get_last_execution_ts(str(account_id))
 
-            # Use last persisted timestamp if available, otherwise use gap_start
-            reconcile_start = last_persisted_ts if last_persisted_ts else gap_start
+            # Never let post-gap live writes move the REST window past the
+            # detected outage; duplicates are filtered by exec_id on insert.
+            if (
+                last_persisted_ts
+                and last_persisted_ts.timestamp() < gap_start.timestamp()
+            ):
+                reconcile_start = last_persisted_ts
+            else:
+                reconcile_start = gap_start
 
             logger.debug(
                 f"Reconciliation window: {reconcile_start} to {gap_end} "
