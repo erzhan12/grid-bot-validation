@@ -202,6 +202,18 @@ class BacktestSession:
         (``total_equity``) and the executor margin baseline
         (``current_balance``) synchronous with the post-fill position
         state.
+
+        IMPORTANT call-ordering contract (0043):
+
+        - MUST be invoked immediately after ``record_trade`` inside
+          ``_process_fill``, **before** any downstream calculation that
+          depends on ``total_equity`` or ``current_balance``
+          (pair-liq formula, risk multipliers, emitted parity snapshots).
+        - The caller must STILL invoke ``update_equity`` later in the
+          same tick to record the equity-curve point and update drawdown
+          tracking — ``refresh_balances`` only updates the two balance
+          fields. Calling one without the other will desynchronize the
+          equity curve from the balances.
         """
         pnl_delta = (
             self.total_realized_pnl

@@ -20,7 +20,7 @@ from event_saver.writers import TradeWriter, ExecutionWriter
 from event_saver.writers.ticker_writer import TickerWriter
 from event_saver.writers.order_writer import OrderWriter
 from event_saver.writers.position_writer import PositionWriter
-from event_saver.writers.wallet_writer import WalletWriter
+from event_saver.writers.wallet_writer import WalletWriter, _resolve_exchange_ts
 
 
 @pytest.fixture
@@ -1335,3 +1335,38 @@ class TestWalletWriter:
             and "missing both updateTime and creationTime" in r.message
         ]
         assert len(debug_msgs) == 1
+
+
+class TestWalletWriterTimestampResolution:
+    """Dedicated unit tests for `_resolve_exchange_ts` (0043 review fix).
+
+    Pins the resolution-order contract: ``updateTime`` first, then frame
+    ``creationTime``, then ``local_ts`` as a guard against epoch 0.
+    """
+
+    @pytest.fixture
+    def local_ts(self):
+        return datetime(2026, 5, 16, 12, 0, 0, tzinfo=UTC)
+
+    def test_resolve_exchange_ts_prefers_update_time(self, local_ts):
+        update_time = 1700000000000  # ms
+        frame_ts = 1600000000000     # earlier — should be ignored
+        result = _resolve_exchange_ts(str(update_time), frame_ts, local_ts)
+        assert result == datetime.fromtimestamp(update_time / 1000, tz=UTC)
+
+    def test_resolve_exchange_ts_falls_back_to_creation_time(self, local_ts):
+        frame_ts = 1700000000000
+        # wallet_update_time absent → fall through to frame_ts_ms.
+        result = _resolve_exchange_ts(None, frame_ts, local_ts)
+        assert result == datetime.fromtimestamp(frame_ts / 1000, tz=UTC)
+
+    def test_resolve_exchange_ts_uses_local_ts_as_guard(self, local_ts):
+        # Both timestamps missing/invalid → fall back to local_ts (never epoch).
+        for cases in [
+            (None, 0),
+            ("", 0),
+            ("0", 0),       # string-zero variant; rejected by the explicit skip set
+            ("not-a-number", 0),
+        ]:
+            result = _resolve_exchange_ts(cases[0], cases[1], local_ts)
+            assert result == local_ts, f"resolver fell to epoch for {cases!r}"

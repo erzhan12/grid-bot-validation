@@ -30,7 +30,12 @@ def _resolve_exchange_ts(
     sane when neither exchange-side timestamp is present.
     """
     for candidate in (wallet_update_time, frame_ts_ms):
-        if candidate in (None, "", 0):
+        # Reject the two "no timestamp" shapes Bybit can send (missing key,
+        # empty string, integer 0) plus the string "0" we may see if a payload
+        # field is serialized but defaulted upstream. The trailing `ms > 0`
+        # check also catches these, but the early skip keeps the loop intent
+        # explicit.
+        if candidate in (None, "", 0, "0"):
             continue
         try:
             ms = int(candidate)

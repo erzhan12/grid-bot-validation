@@ -5,8 +5,15 @@
 # gridbot's trading keys (`BYBIT_API_KEY` / `BYBIT_API_SECRET`) are not
 # accidentally rotated when the recorder profile changes. Required
 # scopes for the read-only key: Wallet (read), Positions (read),
-# Orders (read). Without these the initial REST snapshot returns
-# empty and the run fails Phase 4 pre-check.
+# Orders (read).
+#
+# WARNING: If ANY of the three read scopes is missing, the initial
+# REST snapshot returns empty arrays and replay's Phase 4 pre-check
+# rejects the run with "no rows in wallet_snapshots/position_snapshots".
+# Symptom in the recorder log on startup:
+#   "Initial REST snapshot incomplete: wallet_rows=0, position_rows=0"
+# Re-issue the key pair on the Bybit dashboard with all three scopes
+# checked, then restart the recorder.
 
 symbols:
   - "LTCUSDT"

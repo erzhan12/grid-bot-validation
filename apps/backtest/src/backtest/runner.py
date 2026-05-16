@@ -72,6 +72,13 @@ class BacktestRunner:
             runner.process_tick(tick)
     """
 
+    # 0043: short-only safe-cap multiplier. When the raw formula output
+    # exceeds `_SHORT_ONLY_LIQ_CAP_MULTIPLIER × S_entry`, the helper returns
+    # 0 instead. Defensive — see TODO(0043, Phase 4) in
+    # `_estimate_pair_liq_prices` and the matching Open Decisions entry
+    # in docs/features/0043_PLAN.md.
+    _SHORT_ONLY_LIQ_CAP_MULTIPLIER: Decimal = Decimal("2")
+
     def __init__(
         self,
         strategy_config: BacktestStrategyConfig,
@@ -532,20 +539,23 @@ class BacktestRunner:
         )
         self._session.refresh_balances(fresh_unrealized)
 
+        # 0043 perf: compute the pair liq ONCE for this fill and pass the
+        # cached pair down to the three downstream consumers (log,
+        # _update_risk_multipliers, _emit_position_snapshot) instead of
+        # recomputing in each.
+        liq_long, liq_short = self._estimate_pair_liq_prices(
+            self._long_tracker.state,
+            self._short_tracker.state,
+            self._session.total_equity,
+        )
+
         # Compute liq_ratio for logging (liq_price / last_price).
-        # 0043: pair-aware hedge formula — both legs computed together,
-        # pick the just-mutated direction for the log.
         liq_ratio = 0.0
         if (
             self._enable_risk
             and self._last_price is not None
             and tracker.state.size > 0
         ):
-            liq_long, liq_short = self._estimate_pair_liq_prices(
-                self._long_tracker.state,
-                self._short_tracker.state,
-                self._session.total_equity,
-            )
             liq_price = liq_long if direction == DirectionType.LONG else liq_short
             liq_ratio = float(liq_price / self._last_price) if self._last_price else 0.0
 
@@ -571,7 +581,11 @@ class BacktestRunner:
             and self._long_position is not None
             and self._short_position is not None
         ):
-            self._update_risk_multipliers(float(self._last_price))
+            self._update_risk_multipliers(
+                float(self._last_price),
+                liq_long=liq_long,
+                liq_short=liq_short,
+            )
 
         # 0034: emit a parity-checkable position snapshot for the just-mutated
         # direction. Done AFTER _update_risk_multipliers so any multiplier-
@@ -585,7 +599,10 @@ class BacktestRunner:
                 if self._last_mark_price is not None
                 else event.price
             )
-            snap = self._emit_position_snapshot(direction, event.exchange_ts, mark_price)
+            snap = self._emit_position_snapshot(
+                direction, event.exchange_ts, mark_price,
+                liq_long=liq_long, liq_short=liq_short,
+            )
             self.position_snapshot_callback(snap)
 
     def _emit_position_snapshot(
@@ -593,6 +610,8 @@ class BacktestRunner:
         direction: str,
         timestamp: datetime,
         mark_price: Decimal,
+        liq_long: Optional[Decimal] = None,
+        liq_short: Optional[Decimal] = None,
     ) -> PositionSnapshot:
         """Build a parity-checkable position snapshot for the just-mutated direction.
 
@@ -608,6 +627,12 @@ class BacktestRunner:
 
         ``run_id`` / ``account_id`` are NOT set here — the caller (writer)
         owns those fields per the run context.
+
+        ``liq_long`` / ``liq_short`` (0043 perf): when both are provided the
+        pair-liq compute is skipped — `_process_fill` precomputes the pair
+        once per fill and passes the cached pair down. Other callers
+        (e.g. ``engine._wind_down``) pass ``None`` and the helper computes
+        inline.
         """
         tracker = (
             self._long_tracker
@@ -628,12 +653,13 @@ class BacktestRunner:
             position_mm, _mmr = calc_maintenance_margin(
                 position_value, self.symbol, tiers=self._mm_tiers
             )
-            # 0043: pair-aware hedge liq, pick the snapshot's direction.
-            liq_long, liq_short = self._estimate_pair_liq_prices(
-                self._long_tracker.state,
-                self._short_tracker.state,
-                self._session.total_equity,
-            )
+            # 0043: prefer caller-provided pair; fall back to compute.
+            if liq_long is None or liq_short is None:
+                liq_long, liq_short = self._estimate_pair_liq_prices(
+                    self._long_tracker.state,
+                    self._short_tracker.state,
+                    self._session.total_equity,
+                )
             liq_price = liq_long if direction == DirectionType.LONG else liq_short
         else:
             unrealised = Decimal("0")
@@ -766,6 +792,23 @@ class BacktestRunner:
         q_net = L_size - S_size
         pool = total_equity - mm_total
 
+        # Underwater account guard: total_equity has dropped below the
+        # combined MM requirement. The position is already past the
+        # liquidation threshold; raw formula output would be geometrically
+        # nonsensical (e.g. long-liq above entry). Emit entry prices as a
+        # "liquidation imminent" signal so the comparator sees an obviously
+        # distressed state instead of garbage.
+        if pool <= 0:
+            logger.warning(
+                "%s: pool exhausted (total_equity=%s, mm_total=%s); account "
+                "at or beyond liquidation threshold — emitting entry prices "
+                "as liq signal",
+                self.strat_id, total_equity, mm_total,
+            )
+            liq_long_out = L_entry if L_size > 0 else Decimal("0")
+            liq_short_out = S_entry if S_size > 0 else Decimal("0")
+            return liq_long_out, liq_short_out
+
         if q_net > 0:
             # Net long: liq_long = entry - pool/q_net.
             # Negative result means equity fully covers the long; clamp to 0
@@ -787,26 +830,38 @@ class BacktestRunner:
             # 0034 comparator on a short-only run confirms one direction
             # — both options are documented in docs/features/0043_PLAN.md
             # Open Decisions.
-            if L_size <= 0 and liq_short > S_entry * 2:
+            short_only_cap = S_entry * self._SHORT_ONLY_LIQ_CAP_MULTIPLIER
+            if L_size <= 0 and liq_short > short_only_cap:
                 return Decimal("0"), Decimal("0")
             return Decimal("0"), liq_short
         # Fully hedged: q_net == 0 — both legs offset, no liq risk.
         return Decimal("0"), Decimal("0")
 
-    def _update_risk_multipliers(self, last_price: float) -> None:
+    def _update_risk_multipliers(
+        self,
+        last_price: float,
+        liq_long: Optional[Decimal] = None,
+        liq_short: Optional[Decimal] = None,
+    ) -> None:
         """Recalculate risk multipliers from current position state.
 
         Mirrors live bot pattern: reset both, calculate long first, then short.
+
+        ``liq_long`` / ``liq_short`` (0043 perf): caller may pass a
+        precomputed pair so we don't repeat ``_estimate_pair_liq_prices``
+        twice within one ``_process_fill`` call (once here, once in the
+        emitted snapshot). When ``None``, computed inline.
         """
         wallet_balance = self._session.current_balance
 
-        # 0043: compute pair liq once for this tick, hand each leg's
-        # value to _build_position_state. Single call, single formula.
-        liq_long, liq_short = self._estimate_pair_liq_prices(
-            self._long_tracker.state,
-            self._short_tracker.state,
-            self._session.total_equity,
-        )
+        # 0043: compute pair liq once for this tick (or reuse precomputed),
+        # hand each leg's value to _build_position_state. Single formula.
+        if liq_long is None or liq_short is None:
+            liq_long, liq_short = self._estimate_pair_liq_prices(
+                self._long_tracker.state,
+                self._short_tracker.state,
+                self._session.total_equity,
+            )
 
         long_state = self._build_position_state(
             self._long_tracker, wallet_balance, DirectionType.LONG, liq_long

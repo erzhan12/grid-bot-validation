@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -689,9 +690,9 @@ class TestBacktestRunnerRiskMultipliers:
         called_with = []
         original = risk_runner._update_risk_multipliers
 
-        def capture_price(price):
+        def capture_price(price, **kwargs):
             called_with.append(price)
-            return original(price)
+            return original(price, **kwargs)
 
         risk_runner._update_risk_multipliers = capture_price
 
@@ -764,8 +765,7 @@ class TestPairLiqHedge:
         executor = BacktestExecutor(order_manager=order_mgr)
         return BacktestRunner(strategy_config=config, executor=executor, session=session)
 
-    def _state(self, size, entry):
-        from types import SimpleNamespace
+    def _state(self, size, entry) -> SimpleNamespace:
         return SimpleNamespace(
             size=Decimal(str(size)),
             avg_entry_price=Decimal(str(entry)),
@@ -914,6 +914,32 @@ class TestPairLiqHedge:
         assert liq_long == Decimal("0")
         # Short-only with huge equity → safe regime → capped to 0.
         assert liq_short == Decimal("0")
+
+    def test_underwater_account_handles_negative_pool(self, runner, caplog):
+        """0043 P0 fix: when mm_total > total_equity, return entry prices.
+
+        The account is already past the MM threshold — raw formula would
+        produce geometrically nonsensical values (e.g. long-liq above entry).
+        Emit entry prices as a "liquidation imminent" signal so the
+        comparator sees an obviously distressed state instead of garbage.
+        """
+        import logging
+
+        # Large long, tiny equity → mm_total >> equity → pool < 0.
+        long_state = self._state("50", "1000")
+        short_state = self._state("0", "0")
+        equity = Decimal("10")  # 50 * 1000 = 50_000 pv → mm ≈ 250 > equity
+
+        with caplog.at_level(logging.WARNING, logger="backtest.runner"):
+            liq_long, liq_short = runner._estimate_pair_liq_prices(
+                long_state, short_state, equity,
+            )
+
+        # Signal: liquidation imminent — entry price emitted.
+        assert liq_long == Decimal("1000")
+        assert liq_short == Decimal("0")
+        warnings = [r for r in caplog.records if "pool exhausted" in r.message]
+        assert len(warnings) == 1
 
     def test_short_only_below_cap_returns_raw_value(self, runner):
         """Short-only with moderate equity (raw liq within 2× entry) keeps raw value."""
