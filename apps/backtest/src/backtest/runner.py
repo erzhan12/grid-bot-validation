@@ -780,12 +780,13 @@ class BacktestRunner:
             # L=2.2/S=3.1 has live liq_short=171 at S_entry=58 (above 2×).
             # No cap there.
             #
-            # For SHORT-ONLY (L_size == 0) we have no mainnet evidence and
-            # preserve the pre-0043 safe cap: when wallet/equity vastly
-            # exceeds the short notional, the formula's raw output is
-            # absurdly large and the pre-0042 code documented Bybit as
-            # returning 0. Cap defensively until Phase 4 comparator data
-            # contradicts it.
+            # TODO(0043, Phase 4): for SHORT-ONLY (L_size == 0) we lack
+            # mainnet evidence on whether Bybit emits the raw value or
+            # returns 0 when liq is far above market. We preserve the
+            # pre-0043 safe cap defensively. Drop this branch once the
+            # 0034 comparator on a short-only run confirms one direction
+            # — both options are documented in docs/features/0043_PLAN.md
+            # Open Decisions.
             if L_size <= 0 and liq_short > S_entry * 2:
                 return Decimal("0"), Decimal("0")
             return Decimal("0"), liq_short
