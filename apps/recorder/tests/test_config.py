@@ -151,3 +151,32 @@ class TestLoadConfig:
         config = load_config(str(config_file))
         assert config.symbols == []
         assert config.testnet is False
+
+    def test_empty_env_var_raises_value_error(self, tmp_path, monkeypatch):
+        """0043 review fix: env var present but empty fails loudly at load."""
+        monkeypatch.setenv("BYBIT_RECORDER_TEST_EMPTY", "")
+        config_file = tmp_path / "recorder.yaml"
+        config_file.write_text(yaml.dump({
+            "symbols": ["BTCUSDT"],
+            "account": {
+                "api_key": "${BYBIT_RECORDER_TEST_EMPTY}",
+                "api_secret": "secret",
+            },
+        }))
+
+        with pytest.raises(ValueError, match="is set but empty"):
+            load_config(str(config_file))
+
+    def test_unset_env_var_raises_value_error(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("BYBIT_RECORDER_TEST_UNSET", raising=False)
+        config_file = tmp_path / "recorder.yaml"
+        config_file.write_text(yaml.dump({
+            "symbols": ["BTCUSDT"],
+            "account": {
+                "api_key": "${BYBIT_RECORDER_TEST_UNSET}",
+                "api_secret": "secret",
+            },
+        }))
+
+        with pytest.raises(ValueError, match="not set"):
+            load_config(str(config_file))

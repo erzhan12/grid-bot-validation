@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -296,81 +297,78 @@ class TestBacktestRunnerRiskMultipliers:
         assert no_risk_runner.get_amount_multiplier(DirectionType.LONG, SideType.BUY) == 1.0
         assert no_risk_runner.get_amount_multiplier(DirectionType.SHORT, SideType.SELL) == 1.0
 
-    def test_estimate_liq_price_long(self, risk_runner):
-        """Long liq price: cross-margin formula."""
-        entry = Decimal("100000")
-        # qty = pv / entry = 10000 / 100000 = 0.1
-        # mm = 10000 * 0.005 = 50 (tier 1 from cache, small position)
-        # liq = (0.1 * 100000 - 10000 + 50) / 0.1 = 500 / 0.1 = 5000
-        # With large wallet, liq is very low (far from liquidation) — correct for cross margin
-        pv = Decimal("10000")
-        wallet = Decimal("10000")
-        liq = risk_runner._estimate_liquidation_price(entry, DirectionType.LONG, pv, wallet)
-        qty = pv / entry  # 0.1
-        mm, _ = calc_maintenance_margin(pv, "BTCUSDT", tiers=risk_runner._mm_tiers)
-        expected = (qty * entry - wallet + mm) / qty
-        assert liq == expected
+    # 0043: per-leg `_estimate_liquidation_price` removed; the pair function
+    # `_estimate_pair_liq_prices` is the single source of truth. The single-leg
+    # tests below feed an empty opposite leg so the pair formula collapses to
+    # the per-leg result, and the hedge-scenario tests live in TestPairLiqHedge
+    # below.
 
-    def test_estimate_liq_price_short(self, risk_runner):
-        """Short liq price: cross-margin formula."""
-        entry = Decimal("100000")
-        pv = Decimal("10000")
-        wallet = Decimal("10000")
-        liq = risk_runner._estimate_liquidation_price(entry, DirectionType.SHORT, pv, wallet)
-        qty = pv / entry  # 0.1
-        mm, _ = calc_maintenance_margin(pv, "BTCUSDT", tiers=risk_runner._mm_tiers)
-        expected = (qty * entry + wallet - mm) / qty
-        assert liq == expected
+    def _make_state(self, size: Decimal, entry: Decimal) -> SimpleNamespace:
+        """Lightweight tracker-state stand-in for pair-formula unit tests."""
+        return SimpleNamespace(size=size, avg_entry_price=entry)
 
-    def test_estimate_liq_price_short_uses_available_balance_semantics(
-        self, risk_runner
-    ):
-        """0042: larger UTA available balance raises short cross-margin liq."""
-        entry = Decimal("100")
-        pv = Decimal("1000")
-        low_available = Decimal("50")
-        uta_available = Decimal("100")
-
-        low_liq = risk_runner._estimate_liquidation_price(
-            entry, DirectionType.SHORT, pv, low_available
+    def test_pair_liq_long_only(self, risk_runner):
+        """Single long leg: pair formula collapses to per-leg long behaviour."""
+        long_state = self._make_state(Decimal("0.1"), Decimal("100000"))
+        short_state = self._make_state(Decimal("0"), Decimal("0"))
+        equity = Decimal("10000")
+        liq_long, liq_short = risk_runner._estimate_pair_liq_prices(
+            long_state, short_state, equity,
         )
-        uta_liq = risk_runner._estimate_liquidation_price(
-            entry, DirectionType.SHORT, pv, uta_available
+        pv = Decimal("10000")
+        qty = Decimal("0.1")
+        mm, _ = calc_maintenance_margin(pv, "BTCUSDT", tiers=risk_runner._mm_tiers)
+        expected = Decimal("100000") - (equity - mm) / qty
+        assert liq_long == max(expected, Decimal("0"))
+        assert liq_short == Decimal("0")
+
+    def test_pair_liq_short_only(self, risk_runner):
+        """Single short leg: pair formula collapses to per-leg short behaviour."""
+        long_state = self._make_state(Decimal("0"), Decimal("0"))
+        short_state = self._make_state(Decimal("0.1"), Decimal("100000"))
+        equity = Decimal("10000")
+        liq_long, liq_short = risk_runner._estimate_pair_liq_prices(
+            long_state, short_state, equity,
         )
-
-        qty = pv / entry
-        assert uta_liq - low_liq == (uta_available - low_available) / qty
-
-    def test_estimate_liq_price_tiered_large_position(self, risk_runner):
-        """Large position uses tiered MM from cache in cross-margin formula."""
-        entry = Decimal("100000")
-        # position_value=5M → cache tier: mmr=0.0077, ded=8460
-        # mm_amount = 5M * 0.0077 - 8460 = 30040
-        pv = Decimal("5000000")
-        # Wallet smaller than position → meaningful liq price
-        wallet = Decimal("600000")
-        liq = risk_runner._estimate_liquidation_price(entry, DirectionType.LONG, pv, wallet)
-        qty = pv / entry  # 50
+        pv = Decimal("10000")
+        qty = Decimal("0.1")
         mm, _ = calc_maintenance_margin(pv, "BTCUSDT", tiers=risk_runner._mm_tiers)
-        expected = (qty * entry - wallet + mm) / qty
-        assert liq == expected
-        assert liq > 0  # liq price is positive
-        assert liq < entry  # liq price below entry for long
+        expected = Decimal("100000") + (equity - mm) / qty
+        assert liq_long == Decimal("0")
+        assert liq_short == expected
 
-    def test_estimate_liq_price_tiered_short_large(self, risk_runner):
-        """Large short position uses tiered MM in cross-margin formula."""
-        entry = Decimal("100000")
+    def test_pair_liq_short_scales_with_equity(self, risk_runner):
+        """0042+0043: larger total_equity raises short liq linearly with 1/qty."""
+        long_state = self._make_state(Decimal("0"), Decimal("0"))
+        short_state = self._make_state(Decimal("10"), Decimal("100"))
+        low_eq = Decimal("50")
+        high_eq = Decimal("100")
+        _, low_liq = risk_runner._estimate_pair_liq_prices(
+            long_state, short_state, low_eq,
+        )
+        _, high_liq = risk_runner._estimate_pair_liq_prices(
+            long_state, short_state, high_eq,
+        )
+        # Δliq = Δequity / qty (mm cancels because position is identical).
+        assert high_liq - low_liq == (high_eq - low_eq) / Decimal("10")
+
+    def test_pair_liq_tiered_long_large_position(self, risk_runner):
+        """Large long uses tiered MM via combined notional; below-entry liq."""
+        long_state = self._make_state(Decimal("50"), Decimal("100000"))
+        short_state = self._make_state(Decimal("0"), Decimal("0"))
+        equity = Decimal("600000")
+        liq_long, _ = risk_runner._estimate_pair_liq_prices(
+            long_state, short_state, equity,
+        )
         pv = Decimal("5000000")
-        wallet = Decimal("600000")
-        liq = risk_runner._estimate_liquidation_price(entry, DirectionType.SHORT, pv, wallet)
-        qty = pv / entry  # 50
         mm, _ = calc_maintenance_margin(pv, "BTCUSDT", tiers=risk_runner._mm_tiers)
-        expected = (qty * entry + wallet - mm) / qty
-        assert liq == expected
-        assert liq > entry  # liq price above entry for short
+        expected = Decimal("100000") - (equity - mm) / Decimal("50")
+        assert liq_long == expected
+        assert liq_long > 0
+        assert liq_long < Decimal("100000")
 
-    def test_estimate_liq_price_falls_back_to_flat_mmr(self):
-        """When no tiers loaded, falls back to flat maintenance_margin_rate."""
+    def test_pair_liq_falls_back_to_flat_mmr(self):
+        """When no tiers loaded, pair formula uses flat maintenance_margin_rate."""
         from backtest.session import BacktestSession
         config = BacktestStrategyConfig(
             strat_id="test_flat",
@@ -386,68 +384,34 @@ class TestBacktestRunnerRiskMultipliers:
         )
         executor = BacktestExecutor(order_manager=order_mgr)
         runner = BacktestRunner(strategy_config=config, executor=executor, session=session)
-        # Force no tiers
-        runner._mm_tiers = None
-        entry = Decimal("100000")
-        pv = Decimal("10000")
-        wallet = Decimal("10000")
-        liq = runner._estimate_liquidation_price(entry, DirectionType.LONG, pv, wallet)
-        # qty = 0.1, mm = 10000 * 0.008 = 80
-        # liq = (0.1 * 100000 - 10000 + 80) / 0.1 = 80 / 0.1 = 800
-        qty = pv / entry
-        mm = pv * Decimal("0.008")
-        expected = (qty * entry - wallet + mm) / qty
-        assert liq == expected
+        runner._mm_tiers = None  # force flat-MMR path
 
-    def test_estimate_liq_price_with_hardcoded_tiers(self):
-        """When cache file missing, hardcoded tiers are used with cross-margin formula."""
-        from backtest.session import BacktestSession
-        config = BacktestStrategyConfig(
-            strat_id="test_hc",
-            symbol="BTCUSDT",
-            tick_size=Decimal("0.1"),
-            leverage=10,
-            maintenance_margin_rate=0.005,
-            enable_risk_multipliers=True,
-            risk_limits_cache_path="/nonexistent/path.json",
-        )
-        session = BacktestSession(session_id="test_hc", initial_balance=Decimal("10000"))
-        fill_sim = TradeThroughFillSimulator()
-        order_mgr = BacktestOrderManager(
-            fill_simulator=fill_sim, commission_rate=config.commission_rate,
-        )
-        executor = BacktestExecutor(order_manager=order_mgr)
-        runner = BacktestRunner(strategy_config=config, executor=executor, session=session)
-        # Should have fallen back to hardcoded BTCUSDT tiers
-        assert runner._mm_tiers is not None
-        # 5M → hardcoded tier 2: mmr=0.01, ded=10000
-        # mm=5M*0.01-10000=40000
-        entry = Decimal("100000")
-        pv = Decimal("5000000")
-        wallet = Decimal("600000")
-        liq = runner._estimate_liquidation_price(entry, DirectionType.LONG, pv, wallet)
-        qty = pv / entry  # 50
-        mm, _ = calc_maintenance_margin(pv, "BTCUSDT", tiers=runner._mm_tiers)
-        expected = (qty * entry - wallet + mm) / qty
-        assert liq == expected
-        assert liq > 0
+        long_state = SimpleNamespace(size=Decimal("0.1"), avg_entry_price=Decimal("100000"))
+        short_state = SimpleNamespace(size=Decimal("0"), avg_entry_price=Decimal("0"))
+        equity = Decimal("10000")
+        liq_long, _ = runner._estimate_pair_liq_prices(long_state, short_state, equity)
+
+        pv = Decimal("10000")
+        mm = pv * Decimal("0.008")
+        expected = Decimal("100000") - (equity - mm) / Decimal("0.1")
+        assert liq_long == expected
 
     def test_build_position_state_uses_tiered_liq(self, risk_runner):
-        """_build_position_state passes position_value and wallet to cross-margin liq."""
-        # 50 BTC at 100000 = 5M position_value → cache tier with deduction
+        """0043: _build_position_state plumbs the passed liq through to PositionState.
+
+        Liq computation moved to _estimate_pair_liq_prices (called by
+        _update_risk_multipliers). _build_position_state itself now just
+        forwards the value, so this test asserts the plumbing.
+        """
         risk_runner._long_tracker.process_fill(
             side=SideType.BUY, qty=Decimal("50"), price=Decimal("100000")
         )
         wallet = Decimal("600000")
+        explicit_liq = Decimal("99500.5")
         state = risk_runner._build_position_state(
-            risk_runner._long_tracker, wallet, DirectionType.LONG
+            risk_runner._long_tracker, wallet, DirectionType.LONG, explicit_liq
         )
-        pv = Decimal("5000000")
-        qty = Decimal("50")
-        mm, _ = calc_maintenance_margin(pv, "BTCUSDT", tiers=risk_runner._mm_tiers)
-        expected_liq = (qty * Decimal("100000") - wallet + mm) / qty
-        assert state.liquidation_price == expected_liq
-        assert state.liquidation_price > 0
+        assert state.liquidation_price == explicit_liq
 
     def test_load_mm_tiers_from_cache_file(self, tmp_path):
         """Cache file with valid tiers is loaded correctly."""
@@ -523,34 +487,31 @@ class TestBacktestRunnerRiskMultipliers:
     def test_build_position_state_empty(self, risk_runner):
         """Empty tracker produces zero-state PositionState."""
         state = risk_runner._build_position_state(
-            risk_runner._long_tracker, Decimal("10000"), DirectionType.LONG
+            risk_runner._long_tracker, Decimal("10000"), DirectionType.LONG,
+            Decimal("0"),
         )
         assert state.size == Decimal("0")
         assert state.margin == Decimal("0")
         assert state.liquidation_price == Decimal("0")
 
     def test_build_position_state_with_position(self, risk_runner):
-        """Tracker with position produces correct PositionState."""
-        # Manually add a position
+        """Tracker with position produces correct PositionState; liq plumbed."""
         risk_runner._long_tracker.process_fill(
             side=SideType.BUY, qty=Decimal("0.1"), price=Decimal("100000")
         )
 
         wallet = Decimal("10000")
+        explicit_liq = Decimal("90123.45")
         state = risk_runner._build_position_state(
-            risk_runner._long_tracker, wallet, DirectionType.LONG
+            risk_runner._long_tracker, wallet, DirectionType.LONG, explicit_liq
         )
         assert state.size == Decimal("0.1")
         assert state.entry_price == Decimal("100000")
         # position_value = 0.1 * 100000 = 10000, margin = 10000/10000 = 1.0
         assert state.margin == Decimal("1")
         assert state.position_value == Decimal("10000")
-        # Cross-margin: liq = (qty*entry - wallet + mm) / qty
-        pv = Decimal("10000")
-        qty = pv / Decimal("100000")  # 0.1
-        mm, _ = calc_maintenance_margin(pv, "BTCUSDT", tiers=risk_runner._mm_tiers)
-        expected_liq = (qty * Decimal("100000") - wallet + mm) / qty
-        assert state.liquidation_price == expected_liq
+        # 0043: liq comes straight from the caller, not from per-leg formula.
+        assert state.liquidation_price == explicit_liq
         assert state.leverage == 10
 
     def test_build_position_state_zero_wallet_with_position_raises(self, risk_runner):
@@ -563,7 +524,8 @@ class TestBacktestRunnerRiskMultipliers:
         # Should raise ValueError when wallet is zero but position exists
         with pytest.raises(ValueError, match="wallet_balance is zero"):
             risk_runner._build_position_state(
-                risk_runner._long_tracker, Decimal("0"), DirectionType.LONG
+                risk_runner._long_tracker, Decimal("0"), DirectionType.LONG,
+                Decimal("0"),
             )
 
     def test_multiplier_updates_after_fill(self, risk_runner):
@@ -726,9 +688,9 @@ class TestBacktestRunnerRiskMultipliers:
         called_with = []
         original = risk_runner._update_risk_multipliers
 
-        def capture_price(price):
+        def capture_price(price, **kwargs):
             called_with.append(price)
-            return original(price)
+            return original(price, **kwargs)
 
         risk_runner._update_risk_multipliers = capture_price
 
@@ -765,6 +727,299 @@ class TestBacktestRunnerRiskMultipliers:
         # Should have been called with market price (95000), not fill price (100000)
         assert len(called_with) == 1
         assert called_with[0] == 95000.0
+
+
+class TestPairLiqHedge:
+    """Hedge-mode pair liquidation formula (feature 0043).
+
+    Validation table: docs/features/0043_PLAN.md Phase 2. Single quantitative
+    point per scenario is anchored to the on-mainnet derivation data so any
+    formula drift breaks these tests immediately.
+    """
+
+    @pytest.fixture
+    def runner(self):
+        config = BacktestStrategyConfig(
+            strat_id="test_pair_liq",
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            grid_count=50,
+            grid_step=0.2,
+            amount="x0.001",
+            max_margin=8.0,
+            commission_rate=Decimal("0.0002"),
+            min_liq_ratio=0.8,
+            max_liq_ratio=1.2,
+            min_total_margin=0.15,
+            leverage=10,
+            maintenance_margin_rate=0.005,
+            enable_risk_multipliers=True,
+        )
+        session = BacktestSession(session_id="test_pair_liq", initial_balance=Decimal("10000"))
+        fill_sim = TradeThroughFillSimulator()
+        order_mgr = BacktestOrderManager(
+            fill_simulator=fill_sim, commission_rate=config.commission_rate,
+        )
+        executor = BacktestExecutor(order_manager=order_mgr)
+        return BacktestRunner(strategy_config=config, executor=executor, session=session)
+
+    def _state(self, size, entry) -> SimpleNamespace:
+        return SimpleNamespace(
+            size=Decimal(str(size)),
+            avg_entry_price=Decimal(str(entry)),
+        )
+
+    def test_zero_positions_returns_zero_zero(self, runner):
+        """Empty trackers → both legs 0, no division-by-zero."""
+        liq_long, liq_short = runner._estimate_pair_liq_prices(
+            self._state(0, 0), self._state(0, 0), Decimal("1000"),
+        )
+        assert (liq_long, liq_short) == (Decimal("0"), Decimal("0"))
+
+    def test_fully_hedged_returns_zero_zero(self, runner):
+        """L == S → q_net = 0 → both legs 0 (no real liq risk)."""
+        long_state = self._state("2.5", "100")
+        short_state = self._state("2.5", "100")
+        liq_long, liq_short = runner._estimate_pair_liq_prices(
+            long_state, short_state, Decimal("1000"),
+        )
+        assert liq_long == Decimal("0")
+        assert liq_short == Decimal("0")
+
+    def test_net_long_dominant_leg_positive(self, runner):
+        """Net long with q_net > equity-derived threshold gives positive liq_long.
+
+        Pins the Phase 2 validation row q_net=2.0 (docs/features/0043_PLAN.md):
+        L=4.5 @ 57.43403588, S=2.5 @ 57.67686663, equity=105.19303398.
+        Live ``liqPrice`` from Bybit at that snapshot = 5.9049, formula
+        f_full delta = -0.061 (i.e. formula = 5.8439). Test asserts both:
+        the formula's exact output for those inputs AND that the result
+        lands within the documented Δ band vs live Bybit data.
+
+        BTCUSDT tier 1 MMR (0.005, deduction=0) is identical to LTCUSDT
+        tier 1, so the BTCUSDT-shaped runner reproduces the LTCUSDT
+        validation numerics for combined notional in the first tier.
+        """
+        L_size = Decimal("4.5")
+        L_entry = Decimal("57.43403588")
+        S_size = Decimal("2.5")
+        S_entry = Decimal("57.67686663")
+        equity = Decimal("105.19303398")
+
+        long_state = self._state(L_size, L_entry)
+        short_state = self._state(S_size, S_entry)
+        liq_long, liq_short = runner._estimate_pair_liq_prices(
+            long_state, short_state, equity,
+        )
+
+        # Smaller (over-hedged) leg is always 0.
+        assert liq_short == Decimal("0")
+
+        # Pin the exact formula output computed from the same inputs.
+        combined_pv = L_size * L_entry + S_size * S_entry
+        mm_total = combined_pv * Decimal("0.005")  # tier 1 mmr, deduction 0
+        pool = equity - mm_total
+        expected = L_entry - pool / (L_size - S_size)
+        assert liq_long == expected
+
+        # Sanity vs live Bybit at the snapshot: |Δ| within 0.5 USDT of live.
+        live = Decimal("5.9049")
+        assert abs(liq_long - live) < Decimal("0.5")
+
+    def test_net_short_dominant_leg_positive(self, runner):
+        """Net short pins Phase 2 validation row q_net=-0.9.
+
+        Inputs from docs/features/0043_PLAN.md table: L=2.2 @ 57.92552512,
+        S=3.1 @ 57.95695445, equity=104.47256893. Live ``liqPrice`` for
+        the dominant short = 171.7334, formula f_full delta = +0.598
+        (so formula ≈ 172.33). Test pins both numerics.
+        """
+        L_size = Decimal("2.2")
+        L_entry = Decimal("57.92552512")
+        S_size = Decimal("3.1")
+        S_entry = Decimal("57.95695445")
+        equity = Decimal("104.47256893")
+
+        long_state = self._state(L_size, L_entry)
+        short_state = self._state(S_size, S_entry)
+        liq_long, liq_short = runner._estimate_pair_liq_prices(
+            long_state, short_state, equity,
+        )
+
+        # Smaller (over-hedged) long leg is 0.
+        assert liq_long == Decimal("0")
+
+        # Pin the exact formula output.
+        combined_pv = L_size * L_entry + S_size * S_entry
+        mm_total = combined_pv * Decimal("0.005")
+        pool = equity - mm_total
+        expected = S_entry + pool / (S_size - L_size)
+        assert liq_short == expected
+
+        # Sanity vs live Bybit.
+        live = Decimal("171.7334")
+        assert abs(liq_short - live) < Decimal("1.0")
+
+    def test_net_long_clamps_negative_to_zero(self, runner):
+        """Net long with equity covering position → formula returns 0, not negative."""
+        long_state = self._state("0.1", "100")
+        short_state = self._state("0.05", "100")
+        # Equity huge → pool/q_net >> entry → raw liq_long < 0 → clamped to 0.
+        equity = Decimal("1000000")
+        liq_long, liq_short = runner._estimate_pair_liq_prices(
+            long_state, short_state, equity,
+        )
+        assert liq_long == Decimal("0")
+        assert liq_short == Decimal("0")
+
+    def test_hedged_net_short_returns_raw_value_above_2x_entry(self, runner):
+        """Hedged net short far above market: pair formula returns the raw liq.
+
+        0043 derivation found Bybit DOES emit raw liq even when it sits well
+        above market in hedge configurations (validation row: live=171 at
+        S_entry=58 — above 2× entry). The per-leg cap was dropped FOR
+        HEDGED CASES; see ``test_short_only_caps_above_2x_entry`` for the
+        single-leg behaviour.
+        """
+        # Both legs > 0 → hedged → no cap.
+        long_state = self._state("0.05", "100")
+        short_state = self._state("0.1", "100")
+        equity = Decimal("1000000")
+        liq_long, liq_short = runner._estimate_pair_liq_prices(
+            long_state, short_state, equity,
+        )
+        assert liq_long == Decimal("0")
+        # Raw formula yields a very large positive number — no cap in hedged.
+        assert liq_short > Decimal("100") * 2  # well above 2× entry
+
+    def test_short_only_caps_above_2x_entry(self, runner):
+        """Short-only (L_size == 0) preserves the pre-0043 safe cap.
+
+        Without a hedging long leg there is no mainnet evidence that Bybit
+        emits absurd-magnitude liq prices; pre-0042 code documented Bybit
+        returning 0 when computed liq exceeded 2× entry, and the pair
+        formula preserves that defensively until Phase 4 comparator data
+        contradicts it.
+        """
+        long_state = self._state("0", "0")
+        short_state = self._state("0.1", "100")
+        # Equity huge → raw liq_short would be entry + (1e6 - mm)/0.1 ≈ 1e7,
+        # well above 2 × entry = 200.
+        equity = Decimal("1000000")
+        liq_long, liq_short = runner._estimate_pair_liq_prices(
+            long_state, short_state, equity,
+        )
+        assert liq_long == Decimal("0")
+        # Short-only with huge equity → safe regime → capped to 0.
+        assert liq_short == Decimal("0")
+
+    def test_underwater_account_handles_negative_pool(self, runner, caplog):
+        """0043 P0 fix: when mm_total > total_equity, return entry prices.
+
+        The account is already past the MM threshold — raw formula would
+        produce geometrically nonsensical values (e.g. long-liq above entry).
+        Emit entry prices as a "liquidation imminent" signal so the
+        comparator sees an obviously distressed state instead of garbage.
+        """
+        import logging
+
+        # Large long, tiny equity → mm_total >> equity → pool < 0.
+        long_state = self._state("50", "1000")
+        short_state = self._state("0", "0")
+        equity = Decimal("10")  # 50 * 1000 = 50_000 pv → mm ≈ 250 > equity
+
+        with caplog.at_level(logging.WARNING, logger="backtest.runner"):
+            liq_long, liq_short = runner._estimate_pair_liq_prices(
+                long_state, short_state, equity,
+            )
+
+        # Signal: liquidation imminent — entry price emitted.
+        assert liq_long == Decimal("1000")
+        assert liq_short == Decimal("0")
+        warnings = [r for r in caplog.records if "pool exhausted" in r.message]
+        assert len(warnings) == 1
+
+    def test_short_only_below_cap_returns_raw_value(self, runner):
+        """Short-only with moderate equity (raw liq within 2× entry) keeps raw value."""
+        long_state = self._state("0", "0")
+        short_state = self._state("1.0", "100")  # S_pv = 100
+        # Equity 80 → pool ≈ 79.5 → liq_short = 100 + 79.5 = 179.5, < 200 (2× entry).
+        equity = Decimal("80")
+        liq_long, liq_short = runner._estimate_pair_liq_prices(
+            long_state, short_state, equity,
+        )
+        assert liq_long == Decimal("0")
+        assert liq_short > Decimal("100")
+        assert liq_short < Decimal("200")  # below 2× entry → no cap fired
+
+    def test_uses_total_equity_not_current_balance(self, runner):
+        """Pool input is the total_equity arg, not session.current_balance."""
+        long_state = self._state("0.1", "100")
+        short_state = self._state("0", "0")
+        # Set current_balance high to verify it's NOT consulted.
+        runner._session.current_balance = Decimal("999999")
+        small_equity = Decimal("9")
+        liq_long, _ = runner._estimate_pair_liq_prices(
+            long_state, short_state, small_equity,
+        )
+        # With small equity vs L_pv=10, expect a positive liq close to entry.
+        assert Decimal("0") < liq_long < Decimal("100")
+        # Sanity: result must scale with the explicit equity arg, not the
+        # large current_balance the test deliberately injected.
+        big_equity = Decimal("90")
+        liq_long_big, _ = runner._estimate_pair_liq_prices(
+            long_state, short_state, big_equity,
+        )
+        assert liq_long_big < liq_long
+
+    def test_combined_notional_drives_mm(self, runner):
+        """MM term is computed from L_pv + S_pv, not from the dominant leg alone.
+
+        This is the non-obvious 0043 choice: Bybit publishes the smaller leg's
+        ``positionMM`` with a hedge discount but reverts to full MMR on the
+        combined notional for liq calc. Regression guard: a per-leg or
+        dominant-only MM substitution shifts the liq by ``Δmm / q_net`` and
+        this test catches that drift.
+
+        Setup keeps the dominant leg (long) as the asserted side and varies
+        the hedged short side; equity is sized so the formula output is
+        positive (not clamped to 0).
+        """
+        # L = 1.0 @ 100 dominant; S = 0.5 @ 100 hedged. q_net = +0.5 (net long).
+        L_size = Decimal("1.0")
+        L_entry = Decimal("100")
+        S_size = Decimal("0.5")
+        S_entry = Decimal("100")
+        equity = Decimal("50")  # small enough so liq_long stays positive
+
+        liq_long, liq_short = runner._estimate_pair_liq_prices(
+            self._state(L_size, L_entry),
+            self._state(S_size, S_entry),
+            equity,
+        )
+
+        # Over-hedged smaller leg stays zero by branch.
+        assert liq_short == Decimal("0")
+
+        # Expected uses combined notional MM (correct):
+        L_pv = L_size * L_entry           # 100
+        S_pv = S_size * S_entry           # 50
+        combined_pv = L_pv + S_pv         # 150
+        mm_correct = combined_pv * Decimal("0.005")   # 0.75
+        pool_correct = equity - mm_correct
+        q_net = L_size - S_size
+        expected = L_entry - pool_correct / q_net
+        assert liq_long == expected
+
+        # A wrong-implementation that took MM only from the dominant leg
+        # would compute a different liq. Confirm the gap is real so this
+        # test would fail if the formula regressed.
+        mm_dominant_only = L_pv * Decimal("0.005")    # 0.50
+        pool_wrong = equity - mm_dominant_only
+        wrong_liq = L_entry - pool_wrong / q_net
+        assert wrong_liq != liq_long
+        # The drift is exactly Δmm / q_net = 0.25 / 0.5 = 0.5 USDT.
+        assert (wrong_liq - liq_long) == Decimal("-0.5")
 
 
 class TestEarlyImbalanceMultiplierBacktest:
@@ -896,7 +1151,9 @@ class TestEarlyImbalanceMultiplierBacktest:
         runner = self._build_runner(early_imb=1.5)
         # Inflate session balance so liquidation estimates land at 0
         # (long: liq <= 0 floored to 0; short: liq > 2*entry returned as 0).
+        # 0043: pair-aware liq reads total_equity, so bump both baselines.
         runner._session.current_balance = Decimal("1000000")
+        runner._session.total_equity = Decimal("1000000")
 
         # Drive long: process_fill with Buy (opens long).
         runner._long_tracker.process_fill(
@@ -1656,6 +1913,91 @@ class TestPositionSnapshotEmission:
         assert tracker.state.cum_realised_pnl == Decimal("42.5")
         # And realized_pnl (window-scoped) is zeroed
         assert tracker.state.realized_pnl == Decimal("0")
+
+    def test_process_fill_refreshes_session_equity_before_snapshot_emit(
+        self, sample_strategy_config, sample_timestamp,
+    ):
+        """0043 review fix: `_process_fill` must refresh `session.total_equity`
+        before the parity snapshot is emitted, otherwise the comparator sees
+        post-fill position size paired with pre-fill equity in the liq input.
+
+        Regression: a fill that records non-zero realized_pnl is processed.
+        After `_process_fill` returns (before the engine's per-tick
+        `update_equity`), `session.total_equity` must already reflect the
+        new realized PnL.
+        """
+        from gridcore import ExecutionEvent
+        from gridcore.events import EventType
+        from backtest.order_manager import SimulatedOrder
+        from backtest.session import BacktestSession
+
+        # Distinct initial balances so the test can tell which field updated.
+        session = BacktestSession(
+            session_id="p1_regress",
+            initial_balance=Decimal("10000"),
+            initial_equity=Decimal("15000"),
+        )
+        fill_simulator = TradeThroughFillSimulator()
+        order_manager = BacktestOrderManager(
+            fill_simulator=fill_simulator,
+            commission_rate=sample_strategy_config.commission_rate,
+        )
+        executor = BacktestExecutor(order_manager=order_manager, qty_calculator=None)
+        runner = BacktestRunner(
+            strategy_config=sample_strategy_config, executor=executor, session=session,
+        )
+
+        # Open a long; tracker now has a non-trivial unrealized PnL when mark
+        # moves below entry.
+        runner.long_tracker.process_fill("Buy", Decimal("1.0"), Decimal("100"))
+        runner._last_mark_price = Decimal("90")
+
+        # Pre-fill snapshot of session state.
+        pre_equity = session.total_equity
+        pre_realized = session.total_realized_pnl
+        assert pre_equity == Decimal("15000")
+        assert pre_realized == Decimal("0")
+
+        # Register the closing order so direction lookup succeeds.
+        order_manager.active_orders["close-1"] = SimulatedOrder(
+            order_id="ord-1",
+            client_order_id="close-1",
+            symbol=sample_strategy_config.symbol,
+            side="Sell",
+            direction=DirectionType.LONG,
+            price=Decimal("110"),
+            qty=Decimal("0.5"),
+            reduce_only=True,
+            grid_level=0,
+        )
+
+        # Close 0.5 @ 110 — realized PnL = 5.
+        event = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol=sample_strategy_config.symbol,
+            exchange_ts=sample_timestamp,
+            local_ts=sample_timestamp,
+            exec_id="exec-1",
+            order_id="ord-1",
+            order_link_id="close-1",
+            side="Sell",
+            price=Decimal("110"),
+            qty=Decimal("0.5"),
+            fee=Decimal("0.011"),
+        )
+        runner._process_fill(event)
+
+        # `session.total_realized_pnl` was bumped by record_trade.
+        assert session.total_realized_pnl == Decimal("5.0")
+        # 0043 fix: total_equity should already reflect post-fill state.
+        # initial_equity=15000 + realized 5 + unrealized (remaining 0.5
+        # long @ avg 100, mark 90 → -5) - commission 0.011 = 14999.989.
+        expected_equity = (
+            Decimal("15000") + Decimal("5") + Decimal("-5") - Decimal("0.011")
+        )
+        assert session.total_equity == expected_equity
+        # Must have changed from the pre-fill value.
+        assert session.total_equity != pre_equity
 
     def test_emission_uses_ticker_mark_not_last_price(
         self, sample_strategy_config, session, sample_timestamp,
