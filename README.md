@@ -1,128 +1,225 @@
 # Grid Bot Validation
 
-Grid trading bot validation and backtesting framework.
+A monorepo for running, recording, and validating a Bybit USDT-perpetual grid trading bot.
 
-## Project Structure
+It contains the live trading bot, an event-driven backtester, a mainnet data recorder, a replay engine that drives the bot against recorded data, and tooling to compare backtest results against live execution.
+
+## Repository Layout
 
 ```
 grid-bot-validation/
-├── packages/
-│   └── gridcore/          # Pure grid trading strategy logic (zero dependencies)
-├── bbu_reference/         # Reference implementation from bbu2-master
-├── backtest_reference/    # Backtest reference implementation
-├── docs/                  # Documentation and feature plans
-├── tests/                 # Integration tests
-└── pyproject.toml         # uv workspace configuration
+├── packages/                # Reusable libraries (pure logic, no I/O at the edges)
+│   ├── gridcore/            # Grid strategy engine — zero external dependencies
+│   └── bybit_adapter/       # Bybit REST + WebSocket client wrappers
+│
+├── shared/
+│   └── db/                  # grid-db — SQLAlchemy models, multi-tenant DB layer
+│
+├── apps/                    # Runnable services / CLIs
+│   ├── gridbot/             # Live multi-tenant grid trading bot
+│   ├── backtest/            # Historical backtest engine
+│   ├── recorder/            # Captures live Bybit market + private data to SQLite
+│   ├── replay/              # Replays recorded data through the strategy engine
+│   ├── comparator/          # Diffs backtest vs live trade outcomes
+│   ├── event_saver/         # Streaming event persistence used by gridbot
+│   └── pnl_checker/         # Reconciles our PnL math against Bybit's API
+│
+├── conf/                    # Shared on-disk caches (risk-limit tiers, instruments)
+├── docs/                    # Architecture notes, feature plans, validation results
+├── scripts/                 # One-off migrations and analysis scripts
+├── tests/integration/       # Cross-package integration tests
+├── Makefile                 # `make test`, `make lint`, `make clear-log`
+├── pyproject.toml           # uv workspace root
+└── uv.lock
 ```
+
+The workspace is glued together by `uv` (`[tool.uv.workspace]` in the root `pyproject.toml`). Every directory under `packages/`, `shared/`, and `apps/` is a workspace member resolved from source — there is nothing to publish.
+
+## Components
+
+### Libraries
+
+**`gridcore`** — Pure grid trading logic with **zero external dependencies**.
+Holds grid-level math (`greed.py`), the event-driven strategy engine (`strat.py`), per-position risk management (`position.py`), and the maintenance-margin tier tables / margin formulas used by every downstream component. Everything else depends on it.
+
+**`bybit_adapter`** — Thin wrappers around `pybit` for Bybit V5 REST + WebSocket APIs (public market data, private order/position/wallet streams, risk-limit lookups). Keeps exchange-specific concerns out of `gridcore`.
+
+**`grid-db`** — SQLAlchemy 2.0 data layer shared by every app. Supports SQLite (development, replay, recorder) and PostgreSQL (production gridbot). Tables cover orders, fills, positions, wallet snapshots, ticker snapshots, and per-strategy runs.
+
+### Apps
+
+**`gridbot`** — The live multi-tenant grid trading bot. Reads a YAML config of accounts + strategies, attaches `gridcore` engines to live Bybit streams, places/cancels orders, and persists every state transition via `grid-db`. Supports hedge mode, dynamic risk multipliers, and Telegram notifications.
+
+**`backtest`** — Offline historical backtester. Drives `gridcore` against recorded ticker snapshots and fills with a configurable fill simulator (`book_touch`, `trade_through_at_limit`, `strict_cross`), accurate maintenance-margin tiers, funding accrual, and an honest hedge-aware pair-liquidation model. Outputs per-strategy reports (PnL curve, drawdown, fill log).
+
+**`recorder`** — A standalone process that subscribes to Bybit mainnet WebSocket streams and writes them to SQLite for later replay. Captures L1 ticker snapshots, public trades (optional), and — when API keys are provided — private orders, executions, positions, and wallet snapshots. Tracks gaps and reconciles via REST.
+
+**`replay`** — Reads a recorder database for a given `run_id` and time window, then feeds it through the same `gridcore` engine the live bot uses. The point is *shadow validation*: did our strategy, given the exact market it saw live, produce the same orders, fills, and PnL? Hands its output to `comparator`.
+
+**`comparator`** — Compares a replay/backtest run against the corresponding live run from the same database. Surfaces order divergences, fill mismatches, and PnL deltas with configurable price/quantity tolerances.
+
+**`event_saver`** — Background writer used inside `gridbot` to batch streaming events into the database without blocking the trading loop.
+
+**`pnl_checker`** — CLI that pulls live wallet/position state from Bybit and compares it against `gridcore`'s own PnL calculations. Used to keep our margin/liquidation math honest against the real exchange.
+
+## Data Flow
+
+```
+                ┌──────────────────────────────┐
+                │ Bybit Mainnet (WS + REST)    │
+                └──────────┬───────────────────┘
+                           │
+        ┌──────────────────┼──────────────────────────┐
+        │                  │                          │
+        ▼                  ▼                          ▼
+   ┌─────────┐        ┌─────────┐               ┌────────────┐
+   │ gridbot │───────▶│ grid-db │◀──────────────│  recorder  │
+   └─────────┘  live  └────┬────┘    recorded   └────────────┘
+        ▲                  │
+        │                  │ replay reads same DB
+        │                  ▼
+        │            ┌──────────┐      ┌────────────┐
+        │            │  replay  │─────▶│ comparator │
+        │            └──────────┘      └────────────┘
+        │                                    │
+        │                                    ▼
+        │                              live-vs-shadow diff
+        │
+   ┌────┴────────┐
+   │ pnl_checker │  (sanity-checks live PnL math vs Bybit)
+   └─────────────┘
+```
+
+`gridcore` is the strategy engine shared by **gridbot**, **backtest**, and **replay** — that is the entire point of the architecture. The same code that trades live also runs against recorded history and against synthetic backtest data, so divergences are bugs in I/O wrappers or in the data, not in two parallel strategy implementations.
 
 ## Quick Start
 
 ### Prerequisites
-
 - Python 3.11+
-- [uv](https://github.com/astral-sh/uv) package manager
+- [`uv`](https://github.com/astral-sh/uv) for dependency management
+- SQLite (bundled) for local dev; PostgreSQL for production gridbot
 
-### Installation
+### Install
 
 ```bash
-# Clone the repository
 git clone <repository-url>
 cd grid-bot-validation
-
-# Sync the workspace with uv
 uv sync
-
-# Install gridcore package in editable mode
-uv pip install -e packages/gridcore
 ```
 
-### Running Tests
+`uv sync` resolves the workspace and installs every package in editable mode. No further `pip install` is needed.
+
+### Configure
+
+Each app reads YAML from its own `conf/` directory. Copy the `.example` file and edit:
 
 ```bash
-# Run all gridcore tests
-uv run pytest packages/gridcore/tests/ --cov=gridcore --cov-fail-under=80 -v
-
-# Run specific test file
-uv run pytest packages/gridcore/tests/test_grid.py -v
+cp apps/gridbot/conf/gridbot.yaml.example   apps/gridbot/conf/gridbot.yaml
+cp apps/backtest/conf/backtest.yaml.example apps/backtest/conf/backtest.yaml
+cp apps/recorder/conf/recorder.yaml.example apps/recorder/conf/recorder.yaml
+cp apps/replay/conf/replay.yaml.example     apps/replay/conf/replay.yaml
 ```
 
-## Packages
+API keys and DB URLs are referenced via environment variables (`${BYBIT_API_KEY}`, `${DATABASE_URL}`) — do **not** commit secrets. Recorder configs that hold credentials should be `chmod 600`.
 
-### gridcore
-
-Pure grid trading strategy logic with **zero exchange dependencies**.
-
-- **Location**: `packages/gridcore/`
-- **Description**: Core grid trading strategy implementation extracted from bbu2-master
-- **Test Coverage**: 89%
-- **Dependencies**: None (production), pytest + pytest-cov (dev)
-
-See [`packages/gridcore/README.md`](packages/gridcore/README.md) for detailed documentation.
-
-## Development Workflow
-
-This project follows a structured workflow defined in `CLAUDE.md`:
-
-1. Define task clearly
-2. Research codebase and RULES.md
-3. Create plan and get confirmation
-4. Implement with testing
-5. Update RULES.md with learnings
-6. Verify and commit
-
-See [`CLAUDE.md`](CLAUDE.md) for full workflow details and [`RULES.md`](RULES.md) for project-specific guidelines.
-
-## Package Management with uv
-
-This project uses [uv](https://github.com/astral-sh/uv) for fast, reliable Python package management.
-
-### Common Commands
+### Run
 
 ```bash
-# Sync all dependencies
-uv sync
+# Live trading bot
+uv run python -m gridbot.main --config apps/gridbot/conf/gridbot.yaml
 
-# Add a dependency to workspace dev dependencies
-uv add --dev <package>
+# Backtest
+uv run python -m backtest --config apps/backtest/conf/backtest.yaml
 
-# Add a dependency to a specific package
-cd packages/gridcore
+# Recorder (standalone process — keep running to capture data)
+uv run python -m recorder.main --config apps/recorder/conf/recorder.yaml
+
+# Replay recorded data through the strategy engine
+uv run python -m replay.main --config apps/replay/conf/replay.yaml
+
+# Compare backtest/replay vs live
+uv run python -m comparator --config apps/replay/conf/replay.yaml
+
+# Validate live PnL against Bybit
+uv run python -m pnl_checker --config apps/pnl_checker/conf/pnl_checker.yaml
+```
+
+## Configuration Cheat Sheet
+
+A typical gridbot strategy block:
+
+```yaml
+strategies:
+  - strat_id: ltcusdt_main
+    account: mainnet_live
+    symbol: LTCUSDT
+    tick_size: "0.1"
+    grid_count: 20
+    grid_step: 0.3
+    amount: "x0.001"             # 0.1% of wallet per order
+    max_margin: 5.0              # hard cap on margin used
+    min_total_margin: 3          # threshold for the low-margin boost
+    increase_same_position_on_low_margin: true
+    shadow_mode: false           # true = log-only, no orders sent
+```
+
+The same shape (minus `account` / `shadow_mode`) appears in `backtest.yaml`, so a strategy can be backtested and live-traded from near-identical config.
+
+## Development
+
+### Tests
+
+```bash
+# Full suite (per-package, with coverage merged)
+make test
+
+# Cross-package integration tests only
+make test-integration
+
+# Single package
+uv run pytest packages/gridcore/tests --cov=gridcore -v
+
+# Single file
+uv run pytest apps/backtest/tests/test_runner.py -v
+```
+
+Always run tests through `uv run` — bare `python -m pytest` skips the workspace's editable installs and resolves the wrong import paths.
+
+### Lint
+
+```bash
+make lint   # ruff over the whole workspace
+```
+
+### Adding a Dependency
+
+```bash
+# To a specific package
+cd packages/<name>
 uv add <package>
 
-# Run tests
-uv run pytest packages/gridcore/tests/
-
-# Run Python scripts
-uv run python script.py
+# To workspace dev tools
+uv add --dev <package>
 ```
 
-### Why uv?
+## Database
 
-- **Fast**: 10-100x faster than pip
-- **Reliable**: Deterministic dependency resolution with lockfile
-- **Modern**: Built-in workspace support for monorepos
-- **Compatible**: Works with existing pip/PyPI ecosystem
+`grid-db` works with both SQLite and PostgreSQL via SQLAlchemy. For local development and replay, point `database_url` at a SQLite file:
 
-## Features
+```yaml
+database_url: "sqlite:///gridbot.db"
+```
 
-### Phase B: Core Library Extraction ✅ COMPLETED
+For production gridbot, use PostgreSQL:
 
-**Status**: Completed 2025-12-30
+```yaml
+database_url: "${DATABASE_URL}"   # postgresql+psycopg2://...
+```
 
-Extracted pure strategy logic from `bbu2-master` into `gridcore` package with zero exchange dependencies.
+Multi-tenancy is enforced at the row level via `account` + `strat_id` columns — one database can host any number of strategies and accounts side by side.
 
-- ✅ Grid calculations (from greed.py)
-- ✅ Event-driven strategy engine (from strat.py)
-- ✅ Position risk management (from position.py)
-- ✅ 89% test coverage (37 tests passing)
-- ✅ Zero exchange dependencies verified
+## Workflow
 
-See [`docs/features/0001_IMPLEMENTATION_SUMMARY.md`](docs/features/0001_IMPLEMENTATION_SUMMARY.md) for full details.
+Project conventions live in `CLAUDE.md` (development workflow) and `RULES.md` (code-style / domain gotchas). Feature plans, post-mortems, and architecture notes live under `docs/`.
 
-## License
-
-[Specify license here]
-
-## Contributing
-
-[Specify contribution guidelines here]
+The short version: clearly define the task, search the codebase and `RULES.md` for prior art, agree on a plan before touching code, implement against tests, then update `RULES.md` with anything that future-you would want to know.
