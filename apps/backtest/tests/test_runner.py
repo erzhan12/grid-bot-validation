@@ -303,9 +303,8 @@ class TestBacktestRunnerRiskMultipliers:
     # the per-leg result, and the hedge-scenario tests live in TestPairLiqHedge
     # below.
 
-    def _make_state(self, size: Decimal, entry: Decimal):
+    def _make_state(self, size: Decimal, entry: Decimal) -> SimpleNamespace:
         """Lightweight tracker-state stand-in for pair-formula unit tests."""
-        from types import SimpleNamespace
         return SimpleNamespace(size=size, avg_entry_price=entry)
 
     def test_pair_liq_long_only(self, risk_runner):
@@ -387,7 +386,6 @@ class TestBacktestRunnerRiskMultipliers:
         runner = BacktestRunner(strategy_config=config, executor=executor, session=session)
         runner._mm_tiers = None  # force flat-MMR path
 
-        from types import SimpleNamespace
         long_state = SimpleNamespace(size=Decimal("0.1"), avg_entry_price=Decimal("100000"))
         short_state = SimpleNamespace(size=Decimal("0"), avg_entry_price=Decimal("0"))
         equity = Decimal("10000")
