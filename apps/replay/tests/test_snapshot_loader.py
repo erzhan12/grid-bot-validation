@@ -509,6 +509,131 @@ class TestLoadWalletSeedFull:
 
         assert seed is None
 
+    def test_zero_total_available_balance_returns_none(
+        self, session, sample_account, sample_run, base_ts, caplog
+    ):
+        """0043 review: refuse rows where total_available_balance == 0.
+
+        Symmetric to the total_equity guard. Defends against Bybit dropping
+        the `totalAvailableBalance` key while keeping `totalEquity` — writer
+        would store 0 via decimal_or_zero, loader would otherwise pass the
+        row and seed `BacktestSession.current_balance = 0`, breaking
+        executor margin gating / qty calculator / risk multipliers.
+        """
+        import logging
+
+        repo = WalletSnapshotRepository(session)
+        repo.bulk_insert([
+            WalletSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                exchange_ts=base_ts,
+                local_ts=base_ts,
+                coin="USDT",
+                wallet_balance=Decimal("12345.67"),
+                available_balance=Decimal("12000.00"),
+                total_available_balance=Decimal("0"),  # zero — refuse
+                total_equity=Decimal("15000.50"),
+            ),
+        ])
+
+        with caplog.at_level(logging.WARNING, logger="replay.snapshot_loader"):
+            seed = load_wallet_seed_full(
+                session,
+                sample_run.run_id,
+                str(sample_account.account_id),
+                base_ts + timedelta(seconds=1),
+            )
+
+        assert seed is None
+        warnings = [
+            r for r in caplog.records
+            if "total_available_balance=0" in r.message and "<= 0" in r.message
+        ]
+        assert len(warnings) == 1
+
+    def test_zero_total_equity_returns_none(
+        self, session, sample_account, sample_run, base_ts, caplog
+    ):
+        """0043 review: refuse rows where total_equity == 0.
+
+        Defends against the WS writer's `decimal_or_zero` fallback: a future
+        Bybit payload-shape change that drops account-level keys would
+        currently land as `0` in the DB instead of `NULL`, bypassing the
+        `is None` guard. Also covers the genuinely-empty-account case.
+        """
+        import logging
+
+        repo = WalletSnapshotRepository(session)
+        repo.bulk_insert([
+            WalletSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                exchange_ts=base_ts,
+                local_ts=base_ts,
+                coin="USDT",
+                wallet_balance=Decimal("12345.67"),
+                available_balance=Decimal("12000.00"),
+                total_available_balance=Decimal("14000.25"),
+                total_equity=Decimal("0"),  # simulated writer-zero fallback
+            ),
+        ])
+
+        with caplog.at_level(logging.WARNING, logger="replay.snapshot_loader"):
+            seed = load_wallet_seed_full(
+                session,
+                sample_run.run_id,
+                str(sample_account.account_id),
+                base_ts + timedelta(seconds=1),
+            )
+
+        assert seed is None
+        warnings = [
+            r for r in caplog.records
+            if "total_equity=0" in r.message and "<= 0" in r.message
+        ]
+        assert len(warnings) == 1
+
+    def test_null_total_equity_returns_none(
+        self, session, sample_account, sample_run, base_ts, caplog
+    ):
+        """0043 review fix: refuse to seed when total_equity is NULL even if
+        total_available_balance is populated. Zero is not a safe default for
+        the pair-liq pool input — it would silently corrupt liq for the
+        entire replay run.
+        """
+        import logging
+
+        repo = WalletSnapshotRepository(session)
+        repo.bulk_insert([
+            WalletSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                exchange_ts=base_ts,
+                local_ts=base_ts,
+                coin="USDT",
+                wallet_balance=Decimal("12345.67"),
+                available_balance=Decimal("12000.00"),
+                total_available_balance=Decimal("14000.25"),
+                # total_equity intentionally NULL — partial-migration shape.
+            ),
+        ])
+
+        with caplog.at_level(logging.WARNING, logger="replay.snapshot_loader"):
+            seed = load_wallet_seed_full(
+                session,
+                sample_run.run_id,
+                str(sample_account.account_id),
+                base_ts + timedelta(seconds=1),
+            )
+
+        assert seed is None
+        warnings = [
+            r for r in caplog.records
+            if "NULL total_equity" in r.message
+        ]
+        assert len(warnings) == 1
+
 
 # ---------------------------------------------------------------------------
 # load_active_orders

@@ -15,6 +15,37 @@ from grid_db._decimal import WALLET_ACCOUNT_JSON_KEYS, decimal_or_zero
 logger = logging.getLogger(__name__)
 
 
+def _resolve_exchange_ts(
+    wallet_update_time: object,
+    frame_ts_ms: int,
+    local_ts: datetime,
+) -> datetime:
+    """Pick the best available exchange timestamp for a wallet row.
+
+    Resolution order: wallet_data.updateTime → msg.creationTime → local_ts.
+    The Bybit V5 wallet stream omits `updateTime` inside `data[i]` and
+    carries the exchange timestamp at the frame top level instead; pre-V5
+    payloads (and test fixtures) still set the inner field. Falling back
+    to `local_ts` keeps `WalletSnapshotRepository` time-windowed lookups
+    sane when neither exchange-side timestamp is present.
+    """
+    for candidate in (wallet_update_time, frame_ts_ms):
+        if candidate in (None, "", 0):
+            continue
+        try:
+            ms = int(candidate)
+        except (TypeError, ValueError):
+            continue
+        if ms > 0:
+            return datetime.fromtimestamp(ms / 1000, tz=UTC)
+    logger.debug(
+        "Wallet WS frame missing both updateTime and creationTime; "
+        "stamping exchange_ts from recorder local_ts=%s",
+        local_ts,
+    )
+    return local_ts
+
+
 class WalletWriter:
     """Buffers and bulk-inserts wallet balance snapshots.
 
@@ -179,31 +210,50 @@ class WalletWriter:
         Returns:
             List of WalletSnapshot ORM models.
 
-        Message structure (from Bybit wallet stream):
+        Message structure (Bybit V5 wallet WS frame):
         {
+            "id": "...",
+            "topic": "wallet",
+            "creationTime": 1704067200000,   # top-level, ms — V5 source of truth
             "data": [{
+                "accountIMRate": "...",
                 "coin": [{
                     "coin": "USDT",
                     "walletBalance": "10000.0",
                     "availableToWithdraw": "9500.0"
-                }],
-                "updateTime": "1704067200000"
+                }]
+                # V5 does NOT include `updateTime` here; pre-V5 fixtures may.
             }]
         }
+
+        Timestamp resolution (highest priority first):
+        1. `wallet_data["updateTime"]` — legacy / V3 / test fixtures.
+        2. `msg["creationTime"]` — V5 frame-level exchange timestamp.
+        3. `local_ts` — recorder wall clock; prevents the epoch fallback
+           that would otherwise sort all WS rows below the single REST row
+           in `WalletSnapshotRepository.get_latest_before`.
         """
         snapshots = []
         local_ts = datetime.now(UTC)
 
         for msg in messages:
             data = msg.get("data", [])
+            frame_creation_time = msg.get("creationTime")
+            try:
+                frame_ts_ms = (
+                    int(frame_creation_time)
+                    if frame_creation_time not in (None, "")
+                    else 0
+                )
+            except (TypeError, ValueError):
+                frame_ts_ms = 0
+
             for wallet_data in data:
-                try:
-                    # Parse timestamp
-                    update_time_ms = int(wallet_data.get("updateTime", 0))
-                    exchange_ts = datetime.fromtimestamp(update_time_ms / 1000, tz=UTC)
-                except Exception as e:
-                    logger.warning(f"Error parsing wallet snapshot timestamp: {e}")
-                    continue
+                exchange_ts = _resolve_exchange_ts(
+                    wallet_data.get("updateTime"),
+                    frame_ts_ms,
+                    local_ts,
+                )
 
                 account_raw = {
                     key: wallet_data.get(key)

@@ -85,19 +85,30 @@ class BacktestSession:
 
     Tracks trades, equity curve, and calculates performance metrics.
 
-    In standalone backtests, ``initial_balance`` is the configured starting
-    balance. In replay seeded from 0042 wallet snapshots, ``initial_balance``
-    and ``current_balance`` represent Bybit UTA account-level
-    ``totalAvailableBalance`` plus simulated PnL/fees/funding, not the legacy
-    per-coin USDT ``walletBalance``. Backtest liquidation math, order margin
-    gating, wallet-fraction sizing, margin logs, and risk multipliers all
-    consume that UTA available-balance baseline via ``current_balance``.
+    Two parallel balance baselines are tracked:
+
+    - ``current_balance`` — UTA ``totalAvailableBalance`` (0042). Consumed
+      by executor margin gating, wallet-fraction qty sizing, margin
+      logs, and risk multipliers. Initially set to ``initial_balance``.
+    - ``total_equity`` — UTA ``totalEquity`` (0043). Consumed by the
+      pair liquidation formula. Initially set to ``initial_equity``,
+      which falls back to ``initial_balance`` when not provided so
+      pre-0043 callers keep the same numeric behaviour.
+
+    Both baselines evolve by the same per-tick delta
+    (``realized_pnl + unrealized_pnl + funding − commission``); only the
+    starting offsets differ. Live ``totalEquity`` exceeds
+    ``totalAvailableBalance`` by the locked initial-margin and similar
+    UTA buffers, so a replay seeded from feature 0042 wallet snapshots
+    will start with ``total_equity > current_balance`` and the gap
+    persists across the run.
     """
 
     def __init__(
         self,
         session_id: Optional[str] = None,
         initial_balance: Decimal = Decimal("10000"),
+        initial_equity: Optional[Decimal] = None,
     ):
         """Initialize backtest session.
 
@@ -106,10 +117,19 @@ class BacktestSession:
             initial_balance: Starting available-balance baseline. In replay
                 seeded from feature 0042, this is account-level UTA
                 ``totalAvailableBalance``.
+            initial_equity: Starting total-equity baseline (feature 0043).
+                Used as the pool input to the hedge-aware pair liquidation
+                formula. When ``None``, falls back to ``initial_balance``
+                so non-replay backtests and pre-0043 callers behave
+                identically.
         """
         self.session_id = session_id or uuid.uuid4().hex
         self.initial_balance = initial_balance
         self.current_balance = initial_balance
+        self.initial_equity = (
+            initial_equity if initial_equity is not None else initial_balance
+        )
+        self.total_equity = self.initial_equity
 
         # Trade tracking
         self.trades: list[BacktestTrade] = []
@@ -165,6 +185,33 @@ class BacktestSession:
         """
         self.total_funding += amount
 
+    def refresh_balances(self, unrealized_pnl: Decimal) -> None:
+        """Refresh ``current_balance`` and ``total_equity`` from current state.
+
+        Recomputes both balance baselines using the latest
+        ``total_realized_pnl`` / ``total_commission`` / ``total_funding``
+        plus the supplied ``unrealized_pnl``. Does NOT touch the equity
+        curve, drawdown peak, or margin tracking — use ``update_equity``
+        for that.
+
+        Needed inside ``BacktestRunner._process_fill``: by the time the
+        per-tick ``session.update_equity`` runs, the just-mutated tracker
+        state has already been consumed by liq / risk / snapshot calls,
+        so they would otherwise read last-tick balance values. Calling
+        this helper after ``record_trade`` keeps the pair-liq pool input
+        (``total_equity``) and the executor margin baseline
+        (``current_balance``) synchronous with the post-fill position
+        state.
+        """
+        pnl_delta = (
+            self.total_realized_pnl
+            + unrealized_pnl
+            - self.total_commission
+            + self.total_funding
+        )
+        self.current_balance = self.initial_balance + pnl_delta
+        self.total_equity = self.initial_equity + pnl_delta
+
     def update_equity(
         self,
         timestamp: datetime,
@@ -183,16 +230,19 @@ class BacktestSession:
         Returns:
             Current equity
         """
-        equity = (
-            self.initial_balance
-            + self.total_realized_pnl
+        # Per-tick PnL delta is identical across both baselines; only the
+        # starting offset differs (available vs. equity).
+        pnl_delta = (
+            self.total_realized_pnl
             + unrealized_pnl
             - self.total_commission
             + self.total_funding
         )
+        equity = self.initial_balance + pnl_delta
 
         self.equity_curve.append((timestamp, equity))
         self.current_balance = equity
+        self.total_equity = self.initial_equity + pnl_delta
 
         # Update peak and drawdown
         if equity >= self._peak_equity:

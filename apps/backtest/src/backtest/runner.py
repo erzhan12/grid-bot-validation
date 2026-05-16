@@ -516,18 +516,37 @@ class BacktestRunner:
         # Refresh margin fields so the log below shows current IM/MM
         tracker._update_margin()
 
-        # Compute liq_ratio for logging (liq_price / last_price)
+        # 0043: refresh session balance/equity from post-fill tracker state.
+        # The engine's per-tick `session.update_equity` runs AFTER this
+        # function returns; without this refresh, the pair-liq formula,
+        # the emitted parity snapshot, and risk multipliers would all
+        # consume last-tick balance values against post-fill positions.
+        mark_for_unrealized = (
+            self._last_mark_price
+            if self._last_mark_price is not None
+            else event.price
+        )
+        fresh_unrealized = (
+            self._long_tracker.calculate_unrealized_pnl(mark_for_unrealized)
+            + self._short_tracker.calculate_unrealized_pnl(mark_for_unrealized)
+        )
+        self._session.refresh_balances(fresh_unrealized)
+
+        # Compute liq_ratio for logging (liq_price / last_price).
+        # 0043: pair-aware hedge formula — both legs computed together,
+        # pick the just-mutated direction for the log.
         liq_ratio = 0.0
         if (
             self._enable_risk
             and self._last_price is not None
             and tracker.state.size > 0
         ):
-            position_value = tracker.state.position_value
-            liq_price = self._estimate_liquidation_price(
-                tracker.state.avg_entry_price, direction, position_value,
-                self._session.current_balance,
+            liq_long, liq_short = self._estimate_pair_liq_prices(
+                self._long_tracker.state,
+                self._short_tracker.state,
+                self._session.total_equity,
             )
+            liq_price = liq_long if direction == DirectionType.LONG else liq_short
             liq_ratio = float(liq_price / self._last_price) if self._last_price else 0.0
 
         margin = (
@@ -609,9 +628,13 @@ class BacktestRunner:
             position_mm, _mmr = calc_maintenance_margin(
                 position_value, self.symbol, tiers=self._mm_tiers
             )
-            liq_price = self._estimate_liquidation_price(
-                entry_price, direction, position_value, self._session.current_balance,
+            # 0043: pair-aware hedge liq, pick the snapshot's direction.
+            liq_long, liq_short = self._estimate_pair_liq_prices(
+                self._long_tracker.state,
+                self._short_tracker.state,
+                self._session.total_equity,
             )
+            liq_price = liq_long if direction == DirectionType.LONG else liq_short
         else:
             unrealised = Decimal("0")
             position_im = Decimal("0")
@@ -639,6 +662,7 @@ class BacktestRunner:
         tracker: BacktestPositionTracker,
         wallet_balance: Decimal,
         direction: str,
+        liq_price: Decimal,
     ) -> PositionState:
         """Build gridcore PositionState from backtest tracker state.
 
@@ -646,6 +670,11 @@ class BacktestRunner:
             tracker: Position tracker with current size/entry.
             wallet_balance: Current wallet balance for margin ratio.
             direction: 'long' or 'short'.
+            liq_price: Liquidation price for this leg, already computed
+                by the caller via the pair-aware ``_estimate_pair_liq_prices``
+                (feature 0043). Centralising the call keeps the codebase
+                on a single liq formula and avoids recomputing the pair
+                twice within one ``_update_risk_multipliers`` pass.
 
         Returns:
             PositionState for risk calculation.
@@ -666,7 +695,6 @@ class BacktestRunner:
                 raise ValueError(
                     f"wallet_balance is zero with {direction} position value {position_value}"
                 )
-            liq_price = self._estimate_liquidation_price(entry_price, direction, position_value, wallet_balance)
         else:
             position_value = Decimal("0")
             margin = Decimal("0")
@@ -682,55 +710,87 @@ class BacktestRunner:
             position_value=position_value,
         )
 
-    def _estimate_liquidation_price(
+    def _estimate_pair_liq_prices(
         self,
-        entry_price: Decimal,
-        direction: str,
-        position_value: Decimal,
-        wallet_balance: Decimal,
-    ) -> Decimal:
-        """Estimate liquidation price using Bybit cross-margin formula.
+        long_state,
+        short_state,
+        total_equity: Decimal,
+    ) -> tuple[Decimal, Decimal]:
+        """Hedge-aware pair liquidation prices for (long, short) legs.
 
-        Cross-margin formula (matches live bot behaviour where the full wallet
-        balance backstops the position):
+        Implements the formula derived in feature 0043 against 13 paired
+        mainnet snapshots (max |Δ| 0.60 USDT vs live ``liqPrice``); see
+        ``docs/features/0043_PLAN.md`` Phase 2 for the validation table.
 
-        - Long:  liq = (qty * entry - available + MM) / qty
-        - Short: liq = (qty * entry + available - MM) / qty
+        Three non-obvious choices:
 
-        Where available = wallet_balance. In 0042-seeded replay this is Bybit
-        UTA account-level totalAvailableBalance, not per-coin walletBalance.
+        1. Pair-shaped: a single input pair yields both legs' liq.
+        2. ``total_equity`` is the pool input, not ``totalAvailableBalance``
+           (the latter under-shoots by 30-45 USDT).
+        3. ``mm_total = calc_maintenance_margin(L_pv + S_pv, …)`` — full
+           tier-MMR on combined notional, NOT the sum of per-leg
+           ``positionMM`` (Bybit publishes the smaller leg's MM with a
+           hedge discount but reverts to full MMR for liq calc).
 
-        Reference: Bybit help-center ``Liquidation-Price-USDT-Contract``,
-        bbu_backtest ``bybit_calculations.py:185-197``.
+        Args:
+            long_state: Tracker state with ``size`` and ``avg_entry_price``.
+            short_state: Tracker state with ``size`` and ``avg_entry_price``.
+            total_equity: UTA ``totalEquity`` baseline (0042 wallet field).
+
+        Returns:
+            ``(liq_long, liq_short)``. The over-hedged leg returns ``0`` by
+            construction (Bybit reports ``NULL`` in that case). The
+            dominant leg's negative result is clamped to ``0`` (covered by
+            equity, no real liq risk). For fully-hedged or zero positions
+            both legs return ``0``.
         """
-        if entry_price <= 0 or position_value <= 0:
-            return Decimal("0")
+        L_size = long_state.size
+        L_entry = long_state.avg_entry_price
+        S_size = short_state.size
+        S_entry = short_state.avg_entry_price
 
-        qty = position_value / entry_price
+        if L_size <= 0 and S_size <= 0:
+            return Decimal("0"), Decimal("0")
 
-        # Compute maintenance margin (dollar amount)
-        if self._mm_tiers is not None and position_value > 0:
-            mm_amount, _ = calc_maintenance_margin(
-                position_value, self.symbol, tiers=self._mm_tiers
+        L_pv = L_size * L_entry if L_size > 0 else Decimal("0")
+        S_pv = S_size * S_entry if S_size > 0 else Decimal("0")
+        combined_pv = L_pv + S_pv
+
+        if self._mm_tiers is not None and combined_pv > 0:
+            mm_total, _ = calc_maintenance_margin(
+                combined_pv, self.symbol, tiers=self._mm_tiers
             )
         else:
-            mm_amount = position_value * Decimal(str(self._mmr))
+            mm_total = combined_pv * Decimal(str(self._mmr))
 
-        if direction == DirectionType.LONG:
-            # Long: liq = (qty * entry - available + MM) / qty
-            liq = (qty * entry_price - wallet_balance + mm_amount) / qty
-            # liq <= 0 means wallet fully covers the position (no liquidation risk).
-            # Return 0 to match Bybit behaviour (liqPrice=0 when safe).
-            return max(liq, Decimal("0"))
-        else:
-            # Short: liq = (qty * entry + available - MM) / qty
-            liq = (qty * entry_price + wallet_balance - mm_amount) / qty
-            # When wallet >> position, liq is far above market (no real risk).
-            # Bybit returns liqPrice=0 in this case.  Cap at 2× entry to avoid
-            # absurd ratios; return 0 when liq exceeds that (safe).
-            if liq > entry_price * 2:
-                return Decimal("0")
-            return liq
+        q_net = L_size - S_size
+        pool = total_equity - mm_total
+
+        if q_net > 0:
+            # Net long: liq_long = entry - pool/q_net.
+            # Negative result means equity fully covers the long; clamp to 0
+            # to match Bybit returning NULL/0 in the safe regime.
+            liq_long = L_entry - pool / q_net
+            return max(liq_long, Decimal("0")), Decimal("0")
+        if q_net < 0:
+            q_abs = -q_net
+            liq_short = S_entry + pool / q_abs
+            # 0043 derivation: Bybit returns the raw liq even when it is
+            # far above market in HEDGED configurations — validation row
+            # L=2.2/S=3.1 has live liq_short=171 at S_entry=58 (above 2×).
+            # No cap there.
+            #
+            # For SHORT-ONLY (L_size == 0) we have no mainnet evidence and
+            # preserve the pre-0043 safe cap: when wallet/equity vastly
+            # exceeds the short notional, the formula's raw output is
+            # absurdly large and the pre-0042 code documented Bybit as
+            # returning 0. Cap defensively until Phase 4 comparator data
+            # contradicts it.
+            if L_size <= 0 and liq_short > S_entry * 2:
+                return Decimal("0"), Decimal("0")
+            return Decimal("0"), liq_short
+        # Fully hedged: q_net == 0 — both legs offset, no liq risk.
+        return Decimal("0"), Decimal("0")
 
     def _update_risk_multipliers(self, last_price: float) -> None:
         """Recalculate risk multipliers from current position state.
@@ -739,11 +799,19 @@ class BacktestRunner:
         """
         wallet_balance = self._session.current_balance
 
+        # 0043: compute pair liq once for this tick, hand each leg's
+        # value to _build_position_state. Single call, single formula.
+        liq_long, liq_short = self._estimate_pair_liq_prices(
+            self._long_tracker.state,
+            self._short_tracker.state,
+            self._session.total_equity,
+        )
+
         long_state = self._build_position_state(
-            self._long_tracker, wallet_balance, DirectionType.LONG
+            self._long_tracker, wallet_balance, DirectionType.LONG, liq_long
         )
         short_state = self._build_position_state(
-            self._short_tracker, wallet_balance, DirectionType.SHORT
+            self._short_tracker, wallet_balance, DirectionType.SHORT, liq_short
         )
 
         # Cache size-based position_ratio + liq_price on both Position

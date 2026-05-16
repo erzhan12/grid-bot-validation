@@ -1,5 +1,12 @@
 # Data Recorder Configuration — Phase 4 of feature 0029
-# LTCUSDT mainnet with private streams (API keys via .env).
+# LTCUSDT mainnet with private streams.
+#
+# API keys: recorder uses a SEPARATE read-only key pair so the live
+# gridbot's trading keys (`BYBIT_API_KEY` / `BYBIT_API_SECRET`) are not
+# accidentally rotated when the recorder profile changes. Required
+# scopes for the read-only key: Wallet (read), Positions (read),
+# Orders (read). Without these the initial REST snapshot returns
+# empty and the run fails Phase 4 pre-check.
 
 symbols:
   - "LTCUSDT"
@@ -18,8 +25,8 @@ health_log_interval: 60   # frequent heartbeat for visibility
 
 # Private streams — REQUIRED for seed-aware replay
 account:
-  api_key: "${BYBIT_API_KEY}"
-  api_secret: "${BYBIT_API_SECRET}"
+  api_key: "${BYBIT_READONLY_API_KEY}"
+  api_secret: "${BYBIT_READONLY_API_SECRET}"
 
 # When false (default for Phase 4): no `publicTrade.*` WS subscription
 # at all — recorder never receives or writes market trades. Ticker

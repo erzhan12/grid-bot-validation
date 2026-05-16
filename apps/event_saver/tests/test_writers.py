@@ -1223,3 +1223,115 @@ class TestWalletWriter:
             if "Skipped malformed wallet coin row" in r.message
         ]
         assert len(warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_uses_update_time_when_present(self, mock_db):
+        """Legacy / V3 path: `updateTime` inside wallet_data wins resolution."""
+        writer = WalletWriter(db=mock_db, batch_size=100)
+        update_time_ms = 1704067200000  # 2024-01-01 00:00:00 UTC
+        messages = [
+            {
+                "creationTime": 1700000000000,  # earlier, should be ignored
+                "data": [
+                    {
+                        "accountType": "UNIFIED",
+                        "coin": [
+                            {
+                                "coin": "USDT",
+                                "walletBalance": "100",
+                                "availableToWithdraw": "90",
+                            }
+                        ],
+                        "updateTime": str(update_time_ms),
+                    }
+                ],
+            }
+        ]
+
+        await writer.write(uuid4(), messages)
+
+        assert len(writer._buffer) == 1
+        snap = writer._buffer[0]
+        assert snap.exchange_ts == datetime.fromtimestamp(
+            update_time_ms / 1000, tz=UTC
+        )
+
+    @pytest.mark.asyncio
+    async def test_uses_frame_creation_time_when_update_time_absent(self, mock_db):
+        """V5 path: no `updateTime` in wallet_data; fall back to frame `creationTime`."""
+        writer = WalletWriter(db=mock_db, batch_size=100)
+        creation_time_ms = 1704067200000  # 2024-01-01 00:00:00 UTC
+        messages = [
+            {
+                "creationTime": creation_time_ms,
+                "data": [
+                    {
+                        "accountType": "UNIFIED",
+                        "totalEquity": "104.47",
+                        "totalAvailableBalance": "71.85",
+                        "coin": [
+                            {
+                                "coin": "USDT",
+                                "walletBalance": "104.74",
+                                "availableToWithdraw": "",
+                            }
+                        ],
+                        # NO updateTime here — matches real V5 frames.
+                    }
+                ],
+            }
+        ]
+
+        await writer.write(uuid4(), messages)
+
+        assert len(writer._buffer) == 1
+        snap = writer._buffer[0]
+        assert snap.exchange_ts == datetime.fromtimestamp(
+            creation_time_ms / 1000, tz=UTC
+        )
+        # exchange_ts is NOT the 1970 epoch — regression guard for the bug
+        # that prompted this fix.
+        assert snap.exchange_ts.year >= 2024
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_local_ts_when_both_timestamps_missing(
+        self, mock_db, caplog
+    ):
+        """Both `updateTime` and `creationTime` absent → use local_ts, never epoch."""
+        import logging
+
+        writer = WalletWriter(db=mock_db, batch_size=100)
+        messages = [
+            {
+                # No creationTime at top level.
+                "data": [
+                    {
+                        "accountType": "UNIFIED",
+                        "coin": [
+                            {
+                                "coin": "USDT",
+                                "walletBalance": "100",
+                                "availableToWithdraw": "90",
+                            }
+                        ],
+                        # No updateTime in wallet_data.
+                    }
+                ],
+            }
+        ]
+
+        with caplog.at_level(logging.DEBUG, logger="event_saver.writers.wallet_writer"):
+            await writer.write(uuid4(), messages)
+
+        assert len(writer._buffer) == 1
+        snap = writer._buffer[0]
+        assert snap.exchange_ts == snap.local_ts
+        assert snap.exchange_ts.year >= 2024  # not 1970 epoch
+        # Confirm the debug-level signal fired so production logs can
+        # surface the unexpected-absence case if it spikes.
+        debug_msgs = [
+            r for r in caplog.records
+            if r.levelname == "DEBUG"
+            and "missing both updateTime and creationTime" in r.message
+        ]
+        assert len(debug_msgs) == 1

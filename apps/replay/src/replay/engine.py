@@ -222,7 +222,18 @@ class ReplayEngine:
             if wallet_seed is not None
             else config.initial_balance
         )
-        session = BacktestSession(initial_balance=initial_balance)
+        # 0043: total_equity is the pool input for the hedge-aware pair
+        # liquidation formula. Falls back to initial_balance when no seed
+        # is available (non-replay / pre-0043 paths).
+        initial_equity = (
+            wallet_seed.total_equity
+            if wallet_seed is not None
+            else initial_balance
+        )
+        session = BacktestSession(
+            initial_balance=initial_balance,
+            initial_equity=initial_equity,
+        )
         runner = self._init_runner(
             strategy_config,
             session,
@@ -239,13 +250,14 @@ class ReplayEngine:
             logger.info(
                 "Seeded run_id=%s: long.size=%s, short.size=%s, "
                 "anchor_or_grid_levels=%s, coin_balance=%s, "
-                "total_available_balance=%s, active_orders=%s",
+                "total_available_balance=%s, total_equity=%s, active_orders=%s",
                 run_id,
                 long_seed.size if long_seed is not None else Decimal("0"),
                 short_seed.size if short_seed is not None else Decimal("0"),
                 len(grid_seed.grid) if grid_seed is not None else 0,
                 wallet_seed.coin_balance if wallet_seed is not None else None,
                 initial_balance,
+                initial_equity,
                 len(order_seeds) if order_seeds is not None else 0,
             )
 

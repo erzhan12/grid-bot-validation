@@ -380,19 +380,68 @@ def load_wallet_seed_full(
 ) -> Optional[WalletSeed]:
     """Load the latest 0042 wallet seed for a run/account/coin.
 
-    Returns ``None`` when no snapshot exists or when the snapshot is from a
-    legacy/migrated DB row with ``total_available_balance IS NULL``. That keeps
-    replay's existing fallback-to-config contract intact for old recorder data.
+    Returns ``None`` when:
+
+    - No snapshot exists, OR
+    - ``total_available_balance IS NULL`` (legacy pre-0042 row), OR
+    - ``total_equity IS NULL`` while ``total_available_balance`` is populated, OR
+    - ``total_equity <= 0`` or ``total_available_balance <= 0`` (defensive).
+
+    The non-positive guards catch two distinct failure modes that would
+    otherwise silently corrupt either the 0043 pair-liq formula
+    (``total_equity``) or the 0042 executor margin gating / qty calculator /
+    risk multiplier inputs (``total_available_balance``):
+
+    1. WS-writer fallback. ``wallet_writer._messages_to_models`` uses
+       ``decimal_or_zero(...)`` which maps both ``None`` and ``""`` to
+       ``Decimal(0)``. If a future Bybit payload shape drops one of the
+       account-level keys entirely, the DB row stores ``0`` rather than
+       ``NULL`` and the ``is None`` guard above misses it.
+    2. Genuinely zero baselines. A fully-margined or empty account has no
+       meaningful replay interpretation — simulation cannot open new
+       orders with zero available margin.
+
+    Both produce the same outcome: refuse and let replay fall back to
+    ``config.initial_balance``.
     """
     repo = WalletSnapshotRepository(db_session)
     snap = repo.get_latest_before(run_id, account_id, coin, at_ts)
     if snap is None or snap.total_available_balance is None:
         return None
+    if snap.total_equity is None:
+        logger.warning(
+            "Wallet snapshot for run_id=%s account_id=%s coin=%s has "
+            "total_available_balance but NULL total_equity; refusing to seed "
+            "with zero equity baseline. Re-record after the 0042 migration "
+            "so writes populate both columns.",
+            run_id, account_id, coin,
+        )
+        return None
+    if snap.total_equity <= 0:
+        logger.warning(
+            "Wallet snapshot for run_id=%s account_id=%s coin=%s has "
+            "total_equity=%s (<= 0); refusing to seed. Possible causes: "
+            "Bybit payload missing the totalEquity key (writer stored 0 via "
+            "decimal_or_zero), or the account is empty. Replay will fall "
+            "back to config.initial_balance.",
+            run_id, account_id, coin, snap.total_equity,
+        )
+        return None
+    if snap.total_available_balance <= 0:
+        logger.warning(
+            "Wallet snapshot for run_id=%s account_id=%s coin=%s has "
+            "total_available_balance=%s (<= 0); refusing to seed. Possible "
+            "causes: Bybit payload missing the totalAvailableBalance key "
+            "(writer stored 0 via decimal_or_zero), or the account is "
+            "fully margined. Replay will fall back to config.initial_balance.",
+            run_id, account_id, coin, snap.total_available_balance,
+        )
+        return None
 
     return WalletSeed(
         coin_balance=snap.wallet_balance,
         total_available_balance=snap.total_available_balance,
-        total_equity=snap.total_equity if snap.total_equity is not None else Decimal("0"),
+        total_equity=snap.total_equity,
         total_margin_balance=(
             snap.total_margin_balance
             if snap.total_margin_balance is not None
