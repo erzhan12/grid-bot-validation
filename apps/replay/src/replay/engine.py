@@ -397,9 +397,11 @@ class ReplayEngine:
                 position_pairs = pc.pair_and_compare(live_snaps, bt_snaps)
                 pc.fold_metrics_into(metrics, position_pairs)
                 logger.info(
-                    "Position telemetry: %d pairs compared, %d unmatched bt, %d missing telemetry",
+                    "Position telemetry: %d pairs compared, %d unmatched bt, "
+                    "%d state diverged, %d missing telemetry",
                     metrics.position_pairs_compared,
                     metrics.position_pairs_unmatched_bt,
+                    metrics.position_pairs_state_diverged,
                     metrics.position_pairs_missing_telemetry,
                 )
             else:

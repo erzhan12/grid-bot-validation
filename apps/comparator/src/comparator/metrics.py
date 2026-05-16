@@ -102,6 +102,13 @@ class ValidationMetrics:
     position_pairs_compared: int = 0
     position_pairs_unmatched_bt: int = 0
     position_pairs_missing_telemetry: int = 0
+    # 0044: pairs matched by exchange_ts but where backtest state has drifted
+    # from live (size or entry beyond tolerance). Excluded from delta
+    # aggregates so operator-induced artefacts (e.g. manual fills not in the
+    # grid replay) don't pollute the headline metrics. See
+    # PositionComparator.state_size_tolerance / state_entry_rel_tolerance and
+    # docs/features/0044_PLAN.md.
+    position_pairs_state_diverged: int = 0
 
 
 def _compute_trade_delta(pair: MatchedTrade) -> TradeDelta:
