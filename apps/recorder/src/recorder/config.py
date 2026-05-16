@@ -127,6 +127,16 @@ def load_config(config_path: Optional[str] = None) -> RecorderConfig:
                 f"Environment variable '{var_name}' not set "
                 f"(referenced in {config_path})"
             )
+        if not value:
+            # Set but empty (`BYBIT_API_KEY=` with no value). Pydantic
+            # `SecretStr` would happily accept this and the recorder would
+            # fail later with an opaque Bybit 401. Fail loudly at config
+            # load instead so operators see the misconfiguration immediately.
+            raise ValueError(
+                f"Environment variable '{var_name}' is set but empty "
+                f"(referenced in {config_path}); set a non-empty value or "
+                f"remove the placeholder from the config"
+            )
         return value
 
     expanded = re.sub(r"\$\{(\w+)}", _expand_env, raw)

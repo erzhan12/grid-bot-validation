@@ -317,7 +317,12 @@ class WalletWriter:
                                 raw_json={**coin_data, "_account": account_raw},
                             )
                         )
-                    except Exception as e:
+                    except (InvalidOperation, TypeError) as e:
+                        # Consistent with the account-fields except scope
+                        # above: only catch parse-shaped errors. Anything
+                        # else (AttributeError, KeyError on a malformed
+                        # `coin_data`) propagates so it is visible instead
+                        # of silently dropped.
                         logger.warning(
                             f"Skipped malformed wallet coin row: {e}"
                         )
