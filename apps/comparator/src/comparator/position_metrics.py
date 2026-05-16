@@ -37,6 +37,21 @@ logger = logging.getLogger(__name__)
 PAIR_TOLERANCE_S = 5
 """Maximum exchange_ts gap allowed between paired live/backtest snapshots."""
 
+STATE_SIZE_TOLERANCE = Decimal("0.001")
+"""Default |live.size - bt.size| above which a pair is state-diverged.
+
+Sized to cover float / tier-rounding noise. LTCUSDT qty_step is 0.1 →
+0.001 is well below one quantum, so any real position drift exceeds
+this threshold immediately.
+"""
+
+STATE_ENTRY_REL_TOLERANCE = Decimal("0.001")
+"""Default relative entry-price drift |Δentry/live.entry| → state-diverged.
+
+0.1% is roughly the worst-case rounding within a single fill quantum;
+real divergence (missed fills, manual interventions) far exceeds this.
+"""
+
 
 @dataclass
 class PositionComparisonPair:
@@ -62,6 +77,14 @@ class PositionComparisonPair:
     # True when any per-field delta is None due to NULL telemetry on either
     # side (other fields may still have populated deltas).
     has_missing_telemetry: bool = False
+
+    # 0044: pair matched by exchange_ts but live and backtest hold different
+    # position state (size or entry price beyond tolerance). The deltas above
+    # are still computed for diagnostic CSV output, but ``fold_metrics_into``
+    # excludes them from mean/max abs aggregates so artefacts like operator
+    # manual interventions (recorded live, absent from grid replay) don't
+    # pollute the headline `liq_price_max_abs_delta` metric.
+    state_diverged: bool = False
 
 
 def _safe_sub(a: Optional[Decimal], b: Optional[Decimal]) -> Optional[Decimal]:
@@ -121,8 +144,39 @@ def _build_pair(
 class PositionComparator:
     """Pairs live/backtest snapshots per-side and computes aggregate metrics."""
 
-    def __init__(self, pair_tolerance_s: int = PAIR_TOLERANCE_S):
+    def __init__(
+        self,
+        pair_tolerance_s: int = PAIR_TOLERANCE_S,
+        state_size_tolerance: Decimal = STATE_SIZE_TOLERANCE,
+        state_entry_rel_tolerance: Decimal = STATE_ENTRY_REL_TOLERANCE,
+    ):
         self._tolerance_s = pair_tolerance_s
+        self._size_tol = state_size_tolerance
+        self._entry_rel_tol = state_entry_rel_tolerance
+
+    def _state_diverged(
+        self, live: PositionSnapshot, bt: PositionSnapshot,
+    ) -> bool:
+        """0044: detect whether a paired snapshot's underlying state has drifted.
+
+        Returns True when |live.size − bt.size| exceeds ``state_size_tolerance``
+        OR the relative entry-price drift exceeds ``state_entry_rel_tolerance``.
+        Both-zero positions never diverge (closed-on-both-sides matches
+        trivially). When one side is zero and the other isn't, the size
+        delta triggers the divergence flag.
+        """
+        l_size = live.size or Decimal("0")
+        b_size = bt.size or Decimal("0")
+        if l_size == 0 and b_size == 0:
+            return False
+        if abs(l_size - b_size) > self._size_tol:
+            return True
+        l_entry = live.entry_price or Decimal("0")
+        b_entry = bt.entry_price or Decimal("0")
+        if l_entry > 0:
+            if abs(l_entry - b_entry) / l_entry > self._entry_rel_tol:
+                return True
+        return False
 
     def pair_and_compare(
         self,
@@ -170,7 +224,22 @@ class PositionComparator:
                 # not advance live_idx; the next bt row may claim this live row.
                 out.append(_unmatched_bt_marker(bt_row))
                 continue
-            out.append(_build_pair(live_row, bt_row))
+            pair = _build_pair(live_row, bt_row)
+            # 0044: flag (but keep) pairs where position state has drifted
+            # between live and backtest. The pair is still emitted with
+            # deltas for diagnostic CSV inspection, but folded out of the
+            # mean/max aggregates so operator manual fills don't pollute
+            # the headline metric.
+            if self._state_diverged(live_row, bt_row):
+                pair.state_diverged = True
+                logger.debug(
+                    "Position pair state diverged at exchange_ts=%s "
+                    "side=%s: live(size=%s, entry=%s) vs bt(size=%s, entry=%s)",
+                    bt_row.exchange_ts, live_row.side,
+                    live_row.size, live_row.entry_price,
+                    bt_row.size, bt_row.entry_price,
+                )
+            out.append(pair)
             live_idx += 1  # Consume: one-to-one invariant.
         return out
 
@@ -180,11 +249,19 @@ class PositionComparator:
         pairs: list[PositionComparisonPair],
     ) -> None:
         """Mutate ``metrics`` with the 12 new aggregate fields (idempotent)."""
-        matched = [p for p in pairs if p.backtest is not None and p.live is not None]
+        all_matched = [
+            p for p in pairs if p.backtest is not None and p.live is not None
+        ]
         unmatched = [p for p in pairs if p.backtest is not None and p.live is None]
+        # 0044: state-diverged pairs are matched-by-timestamp but excluded
+        # from delta aggregates. They are counted separately so reporter
+        # output makes the artefact visible without polluting the metric.
+        diverged = [p for p in all_matched if p.state_diverged]
+        matched = [p for p in all_matched if not p.state_diverged]
 
         metrics.position_pairs_compared = len(matched)
         metrics.position_pairs_unmatched_bt = len(unmatched)
+        metrics.position_pairs_state_diverged = len(diverged)
         metrics.position_pairs_missing_telemetry = sum(
             1 for p in matched if p.has_missing_telemetry
         )

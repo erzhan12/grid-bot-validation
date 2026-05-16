@@ -286,3 +286,86 @@ def test_un_migrated_db_raises():
             load_position_snapshots(
                 session, run_id="r", symbol="LTCUSDT", source="live",
             )
+
+
+# ---------------------------------------------------------------------------
+# 0044: state-consistency filter
+# ---------------------------------------------------------------------------
+
+
+class TestStateConsistencyFilter:
+    """Pairs matched by exchange_ts but with drifted position state are
+    flagged ``state_diverged`` and excluded from delta aggregates.
+    """
+
+    def test_consistent_pair_not_diverged(self, base_ts):
+        """Matching size + entry within tolerance → state_diverged=False."""
+        live = [_snap("Buy", base_ts, size=Decimal("1.0"), entry_price=Decimal("100"), source="live")]
+        bt = [_snap("Buy", base_ts, size=Decimal("1.0"), entry_price=Decimal("100"), source="backtest")]
+        pairs = PositionComparator().pair_and_compare(live, bt)
+        assert len(pairs) == 1
+        assert pairs[0].state_diverged is False
+        metrics = ValidationMetrics()
+        PositionComparator().fold_metrics_into(metrics, pairs)
+        assert metrics.position_pairs_compared == 1
+        assert metrics.position_pairs_state_diverged == 0
+
+    def test_size_diverged_pair_flagged(self, base_ts):
+        """|live.size - bt.size| > tol → state_diverged=True, excluded."""
+        live = [_snap("Buy", base_ts, size=Decimal("4.8"), entry_price=Decimal("57.45"),
+                      liq_price=Decimal("14.5"), source="live")]
+        bt = [_snap("Buy", base_ts, size=Decimal("3.1"), entry_price=Decimal("57.45"),
+                    liq_price=Decimal("0"), source="backtest")]
+        pairs = PositionComparator().pair_and_compare(live, bt)
+        assert pairs[0].state_diverged is True
+
+        metrics = ValidationMetrics()
+        PositionComparator().fold_metrics_into(metrics, pairs)
+        # The diverged pair is COUNTED only in the diverged bucket.
+        assert metrics.position_pairs_state_diverged == 1
+        assert metrics.position_pairs_compared == 0
+        # The 14.5 USDT liq_delta does NOT pollute the headline metric.
+        assert metrics.liq_price_max_abs_delta == Decimal("0")
+        assert metrics.liq_price_mean_abs_delta == Decimal("0")
+
+    def test_entry_diverged_pair_flagged(self, base_ts):
+        """|live.entry - bt.entry|/live.entry > tol → state_diverged=True."""
+        live = [_snap("Buy", base_ts, size=Decimal("1.0"), entry_price=Decimal("100"), source="live")]
+        bt = [_snap("Buy", base_ts, size=Decimal("1.0"), entry_price=Decimal("101"), source="backtest")]
+        # |101 - 100| / 100 = 0.01 = 1% > 0.1% tolerance
+        pairs = PositionComparator().pair_and_compare(live, bt)
+        assert pairs[0].state_diverged is True
+
+    def test_size_within_tolerance_inclusive(self, base_ts):
+        """|Δsize| == size_tolerance → still counted (boundary inclusive)."""
+        live = [_snap("Buy", base_ts, size=Decimal("1.000"), source="live")]
+        bt = [_snap("Buy", base_ts, size=Decimal("1.001"), source="backtest")]
+        # Exactly equal to default size_tol (0.001).
+        pairs = PositionComparator().pair_and_compare(live, bt)
+        assert pairs[0].state_diverged is False
+
+    def test_both_zero_size_not_diverged(self, base_ts):
+        """Closed-on-both-sides matches trivially without divergence flag."""
+        live = [_snap("Buy", base_ts, size=Decimal("0"), entry_price=Decimal("0"), source="live")]
+        bt = [_snap("Buy", base_ts, size=Decimal("0"), entry_price=Decimal("0"), source="backtest")]
+        pairs = PositionComparator().pair_and_compare(live, bt)
+        assert pairs[0].state_diverged is False
+
+    def test_one_zero_one_nonzero_flagged(self, base_ts):
+        """Asymmetric closure: one side empty, other not → diverged."""
+        live = [_snap("Buy", base_ts, size=Decimal("0.5"), entry_price=Decimal("100"), source="live")]
+        bt = [_snap("Buy", base_ts, size=Decimal("0"), entry_price=Decimal("0"), source="backtest")]
+        pairs = PositionComparator().pair_and_compare(live, bt)
+        assert pairs[0].state_diverged is True
+
+    def test_custom_tolerances_relaxed(self, base_ts):
+        """Operator may relax tolerances; diverged pairs in default become consistent."""
+        live = [_snap("Buy", base_ts, size=Decimal("4.8"), entry_price=Decimal("57.45"), source="live")]
+        bt = [_snap("Buy", base_ts, size=Decimal("3.1"), entry_price=Decimal("57.45"), source="backtest")]
+        comp = PositionComparator(
+            state_size_tolerance=Decimal("2.0"),
+            state_entry_rel_tolerance=Decimal("0.1"),
+        )
+        pairs = comp.pair_and_compare(live, bt)
+        # |1.7| < 2.0 → considered consistent under relaxed thresholds.
+        assert pairs[0].state_diverged is False

@@ -213,6 +213,7 @@ class ComparatorReporter:
             ("cum_realised_pnl_final_delta", str(m.cum_realised_pnl_final_delta)),
             ("position_pairs_compared", str(m.position_pairs_compared)),
             ("position_pairs_unmatched_bt", str(m.position_pairs_unmatched_bt)),
+            ("position_pairs_state_diverged", str(m.position_pairs_state_diverged)),
             ("position_pairs_missing_telemetry", str(m.position_pairs_missing_telemetry)),
         ]
 
@@ -290,6 +291,7 @@ class ComparatorReporter:
                 "live_cum_realised",
                 "bt_cum_realised",
                 "cum_realised_delta",
+                "state_diverged",
             ])
 
             for pair in self._position_pairs:
@@ -321,6 +323,7 @@ class ComparatorReporter:
                     str(live.cum_realised_pnl) if live.cum_realised_pnl is not None else "",
                     str(bt.cum_realised_pnl) if bt.cum_realised_pnl is not None else "",
                     str(pair.cum_realised_pnl_delta) if pair.cum_realised_pnl_delta is not None else "",
+                    "1" if pair.state_diverged else "0",
                 ])
 
         emitted = sum(1 for p in self._position_pairs if p.live is not None)
@@ -422,6 +425,7 @@ class ComparatorReporter:
             "  POSITION TELEMETRY",
             f"    Pairs compared:        {m.position_pairs_compared}",
             f"    Unmatched (bt):        {m.position_pairs_unmatched_bt}",
+            f"    State diverged:        {m.position_pairs_state_diverged}",
             f"    Missing telemetry:     {m.position_pairs_missing_telemetry}",
             f"    IM mean |delta|:       {m.position_im_mean_abs_delta}",
             f"    IM max |delta|:        {m.position_im_max_abs_delta}",
