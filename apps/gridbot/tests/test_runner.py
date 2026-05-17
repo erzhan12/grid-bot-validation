@@ -2767,8 +2767,10 @@ class TestSameOrderDedupAndAutoRecovery:
         client = MagicMock()
         if exc is not None:
             client.get_executions.side_effect = exc
+            client.get_executions_all.side_effect = exc
         else:
             client.get_executions.return_value = (executions or [], None)
+            client.get_executions_all.return_value = (executions or [], False)
         runner._executor._client = client
         return client
 
@@ -2879,6 +2881,34 @@ class TestSameOrderDedupAndAutoRecovery:
         )
         pair_key = frozenset(("oa", "ob"))
         assert runner._same_order_dedup_cache[pair_key].verdict == "UNKNOWN"
+
+    def test_rest_cross_check_truncated_keeps_soft_block(self, runner, caplog):
+        """A truncated REST slice is not proof of a WS phantom.
+
+        Regression guard: a single-page or otherwise incomplete REST result can
+        be missing one real order_id during a busy account period. The runner
+        must leave SAME ORDER latched instead of auto-clearing and dropping the
+        current execution.
+        """
+        import logging
+
+        notifier = Mock()
+        runner._notifier = notifier
+        client = MagicMock()
+        client.get_executions_all.return_value = ([self._rest_match("oa")], True)
+        runner._executor._client = client
+
+        with caplog.at_level(logging.INFO, logger="gridbot.runner"):
+            self._trigger_pair(runner, datetime.now(UTC))
+
+        assert runner.same_order_error is True
+        assert runner._drop_phantom_event_for_current_call is False
+        assert all(
+            "soft-block auto-cleared" not in r.message for r in caplog.records
+        )
+        pair_key = frozenset(("oa", "ob"))
+        assert runner._same_order_dedup_cache[pair_key].verdict == "UNKNOWN"
+        assert notifier.alert.call_count == 1
 
     # --- Phase 1: dedup gate behavior ----------------------------------------
 
@@ -3112,7 +3142,7 @@ class TestSameOrderDedupAndAutoRecovery:
         ]
         assert len(same_order_errors) == 1
         assert notifier.alert.call_count == 1
-        assert client.get_executions.call_count == 1
+        assert client.get_executions_all.call_count == 1
         assert runner.same_order_error is False
 
     def test_on_execution_drops_phantom_event_before_engine(self, runner):

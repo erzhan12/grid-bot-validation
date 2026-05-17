@@ -12,7 +12,7 @@ import logging
 import math
 from collections import deque
 from dataclasses import dataclass, field, replace
-from datetime import datetime, UTC
+from datetime import datetime, UTC, timedelta
 from decimal import Decimal
 from typing import Optional, Callable
 
@@ -67,6 +67,12 @@ _SAME_ORDER_TIME_WINDOW_SEC = 5.0
 # observed in the 2026-05-09/10 incident; short enough not to outlive a
 # normal operator shift. See docs/features/0031_PLAN.md.
 _SAME_ORDER_DEDUP_TTL_SEC = 21600.0  # 6 hours
+
+# REST confirmation window for SAME ORDER adjudication. The detector's trigger
+# window is small, but pad the REST slice to tolerate exchange timestamp skew
+# while still making pagination completeness meaningful.
+_SAME_ORDER_REST_WINDOW_PADDING_SEC = 60.0
+_SAME_ORDER_REST_MAX_PAGES = 10
 
 
 @dataclass
@@ -1334,10 +1340,12 @@ class StrategyRunner:
         different orders" when there's actually one. REST `get_executions` is
         the authoritative source — it returns Bybit's stored execution list.
 
-        For each of the two order_ids from the SAME ORDER pair, count how
-        many actual fills REST reports. If REST says 1 per orderId → buffer
-        was correct, real duplicate. If REST disagrees (e.g., 0 or some
-        order_id not in REST list) → WS lied.
+        For each of the two order_ids from the SAME ORDER pair, fetch a
+        paginated, time-bounded REST slice and count actual fills. If REST
+        says 1 per orderId → buffer was correct, real duplicate. If a complete
+        REST slice sees exactly one order_id → the missing side is treated as
+        a WS phantom. Truncated/empty coverage is inconclusive and leaves the
+        block latched.
 
         Failures here are logged as ERROR but never raised — diagnostic is
         best-effort, never breaks the main loop.
@@ -1347,21 +1355,43 @@ class StrategyRunner:
             # Access the rest_client through the executor. This is a
             # diagnostic-only path; a proper API addition can come later.
             rest_client = self._executor._client
-            executions, _ = rest_client.get_executions(
-                symbol=self.symbol, limit=50,
+            current_ts = current.get("exchange_ts")
+            previous_ts = previous.get("exchange_ts")
+            if not isinstance(current_ts, datetime) or not isinstance(previous_ts, datetime):
+                raise ValueError("SAME ORDER REST cross-check requires exchange_ts")
+
+            window_start = min(current_ts, previous_ts) - timedelta(
+                seconds=_SAME_ORDER_REST_WINDOW_PADDING_SEC
+            )
+            window_end = max(current_ts, previous_ts) + timedelta(
+                seconds=_SAME_ORDER_REST_WINDOW_PADDING_SEC
+            )
+            start_ms = int(window_start.timestamp() * 1000)
+            end_ms = int(window_end.timestamp() * 1000)
+            executions, truncated = rest_client.get_executions_all(
+                symbol=self.symbol,
+                start_time=start_ms,
+                end_time=end_ms,
+                max_pages=_SAME_ORDER_REST_MAX_PAGES,
+                return_truncated=True,
             )
             cur_id = current["order_id"]
             prev_id = previous["order_id"]
             cur_matches = [e for e in executions if e.get("orderId") == cur_id]
             prev_matches = [e for e in executions if e.get("orderId") == prev_id]
-            verdict = (
-                "REAL_DUPLICATE" if len(cur_matches) >= 1 and len(prev_matches) >= 1
-                and cur_id != prev_id
-                else "WS_GLITCH_SUSPECTED"
-            )
+            if truncated:
+                verdict = "UNKNOWN"
+            elif len(cur_matches) >= 1 and len(prev_matches) >= 1 and cur_id != prev_id:
+                verdict = "REAL_DUPLICATE"
+            elif (len(cur_matches) >= 1) != (len(prev_matches) >= 1):
+                verdict = "WS_GLITCH_SUSPECTED"
+            else:
+                verdict = "UNKNOWN"
             logger.error(
                 f"{self.strat_id}: SAME ORDER REST cross-check — verdict={verdict} "
-                f"(REST returned {len(executions)} recent executions for {self.symbol}). "
+                f"(REST returned {len(executions)} executions for {self.symbol} "
+                f"from {window_start.isoformat()} to {window_end.isoformat()}, "
+                f"truncated={truncated}). "
                 f"current order_id={cur_id} → {len(cur_matches)} REST matches "
                 f"[{[(m.get('execId'), m.get('execPrice'), m.get('execQty'), m.get('orderLinkId'), m.get('execType')) for m in cur_matches[:3]]}]; "
                 f"previous order_id={prev_id} → {len(prev_matches)} REST matches "
