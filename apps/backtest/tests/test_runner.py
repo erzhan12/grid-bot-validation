@@ -2053,3 +2053,384 @@ class TestPositionSnapshotEmission:
             "snapshot.mark_price should reflect ticker.mark_price, "
             f"not last_price (got {captured[0].mark_price})"
         )
+
+
+class TestEstimatePairImMm:
+    """Feature 0045 — hedge-aware ``_estimate_pair_im_mm`` helper.
+
+    Closed-form formula derived from Bybit help-center docs
+    ("Initial Margin USDT Contract", "Maintenance Margin USDT Contract")
+    plus empirical validation against 10 paired LTCUSDT live snapshots
+    (see ``docs/features/0045_PLAN.md`` Phase 1 Results).
+    """
+
+    @pytest.fixture
+    def runner(self):
+        """LTCUSDT runner with realistic Bybit hedge-mode parameters.
+
+        Matches the data used in Phase 1 derivation so golden values
+        are reproducible.
+        """
+        from backtest.session import BacktestSession
+
+        config = BacktestStrategyConfig(
+            strat_id="test_0045_ltc",
+            symbol="LTCUSDT",
+            tick_size=Decimal("0.1"),
+            grid_count=20,
+            grid_step=0.3,
+            amount="x0.001",
+            commission_rate=Decimal("0.0002"),
+            leverage=10,
+            maintenance_margin_rate=0.005,
+            enable_risk_multipliers=False,
+            taker_fee_rate=Decimal("0.00075"),
+            hedge_smaller_buffer_factor=Decimal("5.657"),
+        )
+        session = BacktestSession(session_id="t0045", initial_balance=Decimal("10000"))
+        fill_sim = TradeThroughFillSimulator()
+        order_mgr = BacktestOrderManager(
+            fill_simulator=fill_sim, commission_rate=config.commission_rate,
+        )
+        executor = BacktestExecutor(order_manager=order_mgr)
+        return BacktestRunner(
+            strategy_config=config, executor=executor, session=session,
+        )
+
+    def _state(self, size: Decimal, entry: Decimal) -> SimpleNamespace:
+        return SimpleNamespace(size=size, avg_entry_price=entry)
+
+    # ----- Collapse cases -----
+
+    def test_long_only_matches_one_way_with_fee(self, runner):
+        """Test #1: Long-only collapses to Bybit one-way formula with fee.
+
+        New (post-0045) acceptance: helper produces
+            (pv_mark/lev + fee_long, pv_mark*MMR_tier + fee_long, 0, 0)
+        — same shape as Bybit's published positionIM / positionMM in
+        one-way mode. This is intentionally NOT decimal-equal to the
+        pre-0045 ``calc_initial_margin(L_pv)`` path because that path
+        omitted the fee-to-close component (a known ~0.23 USDT gap).
+        """
+        L = self._state(Decimal("6.2"), Decimal("55.91368848"))
+        S = self._state(Decimal("0"), Decimal("0"))
+        mark = Decimal("53.70")
+        im_L, mm_L, im_S, mm_S = runner._estimate_pair_im_mm(L, S, mark)
+
+        # Tier 1 LTCUSDT (mmr=0.01, deduction=0).
+        fee_long = Decimal("6.2") * Decimal("55.91368848") * (
+            Decimal("1") - Decimal("1") / Decimal("10")
+        ) * Decimal("0.00075")
+        expected_im = Decimal("6.2") * mark / Decimal("10") + fee_long
+        expected_mm = Decimal("6.2") * mark * Decimal("0.01") + fee_long
+
+        assert im_L == expected_im
+        assert mm_L == expected_mm
+        assert im_S == Decimal("0")
+        assert mm_S == Decimal("0")
+
+    def test_short_only_matches_one_way_with_fee(self, runner):
+        """Test #2: Short-only symmetric to long-only with (1+1/lev) fee."""
+        L = self._state(Decimal("0"), Decimal("0"))
+        S = self._state(Decimal("2.2"), Decimal("55.53059536"))
+        mark = Decimal("53.70")
+        im_L, mm_L, im_S, mm_S = runner._estimate_pair_im_mm(L, S, mark)
+
+        fee_short = Decimal("2.2") * Decimal("55.53059536") * (
+            Decimal("1") + Decimal("1") / Decimal("10")
+        ) * Decimal("0.00075")
+        expected_im = Decimal("2.2") * mark / Decimal("10") + fee_short
+        expected_mm = Decimal("2.2") * mark * Decimal("0.01") + fee_short
+
+        assert im_L == Decimal("0")
+        assert mm_L == Decimal("0")
+        assert im_S == expected_im
+        assert mm_S == expected_mm
+
+    def test_zero_positions(self, runner):
+        """Test #6: both legs zero returns all zeros — no DivisionByZero."""
+        L = self._state(Decimal("0"), Decimal("0"))
+        S = self._state(Decimal("0"), Decimal("0"))
+        result = runner._estimate_pair_im_mm(L, S, Decimal("53.70"))
+        assert result == (Decimal("0"), Decimal("0"), Decimal("0"), Decimal("0"))
+
+    # ----- Hedge cases — golden values from Phase 1 paired snapshots -----
+
+    def test_imbalanced_long_dominant_golden(self, runner):
+        """Test #4: imbalanced hedge, long-dominant — matches Bybit live.
+
+        Golden fixture from feature 0045 Phase 1 Results, paired
+        snapshot at 2026-05-18 08:50:43 (L=6.2, S=2.2, mark=53.70):
+            live_im_L  = 33.52648911
+            live_mm_L  =  2.38048911
+            live_im_S  =  0.14782244
+            live_mm_S  =  0.14782244
+        """
+        L = self._state(Decimal("6.2"), Decimal("55.91368848"))
+        S = self._state(Decimal("2.2"), Decimal("55.53059536"))
+        mark = Decimal("53.70")
+        im_L, mm_L, im_S, mm_S = runner._estimate_pair_im_mm(L, S, mark)
+
+        # Tolerance accounts for the gap between the configured taker
+        # rate (0.00075) and the live account's effective rate
+        # (~0.0007444) — under 0.005 USDT, well below the plan's 0.1
+        # USDT MM threshold.
+        tol = Decimal("0.005")
+        assert abs(im_L - Decimal("33.52648911")) <= tol, f"im_L={im_L}"
+        assert abs(mm_L - Decimal("2.38048911")) <= tol, f"mm_L={mm_L}"
+        assert abs(im_S - Decimal("0.14782244")) <= tol, f"im_S={im_S}"
+        assert abs(mm_S - Decimal("0.14782244")) <= tol, f"mm_S={mm_S}"
+
+    def test_imbalanced_short_dominant_golden(self, runner):
+        """Test #5: imbalanced hedge, short-dominant — mirror of long-dominant.
+
+        Mirrors test #4 by swapping leg sizes and entries; same mark.
+        Verifies the symmetric short-dominant branch produces the
+        same magnitudes as the long-dominant case did under #4.
+        """
+        # Swap roles: short bigger now.
+        L = self._state(Decimal("2.2"), Decimal("55.53059536"))
+        S = self._state(Decimal("6.2"), Decimal("55.91368848"))
+        mark = Decimal("53.70")
+        im_L, mm_L, im_S, mm_S = runner._estimate_pair_im_mm(L, S, mark)
+
+        # Compare to test #4's dominant-leg expectations swapped: the
+        # short-dominant case picks up the (1+1/lev) fee factor on the
+        # dominant short, the (1-1/lev) on the smaller long.
+        lev = Decimal("10")
+        inv = Decimal("1") / lev
+        fee_short = Decimal("6.2") * Decimal("55.91368848") * (
+            Decimal("1") + inv
+        ) * Decimal("0.00075")
+        unhedged_short = Decimal("6.2") - Decimal("2.2")
+        expected_im_S = Decimal("6.2") * mark / lev + fee_short
+        expected_mm_S = unhedged_short * mark * Decimal("0.01") + fee_short
+
+        assert im_S == expected_im_S, f"im_S={im_S}"
+        assert mm_S == expected_mm_S, f"mm_S={mm_S}"
+        # Smaller (long) leg sees fee + buffer term.
+        assert im_L == mm_L, "smaller leg should have IM == MM"
+        assert im_L > Decimal("0"), "smaller leg has non-zero residual"
+
+    def test_balanced_hedge(self, runner):
+        """Test #3: balanced hedge — L_size == S_size, different entries.
+
+        No unhedged portion. Dominant leg's MM term collapses to zero
+        + fee_to_close; smaller-leg has only its fee + buffer.
+        """
+        L = self._state(Decimal("2.2"), Decimal("55.91368848"))
+        S = self._state(Decimal("2.2"), Decimal("55.53059536"))
+        mark = Decimal("53.70")
+        im_L, mm_L, im_S, mm_S = runner._estimate_pair_im_mm(L, S, mark)
+
+        # Long is "dominant" (L >= S branch) but unhedged_long = 0, so
+        # dominant MM = fee_long only.
+        fee_long = Decimal("2.2") * Decimal("55.91368848") * (
+            Decimal("1") - Decimal("0.1")
+        ) * Decimal("0.00075")
+        expected_im_L = Decimal("2.2") * mark / Decimal("10") + fee_long
+        expected_mm_L = fee_long  # unhedged_long * ... + fee = 0 + fee
+
+        assert im_L == expected_im_L
+        assert mm_L == expected_mm_L
+        assert im_S > Decimal("0")
+        assert im_S == mm_S
+
+    def test_tier_boundary_uses_dominant_leg_tier(self, runner):
+        """Test #7: tier-boundary crossing — Bybit tier picks per-leg pv.
+
+        LTCUSDT tier 1 max=200,000 USDT. A position with leg pv > 200k
+        crosses into tier 2 (mmr=0.015, deduction=1000). Helper looks
+        up the tier on the leg's own pv (not the combined), matching
+        Bybit's per-leg ``riskLimitValue`` assignment. The deduction
+        term carries through to keep the per-tier MM formula
+        continuous at the tier boundary.
+
+        Numeric expectations below are hard-coded so a regression that
+        e.g. drops the ``− deduction_tier`` term — exactly the P2 bug
+        this commit fixes — would re-fail this test instead of
+        silently shifting both sides of the equation.
+        """
+        # Long pv = 6000 LTC * 50 USDT = 300_000 USDT → tier 2 (max=400k).
+        # Short pv smaller — stays in tier 1.
+        L = self._state(Decimal("6000"), Decimal("50"))
+        S = self._state(Decimal("100"), Decimal("50"))
+        mark = Decimal("50")
+        im_L, mm_L, _, _ = runner._estimate_pair_im_mm(L, S, mark)
+
+        # Hand-derived expectations (LTCUSDT tier 2: mmr=0.015, ded=1000):
+        #   unhedged_long_pv = (6000 - 100) * 50 = 295_000
+        #   fee_long = 6000 * 50 * (1 - 1/10) * 0.00075 = 202.5
+        #   expected_im = 6000 * 50 / 10 + fee_long = 30_000 + 202.5 = 30_202.5
+        #   expected_mm = max(295_000 * 0.015 - 1000, 0) + fee_long
+        #               = max(4_425 - 1_000, 0) + 202.5
+        #               = 3_425 + 202.5
+        #               = 3_627.5
+        assert im_L == Decimal("30202.5"), f"im_L={im_L}"
+        assert mm_L == Decimal("3627.5"), f"mm_L={mm_L}"
+
+    def test_tier_boundary_short_dominant_applies_deduction(self, runner):
+        """Test #7b: symmetric short-dominant deduction subtraction.
+
+        Mirror of #7 — exercises the short-dominant MM branch with
+        tier-2 deduction so a regression dropping the deduction there
+        is caught. The long-dominant test alone would not catch a
+        short-branch regression.
+        """
+        L = self._state(Decimal("100"), Decimal("50"))
+        S = self._state(Decimal("6000"), Decimal("50"))  # 300k → tier 2
+        mark = Decimal("50")
+        _, _, im_S, mm_S = runner._estimate_pair_im_mm(L, S, mark)
+
+        # Mirror arithmetic of #7 with (1 + 1/10) fee factor on the
+        # short side:
+        #   unhedged_short_pv = (6000 - 100) * 50 = 295_000
+        #   fee_short = 6000 * 50 * 1.1 * 0.00075 = 247.5
+        #   expected_im = 6000 * 50 / 10 + fee_short = 30_247.5
+        #   expected_mm = max(295_000 * 0.015 - 1000, 0) + fee_short
+        #               = 3_425 + 247.5
+        #               = 3_672.5
+        assert im_S == Decimal("30247.5"), f"im_S={im_S}"
+        assert mm_S == Decimal("3672.5"), f"mm_S={mm_S}"
+
+    def test_tier_boundary_clamp_when_deduction_exceeds_base(self, runner):
+        """Tier deduction can exceed unhedged_pv × MMR — clamp to 0.
+
+        Pins the ``max(.., 0)`` guard so a regression that drops the
+        clamp (and returns a negative MM contribution) is caught.
+        Constructed so unhedged_long_pv × 0.015 < deduction_tier_2.
+        """
+        # Long pv = 6000 * 50 = 300_000 USDT → tier 2 (mmr=0.015, ded=1000).
+        # Short hedges 5950 of it, leaving unhedged_long = 50 → pv = 2500.
+        # unhedged_long_pv × mmr = 2500 × 0.015 = 37.5  <  deduction 1000.
+        # Clamp drives the MM base to 0; only fee_long remains.
+        L = self._state(Decimal("6000"), Decimal("50"))
+        S = self._state(Decimal("5950"), Decimal("50"))
+        mark = Decimal("50")
+        _, mm_L, _, _ = runner._estimate_pair_im_mm(L, S, mark)
+
+        fee_long = Decimal("6000") * Decimal("50") * (
+            Decimal("1") - Decimal("0.1")
+        ) * Decimal("0.00075")
+        # Expect: max(2500*0.015 - 1000, 0) + fee = max(-962.5, 0) + 202.5
+        assert mm_L == fee_long, f"mm_L={mm_L} (expected fee_long={fee_long})"
+
+    def test_tier_mmr_and_deduction_edge_cases(self, runner):
+        """Direct unit tests for the new ``_tier_mmr_and_deduction`` helper.
+
+        Pins the three zero-return branches (``pv <= 0``, no tiers,
+        no matching tier) and the tier-2 happy path. These were
+        previously only exercised transitively via the pair helper.
+        """
+        # Tier 1 (LTCUSDT pv < 200k): mmr=0.01, ded=0.
+        mmr, ded = runner._tier_mmr_and_deduction(Decimal("100000"))
+        assert mmr == Decimal("0.01")
+        assert ded == Decimal("0")
+
+        # Tier 2 (200k < pv ≤ 400k): mmr=0.015, ded=1000.
+        mmr, ded = runner._tier_mmr_and_deduction(Decimal("300000"))
+        assert mmr == Decimal("0.015")
+        assert ded == Decimal("1000")
+
+        # pv <= 0 → (0, 0).
+        assert runner._tier_mmr_and_deduction(Decimal("0")) == (
+            Decimal("0"), Decimal("0"),
+        )
+        assert runner._tier_mmr_and_deduction(Decimal("-1")) == (
+            Decimal("0"), Decimal("0"),
+        )
+
+        # No tiers loaded → (0, 0).
+        saved = runner._mm_tiers
+        runner._mm_tiers = None
+        try:
+            assert runner._tier_mmr_and_deduction(Decimal("100")) == (
+                Decimal("0"), Decimal("0"),
+            )
+        finally:
+            runner._mm_tiers = saved
+
+    # ----- Integration with _emit_position_snapshot -----
+
+    def test_emit_snapshot_long_uses_pair_helper(self, runner):
+        """Test #8: long-direction snapshot uses pair-aware IM/MM."""
+        runner.long_tracker.process_fill(
+            side="Buy", qty=Decimal("6.2"), price=Decimal("55.91368848"),
+        )
+        runner.short_tracker.process_fill(
+            side="Sell", qty=Decimal("2.2"), price=Decimal("55.53059536"),
+        )
+        ts = datetime(2026, 5, 18, 8, 50, 43, tzinfo=timezone.utc)
+        snap = runner._emit_position_snapshot(
+            DirectionType.LONG, ts, Decimal("53.70"),
+        )
+        # Should match the dominant-leg values from the golden fixture.
+        tol = Decimal("0.005")
+        assert abs(snap.position_im - Decimal("33.52648911")) <= tol
+        assert abs(snap.position_mm - Decimal("2.38048911")) <= tol
+
+    def test_emit_snapshot_short_uses_pair_helper(self, runner):
+        """Test #9: short-direction snapshot picks the smaller-leg values."""
+        runner.long_tracker.process_fill(
+            side="Buy", qty=Decimal("6.2"), price=Decimal("55.91368848"),
+        )
+        runner.short_tracker.process_fill(
+            side="Sell", qty=Decimal("2.2"), price=Decimal("55.53059536"),
+        )
+        ts = datetime(2026, 5, 18, 8, 50, 43, tzinfo=timezone.utc)
+        snap = runner._emit_position_snapshot(
+            DirectionType.SHORT, ts, Decimal("53.70"),
+        )
+        tol = Decimal("0.005")
+        assert abs(snap.position_im - Decimal("0.14782244")) <= tol
+        assert abs(snap.position_mm - Decimal("0.14782244")) <= tol
+        # Smaller-leg invariant: IM == MM.
+        assert snap.position_im == snap.position_mm
+
+    def test_process_fill_emits_exactly_one_helper_call(self, runner, monkeypatch):
+        """Test #10: ``_process_fill`` invokes ``_estimate_pair_im_mm``
+        exactly once per fill.
+
+        Guards against accidental double-emission or recomputation in
+        future refactors.
+        """
+        runner.position_snapshot_callback = lambda snap: None
+        runner.long_tracker.process_fill(
+            side="Buy", qty=Decimal("6.2"), price=Decimal("55.91368848"),
+        )
+        runner.short_tracker.process_fill(
+            side="Sell", qty=Decimal("2.2"), price=Decimal("55.53059536"),
+        )
+        runner._last_price = Decimal("53.70")
+        runner._last_mark_price = Decimal("53.70")
+
+        counter = {"n": 0}
+        original = runner._estimate_pair_im_mm
+
+        def counted(*args, **kwargs):
+            counter["n"] += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(runner, "_estimate_pair_im_mm", counted)
+
+        # Simulate one additional fill on long → one _emit call → one
+        # _estimate_pair_im_mm call.
+        from gridcore.events import ExecutionEvent
+        evt = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="LTCUSDT",
+            exchange_ts=datetime(2026, 5, 18, 9, 0, tzinfo=timezone.utc),
+            local_ts=datetime(2026, 5, 18, 9, 0, tzinfo=timezone.utc),
+            exec_id="t-fill",
+            order_id="t-fill",
+            order_link_id="t-fill",
+            side="Buy",
+            price=Decimal("53.70"),
+            qty=Decimal("0.1"),
+            fee=Decimal("0"),
+        )
+        runner._process_fill(evt)
+
+        assert counter["n"] == 1, (
+            f"expected exactly one helper call per fill, got {counter['n']}"
+        )

@@ -178,5 +178,190 @@
       }
     ],
     "cached_at": "2026-02-26T06:44:38.061951+00:00"
+  },
+  "LTCUSDT": {
+    "tiers": [
+      {
+        "max_value": "200000",
+        "mmr_rate": "0.01",
+        "deduction": "0",
+        "imr_rate": "0.02"
+      },
+      {
+        "max_value": "400000",
+        "mmr_rate": "0.015",
+        "deduction": "1000",
+        "imr_rate": "0.03"
+      },
+      {
+        "max_value": "600000",
+        "mmr_rate": "0.02",
+        "deduction": "3000",
+        "imr_rate": "0.04"
+      },
+      {
+        "max_value": "800000",
+        "mmr_rate": "0.025",
+        "deduction": "6000",
+        "imr_rate": "0.05"
+      },
+      {
+        "max_value": "1000000",
+        "mmr_rate": "0.03",
+        "deduction": "10000",
+        "imr_rate": "0.06"
+      },
+      {
+        "max_value": "1200000",
+        "mmr_rate": "0.035",
+        "deduction": "15000",
+        "imr_rate": "0.07"
+      },
+      {
+        "max_value": "1400000",
+        "mmr_rate": "0.04",
+        "deduction": "21000",
+        "imr_rate": "0.08"
+      },
+      {
+        "max_value": "1600000",
+        "mmr_rate": "0.045",
+        "deduction": "28000",
+        "imr_rate": "0.09"
+      },
+      {
+        "max_value": "1800000",
+        "mmr_rate": "0.05",
+        "deduction": "36000",
+        "imr_rate": "0.1"
+      },
+      {
+        "max_value": "2000000",
+        "mmr_rate": "0.055",
+        "deduction": "45000",
+        "imr_rate": "0.11"
+      },
+      {
+        "max_value": "2200000",
+        "mmr_rate": "0.06",
+        "deduction": "55000",
+        "imr_rate": "0.12"
+      },
+      {
+        "max_value": "2400000",
+        "mmr_rate": "0.065",
+        "deduction": "66000",
+        "imr_rate": "0.13"
+      },
+      {
+        "max_value": "2600000",
+        "mmr_rate": "0.07",
+        "deduction": "78000",
+        "imr_rate": "0.14"
+      },
+      {
+        "max_value": "2800000",
+        "mmr_rate": "0.075",
+        "deduction": "91000",
+        "imr_rate": "0.15"
+      },
+      {
+        "max_value": "3000000",
+        "mmr_rate": "0.08",
+        "deduction": "105000",
+        "imr_rate": "0.16"
+      },
+      {
+        "max_value": "3200000",
+        "mmr_rate": "0.085",
+        "deduction": "120000",
+        "imr_rate": "0.17"
+      },
+      {
+        "max_value": "3400000",
+        "mmr_rate": "0.09",
+        "deduction": "136000",
+        "imr_rate": "0.18"
+      },
+      {
+        "max_value": "3900000",
+        "mmr_rate": "0.095",
+        "deduction": "153000",
+        "imr_rate": "0.19"
+      },
+      {
+        "max_value": "4400000",
+        "mmr_rate": "0.1",
+        "deduction": "172500",
+        "imr_rate": "0.2"
+      },
+      {
+        "max_value": "4900000",
+        "mmr_rate": "0.105",
+        "deduction": "194500",
+        "imr_rate": "0.21"
+      },
+      {
+        "max_value": "5400000",
+        "mmr_rate": "0.11",
+        "deduction": "219000",
+        "imr_rate": "0.22"
+      },
+      {
+        "max_value": "5900000",
+        "mmr_rate": "0.115",
+        "deduction": "246000",
+        "imr_rate": "0.23"
+      },
+      {
+        "max_value": "6400000",
+        "mmr_rate": "0.12",
+        "deduction": "275500",
+        "imr_rate": "0.24"
+      },
+      {
+        "max_value": "6900000",
+        "mmr_rate": "0.125",
+        "deduction": "307500",
+        "imr_rate": "0.25"
+      },
+      {
+        "max_value": "7400000",
+        "mmr_rate": "0.156",
+        "deduction": "521400",
+        "imr_rate": "0.26"
+      },
+      {
+        "max_value": "7900000",
+        "mmr_rate": "0.1764",
+        "deduction": "672360",
+        "imr_rate": "0.294"
+      },
+      {
+        "max_value": "8400000",
+        "mmr_rate": "0.1998",
+        "deduction": "857220",
+        "imr_rate": "0.333"
+      },
+      {
+        "max_value": "8900000",
+        "mmr_rate": "0.24",
+        "deduction": "1194900",
+        "imr_rate": "0.4"
+      },
+      {
+        "max_value": "9400000",
+        "mmr_rate": "0.3",
+        "deduction": "1728900",
+        "imr_rate": "0.5"
+      },
+      {
+        "max_value": "Infinity",
+        "mmr_rate": "0.4002",
+        "deduction": "2670780",
+        "imr_rate": "0.667"
+      }
+    ],
+    "cached_at": "2026-05-18T09:20:40.465565+00:00"
   }
 }

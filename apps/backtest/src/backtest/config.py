@@ -65,6 +65,28 @@ class BacktestStrategyConfig(BaseModel):
         description="Commission rate per trade (0.0002 = 0.02% maker fee)",
     )
 
+    # Feature 0045: taker fee + hedge buffer for IM/MM parity with Bybit UTA.
+    # Bybit publishes positionIM / positionMM INCLUDING the estimated
+    # fee-to-close (per "Initial Margin USDT Contract" and "Maintenance
+    # Margin USDT Contract" help-center articles). Backtest must replicate
+    # that fee to match live snapshots.
+    taker_fee_rate: Decimal = Field(
+        default=Decimal("0.00075"),
+        description="Taker fee rate used in Bybit's fee-to-close component of "
+                    "positionIM/positionMM (default 0.075% = Bybit USDT-Perp "
+                    "non-VIP taker). Account-specific; for VIP tiers reduce "
+                    "accordingly.",
+    )
+    hedge_smaller_buffer_factor: Decimal = Field(
+        default=Decimal("5.657"),
+        description="Empirical Bybit hedge-mode buffer factor C used by the "
+                    "smaller leg in 0045 helper: "
+                    "buffer = MMR * hedged_size * |L_entry - S_entry| * C. "
+                    "Derived from LTCUSDT live data at 10x leverage; needs "
+                    "per-symbol re-calibration. C's closed form is not yet "
+                    "documented by Bybit.",
+    )
+
     @field_validator("tick_size", mode="before")
     @classmethod
     def parse_tick_size(cls, v):
