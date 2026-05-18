@@ -6,7 +6,6 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 # Import the functions under test directly from the script module.
-import importlib
 import sys
 from pathlib import Path
 
@@ -15,7 +14,7 @@ _scripts_dir = str(Path(__file__).resolve().parent.parent.parent.parent / "scrip
 if _scripts_dir not in sys.path:
     sys.path.insert(0, _scripts_dir)
 
-from check_tier_drift import compare_tiers, _rate_drift_pct, _fetch_live_tiers, main
+from check_tier_drift import compare_tiers, _rate_drift_pct, _fetch_live_tiers, main  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -192,10 +191,7 @@ class TestMain:
 
     def test_drift_returns_one(self, capsys):
         """main() returns 1 when drift is detected."""
-        from gridcore.pnl import MM_TIERS
-
         # Create modified tiers with large drift
-        first_symbol = next(iter(MM_TIERS))
         modified = [
             (Decimal("999999"), Decimal("0.99"), Decimal("0"), Decimal("0.99")),
         ]
@@ -209,16 +205,40 @@ class TestMain:
         captured = capsys.readouterr()
         assert "Drift detected" in captured.out
 
-    def test_api_failure_reports_error(self, capsys):
-        """main() includes API failures in drift report."""
+    def test_fetch_failure_returns_two(self, capsys):
+        """main() returns 2 when fetch failures occur without real drift."""
         with patch("check_tier_drift._fetch_live_tiers") as mock_fetch:
             mock_fetch.side_effect = ConnectionError("timeout")
             with patch("sys.argv", ["check_tier_drift.py"]):
                 result = main()
 
+        assert result == 2
+        captured = capsys.readouterr()
+        assert "WARNING: Failed to fetch live tiers" in captured.out
+        assert "failed to fetch live tiers" in captured.out
+
+    def test_drift_with_fetch_failure_returns_one(self, capsys):
+        """main() returns 1 when any real drift is found, even with fetch failures."""
+        from gridcore.pnl import MM_TIERS
+
+        first_symbol = next(iter(MM_TIERS))
+        modified = [
+            (Decimal("999999"), Decimal("0.99"), Decimal("0"), Decimal("0.99")),
+        ]
+
+        def fetch(symbol):
+            if symbol == first_symbol:
+                return modified
+            raise ConnectionError("timeout")
+
+        with patch("check_tier_drift._fetch_live_tiers", side_effect=fetch):
+            with patch("sys.argv", ["check_tier_drift.py", "--threshold", "0.05"]):
+                result = main()
+
         assert result == 1
         captured = capsys.readouterr()
-        assert "failed to fetch live tiers" in captured.out
+        assert "WARNING: Failed to fetch live tiers" in captured.out
+        assert "Drift detected" in captured.out
 
     def test_custom_threshold_respected(self, capsys):
         """Custom --threshold value is passed through to compare_tiers."""

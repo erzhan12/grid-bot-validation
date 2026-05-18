@@ -70,3 +70,11 @@ jobs:
               labels: ['risk-tiers', 'automated'],
               assignees: ['erzhan12'],
             });
+
+      - name: Warn on tier fetch failure
+        if: steps.drift-check.outputs.exit_code == '2'
+        run: |
+          echo "::warning::Tier fetch failed — IP block / transient. Not creating issue."
+          echo "### Tier fetch failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Tier fetch failed — IP block / transient. Not creating issue." >> "$GITHUB_STEP_SUMMARY"
