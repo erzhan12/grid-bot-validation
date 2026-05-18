@@ -18,7 +18,6 @@ from decimal import Decimal
 
 from gridcore.pnl import (
     MM_TIERS,
-    MM_TIERS_DEFAULT,
     MMTiers,
     parse_risk_limit_tiers,
 )
@@ -56,7 +55,6 @@ def compare_tiers(
 ) -> list[str]:
     """Compare hardcoded vs live tiers and return a list of drift messages."""
     drifts: list[str] = []
-    max_len = max(len(hardcoded), len(live))
 
     if len(hardcoded) != len(live):
         drifts.append(
@@ -115,22 +113,32 @@ def main() -> int:
     args = parser.parse_args()
 
     all_drifts: list[str] = []
+    fetch_failures: list[str] = []
 
     for symbol, hardcoded in MM_TIERS.items():
         print(f"Checking {symbol}...")
         try:
             live = _fetch_live_tiers(symbol)
         except Exception as e:
-            all_drifts.append(f"{symbol}: failed to fetch live tiers — {e}")
+            fetch_failures.append(f"{symbol}: failed to fetch live tiers — {e}")
             continue
         drifts = compare_tiers(symbol, hardcoded, live, args.threshold)
         all_drifts.extend(drifts)
+
+    if fetch_failures:
+        print("\nWARNING: Failed to fetch live tiers:")
+        for failure in fetch_failures:
+            print(f"  - {failure}")
 
     if all_drifts:
         print("\nDrift detected:")
         for d in all_drifts:
             print(f"  - {d}")
         return 1
+
+    if fetch_failures:
+        print("\nNo drift detected, but one or more live tier fetches failed.")
+        return 2
 
     print("\nNo drift detected. Hardcoded tiers match live API data.")
     return 0
