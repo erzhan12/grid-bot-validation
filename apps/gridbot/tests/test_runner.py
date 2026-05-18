@@ -2755,6 +2755,378 @@ class TestSameOrderDetection:
         assert len(runner._recent_executions_short) == 1
 
 
+class TestSameOrderWarnThrottle:
+    """Feature 0046: throttle the `Same-order error active, skipping order
+    placement` WARNING emitted by ``on_ticker`` while the SAME ORDER
+    soft-block is latched. See docs/features/0046_PLAN.md and issue #94.
+    """
+
+    def _ticker(self):
+        return TickerEvent(
+            event_type=EventType.TICKER,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            last_price=Decimal("50000.0"),
+        )
+
+    def _warn_records(self, caplog):
+        return [
+            r for r in caplog.records
+            if r.levelname == "WARNING"
+            and "Same-order error active" in r.message
+        ]
+
+    def _recovery_records(self, caplog):
+        return [
+            r for r in caplog.records
+            if r.levelname == "INFO"
+            and "Same-order error cleared" in r.message
+        ]
+
+    def test_warn_throttle_first_emit_loud(self, runner, caplog):
+        """First WARNING after entering blocked state is loud (no suffix)."""
+        import logging
+
+        runner._same_order_error = True
+        with caplog.at_level(logging.WARNING, logger="gridbot.runner"):
+            runner.on_ticker(self._ticker())
+
+        warns = self._warn_records(caplog)
+        assert len(warns) == 1
+        assert "suppressed" not in warns[0].message
+        assert runner._same_order_warn_last_ts is not None
+        assert runner._same_order_warn_suppressed == 0
+
+    def test_warn_throttle_suppresses_within_window(self, runner, caplog):
+        """Subsequent ticks within the throttle window are suppressed (no log,
+        counter increments)."""
+        import logging
+
+        runner._same_order_error = True
+        # Prime the throttle so the next 50 calls are within the window.
+        runner._same_order_warn_last_ts = datetime.now(UTC)
+
+        with caplog.at_level(logging.WARNING, logger="gridbot.runner"):
+            for _ in range(50):
+                runner.on_ticker(self._ticker())
+
+        assert len(self._warn_records(caplog)) == 0
+        assert runner._same_order_warn_suppressed == 50
+
+    def test_warn_throttle_reemits_after_window(self, runner, caplog, monkeypatch):
+        """After the throttle window elapses, a heartbeat WARNING re-emits
+        with the suppressed-count suffix and the counter resets."""
+        import logging
+        from gridbot import runner as runner_mod
+
+        # Make the window effectively 0 so the second tick re-emits.
+        monkeypatch.setattr(runner_mod, "_SAME_ORDER_WARN_THROTTLE_SEC", 0.0)
+
+        runner._same_order_error = True
+        # Seed throttle state with a small suppressed count so the heartbeat
+        # message has a non-zero N to surface.
+        runner._same_order_warn_last_ts = datetime.now(UTC) - timedelta(seconds=1)
+        runner._same_order_warn_suppressed = 42
+
+        with caplog.at_level(logging.WARNING, logger="gridbot.runner"):
+            runner.on_ticker(self._ticker())
+
+        warns = self._warn_records(caplog)
+        assert len(warns) == 1
+        assert "suppressed 42 since last" in warns[0].message
+        assert runner._same_order_warn_suppressed == 0
+        assert runner._same_order_warn_last_ts is not None
+
+    def test_warn_throttle_recovery_emits_info_on_reset_call(self, runner, caplog):
+        """External `reset_same_order_error()` on a latched block emits one
+        recovery INFO and resets throttle state."""
+        import logging
+
+        runner._same_order_error = True
+        runner._same_order_warn_last_ts = datetime.now(UTC)
+        runner._same_order_warn_suppressed = 17
+
+        with caplog.at_level(logging.INFO, logger="gridbot.runner"):
+            runner.reset_same_order_error()
+
+        recovery = self._recovery_records(caplog)
+        assert len(recovery) == 1
+        assert "suppressed 17 WARNINGs since" in recovery[0].message
+        assert runner._same_order_error is False
+        assert runner._same_order_warn_last_ts is None
+        assert runner._same_order_warn_suppressed == 0
+
+    def test_warn_throttle_recovery_via_clean_execution(self, runner, caplog):
+        """P1/P2 regression: True→False net transition inside
+        `_check_same_orders` (clean-fill auto-clear) must emit one recovery
+        INFO and reset throttle state. A subsequent re-latch must re-emit a
+        loud first WARNING (no suffix)."""
+        import logging
+
+        # Latch the block via two duplicate fills at the same price.
+        ev1 = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            exec_id="exec_1",
+            order_id="order_1",
+            order_link_id="abc123",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("0"),
+        )
+        runner._check_same_orders(ev1)
+        ev2 = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            exec_id="exec_2",
+            order_id="order_2",
+            order_link_id="def456",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("0"),
+        )
+        runner._check_same_orders(ev2)
+        assert runner.same_order_error is True
+
+        # Populate throttle state: one loud + several suppressed via on_ticker.
+        with caplog.at_level(logging.WARNING, logger="gridbot.runner"):
+            for _ in range(5):
+                runner.on_ticker(self._ticker())
+        assert runner._same_order_warn_last_ts is not None
+        suppressed_before_clear = runner._same_order_warn_suppressed
+        assert suppressed_before_clear >= 1
+
+        caplog.clear()
+
+        # Drive a clean fill at a different price → True→False transition
+        # inside `_check_same_orders`.
+        ev3 = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            exec_id="exec_3",
+            order_id="order_3",
+            order_link_id="link_3",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("0"),
+        )
+        with caplog.at_level(logging.INFO, logger="gridbot.runner"):
+            runner._check_same_orders(ev3)
+
+        assert runner.same_order_error is False
+        recovery = self._recovery_records(caplog)
+        assert len(recovery) == 1
+        assert f"suppressed {suppressed_before_clear} WARNINGs since" in recovery[0].message
+        assert runner._same_order_warn_last_ts is None
+        assert runner._same_order_warn_suppressed == 0
+
+        # Re-latch via a fresh duplicate pair (different order_ids, same new
+        # price) — drives the real `_check_same_orders` detection path. The
+        # next on_ticker must emit a loud first WARNING (no `suppressed`
+        # suffix) because throttle state is fresh.
+        ev4 = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            exec_id="exec_4",
+            order_id="order_4",
+            order_link_id="link_4",
+            side="Buy",
+            price=Decimal("48000.0"),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("0"),
+        )
+        runner._check_same_orders(ev4)
+        ev5 = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            exec_id="exec_5",
+            order_id="order_5",
+            order_link_id="link_5",
+            side="Buy",
+            price=Decimal("48000.0"),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("0"),
+        )
+        runner._check_same_orders(ev5)
+        assert runner.same_order_error is True
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="gridbot.runner"):
+            runner.on_ticker(self._ticker())
+        warns = self._warn_records(caplog)
+        assert len(warns) == 1
+        assert "suppressed" not in warns[0].message
+
+    def test_warn_throttle_no_spurious_clear_info_on_internal_reset(self, runner, caplog):
+        """False→False non-transition (clean fill while block was never
+        latched) must NOT emit a recovery INFO."""
+        import logging
+
+        ev = ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            exec_id="exec_1",
+            order_id="order_1",
+            order_link_id="abc123",
+            side="Buy",
+            price=Decimal("50000.0"),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("0"),
+        )
+        with caplog.at_level(logging.INFO, logger="gridbot.runner"):
+            runner._check_same_orders(ev)
+
+        assert runner.same_order_error is False
+        assert len(self._recovery_records(caplog)) == 0
+
+    def test_warn_throttle_recovery_via_rest_ws_glitch_auto_clear(self, runner, caplog):
+        """P3: REST WS_GLITCH_SUSPECTED auto-clear path emits exactly ONE
+        INFO containing both verdict context and the suppressed-count suffix.
+        Throttle state is reset.
+
+        Drives the natural flow end-to-end:
+          1. First trigger pair → REST FAILS → cache entry = UNKNOWN,
+             block latched (existing `test_rest_cross_check_exception_keeps_soft_block`
+             behavior).
+          2. Pump `on_ticker` to populate throttle state via the real
+             ``_same_order_error=True`` placement-gate path.
+          3. Re-stub REST to return only one match → on the next retrigger
+             of the same pair, the dedup gate sees UNKNOWN and falls through
+             to the first-trigger REST path (runner.py:1359), which now
+             adjudicates WS_GLITCH_SUSPECTED and auto-clears.
+        """
+        import logging
+
+        def _make_exec(order_id, t):
+            return ExecutionEvent(
+                event_type=EventType.EXECUTION,
+                symbol="BTCUSDT",
+                exchange_ts=t,
+                local_ts=t,
+                exec_id=f"e-{order_id}-{t.timestamp()}",
+                order_id=order_id,
+                order_link_id=f"link-{order_id}",
+                side="Buy",
+                price=Decimal("50000.0"),
+                qty=Decimal("0.1"),
+                fee=Decimal("0.5"),
+                closed_pnl=Decimal("0"),
+                leaves_qty=Decimal("0"),
+                closed_size=Decimal("0"),
+            )
+
+        rest_match = {
+            "orderId": "oa",
+            "execId": "exec-oa",
+            "execPrice": "50000",
+            "execQty": "0.1",
+            "orderLinkId": "link-oa",
+            "execType": "Trade",
+        }
+
+        # Phase 1: REST fails → UNKNOWN cache entry, block latched.
+        failing_client = MagicMock()
+        failing_client.get_executions.side_effect = RuntimeError("boom")
+        failing_client.get_executions_all.side_effect = RuntimeError("boom")
+        runner._executor._client = failing_client
+
+        t0 = datetime.now(UTC)
+        with caplog.at_level(logging.INFO, logger="gridbot.runner"):
+            runner._check_same_orders(_make_exec("oa", t0))
+            runner._check_same_orders(_make_exec("ob", t0 + timedelta(milliseconds=500)))
+        assert runner.same_order_error is True
+        pair_key = frozenset(("oa", "ob"))
+        assert runner._same_order_dedup_cache[pair_key].verdict == "UNKNOWN"
+
+        # Phase 2: pump on_ticker to populate throttle state through the
+        # real placement-gate path.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="gridbot.runner"):
+            for _ in range(5):
+                runner.on_ticker(self._ticker())
+        assert runner._same_order_warn_last_ts is not None
+        suppressed_before_clear = runner._same_order_warn_suppressed
+        assert suppressed_before_clear >= 1
+
+        # Phase 3: REST now succeeds with one match → WS_GLITCH_SUSPECTED.
+        # Re-trigger the same pair within the time window so the UNKNOWN
+        # cache entry falls through to the first-trigger REST path.
+        ok_client = MagicMock()
+        ok_client.get_executions.return_value = ([rest_match], None)
+        ok_client.get_executions_all.return_value = ([rest_match], False)
+        runner._executor._client = ok_client
+
+        caplog.clear()
+        t1 = t0 + timedelta(seconds=2)
+        with caplog.at_level(logging.INFO, logger="gridbot.runner"):
+            # Add a new event with the same order_ids as the buffered pair
+            # so pair_key matches the UNKNOWN cache entry.
+            runner._check_same_orders(_make_exec("oa", t1))
+
+        auto_cleared = [
+            r for r in caplog.records
+            if r.levelname == "INFO" and "soft-block auto-cleared" in r.message
+        ]
+        assert len(auto_cleared) == 1
+        msg = auto_cleared[0].message
+        assert "verdict=WS_GLITCH_SUSPECTED" in msg
+        assert f"suppressed {suppressed_before_clear} WARNINGs since" in msg
+        # No separate "Same-order error cleared" recovery INFO emitted —
+        # the combined line above is the single recovery message.
+        assert len(self._recovery_records(caplog)) == 0
+        assert runner.same_order_error is False
+        assert runner._same_order_warn_last_ts is None
+        assert runner._same_order_warn_suppressed == 0
+        assert runner._same_order_dedup_cache[pair_key].verdict == "WS_GLITCH_SUSPECTED"
+
+    def test_warn_throttle_re_entry_after_clear_is_loud_again(self, runner, caplog):
+        """After any clear path, the next latch re-emits a loud first
+        WARNING (no `suppressed` suffix). Covers the operator's expectation
+        that every fresh block is alert-worthy."""
+        import logging
+
+        # Latch, emit a few WARNINGs, clear via external reset.
+        runner._same_order_error = True
+        with caplog.at_level(logging.WARNING, logger="gridbot.runner"):
+            for _ in range(3):
+                runner.on_ticker(self._ticker())
+        runner.reset_same_order_error()
+        assert runner._same_order_warn_last_ts is None
+
+        # Re-latch. The very next on_ticker must emit a loud WARNING.
+        runner._same_order_error = True
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="gridbot.runner"):
+            runner.on_ticker(self._ticker())
+
+        warns = self._warn_records(caplog)
+        assert len(warns) == 1
+        assert "suppressed" not in warns[0].message
+        assert runner._same_order_warn_last_ts is not None
+
+
 class TestSameOrderDedupAndAutoRecovery:
     """Feature 0031: dedup of SAME ORDER pair retriggers and soft-block
     auto-recovery on `WS_GLITCH_SUSPECTED` REST cross-check verdict.

@@ -74,6 +74,14 @@ _SAME_ORDER_DEDUP_TTL_SEC = 21600.0  # 6 hours
 _SAME_ORDER_REST_WINDOW_PADDING_SEC = 60.0
 _SAME_ORDER_REST_MAX_PAGES = 10
 
+# Throttle window for the `Same-order error active, skipping order placement`
+# WARNING in `on_ticker`. While the soft-block stays latched, every ticker
+# (~100-400 ms) would otherwise emit a fresh WARNING, flooding the log. We
+# emit the first occurrence loudly, suppress within this window, and re-emit
+# at most once per window as a heartbeat with `(suppressed N since last)`.
+# See docs/features/0046_PLAN.md and issue #94.
+_SAME_ORDER_WARN_THROTTLE_SEC = 60.0
+
 
 @dataclass
 class _SameOrderDedupEntry:
@@ -224,6 +232,14 @@ class StrategyRunner:
         self._recent_executions_long: deque[dict] = deque(maxlen=2)
         self._recent_executions_short: deque[dict] = deque(maxlen=2)
         self._same_order_error: bool = False
+        # Throttle state for the `Same-order error active` WARNING in
+        # `on_ticker`. `_same_order_warn_last_ts` is the timestamp of the
+        # most recent emitted WARNING for the current latched block; None
+        # while not blocked or right after a clear. `_same_order_warn_suppressed`
+        # counts WARNINGs suppressed since the last emission within the
+        # current block. See feature 0046 / issue #94.
+        self._same_order_warn_last_ts: Optional[datetime] = None
+        self._same_order_warn_suppressed: int = 0
         # Verdict-aware dedup of SAME ORDER trigger pairs. Keyed by
         # frozenset of the two exchange order_ids in the pair. Used both to
         # rate-limit the REST cross-check and to suppress retriggers within
@@ -271,14 +287,56 @@ class StrategyRunner:
         """
         return self._same_order_error
 
-    def reset_same_order_error(self) -> None:
+    def reset_same_order_error(self, emit_recovery_info: bool = True) -> None:
         """Reset same-order error flag and clear execution history.
 
         Call this after handling the error (e.g., after WebSocket reconnect).
+
+        Single owner of "clear flag + clear execution buffers + clear throttle
+        state". On a True→False transition, optionally emits the recovery INFO
+        summarising the suppressed-WARNING count (feature 0046).
+
+        Args:
+            emit_recovery_info: When True (default), emit the throttle-summary
+                INFO via ``_emit_clear_recovery_if_needed`` on a True→False
+                transition (only if at least one WARNING fired during the
+                latched period). The REST WS-glitch auto-clear path passes
+                False because it has already emitted its own combined
+                verdict + suppressed-count INFO and we must not log two
+                recovery lines on a single clear.
         """
+        was_set = self._same_order_error
         self._same_order_error = False
         self._recent_executions_long.clear()
         self._recent_executions_short.clear()
+        if was_set and emit_recovery_info:
+            self._emit_clear_recovery_if_needed()
+        else:
+            # Always reset throttle state on any reset call — keeps state
+            # consistent even when no recovery INFO is emitted (silent latch
+            # + silent clear, or caller-suppressed INFO).
+            self._same_order_warn_last_ts = None
+            self._same_order_warn_suppressed = 0
+
+    def _emit_clear_recovery_if_needed(self) -> None:
+        """Emit the throttle-summary recovery INFO and reset throttle state.
+
+        Only emits when ``_same_order_warn_last_ts is not None`` — i.e. at
+        least one ``Same-order error active`` WARNING was emitted during the
+        latched period. Silent-latch / silent-clear cycles (block latched
+        and cleared without ``on_ticker`` ever entering the placement gate)
+        produce no recovery INFO because there is no warning flood to close.
+
+        Does not touch ``_same_order_error`` or the execution buffers — the
+        caller owns flag/buffer lifecycle. Idempotent on repeat calls.
+        """
+        if self._same_order_warn_last_ts is not None:
+            logger.info(
+                f"{self.strat_id}: Same-order error cleared "
+                f"(suppressed {self._same_order_warn_suppressed} WARNINGs since)"
+            )
+        self._same_order_warn_last_ts = None
+        self._same_order_warn_suppressed = 0
 
     def _load_grid_state(self) -> Optional[list[dict]]:
         """Load saved grid if config matches.
@@ -373,11 +431,28 @@ class StrategyRunner:
             limit_orders = self.get_limit_orders()
             intents = self._engine.on_event(event, limit_orders)
 
-            # Only execute intents if no same-order error
+            # Only execute intents if no same-order error.
+            # WARNING is throttled (feature 0046 / issue #94): loud-first,
+            # then suppress within _SAME_ORDER_WARN_THROTTLE_SEC, then a
+            # single heartbeat re-emit with `(suppressed N since last)`.
             if self._same_order_error:
-                logger.warning(
-                    f"{self.strat_id}: Same-order error active, skipping order placement"
-                )
+                now = datetime.now(UTC)
+                if self._same_order_warn_last_ts is None:
+                    logger.warning(
+                        f"{self.strat_id}: Same-order error active, skipping order placement"
+                    )
+                    self._same_order_warn_last_ts = now
+                else:
+                    elapsed_sec = (now - self._same_order_warn_last_ts).total_seconds()
+                    if elapsed_sec >= _SAME_ORDER_WARN_THROTTLE_SEC:
+                        logger.warning(
+                            f"{self.strat_id}: Same-order error active, skipping order placement "
+                            f"(suppressed {self._same_order_warn_suppressed} since last)"
+                        )
+                        self._same_order_warn_last_ts = now
+                        self._same_order_warn_suppressed = 0
+                    else:
+                        self._same_order_warn_suppressed += 1
                 return intents
 
             if intents:
@@ -1152,11 +1227,19 @@ class StrategyRunner:
         # own the reset here so an unrelated fill on short can't clear an
         # error detected on long. Early-return after long keeps the work
         # bounded when a duplicate was already found.
+        # Snapshot `was_set` so a True→False net transition (clean-fill
+        # auto-clear: existing block, no duplicate re-established) routes
+        # through the recovery-INFO helper. Does NOT clear execution
+        # buffers — buffers are the substrate of the auto-clear mechanism
+        # itself. See feature 0046 / issue #94.
+        was_set = self._same_order_error
         self._same_order_error = False
         self._check_same_orders_side(self._recent_executions_long)
         if self._same_order_error:
             return
         self._check_same_orders_side(self._recent_executions_short)
+        if was_set and not self._same_order_error:
+            self._emit_clear_recovery_if_needed()
 
     def _check_same_orders_side(self, executions: deque) -> None:
         """Check execution buffer for same-price duplicates within a time window.
@@ -1417,12 +1500,25 @@ class StrategyRunner:
             # duplicate. INFO-level only, no notifier — Notifier.alert always
             # logs at ERROR (notifier.py:67) and a recovery line must not be
             # ERROR-level. REAL_DUPLICATE leaves the block latched.
+            # Single combined INFO carrying verdict + throttle-summary
+            # context (feature 0046): the suppressed-count suffix is appended
+            # when at least one `Same-order error active` WARNING was
+            # emitted during the latched period. `reset_same_order_error`
+            # is called with `emit_recovery_info=False` so it does the
+            # state cleanup without emitting a second recovery INFO.
             if verdict == "WS_GLITCH_SUSPECTED":
+                suffix = ""
+                if self._same_order_warn_last_ts is not None:
+                    suffix = (
+                        f"; suppressed {self._same_order_warn_suppressed} "
+                        f"WARNINGs since"
+                    )
                 logger.info(
                     f"{self.strat_id}: SAME ORDER soft-block auto-cleared "
                     f"(WS glitch confirmed by REST cross-check; verdict={verdict})"
+                    f"{suffix}"
                 )
-                self.reset_same_order_error()
+                self.reset_same_order_error(emit_recovery_info=False)
                 # Mark the in-flight ExecutionEvent as a confirmed phantom so
                 # `on_execution` returns BEFORE `engine.on_event(event)`. The
                 # auto-clear would otherwise both un-gate placement AND let
