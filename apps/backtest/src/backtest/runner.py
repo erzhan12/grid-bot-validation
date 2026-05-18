@@ -153,6 +153,11 @@ class BacktestRunner:
         self._mm_tiers: Optional[MMTiers] = self._load_mm_tiers(
             strategy_config.symbol, strategy_config.risk_limits_cache_path
         )
+        # Feature 0045 — hedge-aware IM/MM helper inputs.
+        self._taker_fee_rate: Decimal = strategy_config.taker_fee_rate
+        self._hedge_smaller_buffer_factor: Decimal = (
+            strategy_config.hedge_smaller_buffer_factor
+        )
 
         if self._enable_risk:
             risk_config = RiskConfig(
@@ -645,14 +650,18 @@ class BacktestRunner:
         entry_price = tracker.state.avg_entry_price
 
         if size > 0 and entry_price > 0:
-            position_value = calc_position_value(size, entry_price)
             unrealised = calc_unrealised_pnl(direction, entry_price, mark_price, size)
-            position_im, _imr = calc_initial_margin(
-                position_value, self._leverage, self.symbol, tiers=self._mm_tiers
+            # 0045: hedge-aware IM/MM helper replaces per-leg
+            # calc_initial_margin / calc_maintenance_margin on the
+            # snapshot path. Single consumer per emit (one snapshot per
+            # call), so inline call — no precompute / kwargs threading.
+            im_long, mm_long, im_short, mm_short = self._estimate_pair_im_mm(
+                self._long_tracker.state, self._short_tracker.state, mark_price,
             )
-            position_mm, _mmr = calc_maintenance_margin(
-                position_value, self.symbol, tiers=self._mm_tiers
-            )
+            if direction == DirectionType.LONG:
+                position_im, position_mm = im_long, mm_long
+            else:
+                position_im, position_mm = im_short, mm_short
             # 0043: prefer caller-provided pair; fall back to compute.
             if liq_long is None or liq_short is None:
                 liq_long, liq_short = self._estimate_pair_liq_prices(
@@ -735,6 +744,117 @@ class BacktestRunner:
             leverage=self._leverage,
             position_value=position_value,
         )
+
+    def _estimate_pair_im_mm(
+        self,
+        long_state,
+        short_state,
+        mark_price: Decimal,
+    ) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+        """Hedge-aware pair ``positionIM`` / ``positionMM`` per leg.
+
+        Returns ``(im_long, mm_long, im_short, mm_short)``. Mirrors the
+        shape of ``_estimate_pair_liq_prices``: one input pair → both
+        legs' values, in the order long-first, short-second.
+
+        Derived from Bybit help-center docs ("Initial Margin USDT
+        Contract", "Maintenance Margin USDT Contract") plus empirical
+        validation against 10 paired live snapshots in feature 0045
+        Phase 1 (max ``|Δ|`` 0.004 USDT, well below the plan's 0.1 USDT
+        acceptance threshold for MM).
+
+        Three non-obvious choices:
+
+        1. **`positionIM` and `positionMM` include the fee-to-close.**
+           Bybit's API returns these fields with the taker fee baked in
+           (per the linked help articles). The pre-0045 backtest path
+           used ``calc_initial_margin`` / ``calc_maintenance_margin``
+           which omit that fee — that omission was a ~0.23 USDT
+           single-leg gap. The new helper bakes the fee in so single-leg
+           values also align with live.
+        2. **Dominant-leg MM uses ONLY the unhedged portion at full
+           tier MMR.** The hedged portion of the dominant leg's notional
+           contributes zero to that leg's published MM in hedge mode:
+           Bybit cross-credits the hedged size to the smaller leg.
+           ``L_MM = max(L − S, 0) × mark × MMR_tier + fee_to_close_long``.
+        3. **Smaller leg has no per-MMR-on-PV term; only a hedge
+           buffer + fee.** When fully hedged (``S ≤ L`` for short-
+           smaller) Bybit publishes ``smaller_IM == smaller_MM ==
+           fee_to_close_smaller + hedged_size × |L_entry − S_entry| ×
+           MMR × C``, where ``C`` is an empirical Bybit-internal hedge
+           factor (≈ 5.657 for LTCUSDT @ 10x). Single-leg case
+           (opposite leg zero) collapses naturally — there is no
+           "smaller" leg to apply the buffer to.
+
+        Args:
+            long_state: Tracker state with ``size`` and ``avg_entry_price``.
+            short_state: Tracker state with ``size`` and ``avg_entry_price``.
+            mark_price: Current mark price (Bybit hedge formulas are
+                mark-based since 2025-09-02).
+
+        Returns:
+            ``(im_long, mm_long, im_short, mm_short)`` as Decimals. Zero
+            entries on legs with ``size == 0``.
+        """
+        L_size = long_state.size
+        S_size = short_state.size
+        L_entry = long_state.avg_entry_price
+        S_entry = short_state.avg_entry_price
+
+        zero = Decimal("0")
+        if L_size <= zero and S_size <= zero:
+            return zero, zero, zero, zero
+
+        lev = Decimal(str(self._leverage))
+        inv_lev = Decimal("1") / lev
+        taker = self._taker_fee_rate
+        hedge_C = self._hedge_smaller_buffer_factor
+
+        # Fee-to-close — formulas per Bybit docs (use avg entry price).
+        L_fee = L_size * L_entry * (Decimal("1") - inv_lev) * taker if L_size > zero else zero
+        S_fee = S_size * S_entry * (Decimal("1") + inv_lev) * taker if S_size > zero else zero
+
+        # Tier MMR is looked up on each leg's own mark-PV.
+        L_pv_mark = L_size * mark_price
+        S_pv_mark = S_size * mark_price
+        if L_size > zero:
+            _, mmr_long = calc_maintenance_margin(L_pv_mark, self.symbol, tiers=self._mm_tiers)
+        else:
+            mmr_long = zero
+        if S_size > zero:
+            _, mmr_short = calc_maintenance_margin(S_pv_mark, self.symbol, tiers=self._mm_tiers)
+        else:
+            mmr_short = zero
+
+        unhedged_long = max(L_size - S_size, zero)
+        unhedged_short = max(S_size - L_size, zero)
+        hedged_size = min(L_size, S_size) if (L_size > zero and S_size > zero) else zero
+        entry_diff = abs(L_entry - S_entry) if hedged_size > zero else zero
+
+        if L_size >= S_size:
+            # Long-dominant (or equal) regime: long is the heavier leg.
+            im_long = L_pv_mark / lev + L_fee if L_size > zero else zero
+            mm_long = unhedged_long * mark_price * mmr_long + L_fee if L_size > zero else zero
+            if S_size > zero:
+                # Smaller leg uses the dominant leg's tier MMR for the
+                # hedged-buffer term (Bybit applies a single MMR per
+                # paired position — the smaller leg sees the dominant
+                # tier, not its own).
+                buffer_short = mmr_long * hedged_size * entry_diff * hedge_C
+                im_short = mm_short = S_fee + buffer_short
+            else:
+                im_short = mm_short = zero
+            return im_long, mm_long, im_short, mm_short
+
+        # Short-dominant regime (symmetric).
+        im_short = S_pv_mark / lev + S_fee
+        mm_short = unhedged_short * mark_price * mmr_short + S_fee
+        if L_size > zero:
+            buffer_long = mmr_short * hedged_size * entry_diff * hedge_C
+            im_long = mm_long = L_fee + buffer_long
+        else:
+            im_long = mm_long = zero
+        return im_long, mm_long, im_short, mm_short
 
     def _estimate_pair_liq_prices(
         self,
