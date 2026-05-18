@@ -2245,6 +2245,11 @@ class TestEstimatePairImMm:
         Bybit's per-leg ``riskLimitValue`` assignment. The deduction
         term carries through to keep the per-tier MM formula
         continuous at the tier boundary.
+
+        Numeric expectations below are hard-coded so a regression that
+        e.g. drops the ``− deduction_tier`` term — exactly the P2 bug
+        this commit fixes — would re-fail this test instead of
+        silently shifting both sides of the equation.
         """
         # Long pv = 6000 LTC * 50 USDT = 300_000 USDT → tier 2 (max=400k).
         # Short pv smaller — stays in tier 1.
@@ -2253,23 +2258,97 @@ class TestEstimatePairImMm:
         mark = Decimal("50")
         im_L, mm_L, _, _ = runner._estimate_pair_im_mm(L, S, mark)
 
-        # Sanity: this is tier 2 (mmr=0.015, deduction=1000), not tier 1.
-        mmr_long, deduction_long = runner._tier_mmr_and_deduction(
-            Decimal("6000") * mark,
-        )
-        assert mmr_long == Decimal("0.015"), f"got tier MMR {mmr_long}"
-        assert deduction_long == Decimal("1000"), f"got tier ded {deduction_long}"
+        # Hand-derived expectations (LTCUSDT tier 2: mmr=0.015, ded=1000):
+        #   unhedged_long_pv = (6000 - 100) * 50 = 295_000
+        #   fee_long = 6000 * 50 * (1 - 1/10) * 0.00075 = 202.5
+        #   expected_im = 6000 * 50 / 10 + fee_long = 30_000 + 202.5 = 30_202.5
+        #   expected_mm = max(295_000 * 0.015 - 1000, 0) + fee_long
+        #               = max(4_425 - 1_000, 0) + 202.5
+        #               = 3_425 + 202.5
+        #               = 3_627.5
+        assert im_L == Decimal("30202.5"), f"im_L={im_L}"
+        assert mm_L == Decimal("3627.5"), f"mm_L={mm_L}"
 
-        unhedged_long_pv = (Decimal("6000") - Decimal("100")) * mark  # 295_000
+    def test_tier_boundary_short_dominant_applies_deduction(self, runner):
+        """Test #7b: symmetric short-dominant deduction subtraction.
+
+        Mirror of #7 — exercises the short-dominant MM branch with
+        tier-2 deduction so a regression dropping the deduction there
+        is caught. The long-dominant test alone would not catch a
+        short-branch regression.
+        """
+        L = self._state(Decimal("100"), Decimal("50"))
+        S = self._state(Decimal("6000"), Decimal("50"))  # 300k → tier 2
+        mark = Decimal("50")
+        _, _, im_S, mm_S = runner._estimate_pair_im_mm(L, S, mark)
+
+        # Mirror arithmetic of #7 with (1 + 1/10) fee factor on the
+        # short side:
+        #   unhedged_short_pv = (6000 - 100) * 50 = 295_000
+        #   fee_short = 6000 * 50 * 1.1 * 0.00075 = 247.5
+        #   expected_im = 6000 * 50 / 10 + fee_short = 30_247.5
+        #   expected_mm = max(295_000 * 0.015 - 1000, 0) + fee_short
+        #               = 3_425 + 247.5
+        #               = 3_672.5
+        assert im_S == Decimal("30247.5"), f"im_S={im_S}"
+        assert mm_S == Decimal("3672.5"), f"mm_S={mm_S}"
+
+    def test_tier_boundary_clamp_when_deduction_exceeds_base(self, runner):
+        """Tier deduction can exceed unhedged_pv × MMR — clamp to 0.
+
+        Pins the ``max(.., 0)`` guard so a regression that drops the
+        clamp (and returns a negative MM contribution) is caught.
+        Constructed so unhedged_long_pv × 0.015 < deduction_tier_2.
+        """
+        # Long pv = 6000 * 50 = 300_000 USDT → tier 2 (mmr=0.015, ded=1000).
+        # Short hedges 5950 of it, leaving unhedged_long = 50 → pv = 2500.
+        # unhedged_long_pv × mmr = 2500 × 0.015 = 37.5  <  deduction 1000.
+        # Clamp drives the MM base to 0; only fee_long remains.
+        L = self._state(Decimal("6000"), Decimal("50"))
+        S = self._state(Decimal("5950"), Decimal("50"))
+        mark = Decimal("50")
+        _, mm_L, _, _ = runner._estimate_pair_im_mm(L, S, mark)
+
         fee_long = Decimal("6000") * Decimal("50") * (
             Decimal("1") - Decimal("0.1")
         ) * Decimal("0.00075")
-        expected_mm = max(
-            unhedged_long_pv * mmr_long - deduction_long, Decimal("0"),
-        ) + fee_long
-        expected_im = Decimal("6000") * mark / Decimal("10") + fee_long
-        assert im_L == expected_im
-        assert mm_L == expected_mm
+        # Expect: max(2500*0.015 - 1000, 0) + fee = max(-962.5, 0) + 202.5
+        assert mm_L == fee_long, f"mm_L={mm_L} (expected fee_long={fee_long})"
+
+    def test_tier_mmr_and_deduction_edge_cases(self, runner):
+        """Direct unit tests for the new ``_tier_mmr_and_deduction`` helper.
+
+        Pins the three zero-return branches (``pv <= 0``, no tiers,
+        no matching tier) and the tier-2 happy path. These were
+        previously only exercised transitively via the pair helper.
+        """
+        # Tier 1 (LTCUSDT pv < 200k): mmr=0.01, ded=0.
+        mmr, ded = runner._tier_mmr_and_deduction(Decimal("100000"))
+        assert mmr == Decimal("0.01")
+        assert ded == Decimal("0")
+
+        # Tier 2 (200k < pv ≤ 400k): mmr=0.015, ded=1000.
+        mmr, ded = runner._tier_mmr_and_deduction(Decimal("300000"))
+        assert mmr == Decimal("0.015")
+        assert ded == Decimal("1000")
+
+        # pv <= 0 → (0, 0).
+        assert runner._tier_mmr_and_deduction(Decimal("0")) == (
+            Decimal("0"), Decimal("0"),
+        )
+        assert runner._tier_mmr_and_deduction(Decimal("-1")) == (
+            Decimal("0"), Decimal("0"),
+        )
+
+        # No tiers loaded → (0, 0).
+        saved = runner._mm_tiers
+        runner._mm_tiers = None
+        try:
+            assert runner._tier_mmr_and_deduction(Decimal("100")) == (
+                Decimal("0"), Decimal("0"),
+            )
+        finally:
+            runner._mm_tiers = saved
 
     # ----- Integration with _emit_position_snapshot -----
 

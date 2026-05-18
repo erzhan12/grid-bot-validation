@@ -773,10 +773,15 @@ class BacktestRunner:
            single-leg gap. The new helper bakes the fee in so single-leg
            values also align with live.
         2. **Dominant-leg MM uses ONLY the unhedged portion at full
-           tier MMR.** The hedged portion of the dominant leg's notional
-           contributes zero to that leg's published MM in hedge mode:
-           Bybit cross-credits the hedged size to the smaller leg.
-           ``L_MM = max(L − S, 0) × mark × MMR_tier + fee_to_close_long``.
+           tier MMR, minus the tier deduction.** The hedged portion of
+           the dominant leg's notional contributes zero to that leg's
+           published MM in hedge mode: Bybit cross-credits the hedged
+           size to the smaller leg. The ``deduction`` term carries
+           through (looked up on the leg's own full pv, matching
+           Bybit's per-leg ``riskLimitValue``) so the per-tier MM
+           formula stays continuous at tier boundaries.
+           ``L_MM = max((L − S) × mark × MMR_tier − deduction_tier, 0)
+                  + fee_to_close_long``.
         3. **Smaller leg has no per-MMR-on-PV term; only a hedge
            buffer + fee.** When fully hedged (``S ≤ L`` for short-
            smaller) Bybit publishes ``smaller_IM == smaller_MM ==
