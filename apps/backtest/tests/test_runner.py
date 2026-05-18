@@ -2240,9 +2240,11 @@ class TestEstimatePairImMm:
         """Test #7: tier-boundary crossing — Bybit tier picks per-leg pv.
 
         LTCUSDT tier 1 max=200,000 USDT. A position with leg pv > 200k
-        crosses into tier 2 (mmr=0.015, ded=1000). Helper looks up the
-        tier on the leg's own pv (not the combined), matching Bybit's
-        per-leg riskLimitValue assignment.
+        crosses into tier 2 (mmr=0.015, deduction=1000). Helper looks
+        up the tier on the leg's own pv (not the combined), matching
+        Bybit's per-leg ``riskLimitValue`` assignment. The deduction
+        term carries through to keep the per-tier MM formula
+        continuous at the tier boundary.
         """
         # Long pv = 6000 LTC * 50 USDT = 300_000 USDT → tier 2 (max=400k).
         # Short pv smaller — stays in tier 1.
@@ -2251,19 +2253,20 @@ class TestEstimatePairImMm:
         mark = Decimal("50")
         im_L, mm_L, _, _ = runner._estimate_pair_im_mm(L, S, mark)
 
-        # Long uses tier 2 (mmr=0.015, deduction=1000).
-        unhedged_long_pv = (Decimal("6000") - Decimal("100")) * mark  # 295_000
-        from gridcore.pnl import calc_maintenance_margin
-        _, mmr_long = calc_maintenance_margin(
-            Decimal("6000") * mark, "LTCUSDT", tiers=runner._mm_tiers,
+        # Sanity: this is tier 2 (mmr=0.015, deduction=1000), not tier 1.
+        mmr_long, deduction_long = runner._tier_mmr_and_deduction(
+            Decimal("6000") * mark,
         )
-        # Sanity: this is tier 2, not tier 1.
         assert mmr_long == Decimal("0.015"), f"got tier MMR {mmr_long}"
+        assert deduction_long == Decimal("1000"), f"got tier ded {deduction_long}"
 
+        unhedged_long_pv = (Decimal("6000") - Decimal("100")) * mark  # 295_000
         fee_long = Decimal("6000") * Decimal("50") * (
             Decimal("1") - Decimal("0.1")
         ) * Decimal("0.00075")
-        expected_mm = unhedged_long_pv * mmr_long + fee_long
+        expected_mm = max(
+            unhedged_long_pv * mmr_long - deduction_long, Decimal("0"),
+        ) + fee_long
         expected_im = Decimal("6000") * mark / Decimal("10") + fee_long
         assert im_L == expected_im
         assert mm_L == expected_mm

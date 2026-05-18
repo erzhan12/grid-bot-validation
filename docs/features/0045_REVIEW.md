@@ -5,15 +5,16 @@
 **Issue:** [#99](https://github.com/erzhan12/grid-bot-validation/issues/99)
 **Plan:** [`docs/features/0045_PLAN.md`](./0045_PLAN.md)
 
-## Acceptance — met by 200×
+## Acceptance — met
 
 | Metric | Plan threshold | v3 baseline | 0045 result | Improvement |
 |---|---:|---:|---:|---:|
-| `position_im_max_abs_delta` | ≤ 1.0 USDT | 22.636 | **0.00528** | **4286×** |
-| `position_mm_max_abs_delta` | ≤ 0.1 USDT | 1.770 | **0.00528** | **335×** |
+| `position_im_max_abs_delta` | ≤ 1.0 USDT | 22.636 | **0.1124** | **201×** |
+| `position_mm_max_abs_delta` | ≤ 0.1 USDT | 1.770 | **0.0124** | **143×** |
 | `position_pairs_state_diverged` | must remain 0 | 0 | **0** | regression-clean |
+| `position_pairs_compared` | — | 4 | 4 | — |
 
-The 0045 helper produces values that match Bybit live within **0.005
+The 0045 helper produces values that match Bybit live within **0.12
 USDT** on every paired snapshot — well below both acceptance bounds.
 
 ## Pipeline used
@@ -75,7 +76,9 @@ fee_to_close_short = S_size × S_entry × (1 + 1/leverage) × taker_rate
 
 Long-dominant case (L_size >= S_size):
     im_long  = L_size × mark / leverage + fee_to_close_long
-    mm_long  = max(L_size − S_size, 0) × mark × MMR_tier_long + fee_to_close_long
+    mm_long  = max((L_size − S_size) × mark × MMR_tier_long
+                   − deduction_tier_long, 0)
+             + fee_to_close_long
     im_short = mm_short = fee_to_close_short
                         + MMR_tier_long × min(L_size, S_size)
                                        × |L_entry − S_entry|

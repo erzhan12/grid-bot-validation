@@ -31,11 +31,11 @@ from gridcore.pnl import (
     calc_position_value,
     calc_margin_ratio,
     calc_maintenance_margin,
-    calc_initial_margin,
     calc_unrealised_pnl,
     MMTiers,
     MM_TIERS,
     MM_TIERS_DEFAULT,
+    _find_matching_tier,
 )
 from grid_db.models import PositionSnapshot
 
@@ -814,17 +814,17 @@ class BacktestRunner:
         L_fee = L_size * L_entry * (Decimal("1") - inv_lev) * taker if L_size > zero else zero
         S_fee = S_size * S_entry * (Decimal("1") + inv_lev) * taker if S_size > zero else zero
 
-        # Tier MMR is looked up on each leg's own mark-PV.
+        # Tier looked up on each leg's own mark-PV (Bybit assigns
+        # ``riskLimitValue`` per-leg on the full leg notional). Each
+        # tier contributes a ``(mmr_rate, deduction)`` pair; Bybit's
+        # documented MM formula is ``pv × mmr − deduction``, kept
+        # continuous at tier boundaries by the deduction. We re-apply
+        # that exact shape against the unhedged portion of the
+        # dominant leg.
         L_pv_mark = L_size * mark_price
         S_pv_mark = S_size * mark_price
-        if L_size > zero:
-            _, mmr_long = calc_maintenance_margin(L_pv_mark, self.symbol, tiers=self._mm_tiers)
-        else:
-            mmr_long = zero
-        if S_size > zero:
-            _, mmr_short = calc_maintenance_margin(S_pv_mark, self.symbol, tiers=self._mm_tiers)
-        else:
-            mmr_short = zero
+        mmr_long, deduction_long = self._tier_mmr_and_deduction(L_pv_mark)
+        mmr_short, deduction_short = self._tier_mmr_and_deduction(S_pv_mark)
 
         unhedged_long = max(L_size - S_size, zero)
         unhedged_short = max(S_size - L_size, zero)
@@ -834,7 +834,13 @@ class BacktestRunner:
         if L_size >= S_size:
             # Long-dominant (or equal) regime: long is the heavier leg.
             im_long = L_pv_mark / lev + L_fee if L_size > zero else zero
-            mm_long = unhedged_long * mark_price * mmr_long + L_fee if L_size > zero else zero
+            if L_size > zero:
+                mm_long_base = max(
+                    unhedged_long * mark_price * mmr_long - deduction_long, zero,
+                )
+                mm_long = mm_long_base + L_fee
+            else:
+                mm_long = zero
             if S_size > zero:
                 # Smaller leg uses the dominant leg's tier MMR for the
                 # hedged-buffer term (Bybit applies a single MMR per
@@ -848,13 +854,34 @@ class BacktestRunner:
 
         # Short-dominant regime (symmetric).
         im_short = S_pv_mark / lev + S_fee
-        mm_short = unhedged_short * mark_price * mmr_short + S_fee
+        mm_short_base = max(
+            unhedged_short * mark_price * mmr_short - deduction_short, zero,
+        )
+        mm_short = mm_short_base + S_fee
         if L_size > zero:
             buffer_long = mmr_short * hedged_size * entry_diff * hedge_C
             im_long = mm_long = L_fee + buffer_long
         else:
             im_long = mm_long = zero
         return im_long, mm_long, im_short, mm_short
+
+    def _tier_mmr_and_deduction(self, pv: Decimal) -> tuple[Decimal, Decimal]:
+        """Return ``(mmr_rate, deduction)`` for ``pv`` from the loaded tier table.
+
+        Mirrors the per-tier lookup ``calc_maintenance_margin`` does
+        internally, but exposes ``deduction`` separately so the 0045
+        helper can apply ``unhedged_pv × mmr − deduction`` while still
+        using the leg's full-pv tier. Returns ``(0, 0)`` when no tier
+        matches or when no tier table is loaded.
+        """
+        zero = Decimal("0")
+        if pv <= zero or self._mm_tiers is None:
+            return zero, zero
+        tier = _find_matching_tier(pv, self._mm_tiers)
+        if tier is None:
+            return zero, zero
+        _max_val, mmr, deduction, _imr = tier
+        return mmr, deduction
 
     def _estimate_pair_liq_prices(
         self,
