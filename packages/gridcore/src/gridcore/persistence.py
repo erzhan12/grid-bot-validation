@@ -19,6 +19,7 @@ runs a synchronous main loop (time.sleep), so asyncio.create_task would
 always fall through to the sync path and block the loop on fsync.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -26,6 +27,37 @@ import threading
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+def grid_fingerprint(grid: list[dict], grid_step: float, grid_count: int) -> tuple:
+    """Cheap structural identity of a grid payload.
+
+    Comparable, hashable, and ~50x cheaper than deepcopy + dict equality.
+    Public form of the helper used by both ``GridStateStore`` (file path)
+    and ``GridStateWriter`` (DB path) so dedupe is single-sourced.
+    """
+    return (
+        tuple((g['side'], g['price']) for g in grid),
+        grid_step,
+        grid_count,
+    )
+
+
+def grid_fingerprint_hash(grid: list[dict], grid_step: float, grid_count: int) -> str:
+    """SHA-256 hex digest of the canonical grid fingerprint.
+
+    64-char hex matches the ``raw_fingerprint VARCHAR(64)`` column on
+    ``grid_state_snapshots``. ``default=str`` lets ``json.dumps`` serialise
+    ``Decimal`` / ``float`` mixed numerics safely.
+    """
+    return hashlib.sha256(
+        json.dumps(
+            grid_fingerprint(grid, grid_step, grid_count),
+            separators=(",", ":"),
+            sort_keys=False,
+            default=str,
+        ).encode()
+    ).hexdigest()
 
 
 class GridStateStore:
@@ -69,15 +101,9 @@ class GridStateStore:
         if strat_id == "":
             raise ValueError("strat_id must be a non-empty string")
 
-    @staticmethod
-    def _fingerprint(grid: list[dict], grid_step: float, grid_count: int) -> tuple:
-        """Cheap structural identity of a payload — comparable, hashable,
-        and ~50x cheaper than deepcopy + dict equality."""
-        return (
-            tuple((g['side'], g['price']) for g in grid),
-            grid_step,
-            grid_count,
-        )
+    # Thin alias for backward compatibility — public form lives at module
+    # scope as ``grid_fingerprint`` (0047).
+    _fingerprint = staticmethod(grid_fingerprint)
 
     def _read_all_data(self) -> dict:
         """Read the full JSON file, returning {} on any error or if the root

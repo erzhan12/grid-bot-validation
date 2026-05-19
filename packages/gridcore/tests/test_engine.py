@@ -1083,7 +1083,7 @@ class TestRestoredGrid:
             tick_size=Decimal('0.1'),
             config=config,
             strat_id='btcusdt_test',
-            on_grid_change=lambda g: captured.append(len(g)),
+            on_grid_change=lambda g, ts: captured.append(len(g)),
         )
         engine.on_event(self._ticker(100.0), {'long': [], 'short': []})
         assert captured == [11]

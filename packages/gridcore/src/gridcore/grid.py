@@ -10,6 +10,7 @@ Extracted from bbu2-master/greed.py with the following key transformations:
 """
 
 import logging
+from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Callable, NamedTuple, Optional
@@ -47,7 +48,7 @@ class Grid:
     """
 
     def __init__(self, tick_size: Decimal, grid_count: int = 50, grid_step: float = 0.2, rebalance_threshold: float = 0.3,
-                 on_change: Optional[Callable[[list[dict]], None]] = None):
+                 on_change: Optional[Callable[[list[dict], Optional[datetime]], None]] = None):
         """
         Initialize Grid calculator.
 
@@ -57,8 +58,13 @@ class Grid:
             grid_step: Step size in percentage (default 0.2 = 0.2% between levels)
             rebalance_threshold: Threshold for rebalancing grid when imbalanced (default 0.3 = 30%)
             on_change: Optional callback fired after build_grid/update_grid mutates self.grid.
-                Used by callers (e.g. live runner) to persist grid state. Grid stays pure —
-                the callback is just a function reference, no I/O knowledge here.
+                Signature is ``(grid, exchange_ts)`` — ``exchange_ts`` is the
+                triggering event's timestamp (set by the engine handler in a
+                try/finally on ``self._current_exchange_ts``) or ``None`` if
+                no triggering event is in scope (e.g. constructor-time
+                ``restore_grid``). Callbacks must accept both args; arity
+                mismatches are silenced by ``_notify_change`` and would
+                disable persistence silently (feature 0047).
         """
         self.grid: list[dict] = []
         self.tick_size = tick_size
@@ -67,6 +73,10 @@ class Grid:
         self.REBALANCE_THRESHOLD = rebalance_threshold
         self._original_anchor_price: Optional[float] = None
         self._on_change = on_change
+        # 0047: engine sets this in a try/finally at the top of each event
+        # handler so multiple inner notifies share the same ts; cleared on
+        # handler exit. Read-only here — never reset by _notify_change.
+        self._current_exchange_ts: Optional[datetime] = None
 
     def _notify_change(self) -> None:
         """Invoke on_change callback. Errors are logged but never propagate —
@@ -74,7 +84,7 @@ class Grid:
         if self._on_change is None:
             return
         try:
-            self._on_change(self.grid)
+            self._on_change(self.grid, self._current_exchange_ts)
         except Exception as e:
             logger.error("Grid on_change callback failed: %s", e, exc_info=True)
 

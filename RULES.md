@@ -340,6 +340,25 @@ If the saved `grid_step` or `grid_count` differs from the current strategy confi
 - **`anchor_price` parameter on `GridEngine` is retained for backtest compatibility**, separate from `restored_grid`. Backtest pins grid origin via `anchor_price`; live runner uses `restored_grid` for full-state restore. They serve different use cases.
 - **Known limitation**: an in-flight writer thread that has already popped a payload from `_pending_payload` and is waiting on `_io_lock` cannot be cancelled by a concurrent `delete()`. The writer will eventually re-persist the entry after the delete. Acceptable for current usage (delete is for "strat removed from config" — no concurrent saves expected); not currently fixed.
 
+### Grid State DB snapshots — feature 0047
+
+Live writes the same `grid.grid` payload to **two parallel sinks** from `_on_grid_change`:
+
+1. **Legacy file** — `GridStateStore` (see section above). Timestamp-agnostic, latest-wins-per-strat coalesced into one `db/grid_anchor.json`. Owns live-restart parity.
+2. **DB table** — `grid_state_snapshots` (column set: `run_id, account_id, strat_id, symbol, exchange_ts, local_ts, grid_json, grid_step, grid_count, raw_fingerprint`). Owns Phase 4 replay seeding. Written by `apps/gridbot/src/gridbot/writers/grid_state_writer.py:GridStateWriter` — sync API + `queue.Queue` + single worker thread; **NOT asyncio** (gridbot's main loop is sync; the event_saver writers live in a different process).
+
+Both backends are independent guards in `runner._on_grid_change(grid, exchange_ts)` — file fires whenever `state_store` is configured; DB fires only when `grid_state_writer` is set AND `exchange_ts is not None`. The `on_change` callback signature is `(grid, exchange_ts)`; constructor-time `restore_grid` produces `exchange_ts=None` and DB drops the write (file is unaffected because it doesn't time-index).
+
+**Replay loader priority** (`apps/replay/src/replay/engine.py:_load_seed`): DB row at-or-before `seed.at_ts` → file path if `seed.grid_state_path is not None` → fresh blank-build. `Grid.restore_grid` consumes both DB and file payloads identically (same `list[{side, price}]` shape).
+
+**Pitfalls**
+
+- **`on_change` arity is silently swallowed** at `grid.py:78` — every callsite passing `on_change=` must use `(grid, exchange_ts)`. The grep gate `grep -rE 'on_change|on_grid_change' packages/ apps/ --include='*.py'` should show no single-arg lambdas.
+- **`account_id` MUST match the `uuid5(NAMESPACE, "account:<name>")` formula** at `orchestrator.py:1156-1162`. Any deviation breaks the FK link to `runs.account_id` and replay returns no row. `Orchestrator._account_id_for()` is the single source of truth.
+- **Partial unique index `uq_grid_state_snapshots_fingerprint_at_ts`** is scoped to `(run_id, account_id, strat_id, exchange_ts, raw_fingerprint) WHERE raw_fingerprint IS NOT NULL`. The repository's `insert()` must pass both `index_elements=[...]` AND `index_where=GridStateSnapshot.raw_fingerprint.is_not(None)` to ON CONFLICT DO NOTHING, otherwise the partial constraint won't bind.
+- **`id DESC` tie-break depends on FIFO insertion** for same-`(run, account, strat, exchange_ts)` enqueues. The writer's single global queue preserves this; do NOT introduce per-strat queues or batch reordering without preserving per-(strat, ts) order, or `update_grid` out-of-bounds rebuilds will replay the intermediate (post-rebuild) state instead of the final (post-side-assignment) state.
+- **Bootstrap window**: writer is constructed in `Orchestrator.__init__` but `_run_ids` is populated later in `start()` via `_create_run_records`. Writer's `run_id_provider` returns `None` during this window; writes are dropped with a one-time INFO. WS connect happens AFTER `_create_run_records`, and reconciliation does not mutate the grid, so the first real `_on_grid_change` always fires with `_run_ids` populated.
+
 ## Logging Configuration
 
 Gridcore uses Python's standard library `logging` module. Loggers are named after their modules (`gridcore.grid`, `gridcore.engine`, `gridcore.position`).

@@ -9,6 +9,7 @@ Extracted from bbu2-master/strat.py Strat50 class with the following transformat
 """
 
 import logging
+from datetime import datetime
 from decimal import Decimal
 from typing import Callable, Optional
 
@@ -45,7 +46,7 @@ class GridEngine:
     def __init__(self, symbol: str, tick_size: Decimal, config: GridConfig,
                  strat_id: str, anchor_price: Optional[float] = None,
                  restored_grid: Optional[list[dict]] = None,
-                 on_grid_change: Optional[Callable[[list[dict]], None]] = None):
+                 on_grid_change: Optional[Callable[[list[dict], Optional[datetime]], None]] = None):
         """
         Initialize grid trading engine.
 
@@ -60,9 +61,11 @@ class GridEngine:
                          on construction. Used by the live runner to resume after restart.
                          If validation fails the engine falls back to a fresh build on
                          the first ticker.
-            on_grid_change: Optional callback invoked with the current grid after every
-                         build_grid / update_grid mutation. Used by the live runner to
-                         persist grid state.
+            on_grid_change: Optional callback invoked with ``(grid, exchange_ts)``
+                         after every build_grid / update_grid mutation. ``exchange_ts``
+                         is the triggering event's exchange time (or ``None`` for
+                         non-event mutations, e.g. constructor-time restore_grid).
+                         Used by the live runner to persist grid state.
         """
         self.symbol = symbol
         self.config = config
@@ -135,6 +138,17 @@ class GridEngine:
         Returns:
             List of intents for order placement/cancellation
         """
+        # 0047: propagate the triggering event's exchange_ts to any nested
+        # grid mutation. Cleared in `finally` so subsequent constructor-time
+        # or out-of-handler `_notify_change` calls see None (DB writer
+        # skips; file writer is ts-independent).
+        self.grid._current_exchange_ts = event.exchange_ts
+        try:
+            return self._handle_ticker_event_body(event, limit_orders)
+        finally:
+            self.grid._current_exchange_ts = None
+
+    def _handle_ticker_event_body(self, event: TickerEvent, limit_orders: dict[str, list[dict]]) -> list[PlaceLimitIntent | CancelIntent]:
         intents: list[PlaceLimitIntent | CancelIntent] = []
 
         # Update last close price
@@ -233,18 +247,24 @@ class GridEngine:
         Returns:
             List of intents (typically empty, grid update is internal)
         """
-        # Update last filled price
-        self.last_filled_price = float(event.price)
+        # 0047: see _handle_ticker_event for the rationale on
+        # _current_exchange_ts lifecycle.
+        self.grid._current_exchange_ts = event.exchange_ts
+        try:
+            # Update last filled price
+            self.last_filled_price = float(event.price)
 
-        # Update grid based on fill
-        if self.last_close is not None:
-            self.grid.update_grid(self.last_filled_price, self.last_close)
-        else:
-            # Defer: no last_close yet, so update_grid would early-return.
-            # Consume on first ticker event.
-            self._fill_pending = True
+            # Update grid based on fill
+            if self.last_close is not None:
+                self.grid.update_grid(self.last_filled_price, self.last_close)
+            else:
+                # Defer: no last_close yet, so update_grid would early-return.
+                # Consume on first ticker event.
+                self._fill_pending = True
 
-        return []
+            return []
+        finally:
+            self.grid._current_exchange_ts = None
 
     def _handle_order_update_event(self, event: OrderUpdateEvent) -> list[PlaceLimitIntent | CancelIntent]:
         """

@@ -4153,10 +4153,348 @@ class TestStateStoreWiring:
         runner = StrategyRunner(
             strategy_config=strategy_config, executor=mock_executor, state_store=store,
         )
-        runner._on_grid_change([])
-        runner._on_grid_change([{"side": "Wait", "price": 100.0}])
+        runner._on_grid_change([], None)
+        runner._on_grid_change([{"side": "Wait", "price": 100.0}], None)
         store.save.assert_not_called()
 
     def test_on_grid_change_no_store_is_noop(self, strategy_config, mock_executor):
         runner = StrategyRunner(strategy_config=strategy_config, executor=mock_executor)
-        runner._on_grid_change([{"side": "Wait", "price": 100.0}] * 5)
+        runner._on_grid_change([{"side": "Wait", "price": 100.0}] * 5, None)
+
+    def test_account_id_required_when_grid_state_writer_wired(
+        self, strategy_config, mock_executor,
+    ):
+        """0047: dummy account_id default must NOT be silently accepted
+        when a DB writer is wired — would FK-mismatch replay's account
+        scope and snapshots become invisible.
+        """
+        writer = Mock()
+        with pytest.raises(ValueError, match="account_id must be set"):
+            StrategyRunner(
+                strategy_config=strategy_config,
+                executor=mock_executor,
+                # account_id omitted on purpose — dummy default kicks in.
+                grid_state_writer=writer,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Feature 0047 — exchange_ts propagation through _on_grid_change.
+#
+# These tests assert each mutation path enumerated in plan v18 carries the
+# correct triggering-event timestamp into ``GridStateWriter.write``. Wrong
+# timestamps would persist cleanly (no test fails) but break replay's
+# ``at_or_before(seed.at_ts)`` lookup — the same silent-failure class the
+# plan calls out for the ``grid.py:78`` arity swallow.
+# ---------------------------------------------------------------------------
+
+
+class TestOnGridChangeDbWriter:
+    """0047: ``_on_grid_change`` writer-side behaviour (independent of engine paths)."""
+
+    _ACCOUNT_ID = "00000000-0000-0000-0000-000000000001"
+
+    def _runner(self, strategy_config, mock_executor, *, writer=None, store=None):
+        return StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            account_id=self._ACCOUNT_ID,
+            state_store=store,
+            grid_state_writer=writer,
+        )
+
+    def test_writes_to_db_when_writer_configured(self, strategy_config, mock_executor):
+        store = Mock()
+        store.load.return_value = None
+        writer = Mock()
+        runner = self._runner(strategy_config, mock_executor, writer=writer, store=store)
+
+        ts = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        grid = [
+            {"side": "Buy", "price": 99.0},
+            {"side": "Wait", "price": 100.0},
+            {"side": "Sell", "price": 101.0},
+        ]
+        runner._on_grid_change(grid, ts)
+
+        writer.write.assert_called_once()
+        call = writer.write.call_args
+        assert call.kwargs["strat_id"] == strategy_config.strat_id
+        assert call.kwargs["grid"] is grid
+        assert call.kwargs["grid_step"] == strategy_config.grid_step
+        assert call.kwargs["grid_count"] == strategy_config.grid_count
+        assert call.kwargs["account_id"] == self._ACCOUNT_ID
+        assert call.kwargs["symbol"] == strategy_config.symbol
+        assert call.kwargs["exchange_ts"] == ts
+        # File path also fired in parallel (independent backend guards).
+        store.save.assert_called_once()
+
+    def test_skips_db_write_when_writer_not_configured(self, strategy_config, mock_executor):
+        store = Mock()
+        store.load.return_value = None
+        runner = self._runner(strategy_config, mock_executor, store=store)
+        runner._on_grid_change(
+            [{"side": "Buy", "price": 99.0}, {"side": "Sell", "price": 101.0}],
+            datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        # No grid_state_writer attribute means no DB write path — file path still fires.
+        store.save.assert_called_once()
+
+    def test_db_write_fires_when_state_store_is_none(self, strategy_config, mock_executor):
+        """v12 guard split: backends are independent. DB write fires even
+        when the legacy file backend is disabled (the v11 plan would have
+        skipped this case via the early ``state_store is None`` return)."""
+        writer = Mock()
+        runner = self._runner(strategy_config, mock_executor, writer=writer, store=None)
+        ts = datetime(2026, 1, 1, tzinfo=UTC)
+        runner._on_grid_change(
+            [{"side": "Buy", "price": 99.0}, {"side": "Sell", "price": 101.0}],
+            ts,
+        )
+        writer.write.assert_called_once()
+        assert writer.write.call_args.kwargs["exchange_ts"] == ts
+
+    def test_skips_db_when_exchange_ts_none(self, strategy_config, mock_executor):
+        """Constructor-time restore_grid (or any other code path without a
+        triggering event) carries ``exchange_ts=None``; the DB write must
+        be skipped — non-null column would FK-write garbage and break
+        ``at_or_before`` lookups. File writer is unaffected."""
+        store = Mock()
+        store.load.return_value = None
+        writer = Mock()
+        runner = self._runner(strategy_config, mock_executor, writer=writer, store=store)
+        runner._on_grid_change(
+            [{"side": "Buy", "price": 99.0}, {"side": "Sell", "price": 101.0}],
+            None,
+        )
+        writer.write.assert_not_called()
+        store.save.assert_called_once()
+
+
+class TestOnGridChangeExchangeTsPropagation:
+    """0047: engine-path coverage that the triggering event's exchange_ts
+    is the value that lands at ``GridStateWriter.write``.
+
+    Each test drives one of the engine mutation paths enumerated in plan
+    v18 (restored-grid OOB rebuild, deferred-fill consumption, etc.) and
+    inspects the captured ``exchange_ts`` on a Mock writer.
+    """
+
+    _ACCOUNT_ID = "00000000-0000-0000-0000-000000000001"
+
+    def _runner(
+        self,
+        strategy_config,
+        mock_executor,
+        *,
+        writer,
+        restored_grid=None,
+    ) -> StrategyRunner:
+        store = Mock()
+        store.load.return_value = (
+            {
+                "grid": restored_grid,
+                "grid_step": strategy_config.grid_step,
+                "grid_count": strategy_config.grid_count,
+            }
+            if restored_grid is not None
+            else None
+        )
+        return StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            account_id=self._ACCOUNT_ID,
+            state_store=store,
+            grid_state_writer=writer,
+        )
+
+    @staticmethod
+    def _ticker(price: float, ts: datetime) -> TickerEvent:
+        return TickerEvent(
+            event_type=EventType.TICKER,
+            symbol="BTCUSDT",
+            exchange_ts=ts,
+            local_ts=ts,
+            last_price=Decimal(str(price)),
+            mark_price=Decimal(str(price)),
+            bid1_price=Decimal(str(price - 0.5)),
+            ask1_price=Decimal(str(price + 0.5)),
+            funding_rate=Decimal("0.0001"),
+        )
+
+    @staticmethod
+    def _execution(price: float, ts: datetime, side: str = "Buy") -> ExecutionEvent:
+        return ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=ts,
+            local_ts=ts,
+            exec_id=f"exec-{ts.isoformat()}",
+            order_id=f"order-{ts.isoformat()}",
+            order_link_id="abcdef0123456789-1715170800000",
+            side=side,
+            price=Decimal(str(price)),
+            qty=Decimal("0.001"),
+        )
+
+    def test_first_ticker_build_carries_ticker_ts(
+        self, strategy_config, mock_executor,
+    ):
+        """The very first ticker triggers ``build_grid`` (engine.py:151);
+        the snapshot must carry the ticker's ``exchange_ts``."""
+        writer = Mock()
+        runner = self._runner(strategy_config, mock_executor, writer=writer)
+        runner._wallet_balance = Decimal("10000")
+        ticker_ts = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        runner.on_ticker(self._ticker(50000.0, ticker_ts))
+
+        writer.write.assert_called_once()
+        assert writer.write.call_args.kwargs["exchange_ts"] == ticker_ts
+
+    def test_restored_grid_oob_rebuild_carries_ticker_ts(
+        self, strategy_config, mock_executor,
+    ):
+        """``engine.py:160-181``: first ticker is outside the restored
+        grid's bounds → engine rebuilds around ``last_close``. The
+        snapshot from this mutation must carry the ticker's ts (not the
+        save's wall-clock)."""
+        # Restored grid pinned far below the incoming ticker. The grid
+        # must be valid for ``is_grid_correct`` to accept restoration:
+        # strict-ascending prices, Buy levels < Sell levels.
+        restored_grid = [
+            {"side": "Buy", "price": float(p)}
+            for p in range(100, 100 + strategy_config.grid_count // 2)
+        ] + [{"side": "Wait", "price": float(100 + strategy_config.grid_count // 2)}] + [
+            {"side": "Sell", "price": float(p)}
+            for p in range(
+                100 + strategy_config.grid_count // 2 + 1,
+                100 + strategy_config.grid_count + 1,
+            )
+        ]
+        writer = Mock()
+        runner = self._runner(
+            strategy_config, mock_executor, writer=writer,
+            restored_grid=restored_grid,
+        )
+        runner._wallet_balance = Decimal("10000")
+        # Ticker at 50000 is far above the restored grid (100..150) →
+        # bounds check triggers a rebuild.
+        ticker_ts = datetime(2026, 1, 1, 13, 0, 0, tzinfo=UTC)
+        runner.on_ticker(self._ticker(50000.0, ticker_ts))
+
+        # At least one snapshot must carry the ticker's exchange_ts.
+        assert writer.write.called
+        observed = [c.kwargs["exchange_ts"] for c in writer.write.call_args_list]
+        assert ticker_ts in observed
+        # No wall-clock substitute.
+        assert all(ts == ticker_ts for ts in observed)
+
+    def test_deferred_fill_consumption_uses_ticker_ts(
+        self, strategy_config, mock_executor,
+    ):
+        """``engine.py:194``: execution arrives BEFORE first ticker
+        (``_fill_pending`` set, no grid yet). When ticker arrives, the
+        deferred fill is consumed and ``update_grid`` mutates the grid.
+        The snapshot must carry the **ticker's** ts (the moment live
+        actually mutates), not the earlier execution's.
+        """
+        writer = Mock()
+        runner = self._runner(strategy_config, mock_executor, writer=writer)
+        runner._wallet_balance = Decimal("10000")
+        exec_ts = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        ticker_ts = datetime(2026, 1, 1, 12, 0, 5, tzinfo=UTC)
+
+        # Execution first — engine has no last_close so just sets _fill_pending.
+        runner.on_execution(self._execution(50000.0, exec_ts))
+        assert writer.write.call_count == 0  # no grid mutation yet
+
+        # Ticker — builds grid AND consumes deferred fill.
+        runner.on_ticker(self._ticker(50000.0, ticker_ts))
+        assert writer.write.called
+        observed = [c.kwargs["exchange_ts"] for c in writer.write.call_args_list]
+        # The deferred-fill consumption snapshot must carry the ticker's ts.
+        assert ticker_ts in observed
+        # The earlier execution's ts MUST NOT appear — live mutated at
+        # ticker time, not execution time.
+        assert exec_ts not in observed
+
+    def test_check_and_place_rebuild_carries_ticker_ts(
+        self, strategy_config, mock_executor,
+    ):
+        """``engine.py:331``: when ``_check_and_place`` sees more limits
+        than the grid can fit (``len(limits) > len(grid) + 10``), it
+        rebuilds the grid via ``build_grid(self.last_close)``. The
+        snapshot must carry the **ticker's** ``exchange_ts`` — the
+        rebuild fires inside ``_handle_ticker_event`` whose try/finally
+        already pinned ``_current_exchange_ts`` to the ticker's ts.
+        """
+        writer = Mock()
+        runner = self._runner(strategy_config, mock_executor, writer=writer)
+        runner._wallet_balance = Decimal("10000")
+
+        # First ticker — builds the grid (grid_count=50 → 51 levels).
+        first_ts = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        runner.on_ticker(self._ticker(50000.0, first_ts))
+        writer.reset_mock()
+
+        # Stub get_limit_orders so the second ticker sees > 61 long
+        # orders, which triggers the too-many-orders rebuild branch
+        # (engine.py:347-349). Order shapes are intentionally minimal —
+        # the rebuild check just measures len().
+        runner.get_limit_orders = Mock(return_value={
+            "long": [
+                {
+                    "orderId": f"o{i}",
+                    "orderLinkId": f"link-{i}",
+                    "price": "50000.0",
+                    "qty": "0.001",
+                    "side": "Buy",
+                    "reduceOnly": False,
+                }
+                for i in range(70)
+            ],
+            "short": [],
+        })
+
+        # Second ticker at the same price — bounds OK, no recenter, but
+        # _check_and_place sees too many long orders and rebuilds.
+        ticker_ts = datetime(2026, 1, 1, 12, 1, 0, tzinfo=UTC)
+        runner.on_ticker(self._ticker(50000.0, ticker_ts))
+
+        assert writer.write.called
+        observed = [c.kwargs["exchange_ts"] for c in writer.write.call_args_list]
+        # Every snapshot from this mutation carries the ticker's ts.
+        assert all(ts == ticker_ts for ts in observed)
+        # Earlier ticker ts must NOT bleed in via stale state.
+        assert first_ts not in observed
+
+    def test_update_grid_out_of_bounds_rebuild_carries_execution_ts(
+        self, strategy_config, mock_executor,
+    ):
+        """``engine.py:241``: first ticker sets ``last_close``; then an
+        execution at an OOB price triggers ``update_grid`` rebuild →
+        ``_notify_change`` fires twice (post-rebuild intermediate +
+        post-side-assignment final). Both snapshots must carry the
+        execution's ``exchange_ts``.
+        """
+        writer = Mock()
+        runner = self._runner(strategy_config, mock_executor, writer=writer)
+        runner._wallet_balance = Decimal("10000")
+        ticker_ts = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+        exec_ts = datetime(2026, 1, 1, 12, 5, 0, tzinfo=UTC)
+
+        # First ticker — builds grid centered around 50000 with step 0.2%.
+        runner.on_ticker(self._ticker(50000.0, ticker_ts))
+        writer.reset_mock()
+
+        # Execution far above the grid → update_grid OOB branch fires;
+        # _notify_change is called from build_grid (intermediate) and
+        # again after _assign_sides (final).
+        runner.on_execution(self._execution(70000.0, exec_ts, side="Buy"))
+
+        assert writer.write.called
+        observed = [c.kwargs["exchange_ts"] for c in writer.write.call_args_list]
+        # Every snapshot from this mutation carries the execution's ts.
+        assert all(ts == exec_ts for ts in observed)
+        # Ticker ts must NOT bleed in via stale _current_exchange_ts.
+        assert ticker_ts not in observed
