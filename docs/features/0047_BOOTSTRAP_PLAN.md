@@ -276,8 +276,7 @@ re-querying the `runs` table.
 - After the loop, if `enqueued`:
   - `success = self._grid_state_writer.flush(timeout=5.0)`.
   - If `success is False`:
-    - `self._notifier.alert("bootstrap_grid_state_flush_timeout", ...,
-      error_key="bootstrap_flush")`.
+    - `self._notifier.alert(f"Bootstrap grid snapshot flush timed out after 5.0s ({writer.get_stats()['queue_size']} items still queued)", error_key="bootstrap_flush")`.
     - `self._grid_state_writer._total_bootstrap_failures += 1`.
     - Do NOT re-raise — startup continues (best-effort).
 
