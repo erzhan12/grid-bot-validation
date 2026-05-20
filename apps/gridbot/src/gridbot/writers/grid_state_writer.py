@@ -15,6 +15,8 @@ Concurrency model:
 * If ``run_id_provider(strat_id)`` returns ``None`` (orchestrator hasn't
   populated ``_run_ids`` yet), or ``exchange_ts`` is ``None`` (no triggering
   event in scope), the snapshot is dropped with an INFO log.
+* ``get_last_fingerprint`` / ``prime_fingerprint`` support startup bootstrap
+  (issue #108): probe persisted state and prime dedupe without a redundant row.
 """
 
 import logging
@@ -91,6 +93,7 @@ class GridStateWriter:
         self._total_dropped_no_ts = 0
         self._total_dedup_skipped = 0
         self._total_errors = 0
+        self._total_bootstrap_failures = 0
 
     def write(
         self,
@@ -165,12 +168,16 @@ class GridStateWriter:
         self._worker.start()
         logger.info("GridStateWriter worker started")
 
-    def flush(self, timeout: float = 10.0) -> None:
+    def flush(self, timeout: float = 10.0) -> bool:
         """Block until all queued snapshots have been processed.
 
         Uses ``queue.join`` semantics (worker calls ``task_done`` after each
         insert). On timeout the remaining snapshots stay queued — caller may
         retry by calling ``flush`` again.
+
+        Returns:
+            ``True`` when ``queue.join()`` completed within ``timeout``,
+            ``False`` on timeout.
         """
         deadline_event = threading.Event()
 
@@ -185,6 +192,35 @@ class GridStateWriter:
                 "GridStateWriter.flush timed out after %.1fs with ~%d items pending",
                 timeout, self._queue.qsize(),
             )
+            return False
+        return True
+
+    def get_last_fingerprint(
+        self,
+        run_id: str,
+        account_id: str,
+        strat_id: str,
+    ) -> Optional[tuple[tuple, datetime]]:
+        """Return ``(grid_fingerprint(...), exchange_ts)`` of the latest row, or ``None``."""
+        with self._db.get_session() as session:
+            row = GridStateSnapshotRepository(session).get_latest(
+                run_id, account_id, strat_id,
+            )
+            if row is None:
+                return None
+            return (
+                grid_fingerprint(row.grid_json, float(row.grid_step), row.grid_count),
+                row.exchange_ts,
+            )
+
+    def prime_fingerprint(self, scope: tuple[str, str, str], fp_tuple: tuple) -> None:
+        """Seed the in-memory dedupe gate without enqueueing a snapshot."""
+        with self._dedupe_lock:
+            self._last_fingerprint[scope] = fp_tuple
+
+    def increment_bootstrap_failures(self) -> None:
+        """Bump the bootstrap-failure counter (called by orchestrator bootstrap)."""
+        self._total_bootstrap_failures += 1
 
     def stop(self) -> None:
         """Signal worker to drain and exit, then join."""
@@ -253,5 +289,6 @@ class GridStateWriter:
             "total_dropped_no_run_id": self._total_dropped_no_run_id,
             "total_dropped_no_ts": self._total_dropped_no_ts,
             "total_errors": self._total_errors,
+            "total_bootstrap_failures": self._total_bootstrap_failures,
             "queue_size": self._queue.qsize(),
         }

@@ -1928,6 +1928,526 @@ class TestOrchestratorGridStateWriterWiring:
         )
 
 
+class TestOrchestratorBootstrapGridSnapshots:
+    """Feature 0047 / issue #108 — startup bootstrap grid snapshot probe."""
+
+    STRAT_ID = "btcusdt_test"
+
+    @staticmethod
+    def _count_snapshots(db, run_id) -> int:
+        from grid_db.models import GridStateSnapshot
+        with db.get_session() as sess:
+            return (
+                sess.query(GridStateSnapshot)
+                .filter(GridStateSnapshot.run_id == str(run_id))
+                .count()
+            )
+
+    @staticmethod
+    def _seed_snapshot(db, *, run_id, account_id, strat_id, symbol,
+                       exchange_ts, grid_json, grid_step, grid_count):
+        from grid_db.models import GridStateSnapshot
+        from grid_db.repositories import GridStateSnapshotRepository
+        from decimal import Decimal
+        from gridcore.persistence import grid_fingerprint_hash
+
+        snap = GridStateSnapshot(
+            run_id=str(run_id),
+            account_id=account_id,
+            strat_id=strat_id,
+            symbol=symbol,
+            exchange_ts=exchange_ts,
+            local_ts=exchange_ts,
+            grid_json=[dict(level) for level in grid_json],
+            grid_step=Decimal(str(grid_step)),
+            grid_count=grid_count,
+            raw_fingerprint=grid_fingerprint_hash(
+                grid_json, grid_step, grid_count,
+            ),
+        )
+        with db.get_session() as sess:
+            GridStateSnapshotRepository(sess).insert(snap)
+
+    def _run_bootstrap_harness(
+        self,
+        db,
+        gridbot_config,
+        account_config,
+        strategy_config,
+        tmp_path,
+        *,
+        build_grid: bool = True,
+        pre_seed=None,
+        notifier=None,
+        anchor_store_path=None,
+    ):
+        orchestrator = Orchestrator(
+            gridbot_config,
+            db=db,
+            notifier=notifier,
+            anchor_store_path=anchor_store_path or str(tmp_path / "grid_anchor.json"),
+        )
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        runner = orchestrator._runners[self.STRAT_ID]
+        if build_grid:
+            runner.engine.grid.build_grid(50000.0)
+        orchestrator._create_run_records()
+        run_id = orchestrator._run_ids[self.STRAT_ID]
+        run_start_ts = orchestrator._run_start_ts[self.STRAT_ID]
+        account_id = orchestrator._account_id_for(account_config.name)
+        if pre_seed is not None:
+            pre_seed(db, run_id, run_start_ts, account_id, runner)
+        orchestrator._grid_state_writer.start()
+        orchestrator._bootstrap_grid_snapshots()
+        return orchestrator, runner, run_id, run_start_ts, account_id
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_start_bootstraps_initial_snapshot_when_db_empty(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config, tmp_path,
+    ):
+        """Full start() writes one bootstrap row anchored at Run.start_ts."""
+        from gridcore import GridStateStore, InstrumentInfo
+        from grid_db import DatabaseFactory, DatabaseSettings
+        from grid_db.models import GridStateSnapshot
+        from gridbot.executor import IntentExecutor
+        from gridbot.runner import StrategyRunner
+        from unittest.mock import Mock
+        from decimal import Decimal
+
+        anchor_path = tmp_path / "grid_anchor.json"
+        executor = Mock(spec=IntentExecutor)
+        executor.shadow_mode = False
+        instrument_info = InstrumentInfo(
+            symbol="BTCUSDT",
+            qty_step=Decimal("0.001"),
+            tick_size=Decimal("0.1"),
+            min_qty=Decimal("0.001"),
+            max_qty=Decimal("1000"),
+        )
+        temp_runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=executor,
+            instrument_info=instrument_info,
+        )
+        temp_runner.engine.grid.build_grid(50000.0)
+        saved_grid = temp_runner.engine.grid.grid
+        store = GridStateStore(str(anchor_path))
+        store.save(
+            strategy_config.strat_id, saved_grid,
+            strategy_config.grid_step, strategy_config.grid_count,
+        )
+        store.flush(timeout=5.0)
+
+        db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
+        db.create_tables()
+        orchestrator = Orchestrator(
+            gridbot_config, db=db, anchor_store_path=str(anchor_path),
+        )
+        with patch.object(orchestrator, "_connect_websockets"), \
+             patch.object(orchestrator, "_position_fetcher") as fetcher:
+            fetcher.fetch_and_update = MagicMock()
+            orchestrator.start()
+
+        run_id = orchestrator._run_ids[self.STRAT_ID]
+        runner = orchestrator._runners[self.STRAT_ID]
+        assert self._count_snapshots(db, run_id) == 1
+        with db.get_session() as sess:
+            row = (
+                sess.query(GridStateSnapshot)
+                .filter(GridStateSnapshot.run_id == str(run_id))
+                .one()
+            )
+            assert row.grid_json == runner.engine.grid.grid
+            assert row.exchange_ts.replace(tzinfo=UTC) == orchestrator._run_start_ts[self.STRAT_ID]
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_bootstrap_writes_fresh_row_when_persisted_grid_is_stale_before_run_start(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config, tmp_path,
+    ):
+        from datetime import timedelta
+        from grid_db import DatabaseFactory, DatabaseSettings
+        from grid_db.repositories import GridStateSnapshotRepository
+
+        db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
+        db.create_tables()
+
+        def pre_seed(db, run_id, run_start_ts, account_id, runner):
+            stale = [dict(level) for level in runner.engine.grid.grid]
+            stale[0]["price"] = stale[0]["price"] - 1.0
+            self._seed_snapshot(
+                db, run_id=run_id, account_id=account_id,
+                strat_id=self.STRAT_ID, symbol=runner.symbol,
+                exchange_ts=run_start_ts - timedelta(hours=1),
+                grid_json=stale,
+                grid_step=runner._config.grid_step,
+                grid_count=runner._config.grid_count,
+            )
+
+        orchestrator, runner, run_id, run_start_ts, account_id = (
+            self._run_bootstrap_harness(
+                db, gridbot_config, account_config, strategy_config, tmp_path,
+                pre_seed=pre_seed,
+            )
+        )
+        assert self._count_snapshots(db, run_id) == 2
+        with db.get_session() as sess:
+            repo = GridStateSnapshotRepository(sess)
+            latest = repo.get_latest(str(run_id), account_id, self.STRAT_ID)
+            assert latest.grid_json == runner.engine.grid.grid
+            assert latest.exchange_ts.replace(tzinfo=UTC) == run_start_ts
+            assert latest.exchange_ts.replace(tzinfo=UTC) > (
+                run_start_ts - timedelta(hours=1)
+            )
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_bootstrap_writes_fresh_row_when_persisted_grid_is_stale_equal_to_run_start(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config, tmp_path,
+    ):
+        from grid_db import DatabaseFactory, DatabaseSettings
+        from grid_db.repositories import GridStateSnapshotRepository
+
+        db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
+        db.create_tables()
+        stale_row_id = {}
+
+        def pre_seed(db, run_id, run_start_ts, account_id, runner):
+            stale = [dict(level) for level in runner.engine.grid.grid]
+            stale[0]["price"] = stale[0]["price"] - 1.0
+            self._seed_snapshot(
+                db, run_id=run_id, account_id=account_id,
+                strat_id=self.STRAT_ID, symbol=runner.symbol,
+                exchange_ts=run_start_ts,
+                grid_json=stale,
+                grid_step=runner._config.grid_step,
+                grid_count=runner._config.grid_count,
+            )
+            with db.get_session() as sess:
+                stale_row_id["id"] = (
+                    GridStateSnapshotRepository(sess)
+                    .get_latest(str(run_id), account_id, self.STRAT_ID)
+                    .id
+                )
+
+        orchestrator, runner, run_id, run_start_ts, account_id = (
+            self._run_bootstrap_harness(
+                db, gridbot_config, account_config, strategy_config, tmp_path,
+                pre_seed=pre_seed,
+            )
+        )
+        assert self._count_snapshots(db, run_id) == 2
+        with db.get_session() as sess:
+            repo = GridStateSnapshotRepository(sess)
+            latest = repo.get_latest(str(run_id), account_id, self.STRAT_ID)
+            at_start = repo.get_at_or_before(
+                str(run_id), account_id, self.STRAT_ID, run_start_ts,
+            )
+            assert latest.grid_json == runner.engine.grid.grid
+            assert latest.exchange_ts.replace(tzinfo=UTC) == run_start_ts
+            assert at_start.id == latest.id
+            assert latest.id > stale_row_id["id"]
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_bootstrap_alerts_and_skips_when_stale_row_is_after_run_start(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config, tmp_path,
+    ):
+        from datetime import timedelta
+        from grid_db import DatabaseFactory, DatabaseSettings
+        from grid_db.repositories import GridStateSnapshotRepository
+
+        db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
+        db.create_tables()
+        notifier = Mock(spec=Notifier)
+
+        def pre_seed(db, run_id, run_start_ts, account_id, runner):
+            stale = [dict(level) for level in runner.engine.grid.grid]
+            stale[0]["price"] = stale[0]["price"] - 1.0
+            self._seed_snapshot(
+                db, run_id=run_id, account_id=account_id,
+                strat_id=self.STRAT_ID, symbol=runner.symbol,
+                exchange_ts=run_start_ts + timedelta(hours=1),
+                grid_json=stale,
+                grid_step=runner._config.grid_step,
+                grid_count=runner._config.grid_count,
+            )
+
+        orchestrator, runner, run_id, run_start_ts, account_id = (
+            self._run_bootstrap_harness(
+                db, gridbot_config, account_config, strategy_config, tmp_path,
+                pre_seed=pre_seed, notifier=notifier,
+            )
+        )
+        assert self._count_snapshots(db, run_id) == 1
+        with db.get_session() as sess:
+            latest = GridStateSnapshotRepository(sess).get_latest(
+                str(run_id), account_id, self.STRAT_ID,
+            )
+            assert latest.grid_json[0]["price"] == runner.engine.grid.grid[0]["price"] - 1.0
+        notifier.alert.assert_called_once()
+        assert notifier.alert.call_args.kwargs["error_key"] == f"bootstrap_anomalous_{self.STRAT_ID}"
+        assert orchestrator._grid_state_writer.get_stats()["total_bootstrap_failures"] == 1
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_bootstrap_primes_dedupe_when_persisted_grid_matches(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config, tmp_path,
+    ):
+        from datetime import timedelta
+        from grid_db import DatabaseFactory, DatabaseSettings
+
+        db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
+        db.create_tables()
+
+        def pre_seed(db, run_id, run_start_ts, account_id, runner):
+            grid_json = [dict(level) for level in runner.engine.grid.grid]
+            self._seed_snapshot(
+                db, run_id=run_id, account_id=account_id,
+                strat_id=self.STRAT_ID, symbol=runner.symbol,
+                exchange_ts=run_start_ts - timedelta(hours=1),
+                grid_json=grid_json,
+                grid_step=runner._config.grid_step,
+                grid_count=runner._config.grid_count,
+            )
+
+        orchestrator, runner, run_id, run_start_ts, account_id = (
+            self._run_bootstrap_harness(
+                db, gridbot_config, account_config, strategy_config, tmp_path,
+                pre_seed=pre_seed,
+            )
+        )
+        assert self._count_snapshots(db, run_id) == 1
+        runner._on_grid_change(
+            runner.engine.grid.grid, exchange_ts=datetime.now(UTC),
+        )
+        assert self._count_snapshots(db, run_id) == 1
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_bootstrap_skips_when_grid_unbuilt(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config, tmp_path,
+    ):
+        from grid_db import DatabaseFactory, DatabaseSettings
+
+        db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
+        db.create_tables()
+
+        orchestrator, runner, run_id, run_start_ts, account_id = (
+            self._run_bootstrap_harness(
+                db, gridbot_config, account_config, strategy_config, tmp_path,
+                build_grid=False,
+            )
+        )
+        assert runner.engine.grid.grid == []
+        assert self._count_snapshots(db, run_id) == 0
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    def test_bootstrap_alerts_and_counts_on_probe_failure(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config, tmp_path,
+    ):
+        from grid_db import DatabaseFactory, DatabaseSettings
+
+        db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
+        db.create_tables()
+        notifier = Mock(spec=Notifier)
+
+        orchestrator = Orchestrator(
+            gridbot_config, db=db, notifier=notifier,
+            anchor_store_path=str(tmp_path / "grid_anchor.json"),
+        )
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        runner = orchestrator._runners[self.STRAT_ID]
+        runner.engine.grid.build_grid(50000.0)
+        orchestrator._create_run_records()
+        run_id = orchestrator._run_ids[self.STRAT_ID]
+
+        writer = orchestrator._grid_state_writer
+        writer.get_last_fingerprint = Mock(
+            side_effect=RuntimeError("simulated DB outage"),
+        )
+        writer.start()
+        orchestrator._bootstrap_grid_snapshots()
+
+        assert self._count_snapshots(db, run_id) == 0
+        notifier.alert.assert_called_once()
+        assert notifier.alert.call_args.kwargs["error_key"] == f"bootstrap_{self.STRAT_ID}"
+        assert writer.get_stats()["total_bootstrap_failures"] == 1
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_bootstrap_alerts_and_counts_on_flush_timeout(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config, tmp_path,
+    ):
+        from grid_db import DatabaseFactory, DatabaseSettings
+
+        db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
+        db.create_tables()
+        notifier = Mock(spec=Notifier)
+
+        orchestrator = Orchestrator(
+            gridbot_config, db=db, notifier=notifier,
+            anchor_store_path=str(tmp_path / "grid_anchor.json"),
+        )
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        runner = orchestrator._runners[self.STRAT_ID]
+        runner.engine.grid.build_grid(50000.0)
+        orchestrator._create_run_records()
+
+        writer = orchestrator._grid_state_writer
+        write_called = {"n": 0}
+        original_write = writer.write
+
+        def spy_write(*args, **kwargs):
+            write_called["n"] += 1
+            return original_write(*args, **kwargs)
+
+        writer.write = spy_write
+        writer.flush = Mock(return_value=False)
+        writer.start()
+        orchestrator._bootstrap_grid_snapshots()
+
+        assert write_called["n"] == 1
+        notifier.alert.assert_called_once()
+        assert notifier.alert.call_args.kwargs["error_key"] == "bootstrap_flush"
+        assert writer.get_stats()["total_bootstrap_failures"] == 1
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_bootstrap_alerts_and_counts_on_insert_failure(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config, tmp_path,
+    ):
+        from gridbot.writers import grid_state_writer as gsw
+        from grid_db import DatabaseFactory, DatabaseSettings
+
+        db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
+        db.create_tables()
+        notifier = Mock(spec=Notifier)
+
+        orchestrator = Orchestrator(
+            gridbot_config, db=db, notifier=notifier,
+            anchor_store_path=str(tmp_path / "grid_anchor.json"),
+        )
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        runner = orchestrator._runners[self.STRAT_ID]
+        runner.engine.grid.build_grid(50000.0)
+        orchestrator._create_run_records()
+        run_id = orchestrator._run_ids[self.STRAT_ID]
+
+        original_repo = gsw.GridStateSnapshotRepository
+
+        class FailingRepo(original_repo):
+            def insert(self, snapshot):
+                raise RuntimeError("simulated bootstrap insert failure")
+
+        gsw.GridStateSnapshotRepository = FailingRepo
+        try:
+            orchestrator._grid_state_writer.start()
+            orchestrator._bootstrap_grid_snapshots()
+        finally:
+            gsw.GridStateSnapshotRepository = original_repo
+
+        assert self._count_snapshots(db, run_id) == 0
+        notifier.alert.assert_called_once()
+        assert notifier.alert.call_args.kwargs["error_key"] == "bootstrap_insert"
+        assert orchestrator._grid_state_writer.get_stats()["total_bootstrap_failures"] == 1
+        assert orchestrator._grid_state_writer.get_stats()["total_errors"] == 1
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_bootstrap_insert_failure_detected_when_worker_fails_during_enqueue(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config, tmp_path,
+    ):
+        """Deterministic race regression: worker increments _total_errors during
+        the enqueue loop, before flush(). Baseline must be captured before any
+        bootstrap write(), not after enqueue completes."""
+        from gridbot.writers import grid_state_writer as gsw
+        from grid_db import DatabaseFactory, DatabaseSettings
+
+        db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
+        db.create_tables()
+        notifier = Mock(spec=Notifier)
+
+        orchestrator = Orchestrator(
+            gridbot_config, db=db, notifier=notifier,
+            anchor_store_path=str(tmp_path / "grid_anchor.json"),
+        )
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        runner = orchestrator._runners[self.STRAT_ID]
+        runner.engine.grid.build_grid(50000.0)
+        orchestrator._create_run_records()
+        run_id = orchestrator._run_ids[self.STRAT_ID]
+
+        failure_happened = threading.Event()
+        release_worker = threading.Event()
+        original_insert_one = gsw.GridStateWriter._insert_one
+
+        def failing_insert_one(self, snapshot, scope, fp_tuple):
+            try:
+                raise RuntimeError("simulated fast bootstrap insert failure")
+            except Exception as e:
+                self._total_errors += 1
+                failure_happened.set()
+                release_worker.wait(timeout=5.0)
+                gsw.logger.error("GridStateWriter insert failed: %s", e, exc_info=True)
+                with self._dedupe_lock:
+                    if self._last_fingerprint.get(scope) == fp_tuple:
+                        self._last_fingerprint.pop(scope, None)
+
+        gsw.GridStateWriter._insert_one = failing_insert_one
+        try:
+            orchestrator._grid_state_writer.start()
+            bootstrap_thread = threading.Thread(
+                target=orchestrator._bootstrap_grid_snapshots,
+                name="bootstrap-test",
+            )
+            bootstrap_thread.start()
+            assert failure_happened.wait(timeout=5.0)
+            assert orchestrator._grid_state_writer.get_stats()["total_errors"] == 1
+            release_worker.set()
+            bootstrap_thread.join(timeout=5.0)
+            assert not bootstrap_thread.is_alive()
+        finally:
+            gsw.GridStateWriter._insert_one = original_insert_one
+
+        assert self._count_snapshots(db, run_id) == 0
+        notifier.alert.assert_called_once()
+        assert notifier.alert.call_args.kwargs["error_key"] == "bootstrap_insert"
+        assert orchestrator._grid_state_writer.get_stats()["total_bootstrap_failures"] == 1
+
+
 class TestOrchestratorRetryDispatcher:
     """Tests for retry queue intent dispatch routing."""
 

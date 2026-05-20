@@ -20,7 +20,7 @@ from grid_db.models import (
 from grid_db.repositories import GridStateSnapshotRepository
 from grid_db.settings import DatabaseSettings
 from gridbot.writers.grid_state_writer import GridStateWriter
-from gridcore.persistence import grid_fingerprint_hash
+from gridcore.persistence import grid_fingerprint, grid_fingerprint_hash
 
 
 @pytest.fixture
@@ -346,3 +346,102 @@ class TestGridStateWriter:
             )
             assert picked is not None
             assert picked.grid_json == final
+
+    def test_get_last_fingerprint_returns_none_when_empty(self, db, grid):
+        writer = _make_writer(db, {"strat1": "run1"})
+        assert writer.get_last_fingerprint("run1", "acc1", "strat1") is None
+        writer.stop()
+
+    def test_get_last_fingerprint_returns_tuple_and_exchange_ts_from_latest_row(
+        self, db, grid,
+    ):
+        writer = _make_writer(db, {"strat1": "run1"})
+        ts_early = datetime(2026, 1, 1, tzinfo=UTC)
+        ts_late = datetime(2026, 1, 2, tzinfo=UTC)
+        grid_early = [{"side": "Buy", "price": 100.0}, *grid[1:]]
+        grid_late = [{"side": "Buy", "price": 200.0}, *grid[1:]]
+        writer.write(
+            strat_id="strat1", grid=grid_early, grid_step=0.5, grid_count=3,
+            account_id="acc1", symbol="LTCUSDT", exchange_ts=ts_early,
+        )
+        writer.write(
+            strat_id="strat1", grid=grid_late, grid_step=0.5, grid_count=3,
+            account_id="acc1", symbol="LTCUSDT", exchange_ts=ts_late,
+        )
+        writer.flush(timeout=5.0)
+        writer.stop()
+
+        result = writer.get_last_fingerprint("run1", "acc1", "strat1")
+        assert result is not None
+        fp, exchange_ts = result
+        assert fp == grid_fingerprint(grid_late, 0.5, 3)
+        assert exchange_ts.replace(tzinfo=UTC) == ts_late
+
+    def test_get_last_fingerprint_propagates_db_errors(self, db, grid):
+        writer = _make_writer(db, {"strat1": "run1"})
+        from gridbot.writers import grid_state_writer as gsw
+
+        class BrokenRepo(gsw.GridStateSnapshotRepository):
+            def get_latest(self, run_id, account_id, strat_id):
+                raise RuntimeError("simulated DB outage")
+
+        original = gsw.GridStateSnapshotRepository
+        gsw.GridStateSnapshotRepository = BrokenRepo
+        try:
+            with pytest.raises(RuntimeError, match="simulated DB outage"):
+                writer.get_last_fingerprint("run1", "acc1", "strat1")
+        finally:
+            gsw.GridStateSnapshotRepository = original
+            writer.stop()
+
+    def test_prime_fingerprint_blocks_identical_subsequent_write(self, db, grid):
+        writer = _make_writer(db, {"strat1": "run1"})
+        fp = grid_fingerprint(grid, 0.5, 3)
+        writer.prime_fingerprint(("run1", "acc1", "strat1"), fp)
+        writer.write(
+            strat_id="strat1", grid=grid, grid_step=0.5, grid_count=3,
+            account_id="acc1", symbol="LTCUSDT",
+            exchange_ts=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        writer.flush(timeout=5.0)
+        writer.stop()
+
+        assert _rows(db) == []
+        assert writer.get_stats()["total_dedup_skipped"] == 1
+
+    def test_flush_returns_true_on_clean_drain_false_on_timeout(self, db, grid, caplog):
+        import threading
+
+        writer = _make_writer(db, {"strat1": "run1"})
+        writer.write(
+            strat_id="strat1", grid=grid, grid_step=0.5, grid_count=3,
+            account_id="acc1", symbol="LTCUSDT",
+            exchange_ts=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        assert writer.flush(timeout=5.0) is True
+
+        block_event = threading.Event()
+        from gridbot.writers import grid_state_writer as gsw
+
+        original_insert = gsw.GridStateWriter._insert_one
+
+        def slow_insert(self, snapshot, scope, fp_tuple):
+            block_event.wait(timeout=10.0)
+            return original_insert(self, snapshot, scope, fp_tuple)
+
+        gsw.GridStateWriter._insert_one = slow_insert
+        try:
+            writer.write(
+                strat_id="strat1", grid=[{"side": "Buy", "price": 99.0}, *grid[1:]],
+                grid_step=0.5, grid_count=3,
+                account_id="acc1", symbol="LTCUSDT",
+                exchange_ts=datetime(2026, 1, 2, tzinfo=UTC),
+            )
+            with caplog.at_level("WARNING"):
+                assert writer.flush(timeout=0.1) is False
+            assert any("timed out" in rec.message for rec in caplog.records)
+            block_event.set()
+            assert writer.flush(timeout=5.0) is True
+        finally:
+            gsw.GridStateWriter._insert_one = original_insert
+            writer.stop()
