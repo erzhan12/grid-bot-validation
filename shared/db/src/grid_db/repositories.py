@@ -23,6 +23,7 @@ from grid_db.models import (
     Order,
     PositionSnapshot,
     WalletSnapshot,
+    GridStateSnapshot,
 )
 
 
@@ -1181,5 +1182,96 @@ class WalletSnapshotRepository(BaseRepository[WalletSnapshot]):
                 WalletSnapshot.exchange_ts <= at_ts,
             )
             .order_by(WalletSnapshot.exchange_ts.desc())
+            .first()
+        )
+
+
+class GridStateSnapshotRepository(BaseRepository[GridStateSnapshot]):
+    """Repository for GridStateSnapshot operations (feature 0047).
+
+    Insert path is single-row with ``ON CONFLICT DO NOTHING`` against the
+    partial unique index ``uq_grid_state_snapshots_fingerprint_at_ts`` (only
+    rows with non-NULL ``raw_fingerprint`` participate). The replay loader
+    reads back via ``get_at_or_before`` which orders by
+    ``exchange_ts DESC, id DESC`` — the latter breaks ties for
+    multi-notify outer mutations (e.g. ``update_grid`` out-of-bounds path
+    emits post-rebuild then post-side-assignment at the same ts; the
+    largest id wins, which by writer FIFO contract is the final snapshot).
+    """
+
+    def __init__(self, session: Session):
+        super().__init__(session, GridStateSnapshot)
+
+    def insert(self, snapshot: GridStateSnapshot) -> int:
+        """Insert a single snapshot, no-op on partial-index conflict.
+
+        Returns rowcount (0 if dedup'd by the partial unique constraint).
+        """
+        snapshot_data = {
+            "run_id": snapshot.run_id,
+            "account_id": snapshot.account_id,
+            "strat_id": snapshot.strat_id,
+            "symbol": snapshot.symbol,
+            "exchange_ts": snapshot.exchange_ts,
+            "local_ts": snapshot.local_ts,
+            "grid_json": snapshot.grid_json,
+            "grid_step": snapshot.grid_step,
+            "grid_count": snapshot.grid_count,
+            "raw_fingerprint": snapshot.raw_fingerprint,
+        }
+
+        # index_where MUST match the partial-index WHERE predicate or
+        # PostgreSQL won't bind the conflict target to the partial constraint
+        # (and SQLite >=3.24 partial-index ON CONFLICT behaves the same way).
+        index_elements = [
+            "run_id", "account_id", "strat_id", "exchange_ts", "raw_fingerprint",
+        ]
+        index_where = GridStateSnapshot.raw_fingerprint.is_not(None)
+
+        db_dialect = self.session.get_bind().dialect.name
+        if db_dialect == "postgresql":
+            stmt = postgresql_insert(GridStateSnapshot).values(**snapshot_data)
+            stmt = stmt.on_conflict_do_nothing(
+                index_elements=index_elements,
+                index_where=index_where,
+            )
+        elif db_dialect == "sqlite":
+            stmt = sqlite_insert(GridStateSnapshot).values(**snapshot_data)
+            stmt = stmt.on_conflict_do_nothing(
+                index_elements=index_elements,
+                index_where=index_where,
+            )
+        else:
+            stmt = insert(GridStateSnapshot).values(**snapshot_data)
+
+        result = self.session.execute(stmt)
+        self.session.flush()
+        return result.rowcount if result.rowcount else 0
+
+    def get_at_or_before(
+        self,
+        run_id: str,
+        account_id: str,
+        strat_id: str,
+        at_ts: datetime,
+    ) -> Optional[GridStateSnapshot]:
+        """Latest grid snapshot for the scope at-or-before ``at_ts``.
+
+        ``ORDER BY exchange_ts DESC, id DESC`` — the secondary ``id`` sort
+        picks the final notify of a multi-notify outer mutation when both
+        snapshots share the same ``exchange_ts``.
+        """
+        return (
+            self.session.query(GridStateSnapshot)
+            .filter(
+                GridStateSnapshot.run_id == run_id,
+                GridStateSnapshot.account_id == account_id,
+                GridStateSnapshot.strat_id == strat_id,
+                GridStateSnapshot.exchange_ts <= at_ts,
+            )
+            .order_by(
+                GridStateSnapshot.exchange_ts.desc(),
+                GridStateSnapshot.id.desc(),
+            )
             .first()
         )

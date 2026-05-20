@@ -10,6 +10,7 @@ import pytest
 
 from grid_db import (
     BybitAccount,
+    GridStateSnapshot,
     Order,
     OrderRepository,
     PositionSnapshot,
@@ -20,8 +21,9 @@ from grid_db import (
     WalletSnapshot,
     WalletSnapshotRepository,
 )
+from grid_db.repositories import GridStateSnapshotRepository
 
-from gridcore.persistence import GridStateStore
+from gridcore.persistence import GridStateStore, grid_fingerprint_hash
 
 from replay.snapshot_loader import (
     ActiveOrderSeed,
@@ -32,6 +34,7 @@ from replay.snapshot_loader import (
     WalletSeed,
     load_active_orders,
     load_grid_state,
+    load_grid_state_from_snapshots,
     load_position_snapshots,
     load_wallet_seed_full,
     load_wallet_snapshot,
@@ -205,6 +208,368 @@ class TestLoadGridState:
 
         seed = load_grid_state(store, "strat-C", expected_step=0.2, expected_count=99)
         assert seed is None
+
+
+# ---------------------------------------------------------------------------
+# load_grid_state_from_snapshots (feature 0047)
+# ---------------------------------------------------------------------------
+
+
+def _make_grid_row(
+    sample_run,
+    sample_account,
+    *,
+    strat_id: str = "strat-A",
+    grid: list[dict] | None = None,
+    grid_step: float = 0.2,
+    grid_count: int = 3,
+    exchange_ts: datetime | None = None,
+    raw_fingerprint: str | None = None,
+) -> GridStateSnapshot:
+    grid = grid or [
+        {"side": "Buy", "price": 100.0},
+        {"side": "Wait", "price": 101.0},
+        {"side": "Sell", "price": 102.0},
+    ]
+    ts = exchange_ts or datetime(2026, 5, 7, 10, 0, 0, tzinfo=timezone.utc)
+    if raw_fingerprint is None:
+        raw_fingerprint = grid_fingerprint_hash(grid, grid_step, grid_count)
+    return GridStateSnapshot(
+        run_id=sample_run.run_id,
+        account_id=str(sample_account.account_id),
+        strat_id=strat_id,
+        symbol="BTCUSDT",
+        exchange_ts=ts,
+        local_ts=ts,
+        grid_json=grid,
+        grid_step=Decimal(str(grid_step)),
+        grid_count=grid_count,
+        raw_fingerprint=raw_fingerprint,
+    )
+
+
+class TestLoadGridStateFromSnapshots:
+    """Loader-level coverage for the 0047 DB grid-state path."""
+
+    def test_happy_path_returns_seed(
+        self, session, sample_account, sample_run, base_ts
+    ):
+        repo = GridStateSnapshotRepository(session)
+        repo.insert(_make_grid_row(sample_run, sample_account, exchange_ts=base_ts))
+        session.flush()
+
+        seed = load_grid_state_from_snapshots(
+            session,
+            run_id=sample_run.run_id,
+            account_id=str(sample_account.account_id),
+            strat_id="strat-A",
+            at_ts=base_ts + timedelta(minutes=1),
+            expected_step=0.2,
+            expected_count=3,
+        )
+        assert seed is not None
+        assert seed.strat_id == "strat-A"
+        assert seed.grid_step == 0.2
+        assert seed.grid_count == 3
+        assert seed.grid[0]["side"] == "Buy"
+
+    def test_no_snapshot_returns_none(
+        self, session, sample_account, sample_run, base_ts, caplog
+    ):
+        with caplog.at_level(logging.INFO):
+            seed = load_grid_state_from_snapshots(
+                session,
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                strat_id="missing",
+                at_ts=base_ts,
+                expected_step=0.2,
+                expected_count=3,
+            )
+        assert seed is None
+        assert any(
+            "no grid snapshot at-or-before" in rec.message for rec in caplog.records
+        )
+
+    def test_same_exchange_ts_picks_latest_by_id(
+        self, session, sample_account, sample_run, base_ts
+    ):
+        """Two snapshots at the same exchange_ts (multi-notify simulation) →
+        loader returns the row inserted second (larger id)."""
+        repo = GridStateSnapshotRepository(session)
+        intermediate = [
+            {"side": "Buy", "price": 100.0},
+            {"side": "Wait", "price": 101.0},
+        ]
+        final = [
+            {"side": "Buy", "price": 100.0},
+            {"side": "Sell", "price": 101.0},
+        ]
+        repo.insert(
+            _make_grid_row(
+                sample_run, sample_account, grid=intermediate, grid_count=2,
+                exchange_ts=base_ts,
+            )
+        )
+        repo.insert(
+            _make_grid_row(
+                sample_run, sample_account, grid=final, grid_count=2,
+                exchange_ts=base_ts,
+            )
+        )
+        session.flush()
+
+        seed = load_grid_state_from_snapshots(
+            session,
+            run_id=sample_run.run_id,
+            account_id=str(sample_account.account_id),
+            strat_id="strat-A",
+            at_ts=base_ts + timedelta(minutes=1),
+            expected_step=0.2,
+            expected_count=2,
+        )
+        assert seed is not None
+        assert seed.grid == final
+
+    def test_picks_latest_at_or_before(
+        self, session, sample_account, sample_run, base_ts
+    ):
+        repo = GridStateSnapshotRepository(session)
+        repo.insert(_make_grid_row(sample_run, sample_account, exchange_ts=base_ts))
+        repo.insert(
+            _make_grid_row(
+                sample_run, sample_account,
+                grid=[
+                    {"side": "Buy", "price": 200.0},
+                    {"side": "Wait", "price": 201.0},
+                    {"side": "Sell", "price": 202.0},
+                ],
+                exchange_ts=base_ts + timedelta(minutes=10),
+            )
+        )
+        session.flush()
+
+        seed = load_grid_state_from_snapshots(
+            session,
+            run_id=sample_run.run_id,
+            account_id=str(sample_account.account_id),
+            strat_id="strat-A",
+            at_ts=base_ts + timedelta(minutes=5),
+            expected_step=0.2,
+            expected_count=3,
+        )
+        assert seed is not None
+        # First row (base_ts) wins — later row (+10m) is past the at_ts upper bound.
+        assert seed.grid[0]["price"] == 100.0
+
+    def test_cross_run_isolation(
+        self, session, sample_user, sample_account, sample_strategy, sample_run,
+        base_ts,
+    ):
+        """Snapshot present for another run only → loader returns None."""
+        other_run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="recording",
+            status="running",
+            start_ts=base_ts,
+        )
+        session.add(other_run)
+        session.flush()
+        repo = GridStateSnapshotRepository(session)
+        repo.insert(_make_grid_row(other_run, sample_account, exchange_ts=base_ts))
+        session.flush()
+
+        seed = load_grid_state_from_snapshots(
+            session,
+            run_id=sample_run.run_id,
+            account_id=str(sample_account.account_id),
+            strat_id="strat-A",
+            at_ts=base_ts + timedelta(minutes=1),
+            expected_step=0.2,
+            expected_count=3,
+        )
+        assert seed is None
+
+    def test_cross_strat_isolation(
+        self, session, sample_account, sample_run, base_ts
+    ):
+        repo = GridStateSnapshotRepository(session)
+        repo.insert(
+            _make_grid_row(
+                sample_run, sample_account, strat_id="other-strat",
+                exchange_ts=base_ts,
+            )
+        )
+        session.flush()
+        seed = load_grid_state_from_snapshots(
+            session,
+            run_id=sample_run.run_id,
+            account_id=str(sample_account.account_id),
+            strat_id="strat-A",
+            at_ts=base_ts + timedelta(minutes=1),
+            expected_step=0.2,
+            expected_count=3,
+        )
+        assert seed is None
+
+    def test_step_count_mismatch_returns_none(
+        self, session, sample_account, sample_run, base_ts, caplog
+    ):
+        repo = GridStateSnapshotRepository(session)
+        repo.insert(_make_grid_row(sample_run, sample_account, exchange_ts=base_ts))
+        session.flush()
+        with caplog.at_level(logging.INFO):
+            seed = load_grid_state_from_snapshots(
+                session,
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                strat_id="strat-A",
+                at_ts=base_ts + timedelta(minutes=1),
+                expected_step=0.2,
+                expected_count=99,  # Mismatch.
+            )
+        assert seed is None
+        assert any("grid_count" in rec.message for rec in caplog.records)
+
+    def test_pre_0047_db_missing_table_returns_none(
+        self, db, sample_account, sample_run, base_ts, caplog
+    ):
+        """0047 P1: replay against a pre-0047 recorder DB (no
+        ``grid_state_snapshots`` table) must return ``None`` with INFO so
+        the engine falls back to ``seed.grid_state_path``. Without this,
+        SQLAlchemy raises ``no such table`` and the file fallback never
+        runs — breaking the plan's "old datasets stay on file mode"
+        out-of-scope clause.
+        """
+        # The other sample_* fixtures already used ``db`` to create all
+        # tables; drop the 0047 table to simulate the pre-0047 schema.
+        GridStateSnapshot.__table__.drop(db.engine)
+        try:
+            with db.get_session() as sess:
+                with caplog.at_level(logging.INFO):
+                    seed = load_grid_state_from_snapshots(
+                        sess,
+                        run_id=sample_run.run_id,
+                        account_id=str(sample_account.account_id),
+                        strat_id="strat-A",
+                        at_ts=base_ts,
+                        expected_step=0.2,
+                        expected_count=3,
+                    )
+            assert seed is None
+            assert any(
+                "table not present" in rec.message for rec in caplog.records
+            )
+        finally:
+            # Restore the table so other tests in the session aren't affected.
+            GridStateSnapshot.__table__.create(db.engine)
+
+    def test_step_value_mismatch_returns_none(
+        self, session, sample_account, sample_run, base_ts, caplog
+    ):
+        """Step branch is exercised independently of the count branch:
+        stored step != expected step → None + INFO. Count is left equal
+        on purpose so count branch is not what catches the mismatch.
+        """
+        repo = GridStateSnapshotRepository(session)
+        repo.insert(
+            _make_grid_row(
+                sample_run, sample_account,
+                grid_step=0.2, grid_count=3, exchange_ts=base_ts,
+            )
+        )
+        session.flush()
+        with caplog.at_level(logging.INFO):
+            seed = load_grid_state_from_snapshots(
+                session,
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                strat_id="strat-A",
+                at_ts=base_ts + timedelta(minutes=1),
+                expected_step=0.5,  # Mismatch — distinct decimal value.
+                expected_count=3,
+            )
+        assert seed is None
+        assert any("grid_step" in rec.message for rec in caplog.records)
+
+    def test_loader_output_round_trips_through_restore_grid(
+        self, session, sample_account, sample_run, base_ts
+    ):
+        """The loader's payload must drop straight into
+        ``Grid.restore_grid`` (live's restart API) without massaging.
+        Locks the invariant: anything ``GridStateWriter`` writes must be
+        consumable by the same code that consumes the legacy JSON file.
+        """
+        from decimal import Decimal
+        from gridcore.grid import Grid
+
+        # Use a Grid-valid layout (strict-ascending prices, Buy → Wait →
+        # Sell). ``is_grid_correct`` rejects anything else.
+        canonical_grid = [
+            {"side": "Buy", "price": 99.0},
+            {"side": "Buy", "price": 99.5},
+            {"side": "Wait", "price": 100.0},
+            {"side": "Sell", "price": 100.5},
+            {"side": "Sell", "price": 101.0},
+        ]
+        repo = GridStateSnapshotRepository(session)
+        repo.insert(
+            _make_grid_row(
+                sample_run, sample_account,
+                grid=canonical_grid, grid_step=0.5, grid_count=5,
+                exchange_ts=base_ts,
+            )
+        )
+        session.flush()
+        seed = load_grid_state_from_snapshots(
+            session,
+            run_id=sample_run.run_id,
+            account_id=str(sample_account.account_id),
+            strat_id="strat-A",
+            at_ts=base_ts + timedelta(minutes=1),
+            expected_step=0.5,
+            expected_count=5,
+        )
+        assert seed is not None
+
+        # Same restore_grid call live performs on cold start.
+        grid_obj = Grid(
+            tick_size=Decimal("0.1"),
+            grid_count=seed.grid_count,
+            grid_step=seed.grid_step,
+        )
+        assert grid_obj.restore_grid(seed.grid) is True
+        assert grid_obj.grid == canonical_grid
+
+    def test_step_binary_imprecise_match_accepted(
+        self, session, sample_account, sample_run, base_ts
+    ):
+        """``expected_step=0.1`` (float) must accept ``Decimal('0.10000000')`` row.
+
+        Naive ``Decimal == float`` would reject because Python's ``0.1``
+        literal is ``0.1000000000000000055511...``.
+        """
+        repo = GridStateSnapshotRepository(session)
+        repo.insert(
+            _make_grid_row(
+                sample_run, sample_account,
+                grid_step=0.1,
+                exchange_ts=base_ts,
+            )
+        )
+        session.flush()
+        seed = load_grid_state_from_snapshots(
+            session,
+            run_id=sample_run.run_id,
+            account_id=str(sample_account.account_id),
+            strat_id="strat-A",
+            at_ts=base_ts + timedelta(minutes=1),
+            expected_step=0.1,
+            expected_count=3,
+        )
+        assert seed is not None
 
 
 # ---------------------------------------------------------------------------

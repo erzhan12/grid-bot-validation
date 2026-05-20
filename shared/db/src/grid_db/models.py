@@ -1,9 +1,9 @@
 """SQLAlchemy ORM models for multi-tenant grid bot database.
 
-Supports 10 tables:
+Supports 12 tables:
 - Core entities: users, bybit_accounts, api_credentials, strategies, runs
 - Data tables: ticker_snapshots, public_trades, private_executions, orders,
-  position_snapshots, wallet_snapshots
+  position_snapshots, wallet_snapshots, grid_state_snapshots
 """
 
 from datetime import datetime, UTC
@@ -24,6 +24,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     Integer,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -407,6 +408,58 @@ class PositionSnapshot(Base):
         CheckConstraint(
             "source IN ('live', 'backtest')",
             name="ck_position_snapshots_source",
+        ),
+    )
+
+
+class GridStateSnapshot(Base):
+    """Verbatim grid-state snapshots written by gridbot's on_grid_change path.
+
+    Replay's seed loader reads the latest at-or-before ``seed.at_ts`` row and
+    feeds ``grid_json`` into ``Grid.restore_grid``, byte-identical to live's
+    restart path. The partial unique index blocks race-double-inserts at the
+    same instant while allowing the same grid state to recur later in the
+    run.
+    """
+
+    __tablename__ = "grid_state_snapshots"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("runs.run_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    account_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    strat_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    exchange_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    local_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    grid_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)
+    grid_step: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
+    grid_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    raw_fingerprint: Mapped[Optional[str]] = mapped_column(String(64))
+
+    __table_args__ = (
+        Index(
+            "ix_grid_state_snapshots_lookup",
+            "run_id", "account_id", "strat_id", "exchange_ts", "id",
+        ),
+        # Partial unique index: blocks race-double-inserts at the same
+        # (run, account, strat, ts, fingerprint) while allowing repeats
+        # across different exchange_ts values. Migration creates the
+        # partial WHERE predicate; declaring it here lets ON CONFLICT DO
+        # NOTHING bind via index_where=raw_fingerprint.is_not(None).
+        Index(
+            "uq_grid_state_snapshots_fingerprint_at_ts",
+            "run_id", "account_id", "strat_id", "exchange_ts", "raw_fingerprint",
+            unique=True,
+            sqlite_where=text("raw_fingerprint IS NOT NULL"),
+            postgresql_where=text("raw_fingerprint IS NOT NULL"),
         ),
     )
 

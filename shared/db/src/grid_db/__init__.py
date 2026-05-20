@@ -19,6 +19,7 @@ from grid_db.models import (
     Order,
     PositionSnapshot,
     WalletSnapshot,
+    GridStateSnapshot,
 )
 from grid_db.enums import RunType
 from grid_db.utils import redact_db_url
@@ -35,6 +36,7 @@ from grid_db.repositories import (
     OrderRepository,
     PositionSnapshotRepository,
     WalletSnapshotRepository,
+    GridStateSnapshotRepository,
 )
 
 __all__ = [
@@ -58,6 +60,7 @@ __all__ = [
     "Order",
     "PositionSnapshot",
     "WalletSnapshot",
+    "GridStateSnapshot",
     # Repositories
     "BaseRepository",
     "UserRepository",
@@ -71,6 +74,7 @@ __all__ = [
     "OrderRepository",
     "PositionSnapshotRepository",
     "WalletSnapshotRepository",
+    "GridStateSnapshotRepository",
     # Utils
     "redact_db_url",
 ]

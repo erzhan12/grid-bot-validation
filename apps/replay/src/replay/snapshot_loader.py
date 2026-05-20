@@ -42,9 +42,12 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import Session
 
 from grid_db import (
+    GridStateSnapshot,
+    GridStateSnapshotRepository,
     OrderRepository,
     PositionSnapshotRepository,
     WalletSnapshotRepository,
@@ -262,6 +265,74 @@ def load_grid_state(
         grid=entry["grid"],
         grid_step=saved_step,
         grid_count=saved_count,
+    )
+
+
+def load_grid_state_from_snapshots(
+    db_session: Session,
+    run_id: str,
+    account_id: str,
+    strat_id: str,
+    at_ts: datetime,
+    expected_step: float,
+    expected_count: int,
+) -> Optional[GridStateSeed]:
+    """Load grid state from the ``grid_state_snapshots`` DB table (0047).
+
+    Mirrors ``load_grid_state`` (file path) but pulls the row written by
+    gridbot's ``GridStateWriter`` at the latest ``exchange_ts`` ≤ ``at_ts``.
+    Returns ``None`` on no-row-found or on step/count mismatch (engine
+    falls back to file path, then to a fresh blank-build).
+
+    ``grid_step`` comparison uses ``Decimal(str(...))`` normalisation so a
+    binary-imprecise float (e.g. ``0.1`` literal vs ``Decimal('0.10000000')``
+    from ``Numeric(20, 8)``) doesn't false-reject.
+
+    Pre-0047 recorder DBs do not have the ``grid_state_snapshots`` table.
+    The project provisions schema via ``Base.metadata.create_all`` rather
+    than Alembic, so an old DB literally does not contain this table.
+    Return ``None`` (with INFO) when the table is missing so the engine's
+    file fallback at ``engine.py:_load_seed`` runs.
+    """
+    # Use ``session.connection()`` (NOT ``get_bind()``) so the inspector
+    # shares the session's open transaction. ``inspect(engine).has_table``
+    # would acquire a fresh connection from the pool — on SQLite
+    # ``:memory:`` + StaticPool this issues a ROLLBACK that wipes the
+    # session's uncommitted writes.
+    if not sa_inspect(db_session.connection()).has_table(
+        GridStateSnapshot.__tablename__,
+    ):
+        logger.info(
+            "%s: grid_state_snapshots table not present (pre-0047 DB); "
+            "falling back to file path / fresh build",
+            strat_id,
+        )
+        return None
+    row = GridStateSnapshotRepository(db_session).get_at_or_before(
+        run_id, account_id, strat_id, at_ts,
+    )
+    if row is None:
+        logger.info(
+            "%s: no grid snapshot at-or-before %s", strat_id, at_ts,
+        )
+        return None
+    if int(row.grid_count) != int(expected_count):
+        logger.info(
+            "%s: saved grid_count=%d differs from replay config %d; falling back",
+            strat_id, row.grid_count, expected_count,
+        )
+        return None
+    if Decimal(str(row.grid_step)) != Decimal(str(expected_step)):
+        logger.info(
+            "%s: saved grid_step=%s differs from replay config %s; falling back",
+            strat_id, row.grid_step, expected_step,
+        )
+        return None
+    return GridStateSeed(
+        strat_id=strat_id,
+        grid=row.grid_json,
+        grid_step=float(row.grid_step),
+        grid_count=int(row.grid_count),
     )
 
 
@@ -538,6 +609,7 @@ __all__ = [
     "SeedConfigMismatchError",
     "SeedDataQualityError",
     "load_grid_state",
+    "load_grid_state_from_snapshots",
     "load_position_snapshots",
     "load_wallet_seed_full",
     "load_wallet_snapshot",

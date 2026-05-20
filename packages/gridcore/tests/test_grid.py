@@ -574,7 +574,7 @@ class TestGridOnChangeCallback:
     def test_callback_fires_after_build_grid(self):
         calls = []
         grid = Grid(tick_size=Decimal('0.1'), grid_count=10, grid_step=0.2,
-                    on_change=lambda g: calls.append(list(g)))
+                    on_change=lambda g, ts: calls.append(list(g)))
         grid.build_grid(100.0)
         assert len(calls) == 1
         assert len(calls[0]) == 11  # 5 buy + 1 wait + 5 sell
@@ -582,7 +582,7 @@ class TestGridOnChangeCallback:
     def test_callback_fires_after_update_grid(self):
         calls = []
         grid = Grid(tick_size=Decimal('0.1'), grid_count=10, grid_step=0.2,
-                    on_change=lambda g: calls.append(list(g)))
+                    on_change=lambda g, ts: calls.append(list(g)))
         grid.build_grid(100.0)
         calls.clear()
         grid.update_grid(last_filled_price=100.2, last_close=100.0)
@@ -593,7 +593,7 @@ class TestGridOnChangeCallback:
         what was already on disk)."""
         calls = []
         grid = Grid(tick_size=Decimal('0.1'), grid_count=10, grid_step=0.2,
-                    on_change=lambda g: calls.append(list(g)))
+                    on_change=lambda g, ts: calls.append(list(g)))
         serialized = [
             {'side': 'Buy', 'price': 99.0},
             {'side': 'Buy', 'price': 99.5},
@@ -607,7 +607,7 @@ class TestGridOnChangeCallback:
     def test_callback_errors_do_not_break_grid(self):
         """Callback failures are logged but never propagate — persistence
         failures must not crash strategy logic."""
-        def raise_callback(g):
+        def raise_callback(g, ts):
             raise RuntimeError("boom")
 
         grid = Grid(tick_size=Decimal('0.1'), grid_count=10, grid_step=0.2,
@@ -917,7 +917,7 @@ class TestRecenterIfDrifted:
             tick_size=Decimal('0.01'),
             grid_count=20,
             grid_step=1.0,
-            on_change=lambda g: calls.append(len(g)),
+            on_change=lambda g, ts: calls.append(len(g)),
         )
         grid.build_grid(100.0)
         calls_after_build = len(calls)
@@ -931,7 +931,7 @@ class TestRecenterIfDrifted:
             tick_size=Decimal('0.01'),
             grid_count=20,
             grid_step=1.0,
-            on_change=lambda g: calls.append(len(g)),
+            on_change=lambda g, ts: calls.append(len(g)),
         )
         grid.build_grid(100.0)
         calls_after_build = len(calls)

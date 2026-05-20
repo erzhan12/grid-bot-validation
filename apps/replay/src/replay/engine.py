@@ -63,6 +63,7 @@ from replay.snapshot_loader import (
     WalletSeed,
     load_active_orders,
     load_grid_state,
+    load_grid_state_from_snapshots,
     load_position_snapshots,
     load_wallet_seed_full,
 )
@@ -644,16 +645,35 @@ class ReplayEngine:
                 "seed.enabled=True but at_ts/account_id/strat_id are unset"
             )
 
-        # Grid state lives outside the DB; load before opening a session.
-        grid_seed = load_grid_state(
-            GridStateStore(file_path=seed.grid_state_path),
-            seed.strat_id,
-            expected_step=config.strategy.grid_step,
-            expected_count=config.strategy.grid_count,
-        )
-
+        # 0047: try the DB grid-state snapshot first, fall back to the file
+        # path, then to a blank build. DB lookup needs a session, so open it
+        # FIRST and run all loaders inside.
         with self._db.get_session() as db_session:
             self._seed_pre_check(db_session, run_id, seed.at_ts)
+
+            grid_seed = load_grid_state_from_snapshots(
+                db_session,
+                run_id,
+                seed.account_id,
+                seed.strat_id,
+                seed.at_ts,
+                expected_step=config.strategy.grid_step,
+                expected_count=config.strategy.grid_count,
+            )
+            grid_source = "db"
+            if grid_seed is None and seed.grid_state_path is not None:
+                grid_seed = load_grid_state(
+                    GridStateStore(file_path=seed.grid_state_path),
+                    seed.strat_id,
+                    expected_step=config.strategy.grid_step,
+                    expected_count=config.strategy.grid_count,
+                )
+                grid_source = "file" if grid_seed is not None else "fresh"
+            elif grid_seed is None:
+                grid_source = "fresh"
+            logger.info(
+                "%s: grid seed source=%s", seed.strat_id, grid_source,
+            )
 
             long_seed, short_seed = load_position_snapshots(
                 db_session,

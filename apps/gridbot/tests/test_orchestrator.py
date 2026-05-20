@@ -1755,6 +1755,179 @@ class TestOrchestratorDbRecords:
         assert orchestrator._run_ids == {}
 
 
+class TestOrchestratorGridStateWriterWiring:
+    """Feature 0047 — regression coverage for the parallel DB grid-state writer.
+
+    The writer is constructed in ``Orchestrator.__init__`` conditional on
+    ``db is not None``, threaded into every ``StrategyRunner`` via
+    ``_init_strategy``, started in ``start()`` AFTER ``_create_run_records``,
+    and flushed + stopped in ``stop()``. These tests assert each link
+    individually so a regression in any one of them is caught before
+    feature 0047 silently produces zero snapshots.
+    """
+
+    def test_no_writer_constructed_when_db_is_none(self, gridbot_config):
+        orchestrator = Orchestrator(gridbot_config, db=None)
+        assert orchestrator._grid_state_writer is None
+
+    def test_writer_constructed_when_db_present(self, gridbot_config):
+        from grid_db import DatabaseFactory, DatabaseSettings
+        from gridbot.writers import GridStateWriter
+
+        db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
+        db.create_tables()
+
+        orchestrator = Orchestrator(gridbot_config, db=db)
+        assert isinstance(orchestrator._grid_state_writer, GridStateWriter)
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_writer_threaded_into_runner_with_correct_account_id(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """``_init_strategy`` passes the shared writer + uuid5 account_id
+        into every ``StrategyRunner`` so ``_on_grid_change`` can fire the
+        DB write path."""
+        from uuid import UUID, uuid5
+        from grid_db import DatabaseFactory, DatabaseSettings
+
+        db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
+        db.create_tables()
+
+        orchestrator = Orchestrator(gridbot_config, db=db)
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+
+        runner = orchestrator._runners["btcusdt_test"]
+        # Same instance — one writer shared by every runner.
+        assert runner._grid_state_writer is orchestrator._grid_state_writer
+        # account_id must match the orchestrator's UUID5 formula or
+        # snapshots FK-mismatch replay's account scope.
+        namespace = UUID("12345678-1234-5678-1234-567812345678")
+        expected = str(uuid5(namespace, f"account:{account_config.name}"))
+        assert runner._account_id == expected
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_start_starts_writer_after_run_records_populated(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """``start()`` invokes ``writer.start()`` only AFTER
+        ``_create_run_records`` has populated ``_run_ids`` — otherwise
+        the writer's ``run_id_provider`` would drop all early enqueues.
+        """
+        from grid_db import DatabaseFactory, DatabaseSettings
+
+        db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
+        db.create_tables()
+
+        orchestrator = Orchestrator(gridbot_config, db=db)
+        # Replace the writer with a MagicMock so we can observe start().
+        writer_mock = MagicMock()
+        orchestrator._grid_state_writer = writer_mock
+
+        # Capture the state of _run_ids at the moment start() is called.
+        run_ids_when_started: dict = {}
+
+        def _capture_state():
+            run_ids_when_started.update(dict(orchestrator._run_ids))
+
+        writer_mock.start.side_effect = _capture_state
+
+        # Patch out networked pieces so start() completes without I/O.
+        with patch.object(orchestrator, "_connect_websockets"), \
+             patch.object(orchestrator, "_position_fetcher") as fetcher:
+            fetcher.fetch_and_update = MagicMock()
+            orchestrator.start()
+
+        writer_mock.start.assert_called_once()
+        # _run_ids must already be populated when writer.start() fires.
+        assert "btcusdt_test" in run_ids_when_started
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_stop_flushes_and_stops_writer(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """``stop()`` calls ``writer.flush(timeout=10.0)`` then
+        ``writer.stop()`` so the last post-fill snapshots in the queue
+        are persisted before the process exits.
+        """
+        from grid_db import DatabaseFactory, DatabaseSettings
+
+        db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
+        db.create_tables()
+
+        orchestrator = Orchestrator(gridbot_config, db=db)
+        writer_mock = MagicMock()
+        orchestrator._grid_state_writer = writer_mock
+
+        with patch.object(orchestrator, "_connect_websockets"), \
+             patch.object(orchestrator, "_position_fetcher") as fetcher:
+            fetcher.fetch_and_update = MagicMock()
+            orchestrator.start()
+            orchestrator.stop()
+
+        writer_mock.flush.assert_called_once_with(timeout=10.0)
+        writer_mock.stop.assert_called_once()
+
+    def test_stop_does_not_crash_without_writer(self, gridbot_config):
+        """Standalone / no-DB orchestrator stop() must not NPE on the
+        ``self._grid_state_writer is None`` branch."""
+        orchestrator = Orchestrator(gridbot_config, db=None)
+        # Mark started so stop() takes the real path.
+        orchestrator._started = True
+        # No WS to disconnect — empty dicts already cover that.
+        orchestrator.stop()  # Must not raise.
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_start_provisions_grid_state_snapshots_table_on_pre_0047_db(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """0047: deploying 0047 onto a pre-0047 production DB must
+        auto-create the missing ``grid_state_snapshots`` table at
+        ``start()``. ``Base.metadata.create_all`` is idempotent so
+        existing tables are untouched.
+        """
+        from sqlalchemy import inspect as sa_inspect
+        from grid_db import DatabaseFactory, DatabaseSettings
+        from grid_db.models import Base, GridStateSnapshot
+
+        # Provision the schema MINUS grid_state_snapshots to simulate a
+        # pre-0047 DB.
+        db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
+        Base.metadata.create_all(
+            db.engine,
+            tables=[
+                t for t in Base.metadata.sorted_tables
+                if t.name != GridStateSnapshot.__tablename__
+            ],
+        )
+        assert not sa_inspect(db.engine).has_table(
+            GridStateSnapshot.__tablename__
+        )
+
+        orchestrator = Orchestrator(gridbot_config, db=db)
+        with patch.object(orchestrator, "_connect_websockets"), \
+             patch.object(orchestrator, "_position_fetcher") as fetcher:
+            fetcher.fetch_and_update = MagicMock()
+            orchestrator.start()
+
+        # Table now present — writer can land snapshots.
+        assert sa_inspect(db.engine).has_table(
+            GridStateSnapshot.__tablename__
+        )
+
+
 class TestOrchestratorRetryDispatcher:
     """Tests for retry queue intent dispatch routing."""
 

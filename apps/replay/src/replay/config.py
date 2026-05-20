@@ -124,9 +124,14 @@ class SeedConfig(BaseModel):
         default=None,
         description="Strategy identifier used as GridStateStore key. Required when enabled.",
     )
-    grid_state_path: str = Field(
-        default="db/grid_anchor.json",
-        description="Path to grid-state JSON file shared with live (legacy filename retained from feature 0021).",
+    grid_state_path: Optional[str] = Field(
+        default=None,
+        description=(
+            "Path to legacy grid-state JSON file (feature 0021). With 0047 "
+            "the engine prefers ``grid_state_snapshots`` in DB and only "
+            "falls back to this file when a path is set AND no DB snapshot "
+            "covers ``at_ts``. None disables the file fallback entirely."
+        ),
     )
     wallet_coin: str = Field(
         default="USDT",

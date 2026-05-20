@@ -36,6 +36,7 @@ from gridbot.reconciler import Reconciler
 from gridbot.retry_queue import RetryQueue
 from gridbot.position_fetcher import PositionFetcher, _POSITION_TICK_BASE
 from gridbot.auth_cooldown_manager import AuthCooldownManager
+from gridbot.writers import GridStateWriter
 
 _HEALTH_CHECK_INTERVAL = 10  # seconds
 _WS_HEALTH_CHECK_INTERVAL = 10.0  # seconds — bbu2 ENSURE_SOCKET_INTERVAL parity
@@ -118,6 +119,25 @@ class Orchestrator:
 
         # Run tracking
         self._run_ids: dict[str, UUID] = {}  # strat_id -> run_id
+
+        # 0047: parallel DB grid-state writer. Constructed only when a DB
+        # is configured — standalone / no-DB runs (where _create_run_records
+        # early-returns) get a None writer. Background thread starts in
+        # start() (after _create_run_records populates _run_ids). The
+        # run_id_provider closure reads _run_ids lazily at write time;
+        # bootstrap-window writes (before _create_run_records) return None
+        # and are dropped by the writer with an INFO log.
+        if self._db is not None:
+            self._grid_state_writer: Optional[GridStateWriter] = GridStateWriter(
+                db=self._db,
+                run_id_provider=lambda strat_id: (
+                    str(self._run_ids[strat_id])
+                    if strat_id in self._run_ids
+                    else None
+                ),
+            )
+        else:
+            self._grid_state_writer = None
 
         # Event routing maps
         self._symbol_to_runners: dict[str, list[StrategyRunner]] = {}  # symbol -> runners
@@ -265,6 +285,28 @@ class Orchestrator:
 
         # Create database Run records (populates _run_ids)
         self._create_run_records()
+
+        # 0047: ensure the new ``grid_state_snapshots`` table exists on
+        # pre-0047 production DBs. ``Base.metadata.create_all`` is
+        # idempotent — only missing tables get created — and this project
+        # provisions schema this way (no Alembic). Without this, deploys
+        # would need an out-of-band ``python -m grid_db.init_db`` step or
+        # the loader's ``has_table`` fallback would suppress every write.
+        if self._db is not None:
+            try:
+                self._db.create_tables()
+            except Exception as e:
+                logger.warning(
+                    "Schema provisioning failed (continuing without DB grid-state writer): %s",
+                    e,
+                )
+
+        # 0047: start the DB grid-state writer's worker thread now that
+        # _run_ids is populated; bootstrap-window writes (between runner
+        # construction and this point) were dropped by the writer's
+        # provider-returns-None guard.
+        if self._grid_state_writer is not None:
+            self._grid_state_writer.start()
 
         # Connect WebSocket streams (pybit internal threads start here)
         for account_name in self._public_ws:
@@ -577,6 +619,14 @@ class Orchestrator:
         # SIGTERM. 10s matches typical fsync upper bounds on healthy disks.
         self._state_store.flush(timeout=10.0)
 
+        # 0047: drain the parallel DB writer before exit so the last
+        # post-fill snapshot(s) sitting in its queue don't get killed
+        # along with the daemon thread. Guarded for standalone / no-DB
+        # mode where the writer was never constructed.
+        if self._grid_state_writer is not None:
+            self._grid_state_writer.flush(timeout=10.0)
+            self._grid_state_writer.stop()
+
         # Update Run records
         self._update_run_records_stopped()
 
@@ -634,6 +684,16 @@ class Orchestrator:
 
         logger.info(f"Initialized account: {name}")
 
+    # 0047: shared UUID5 namespace for deterministic account/user/run/strategy
+    # IDs. Must match _create_run_records exactly or grid-state-writer FK
+    # validation against runs.account_id will fail.
+    _UUID_NAMESPACE = UUID("12345678-1234-5678-1234-567812345678")
+
+    @classmethod
+    def _account_id_for(cls, account_name: str) -> str:
+        """UUID5 derivation matching _create_run_records (orchestrator.py:1156-1162)."""
+        return str(uuid5(cls._UUID_NAMESPACE, f"account:{account_name}"))
+
     def _init_strategy(self, strategy_config: StrategyConfig) -> None:
         """Initialize a strategy runner."""
         strat_id = strategy_config.strat_id
@@ -670,8 +730,10 @@ class Orchestrator:
         runner = StrategyRunner(
             strategy_config=strategy_config,
             executor=executor,
+            account_id=self._account_id_for(account_name),
             instrument_info=instrument_info,
             state_store=self._state_store,
+            grid_state_writer=self._grid_state_writer,
             on_intent_failed=lambda intent, error: retry_queue.add(intent, error),
             on_retry_cancel_for_prefix=lambda prefix: retry_queue.cancel_for_prefix(prefix),
             on_unknown_order=self._request_immediate_order_sync,

@@ -292,11 +292,26 @@ Verify nothing's left running:
 ps aux | grep -E "gridbot|recorder" | grep -v grep   # expect: empty
 ```
 
-Snapshot the final live grid state so replay reads the same file:
+**Grid-state snapshot — branch by run vintage**:
 
-```bash
-cp db/grid_anchor.json db/grid_anchor.phase4.json
-```
+* **Runs recorded with feature 0047 or later** (the live gridbot is
+  writing to the ``grid_state_snapshots`` DB table — check with
+  ``sqlite3 data/recorder_ltcusdt_phase4.db 'SELECT COUNT(*) FROM
+  grid_state_snapshots WHERE run_id = "<RUN_ID>"';`` — expect > 0):
+  **skip the ``cp`` step**. Replay reads the DB row at-or-before
+  ``seed.at_ts``. Leave ``seed.grid_state_path`` unset (or remove the
+  line entirely) in your Step 8 YAML.
+
+* **Pre-0047 runs** (no ``grid_state_snapshots`` table, or zero rows
+  for the run): snapshot the live grid state file so replay reads it:
+
+  ```bash
+  cp db/grid_anchor.json db/grid_anchor.phase4.json
+  ```
+
+  and set ``seed.grid_state_path: "db/grid_anchor.phase4.json"`` in
+  your Step 8 YAML. The 2026-05-18 18 h dataset and any prior run
+  uses this path.
 
 ## Step 8 — Replay config
 

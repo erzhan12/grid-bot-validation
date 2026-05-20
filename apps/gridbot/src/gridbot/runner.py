@@ -14,7 +14,10 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, UTC, timedelta
 from decimal import Decimal
-from typing import Optional, Callable
+from typing import Optional, Callable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from gridbot.writers.grid_state_writer import GridStateWriter
 
 from gridcore import (
     GridEngine,
@@ -149,12 +152,21 @@ class StrategyRunner:
         runner.on_execution(execution_event)
     """
 
+    # Sentinel default for ``account_id``: avoids forcing every existing
+    # test/fixture (~40 sites) to pass a real UUID while still letting the
+    # constructor reject the dummy if a DB writer is actually wired —
+    # otherwise snapshots would silently land under the zero UUID and be
+    # invisible to replay's real account scope (feature 0047).
+    _ACCOUNT_ID_DEFAULT = "00000000-0000-0000-0000-000000000000"
+
     def __init__(
         self,
         strategy_config: StrategyConfig,
         executor: IntentExecutor,
+        account_id: str = _ACCOUNT_ID_DEFAULT,
         instrument_info: Optional[InstrumentInfo] = None,
         state_store: Optional[GridStateStore] = None,
+        grid_state_writer: Optional["GridStateWriter"] = None,
         on_intent_failed: Optional[Callable[[PlaceLimitIntent | CancelIntent, str], None]] = None,
         on_unknown_order: Optional[Callable[[str], None]] = None,
         notifier: Optional[Notifier] = None,
@@ -165,8 +177,15 @@ class StrategyRunner:
         Args:
             strategy_config: Strategy configuration.
             executor: Intent executor for API calls.
+            account_id: UUID5-derived account identifier; matches the value
+                ``orchestrator.py:1156-1162`` computes from the account name.
+                Used by the DB grid-state writer (feature 0047) so snapshots
+                FK-match ``runs.account_id``.
             instrument_info: Instrument info for qty rounding (None uses no rounding).
             state_store: Optional grid state store for persistence.
+            grid_state_writer: Optional DB writer for ``grid_state_snapshots``
+                (feature 0047). When provided, ``_on_grid_change`` writes a
+                second snapshot path in parallel with ``state_store``.
             on_intent_failed: Callback when intent execution fails (for retry queue).
             on_unknown_order: Callback when WS reports a New order we don't track
                 (for fast-tracking the next order-sync sweep).
@@ -174,9 +193,27 @@ class StrategyRunner:
             on_retry_cancel_for_prefix: Optional callback to cancel queued
                 placement retries after reconcile proves the order was accepted.
         """
+        # 0047: if a DB writer is wired, account_id MUST be explicitly set —
+        # the dummy default would FK-mismatch with replay's account scope
+        # (and `runs.account_id` does not catch this because the writer's
+        # FK is to `runs.run_id`). Orchestrator passes the real UUID5; any
+        # other caller wiring the writer must do the same.
+        if (
+            grid_state_writer is not None
+            and account_id == self._ACCOUNT_ID_DEFAULT
+        ):
+            raise ValueError(
+                "StrategyRunner.account_id must be set explicitly when "
+                "grid_state_writer is provided; got the placeholder default. "
+                "Orchestrator derives it via Orchestrator._account_id_for("
+                "account_name) (uuid5(NAMESPACE, 'account:<name>'))."
+            )
+
         self._config = strategy_config
         self._executor = executor
+        self._account_id = account_id
         self._state_store = state_store
+        self._grid_state_writer = grid_state_writer
         self._on_intent_failed = on_intent_failed
         self._on_unknown_order = on_unknown_order
         self._notifier = notifier
@@ -369,20 +406,38 @@ class StrategyRunner:
             )
             return None
 
-    def _on_grid_change(self, grid: list[dict]) -> None:
+    def _on_grid_change(self, grid: list[dict], exchange_ts: Optional[datetime]) -> None:
         """Persist grid mutations triggered from inside Grid.build_grid /
         Grid.update_grid. Skips writes for the just-built single-WAIT case
-        and for empty grids (a restored grid that failed validation)."""
-        if self._state_store is None:
-            return
+        and for empty grids (a restored grid that failed validation).
+
+        Backends are independent guards (0047): file path is timestamp-agnostic
+        and runs whenever ``_state_store`` is configured; DB path requires
+        ``_grid_state_writer`` AND a non-None ``exchange_ts`` (constructor-time
+        restore_grid carries no triggering event and would falsify
+        ``at_or_before`` lookups).
+        """
         if len(grid) <= 1:
             return
-        self._state_store.save(
-            strat_id=self._config.strat_id,
-            grid=grid,
-            grid_step=self._config.grid_step,
-            grid_count=self._config.grid_count,
-        )
+
+        if self._state_store is not None:
+            self._state_store.save(
+                strat_id=self._config.strat_id,
+                grid=grid,
+                grid_step=self._config.grid_step,
+                grid_count=self._config.grid_count,
+            )
+
+        if self._grid_state_writer is not None and exchange_ts is not None:
+            self._grid_state_writer.write(
+                strat_id=self._config.strat_id,
+                grid=grid,
+                grid_step=self._config.grid_step,
+                grid_count=self._config.grid_count,
+                account_id=self._account_id,
+                symbol=self._config.symbol,
+                exchange_ts=exchange_ts,
+            )
 
     def get_limit_orders(self) -> dict[str, list[dict]]:
         """Get current limit orders in format expected by GridEngine.

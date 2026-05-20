@@ -18,6 +18,7 @@ import pytest
 
 from grid_db import (
     BybitAccount,
+    GridStateSnapshot,
     Order,
     OrderRepository,
     PositionSnapshot,
@@ -28,8 +29,9 @@ from grid_db import (
     WalletSnapshot,
     WalletSnapshotRepository,
 )
+from grid_db.repositories import GridStateSnapshotRepository
 
-from gridcore.persistence import GridStateStore
+from gridcore.persistence import GridStateStore, grid_fingerprint_hash
 
 from replay.config import ReplayConfig, ReplayStrategyConfig, SeedConfig
 from replay.engine import ReplayEngine
@@ -350,6 +352,98 @@ class TestReplayEngineSeedingPipeline:
         assert short_seed is not None
         assert grid_seed is not None
         assert order_seeds is not None
+
+    def test_load_seed_prefers_db_over_file(
+        self, seeded_db, replay_config, snapshot_ts, mock_instrument,
+    ):
+        """0047: when a DB snapshot covers ``at_ts``, engine returns it
+        — the file grid (different payload) is ignored."""
+        db_grid = [
+            {"side": "Buy", "price": 90000.0},
+            {"side": "Buy", "price": 90200.0},
+            {"side": "Sell", "price": 90600.0},
+            {"side": "Sell", "price": 90800.0},
+        ]
+        with seeded_db.get_session() as session:
+            GridStateSnapshotRepository(session).insert(
+                GridStateSnapshot(
+                    run_id="seed-run", account_id="acc-1", strat_id=STRAT_ID,
+                    symbol=SYMBOL,
+                    exchange_ts=snapshot_ts, local_ts=snapshot_ts,
+                    grid_json=db_grid, grid_step=Decimal("0.2"), grid_count=4,
+                    raw_fingerprint=grid_fingerprint_hash(db_grid, 0.2, 4),
+                )
+            )
+
+        engine = ReplayEngine(config=replay_config, db=seeded_db)
+        run_id, *_ = engine._resolve_run(replay_config)
+        _, _, _, grid_seed, _ = engine._load_seed(replay_config, run_id)
+        assert grid_seed is not None
+        assert grid_seed.grid == db_grid
+
+    def test_load_seed_falls_back_to_file_when_no_db_snapshot(
+        self, seeded_db, replay_config, mock_instrument,
+    ):
+        """0047: no DB row at-or-before at_ts → file path wins."""
+        engine = ReplayEngine(config=replay_config, db=seeded_db)
+        run_id, *_ = engine._resolve_run(replay_config)
+        _, _, _, grid_seed, _ = engine._load_seed(replay_config, run_id)
+        assert grid_seed is not None
+        # File fixture has 4 levels starting at 99600.0 (see grid_state_path).
+        assert grid_seed.grid[0]["price"] == 99600.0
+
+    def test_load_seed_falls_back_to_file_when_table_missing(
+        self, seeded_db, replay_config, mock_instrument,
+    ):
+        """0047 P1: pre-0047 DB (no ``grid_state_snapshots`` table) must
+        still drop into the file path so old recorder datasets stay
+        usable. Without this, SQLAlchemy raises ``no such table`` and the
+        plan's "old datasets stay on file mode" out-of-scope clause breaks.
+        """
+        GridStateSnapshot.__table__.drop(seeded_db.engine)
+        try:
+            engine = ReplayEngine(config=replay_config, db=seeded_db)
+            run_id, *_ = engine._resolve_run(replay_config)
+            _, _, _, grid_seed, _ = engine._load_seed(replay_config, run_id)
+        finally:
+            GridStateSnapshot.__table__.create(seeded_db.engine)
+
+        assert grid_seed is not None
+        # File fixture has 4 levels starting at 99600.0.
+        assert grid_seed.grid[0]["price"] == 99600.0
+
+    def test_load_seed_falls_back_to_fresh_when_no_db_and_no_file(
+        self, seeded_db, seed_ts, mock_instrument,
+    ):
+        """0047: no DB row AND grid_state_path is None → grid_seed is None."""
+        seed_config = SeedConfig(
+            enabled=True,
+            at_ts=seed_ts,
+            account_id="acc-1",
+            strat_id=STRAT_ID,
+            grid_state_path=None,
+            wallet_coin="USDT",
+        )
+        replay_config = ReplayConfig(
+            database_url="sqlite:///:memory:",
+            run_id="seed-run",
+            symbol=SYMBOL,
+            start_ts=seed_ts,
+            end_ts=seed_ts + timedelta(hours=1),
+            strategy=ReplayStrategyConfig(
+                tick_size=Decimal("0.1"),
+                grid_count=4,
+                grid_step=0.2,
+                enable_risk_multipliers=True,
+            ),
+            initial_balance=Decimal("10000"),
+            enable_funding=False,
+            seed=seed_config,
+        )
+        engine = ReplayEngine(config=replay_config, db=seeded_db)
+        run_id, *_ = engine._resolve_run(replay_config)
+        _, _, _, grid_seed, _ = engine._load_seed(replay_config, run_id)
+        assert grid_seed is None
 
 
 # ---------------------------------------------------------------------------
