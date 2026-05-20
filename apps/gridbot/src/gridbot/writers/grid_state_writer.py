@@ -218,6 +218,10 @@ class GridStateWriter:
         with self._dedupe_lock:
             self._last_fingerprint[scope] = fp_tuple
 
+    def increment_bootstrap_failures(self) -> None:
+        """Bump the bootstrap-failure counter (called by orchestrator bootstrap)."""
+        self._total_bootstrap_failures += 1
+
     def stop(self) -> None:
         """Signal worker to drain and exit, then join."""
         if not self._running:

@@ -1360,7 +1360,7 @@ class Orchestrator:
                             f"run_id reuse)",
                             error_key=f"bootstrap_anomalous_{strat_id}",
                         )
-                        writer._total_bootstrap_failures += 1
+                        writer.increment_bootstrap_failures()
             except Exception as exc:
                 run_id = self._run_ids.get(strat_id)
                 logger.warning(
@@ -1373,7 +1373,7 @@ class Orchestrator:
                     f"(run {run_id}): {exc}",
                     error_key=f"bootstrap_{strat_id}",
                 )
-                writer._total_bootstrap_failures += 1
+                writer.increment_bootstrap_failures()
 
         if enqueued:
             success = writer.flush(timeout=5.0)
@@ -1384,7 +1384,7 @@ class Orchestrator:
                     f"({writer.get_stats()['queue_size']} items still queued)",
                     error_key="bootstrap_flush",
                 )
-                writer._total_bootstrap_failures += 1
+                writer.increment_bootstrap_failures()
             elif errors_after > errors_before:
                 n_failed = errors_after - errors_before
                 logger.warning(
@@ -1397,7 +1397,7 @@ class Orchestrator:
                     f"({n_failed} error(s); see logs)",
                     error_key="bootstrap_insert",
                 )
-                writer._total_bootstrap_failures += 1
+                writer.increment_bootstrap_failures()
 
     def _update_run_records_stopped(self) -> None:
         """Update Run records to stopped status."""
