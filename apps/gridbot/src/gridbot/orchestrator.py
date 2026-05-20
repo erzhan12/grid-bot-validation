@@ -26,6 +26,7 @@ from gridcore import (
     InstrumentInfo,
     TickerEvent,
 )
+from gridcore.persistence import grid_fingerprint
 from gridcore.intents import CancelIntent
 
 from gridbot.config import GridbotConfig, AccountConfig, StrategyConfig
@@ -48,6 +49,13 @@ _UNKNOWN_ORDER_DEBOUNCE_SEC = 2.0  # min interval between WS-triggered fast-trac
 
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_utc_aware(dt: datetime) -> datetime:
+    """Normalize datetimes for comparison (SQLite may return naive values)."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC)
 
 
 def _runner_market_price(runner: StrategyRunner, latest_ticker: TickerEvent | None = None) -> float | None:
@@ -119,6 +127,7 @@ class Orchestrator:
 
         # Run tracking
         self._run_ids: dict[str, UUID] = {}  # strat_id -> run_id
+        self._run_start_ts: dict[str, datetime] = {}  # strat_id -> Run.start_ts
 
         # 0047: parallel DB grid-state writer. Constructed only when a DB
         # is configured — standalone / no-DB runs (where _create_run_records
@@ -304,9 +313,12 @@ class Orchestrator:
         # 0047: start the DB grid-state writer's worker thread now that
         # _run_ids is populated; bootstrap-window writes (between runner
         # construction and this point) were dropped by the writer's
-        # provider-returns-None guard.
+        # provider-returns-None guard. Immediately probe and write an
+        # initial snapshot per built grid (issue #108); failures alert but
+        # do not block startup.
         if self._grid_state_writer is not None:
             self._grid_state_writer.start()
+            self._bootstrap_grid_snapshots()
 
         # Connect WebSocket streams (pybit internal threads start here)
         for account_name in self._public_ws:
@@ -1276,6 +1288,7 @@ class Orchestrator:
                         session.flush()  # populate run.run_id
 
                         self._run_ids[strat_config.strat_id] = UUID(run.run_id)
+                        self._run_start_ts[strat_config.strat_id] = run.start_ts
                         logger.info(
                             "Created Run %s for strategy %s",
                             run.run_id,
@@ -1284,6 +1297,107 @@ class Orchestrator:
 
         except Exception as e:
             logger.warning("Failed to create Run records: %s", e)
+
+    def _bootstrap_grid_snapshots(self) -> None:
+        """Best-effort initial grid_state_snapshots write after restart (issue #108)."""
+        if self._grid_state_writer is None:
+            return
+
+        writer = self._grid_state_writer
+        errors_before = writer.get_stats()["total_errors"]
+        enqueued = False
+
+        for strat_id, runner in self._runners.items():
+            try:
+                if strat_id not in self._run_ids:
+                    continue
+
+                run_id = str(self._run_ids[strat_id])
+                run_start_ts = _ensure_utc_aware(self._run_start_ts[strat_id])
+                account_name = self._get_account_for_strategy(strat_id)
+                account_id = self._account_id_for(account_name)
+
+                grid_step = runner._config.grid_step
+                grid_count = runner._config.grid_count
+                symbol = runner.symbol
+
+                grid = runner.engine.grid.grid
+                if len(grid) <= 1:
+                    continue
+
+                current_fp = grid_fingerprint(grid, grid_step, grid_count)
+                last = writer.get_last_fingerprint(run_id, account_id, strat_id)
+                scope = (run_id, account_id, strat_id)
+
+                if last is None:
+                    writer.write(
+                        strat_id, grid, grid_step, grid_count,
+                        account_id, symbol, exchange_ts=run_start_ts,
+                    )
+                    enqueued = True
+                elif last[0] == current_fp:
+                    writer.prime_fingerprint(scope, current_fp)
+                else:
+                    last_ts = _ensure_utc_aware(last[1])
+                    if last_ts <= run_start_ts:
+                        writer.write(
+                            strat_id, grid, grid_step, grid_count,
+                            account_id, symbol, exchange_ts=run_start_ts,
+                        )
+                        enqueued = True
+                    else:
+                        logger.warning(
+                            "Bootstrap grid snapshot anomaly for %s: stale row "
+                            "exchange_ts %s is after run start %s; skipping "
+                            "correction (investigate run_id reuse)",
+                            strat_id, last_ts, run_start_ts,
+                            exc_info=False,
+                        )
+                        self._notifier.alert(
+                            f"Bootstrap grid snapshot anomaly for {strat_id}: "
+                            f"stale row exchange_ts {last_ts} is after run start "
+                            f"{run_start_ts}; skipping correction (investigate "
+                            f"run_id reuse)",
+                            error_key=f"bootstrap_anomalous_{strat_id}",
+                        )
+                        writer._total_bootstrap_failures += 1
+            except Exception as exc:
+                run_id = self._run_ids.get(strat_id)
+                logger.warning(
+                    "Bootstrap grid snapshot failed for %s (run %s): %s",
+                    strat_id, run_id, exc,
+                    exc_info=True,
+                )
+                self._notifier.alert(
+                    f"Bootstrap grid snapshot failed for {strat_id} "
+                    f"(run {run_id}): {exc}",
+                    error_key=f"bootstrap_{strat_id}",
+                )
+                writer._total_bootstrap_failures += 1
+
+        if enqueued:
+            success = writer.flush(timeout=5.0)
+            errors_after = writer.get_stats()["total_errors"]
+            if not success:
+                self._notifier.alert(
+                    f"Bootstrap grid snapshot flush timed out after 5.0s "
+                    f"({writer.get_stats()['queue_size']} items still queued)",
+                    error_key="bootstrap_flush",
+                )
+                writer._total_bootstrap_failures += 1
+            elif errors_after > errors_before:
+                n_failed = errors_after - errors_before
+                logger.warning(
+                    "Bootstrap grid snapshot insert failed for %d enqueued "
+                    "snapshot(s) during flush (total_errors %d -> %d)",
+                    n_failed, errors_before, errors_after,
+                )
+                self._notifier.alert(
+                    f"Bootstrap grid snapshot insert failed during flush "
+                    f"({n_failed} error(s); see logs)",
+                    error_key="bootstrap_insert",
+                )
+                writer._total_bootstrap_failures += 1
 
     def _update_run_records_stopped(self) -> None:
         """Update Run records to stopped status."""

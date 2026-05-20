@@ -1,6 +1,7 @@
 """Tests for repository pattern with multi-tenant filtering."""
 
 from datetime import datetime, timedelta, UTC
+from decimal import Decimal
 
 from grid_db.repositories import (
     BaseRepository,
@@ -11,8 +12,19 @@ from grid_db.repositories import (
     RunRepository,
     PublicTradeRepository,
     PrivateExecutionRepository,
+    GridStateSnapshotRepository,
 )
-from grid_db.models import User, BybitAccount, ApiCredential, Strategy, Run, PublicTrade, PrivateExecution
+from grid_db.models import (
+    User,
+    BybitAccount,
+    ApiCredential,
+    Strategy,
+    Run,
+    PublicTrade,
+    PrivateExecution,
+    GridStateSnapshot,
+)
+from gridcore.persistence import grid_fingerprint_hash
 
 
 class TestBaseRepository:
@@ -1652,3 +1664,96 @@ class TestPositionSnapshotSourceFiltering0034:
         )
         assert result is not None
         assert result.source == "backtest"
+
+
+class TestGridStateSnapshotRepository:
+    """Tests for GridStateSnapshotRepository."""
+
+    def test_get_latest_picks_newest_row_by_exchange_ts_then_id(
+        self, session, sample_run,
+    ):
+        """``get_latest`` uses ``ORDER BY exchange_ts DESC, id DESC``."""
+        repo = GridStateSnapshotRepository(session)
+        grid = [
+            {"side": "Buy", "price": 100.0},
+            {"side": "Wait", "price": 101.0},
+            {"side": "Sell", "price": 102.0},
+        ]
+        ts_old = datetime(2026, 1, 1, tzinfo=UTC)
+        ts_new = datetime(2026, 1, 2, tzinfo=UTC)
+        fp = grid_fingerprint_hash(grid, 0.5, 3)
+
+        older = GridStateSnapshot(
+            run_id=sample_run.run_id,
+            account_id=sample_run.account_id,
+            strat_id="strat_a",
+            symbol="BTCUSDT",
+            exchange_ts=ts_old,
+            local_ts=ts_old,
+            grid_json=grid,
+            grid_step=Decimal("0.5"),
+            grid_count=3,
+            raw_fingerprint=fp,
+        )
+        newer_ts = GridStateSnapshot(
+            run_id=sample_run.run_id,
+            account_id=sample_run.account_id,
+            strat_id="strat_a",
+            symbol="BTCUSDT",
+            exchange_ts=ts_new,
+            local_ts=ts_new,
+            grid_json=grid,
+            grid_step=Decimal("0.5"),
+            grid_count=3,
+            raw_fingerprint=fp,
+        )
+        tie_low_id = GridStateSnapshot(
+            run_id=sample_run.run_id,
+            account_id=sample_run.account_id,
+            strat_id="strat_a",
+            symbol="BTCUSDT",
+            exchange_ts=ts_new,
+            local_ts=ts_new,
+            grid_json=[{"side": "Buy", "price": 99.0}, *grid[1:]],
+            grid_step=Decimal("0.5"),
+            grid_count=3,
+            raw_fingerprint=grid_fingerprint_hash(
+                [{"side": "Buy", "price": 99.0}, *grid[1:]], 0.5, 3,
+            ),
+        )
+        tie_high_id = GridStateSnapshot(
+            run_id=sample_run.run_id,
+            account_id=sample_run.account_id,
+            strat_id="strat_a",
+            symbol="BTCUSDT",
+            exchange_ts=ts_new,
+            local_ts=ts_new,
+            grid_json=[{"side": "Buy", "price": 98.0}, *grid[1:]],
+            grid_step=Decimal("0.5"),
+            grid_count=3,
+            raw_fingerprint=grid_fingerprint_hash(
+                [{"side": "Buy", "price": 98.0}, *grid[1:]], 0.5, 3,
+            ),
+        )
+        for snap in (older, newer_ts, tie_low_id, tie_high_id):
+            repo.insert(snap)
+        session.flush()
+
+        latest = repo.get_latest(
+            sample_run.run_id, sample_run.account_id, "strat_a",
+        )
+        all_rows = (
+            session.query(GridStateSnapshot)
+            .filter(
+                GridStateSnapshot.run_id == sample_run.run_id,
+                GridStateSnapshot.account_id == sample_run.account_id,
+                GridStateSnapshot.strat_id == "strat_a",
+            )
+            .order_by(GridStateSnapshot.id)
+            .all()
+        )
+        assert latest is not None
+        assert len(all_rows) == 4
+        assert latest.exchange_ts.replace(tzinfo=UTC) == ts_new
+        assert latest.grid_json[0]["price"] == 98.0
+        assert latest.id == all_rows[-1].id

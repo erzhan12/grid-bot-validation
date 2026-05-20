@@ -1248,6 +1248,27 @@ class GridStateSnapshotRepository(BaseRepository[GridStateSnapshot]):
         self.session.flush()
         return result.rowcount if result.rowcount else 0
 
+    def get_latest(
+        self,
+        run_id: str,
+        account_id: str,
+        strat_id: str,
+    ) -> Optional[GridStateSnapshot]:
+        """Latest grid snapshot for the scope — same ``ORDER BY`` as ``get_at_or_before`` without the ts predicate."""
+        return (
+            self.session.query(GridStateSnapshot)
+            .filter(
+                GridStateSnapshot.run_id == run_id,
+                GridStateSnapshot.account_id == account_id,
+                GridStateSnapshot.strat_id == strat_id,
+            )
+            .order_by(
+                GridStateSnapshot.exchange_ts.desc(),
+                GridStateSnapshot.id.desc(),
+            )
+            .first()
+        )
+
     def get_at_or_before(
         self,
         run_id: str,
