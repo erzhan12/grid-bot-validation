@@ -13,21 +13,29 @@ Acceptance metric: `match_rate ≥ 0.95` from `apps/comparator`.
 
 ## Architecture
 
-Two processes run in parallel during the recording window:
+Two processes run in parallel during the recording window, **sharing one
+SQLite DB** (Phase 4 default since Feature 0049):
 
 - **`apps/gridbot`** (live) — trades on Bybit mainnet via WS+REST.
-  Writes nothing to DB; recording is a separate process by design.
-- **`apps/recorder`** — independent writer. Always subscribes to the
-  public **ticker** stream and (when `account` is configured) to the
-  private streams (orders, executions, positions, wallet) for the
-  same account. Public **trade** firehose is opt-in via the
-  `capture_public_trades` flag — when `false` (the default we use
-  for Phase 4), the recorder does NOT subscribe to `publicTrade.*`
-  on the WS at all (no network frames, no parsing, no write).
-  Tables populated for Phase 4: `ticker_snapshots`, `orders`,
-  `position_snapshots`, `wallet_snapshots`, `private_executions`.
-  Without recorder running, comparator has no ground truth and
-  cannot match.
+  Writes grid-owned state to the shared DB: `grid_state_snapshots`
+  (Feature 0047 — replay seeds grid state from these rows) and live
+  `runs` rows (`run_type='live'`). Does NOT touch recorder-owned
+  tables.
+- **`apps/recorder`** — independent writer for market/account
+  telemetry. Always subscribes to the public **ticker** stream and
+  (when `account` is configured) to the private streams (orders,
+  executions, positions, wallet) for the same account. Public
+  **trade** firehose is opt-in via the `capture_public_trades` flag
+  — when `false` (the default we use for Phase 4), the recorder does
+  NOT subscribe to `publicTrade.*` on the WS at all (no network
+  frames, no parsing, no write).
+  Recorder-owned tables: `ticker_snapshots`, `orders`,
+  `position_snapshots` (rows with `source='live'`),
+  `wallet_snapshots`, `private_executions`, and `runs WHERE
+  run_type='recording'`. Without recorder running, comparator has no
+  ground truth and cannot match. Note: `grid_state_snapshots` is
+  **gridbot-owned**, not recorder-owned, even though it lives in the
+  same DB.
 
 After the window is captured, two offline runs:
 
@@ -42,10 +50,37 @@ After the window is captured, two offline runs:
 
 ## Prerequisites
 
-- `main` branch checked out at `0d7a35f` or later (the 0029 merge).
-- `BYBIT_API_KEY` / `BYBIT_API_SECRET` in `.env` with read permission
-  on wallet, position, and orders for `category=linear` /
-  `settleCoin=USDT`. Same env vars live gridbot already reads.
+- `main` branch checked out at `0d7a35f` or later (the 0029 merge),
+  and ideally past the Feature 0049 merge for the surgical-wipe
+  helper.
+- **Shared SQLite DB across gridbot, recorder, replay, and comparator
+  (Feature 0049 default).** All four processes must resolve their
+  `database_url` to the **same physical SQLite file**. Mixing an
+  absolute `.env` `DATABASE_URL` for gridbot with relative
+  recorder/replay/comparator URLs that resolve against a different
+  working directory will silently produce two DBs and break Feature
+  0047 grid-state seeding.
+- `.env` must set `DATABASE_URL` to an absolute SQLite URL using the
+  four-slash form so gridbot's runtime CWD cannot move the file:
+
+  ```bash
+  DATABASE_URL="sqlite:////<abs-path>/data/recorder_ltcusdt_phase4.db"
+  ```
+
+  Replace `<abs-path>` with the absolute path to the repo root on
+  the host operator's machine (e.g. `/Users/you/code/grid-bot-validation`,
+  yielding `sqlite:////Users/you/code/grid-bot-validation/data/recorder_ltcusdt_phase4.db`).
+- Both Bybit credential pairs must be present in `.env`:
+  - `BYBIT_READONLY_API_KEY` / `BYBIT_READONLY_API_SECRET` — recorder
+    credentials, **read-only** on wallet, position, and orders for
+    `category=linear` / `settleCoin=USDT`. Used by the recorder
+    config (Step 3) so it can never authenticate with a key that has
+    trade permission.
+  - `BYBIT_API_KEY` / `BYBIT_API_SECRET` — live gridbot's
+    **trading** credentials, the same pair the live bot already
+    consumes. Used by Step 5 when gridbot is started against the
+    same account. Do not reuse the readonly keys here; gridbot needs
+    place/cancel scopes.
 - ~30–60 minutes of attended runtime to accumulate ≥30 closed trades
   on LTCUSDT (current grid_step=0.3% on a non-volatile pair).
 
@@ -107,7 +142,15 @@ anchor-only entry will leak into replay.
 
 ## Step 3 — Create recorder config for LTCUSDT with private streams
 
-`apps/recorder/conf/recorder_ltcusdt.yaml`:
+The recorder `database_url` and gridbot `.env` `DATABASE_URL` must
+resolve to the **same physical SQLite file** for Feature 0047 replay
+seeding. The tracked example uses a relative URL; when running Phase 4,
+either keep the recorder relative (and launch from the repo root so the
+relative path resolves to the same file as gridbot's absolute
+`DATABASE_URL`), or switch the recorder config to the same absolute
+four-slash URL used in `.env`.
+
+`apps/recorder/conf/recorder_ltcusdt.yaml` (tracked, relative):
 
 ```yaml
 symbols:
@@ -121,10 +164,12 @@ flush_interval: 5.0
 gap_threshold_seconds: 5.0
 health_log_interval: 60   # frequent heartbeat for visibility
 
-# Private streams — REQUIRED for seed-aware replay
+# Private streams — REQUIRED for seed-aware replay.
+# These are READ-ONLY credentials, distinct from gridbot's live
+# trading keys (BYBIT_API_KEY / BYBIT_API_SECRET).
 account:
-  api_key: "${BYBIT_API_KEY}"
-  api_secret: "${BYBIT_API_SECRET}"
+  api_key: "${BYBIT_READONLY_API_KEY}"
+  api_secret: "${BYBIT_READONLY_API_SECRET}"
 
 # When false (default for Phase 4): no `publicTrade.*` WS subscription
 # at all — recorder never receives or writes market trades. Ticker
@@ -133,8 +178,10 @@ account:
 capture_public_trades: false
 ```
 
-`${BYBIT_API_KEY}` / `${BYBIT_API_SECRET}` resolve from `.env` via
-`dotenv`, the same pattern live gridbot uses.
+`${BYBIT_READONLY_API_KEY}` / `${BYBIT_READONLY_API_SECRET}` resolve
+from `.env` via `dotenv`. Do NOT swap these for the live trading keys —
+the recorder must never authenticate with a key that has trade
+permissions.
 
 ## Step 4 — Install all workspace packages into the venv (one-time)
 
@@ -176,10 +223,29 @@ scripts/phase4/start_recorder.sh
 # Optionally: scripts/phase4/start_recorder.sh path/to/other_config.yaml
 ```
 
-The script: pkills any prior recorder for the same config (15s
-graceful), wipes the recorder DB + WAL/SHM + `/tmp/recorder.log`,
-starts a fresh recorder in the background, waits up to 15s for the
-"Initial REST snapshot" line, and prints PID + next-step commands.
+The script (post-Feature 0049):
+
+1. Stops any prior recorder for the same config (15s graceful, then
+   SIGTERM escalation).
+2. Performs a **surgical recorder-owned data wipe** on the shared DB
+   via SQL DELETEs inside a single transaction: clears
+   `private_executions`, `orders`, `wallet_snapshots`,
+   `position_snapshots WHERE source='live'`, `ticker_snapshots`, and
+   `runs WHERE run_type='recording'`.
+3. **Preserves** `grid_state_snapshots`, live `runs`
+   (`run_type='live'`), `bybit_accounts`, `strategies`, and `users` —
+   none of those are recorder-owned, and Feature 0047 grid-state
+   seeding depends on `grid_state_snapshots` surviving recorder
+   restarts.
+4. Leaves `$DB_PATH-wal` and `$DB_PATH-shm` sidecars intact (no
+   file-level deletes).
+5. Removes `/tmp/recorder.log`.
+6. Starts a fresh recorder in the background, waits up to 15s for the
+   "Initial REST snapshot" line, and prints PID + next-step commands.
+
+If the DB file does not yet exist (first Phase 4 run on a clean
+machine), the SQL wipe step is skipped and the recorder creates the
+schema via `db.create_tables()` on startup.
 
 To monitor: `scripts/phase4/status.sh` or `tail -f /tmp/recorder.log`.
 
@@ -275,13 +341,19 @@ scripts/phase4/stop_recorder.sh
 ```
 
 The `stop_recorder.sh` output includes the `RUN_ID` and `ACCOUNT_ID`
-you'll need to paste into the replay config in Step 8. Save them:
+you'll need to paste into the replay config in Step 8. Save them
+using queries that are **scoped to the latest recording run** —
+unfiltered `ORDER BY start_ts DESC LIMIT 1` against `runs` is wrong
+in a shared DB because the newest row can be a live gridbot run, and
+`bybit_accounts LIMIT 1` can pick the wrong account when shared
+setup data contains multiple accounts:
 
 ```bash
-RUN_ID=$(sqlite3 data/recorder_ltcusdt_phase4.db \
-  "SELECT run_id FROM runs ORDER BY start_ts DESC LIMIT 1")
-ACCOUNT_ID=$(sqlite3 data/recorder_ltcusdt_phase4.db \
-  "SELECT account_id FROM bybit_accounts LIMIT 1")
+# Use the same absolute four-slash SQLite path as `.env` / gridbot.
+RUN_ID=$(sqlite3 /<abs-path>/data/recorder_ltcusdt_phase4.db \
+  "SELECT run_id FROM runs WHERE run_type='recording' ORDER BY start_ts DESC LIMIT 1")
+ACCOUNT_ID=$(sqlite3 /<abs-path>/data/recorder_ltcusdt_phase4.db \
+  "SELECT account_id FROM runs WHERE run_type='recording' ORDER BY start_ts DESC LIMIT 1")
 echo "RUN_ID:     $RUN_ID"
 echo "ACCOUNT_ID: $ACCOUNT_ID"
 ```
@@ -292,26 +364,31 @@ Verify nothing's left running:
 ps aux | grep -E "gridbot|recorder" | grep -v grep   # expect: empty
 ```
 
-**Grid-state snapshot — branch by run vintage**:
+**Grid-state snapshot — always provide the file fallback until the
+replay lookup is fixed**:
 
-* **Runs recorded with feature 0047 or later** (the live gridbot is
-  writing to the ``grid_state_snapshots`` DB table — check with
-  ``sqlite3 data/recorder_ltcusdt_phase4.db 'SELECT COUNT(*) FROM
-  grid_state_snapshots WHERE run_id = "<RUN_ID>"';`` — expect > 0):
-  **skip the ``cp`` step**. Replay reads the DB row at-or-before
-  ``seed.at_ts``. Leave ``seed.grid_state_path`` unset (or remove the
-  line entirely) in your Step 8 YAML.
+Even on Feature 0047+ runs (where gridbot is writing
+``grid_state_snapshots`` to the shared DB), replay cannot currently
+read those rows for the recording session — its wallet, position,
+order, and execution loaders use the *recording* ``run_id`` captured
+above, while ``grid_state_snapshots`` rows are written by gridbot
+under the *live gridbot* ``run_id``. Replay calls
+``load_grid_state_from_snapshots(..., run_id, ...)`` with the
+recording ``run_id`` and matches no row, so DB-seeded grid state
+silently falls back to file or fresh build. Sharing the DB does not
+fix this lookup mismatch; a follow-up must resolve grid state by the
+live ``run_id`` (or another stable association).
 
-* **Pre-0047 runs** (no ``grid_state_snapshots`` table, or zero rows
-  for the run): snapshot the live grid state file so replay reads it:
+Until that follow-up lands, do the file copy on **every** Phase 4
+run, regardless of vintage:
 
-  ```bash
-  cp db/grid_anchor.json db/grid_anchor.phase4.json
-  ```
+```bash
+cp db/grid_anchor.json db/grid_anchor.phase4.json
+```
 
-  and set ``seed.grid_state_path: "db/grid_anchor.phase4.json"`` in
-  your Step 8 YAML. The 2026-05-18 18 h dataset and any prior run
-  uses this path.
+and set ``seed.grid_state_path: "db/grid_anchor.phase4.json"`` in
+your Step 8 YAML. This is the deterministic grid seed path today.
+The 2026-05-18 18 h dataset used the same approach.
 
 ## Step 8 — Replay config
 
@@ -327,8 +404,15 @@ cp apps/replay/conf/replay_ltcusdt_phase4.yaml.example \
 Final content (replace the four `<paste …>` placeholders with the values
 captured in Step 7):
 
+Use the **same absolute four-slash SQLite URL** here as in `.env` /
+gridbot prerequisites. A relative URL in this file is only safe if
+the replay command is run from the repo root and you have verified it
+resolves to the same physical file as the gridbot/recorder DB.
+
 ```yaml
-database_url: "sqlite:///data/recorder_ltcusdt_phase4.db"
+# Must point at the same physical SQLite file as gridbot's
+# `.env` `DATABASE_URL` and the recorder config.
+database_url: "sqlite:////<abs-path>/data/recorder_ltcusdt_phase4.db"
 run_id: "<paste $RUN_ID>"
 
 symbol: "LTCUSDT"
@@ -396,7 +480,7 @@ uv run python -m comparator.main \
   --start "$SEED_AT_TS" \
   --end "$END_TS" \
   --symbol LTCUSDT \
-  --database-url "sqlite:///data/recorder_ltcusdt_phase4.db" \
+  --database-url "sqlite:////<abs-path>/data/recorder_ltcusdt_phase4.db" \
   --output results/comparison_phase4/ \
   2>&1 | tee /tmp/comparator.log
 ```

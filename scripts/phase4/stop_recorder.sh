@@ -56,8 +56,18 @@ if [[ -f "$DB_PATH" ]]; then
   "
 
   echo ""
-  RUN_ID=$(sqlite3 "$DB_PATH" "SELECT run_id FROM runs ORDER BY start_ts DESC LIMIT 1;")
-  ACCOUNT_ID=$(sqlite3 "$DB_PATH" "SELECT account_id FROM bybit_accounts LIMIT 1;")
+  # Feature 0049: scope to the latest recording run. In a shared DB, the
+  # newest row in `runs` can be a live gridbot run, and `bybit_accounts LIMIT 1`
+  # can pick the wrong account row. Always filter by run_type='recording' and
+  # take account_id from that same row.
+  RUN_ID=$(sqlite3 "$DB_PATH" \
+    "SELECT run_id FROM runs WHERE run_type='recording' ORDER BY start_ts DESC LIMIT 1;")
+  ACCOUNT_ID=$(sqlite3 "$DB_PATH" \
+    "SELECT account_id FROM runs WHERE run_type='recording' ORDER BY start_ts DESC LIMIT 1;")
+  if [[ -z "$RUN_ID" ]]; then
+    echo "WARNING: no run with run_type='recording' found in $DB_PATH" >&2
+    echo "         (paste-into-replay will be blank; check that the recorder created its run row)" >&2
+  fi
   echo "RUN_ID:     $RUN_ID"
   echo "ACCOUNT_ID: $ACCOUNT_ID"
 fi
