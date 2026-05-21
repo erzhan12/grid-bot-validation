@@ -846,9 +846,9 @@ class TestUpdateGridSidewayOscillation:
 
         drift_close = fill_price * 1.004
         grid.update_grid(fill_price, drift_close)
-        filled_after = next(g for g in grid.grid if g['price'] == fill_price)
-        assert filled_after is filled
-        assert filled_after['side'] == GridSideType.WAIT
+        refilled_level = next(g for g in grid.grid if g['price'] == fill_price)
+        assert refilled_level is filled
+        assert refilled_level['side'] == GridSideType.WAIT
 
     def test_out_of_bounds_triggers_rebuild_not_oscillation(self):
         grid = self._make_grid(anchor=54.0, grid_step=0.2)

@@ -278,8 +278,22 @@ class Grid:
     def _assign_sides(self, last_close: float, *, fill_price: float) -> None:
         """Assign side (BUY/SELL/WAIT) to every level relative to last_close.
 
-        WAIT marking uses __is_too_close against fill_price only (bbu2 parity).
-        Called exclusively from update_grid on fill events."""
+        For each level:
+        - WAIT if __is_too_close(level['price'], fill_price) — i.e. the level
+          is within grid_step/4 of the most recent fill. This is bbu2 parity:
+          WAIT marks the just-filled level so the engine does not immediately
+          re-expose it. The reference is the FILL price, not last_close — that
+          is the change introduced by feature 0048 (see RULES.md Grid Module
+          0048 note).
+        - SELL if last_close < level['price'] (level is above market)
+        - BUY  if last_close > level['price'] (level is below market)
+        - unchanged if last_close == level['price'] and not WAIT (rare; pre-
+          existing bbu2 behavior).
+
+        fill_price is a required keyword-only argument; there is no
+        last_close-based WAIT path. Sole caller: update_grid, which runs only
+        on execution events.
+        """
         for level in self.grid:
             if self.__is_too_close(level['price'], fill_price):
                 level['side'] = GridSideType.WAIT
