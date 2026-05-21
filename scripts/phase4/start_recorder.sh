@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
-# Phase 4 recorder launcher: idempotent stop-of-prior + DB wipe + fresh start.
+# Phase 4 recorder launcher: idempotent stop-of-prior + surgical DB reset + fresh start.
 #
 # Why this script: bare `uv run recorder &` is a footgun.
 #   - $RECORDER_PID gets shadowed if the start command is re-run; old kill -INT no-ops.
 #   - Two concurrent recorders writing the same SQLite DB → readonly errors.
-#   - Stale DB rows from a prior run contaminate the new run_id.
+#   - Stale recorder rows from a prior run contaminate the new run_id.
 # This script does the full reset cycle in one call.
+#
+# Feature 0049: Phase 4 default is a SHARED SQLite DB used by gridbot, recorder,
+# replay, and comparator. The old "rm -f $DB_PATH $DB_PATH-wal $DB_PATH-shm" wipe
+# is unsafe under that model — it removes gridbot-owned grid_state_snapshots,
+# live runs, and shared setup rows (bybit_accounts, strategies, users).
+# Instead, this script performs a surgical recorder-owned data wipe via SQL
+# DELETEs inside a single transaction, and leaves the DB file and WAL/SHM
+# sidecars in place.
 #
 # Usage: scripts/phase4/start_recorder.sh [config_path]
 #   config_path: defaults to apps/recorder/conf/recorder_ltcusdt.yaml
@@ -24,7 +32,11 @@ if [[ ! -f "$CONFIG" ]]; then
 fi
 
 # Derive DB path from yaml `database_url` so we wipe the right file.
-# Format: sqlite:///<relative_path>
+# Supported forms:
+#   - relative: sqlite:///data/recorder_ltcusdt_phase4.db
+#   - absolute: sqlite:////<abs-path>/data/recorder_ltcusdt_phase4.db
+# Stripping `sqlite:///` from a four-slash absolute URL leaves the
+# leading `/` of the absolute path, so the same expansion handles both.
 DB_URL="$(grep -E '^database_url:' "$CONFIG" | sed -E 's/^database_url:[[:space:]]*"?([^"]+)"?$/\1/')"
 DB_PATH="${DB_URL#sqlite:///}"
 if [[ -z "$DB_PATH" || "$DB_PATH" == "$DB_URL" ]]; then
@@ -53,9 +65,30 @@ if pgrep -f "recorder --config $CONFIG" > /dev/null; then
 fi
 echo "    no recorder running for this config."
 
-echo "==> Wiping prior recording artifacts..."
-rm -f "$DB_PATH" "$DB_PATH-wal" "$DB_PATH-shm" "$LOG_FILE"
-echo "    removed: $DB_PATH (and -wal/-shm), $LOG_FILE"
+echo "==> Wiping prior recorder-owned data (surgical, shared-DB safe)..."
+if [[ -f "$DB_PATH" ]]; then
+  echo "    db exists: $DB_PATH"
+  echo "    deleting recorder-owned rows: private_executions, orders, wallet_snapshots,"
+  echo "    position_snapshots WHERE source='live', ticker_snapshots, runs WHERE run_type='recording'"
+  echo "    preserving: grid_state_snapshots, live runs, bybit_accounts, strategies, users"
+  sqlite3 "$DB_PATH" <<'SQL'
+.bail on
+PRAGMA foreign_keys = ON;
+BEGIN IMMEDIATE;
+DELETE FROM private_executions;
+DELETE FROM orders;
+DELETE FROM wallet_snapshots;
+DELETE FROM position_snapshots WHERE source = 'live';
+DELETE FROM ticker_snapshots;
+DELETE FROM runs WHERE run_type = 'recording';
+COMMIT;
+SQL
+  echo "    surgical wipe complete (WAL/SHM left intact)."
+else
+  echo "    no DB at $DB_PATH; recorder will create it on startup."
+fi
+rm -f "$LOG_FILE"
+echo "    removed: $LOG_FILE"
 
 echo "==> Starting recorder (background, log → $LOG_FILE)..."
 nohup uv run recorder --config "$CONFIG" > "$LOG_FILE" 2>&1 &
