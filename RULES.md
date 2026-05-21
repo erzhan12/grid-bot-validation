@@ -219,6 +219,7 @@ make test-integration
 - `build_greed()` clears `self.greed = []` before building (prevents doubling on rebuilds)
 - `is_grid_correct()` accepts both BUY→WAIT→SELL and BUY→SELL patterns
 - **GridSideType enum**: `GridSideType.BUY`, `.SELL`, `.WAIT` — always use enum, never raw strings
+- **Feature 0048 (bbu2 parity)**: no per-tick grid walk on ticker events. Drift is handled by `update_grid` post-fill (`last_filled_price` keys WAIT via `_assign_sides`) and bounds-guard `build_grid` on the ticker path (`engine.py` out-of-bounds check). `_assign_sides(last_close, *, fill_price)` requires `fill_price` — no `last_close`-based WAIT path. `anchor_price` tracks build/restore center only; use `wait_center()` for live WAIT-band center.
 
 ### Engine Module (`engine.py`)
 

@@ -155,7 +155,6 @@ class GridEngine:
         self.last_close = float(event.last_price)
 
         # Build grid if empty (a restored grid skips this branch)
-        grid_just_built = False
         if len(self.grid.grid) == 0:
             build_price = self._anchor_price if self._anchor_price else self.last_close
             if self._anchor_price:
@@ -163,43 +162,23 @@ class GridEngine:
             else:
                 logger.info('%s: Building grid from market price %s', self.symbol, build_price)
             self.grid.build_grid(build_price)
-            grid_just_built = True
         else:
-            # Drift guard: if restored (or stale) grid is far from the current
-            # price, rebuild around last_close. Mirrors update_grid's bounds
-            # check (grid.py:157) but applies on the tick path so a restored
-            # grid does not need a fill event to re-anchor. Single-pass bounds
-            # to keep the per-tick cost low.
+            # Bounds guard: if restored (or stale) grid no longer contains
+            # last_close, rebuild around market price. Mirrors update_grid's
+            # bounds check but applies on the tick path so a restored grid
+            # does not need a fill event to re-anchor.
             min_p, max_p = self.grid.bounds
             if not (min_p <= self.last_close <= max_p):
-                # Emit the same Grid-drift INFO line that recenter's safety-cap
-                # path uses, so out-of-bounds rebuilds are observable through
-                # the same telemetry hook (per 0022 Step 3).
-                wait_center = self.grid.wait_center()
-                if wait_center == 0:
-                    logger.warning(
-                        '%s: wait_center is zero, cannot calculate drift metrics',
-                        self.symbol,
-                    )
-                    deviation_pct = 0.0
-                    n_steps = 0
-                else:
-                    deviation_pct = abs(self.last_close - wait_center) / wait_center * 100
-                    n_steps = int(deviation_pct / self.grid.grid_step) if self.grid.grid_step > 0 else 0
-                self._log_drift(deviation_pct, n_steps, self.last_close)
                 logger.info(
                     '%s: Restored grid out of range (last_close=%s, range=[%s, %s]), rebuilding',
                     self.symbol, self.last_close, min_p, max_p,
                 )
                 self.grid.build_grid(self.last_close)
-                grid_just_built = True
 
         # Consume any deferred fill (one that arrived before last_close was set).
-        # Apply it before recenter so __center_grid and post-fill WAIT marking
-        # both get a chance to run before drift detection sees the grid state.
-        # Runs even on the same tick as build_grid so a fill that arrived first
-        # is applied to the freshly-built grid, not deferred to the next ticker.
-        fill_consumed_this_tick = False
+        # Apply any deferred fill before checking and placing orders. Runs even
+        # on the same tick as build_grid so a fill that arrived first is applied
+        # to the freshly-built grid, not deferred to the next ticker.
         if (
             self._fill_pending
             and self.last_filled_price is not None
@@ -207,33 +186,12 @@ class GridEngine:
         ):
             self.grid.update_grid(self.last_filled_price, self.last_close)
             self._fill_pending = False
-            fill_consumed_this_tick = True
-
-        # Per-tick drift detector (feature 0022). Independent of last_filled_price,
-        # so it fires on cold start and after WS reconnect even before the first
-        # fill. Skipped on a plain fresh-build tick — the freshly built grid
-        # reflects an explicit anchor or market-price choice that recenter would
-        # otherwise immediately overwrite. BUT: if a pending fill was consumed
-        # this tick, the consumed fill may have shifted the WAIT band far enough
-        # that drift now legitimately exceeds one grid_step; allow recenter in
-        # that case so order placement isn't done against a stale grid.
-        if not grid_just_built or fill_consumed_this_tick:
-            walked, deviation_pct, n_steps = self.grid.recenter_if_drifted(self.last_close)
-            if walked:
-                self._log_drift(deviation_pct, n_steps, self.last_close)
 
         # Check and place orders for both directions
         intents.extend(self._check_and_place('long', limit_orders.get('long', [])))
         intents.extend(self._check_and_place('short', limit_orders.get('short', [])))
 
         return intents
-
-    def _log_drift(self, deviation_pct: float, n_steps: int, last_close: float) -> None:
-        """Log grid drift recentering event."""
-        logger.info(
-            '%s: Grid drift %.2f%% (N=%d steps) — recentering at %s',
-            self.symbol, deviation_pct, n_steps, last_close,
-        )
 
     def _handle_execution_event(self, event: ExecutionEvent) -> list[PlaceLimitIntent | CancelIntent]:
         """
@@ -352,12 +310,9 @@ class GridEngine:
             intents.extend(self._cancel_all_limits(limits, 'rebuild'))
             return intents
 
-        # NOTE: Pre-0022 this path also called update_grid(last_filled_price,
-        # last_close) every tick. After 0022 added recenter_if_drifted on the
-        # tick path, that call would re-mark WAIT around a stale last_filled_price
-        # and undo recenter's side assignment, causing repeated walks on identical
-        # ticks. update_grid is now driven only by _handle_execution_event (where
-        # fills actually happen); recenter handles per-tick side assignment.
+        # update_grid runs only on execution events (fills). On the tick path the
+        # grid changes only via bounds-guard rebuild (build_grid) or deferred-fill
+        # consumption (update_grid on _fill_pending).
 
         # Place grid orders
         intents.extend(self._place_grid_orders(limits, direction))

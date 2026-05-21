@@ -13,7 +13,7 @@ import logging
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Callable, NamedTuple, Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -23,19 +23,6 @@ class GridSideType(StrEnum):
     BUY = 'Buy'
     SELL = 'Sell'
     WAIT = 'Wait'
-
-
-class RecenterResult(NamedTuple):
-    """Outcome of a recenter_if_drifted() call.
-
-    Truthy when (and only when) the grid was actually mutated. Tuple-compatible
-    so callers can also destructure as `walked, dev, n = grid.recenter_if_drifted(...)`."""
-    walked: bool
-    deviation_pct: float
-    n_steps: int
-
-    def __bool__(self) -> bool:
-        return self.walked
 
 
 class Grid:
@@ -208,9 +195,7 @@ class Grid:
             return False
 
         # Derive _original_anchor_price from the WAIT center so anchor_price
-        # property continues to reflect a meaningful "center" value. Uses
-        # wait_center() to keep the post-restore anchor consistent with the
-        # post-recenter-walk anchor (feature 0022, Step 5.5).
+        # property continues to reflect a meaningful "center" value.
         self._original_anchor_price = self.wait_center()
 
         return True
@@ -219,7 +204,7 @@ class Grid:
     def bounds(self) -> tuple[float, float]:
         """(min_price, max_price) computed in one pass. Raises ValueError if
         the grid is empty. Prefer this over min_grid + max_grid in hot paths
-        (e.g. per-tick drift guard) — saves one full iteration over the grid."""
+        — saves one full iteration over the grid."""
         if not self.grid:
             raise ValueError("Cannot get bounds from empty grid")
         lo = hi = self.grid[0]['price']
@@ -290,86 +275,18 @@ class Grid:
             return (self.grid[n // 2 - 1]['price'] + self.grid[n // 2]['price']) / 2
         return self.grid[n // 2]['price']
 
-    def _assign_sides(self, last_close: float, *, fill_price: Optional[float] = None) -> None:
+    def _assign_sides(self, last_close: float, *, fill_price: float) -> None:
         """Assign side (BUY/SELL/WAIT) to every level relative to last_close.
 
-        WAIT marking uses __is_too_close against fill_price when given (post-fill
-        path used by update_grid), or against last_close otherwise (drift-recenter
-        path used by recenter_if_drifted)."""
-        too_close_ref = fill_price if fill_price is not None else last_close
+        WAIT marking uses __is_too_close against fill_price only (bbu2 parity).
+        Called exclusively from update_grid on fill events."""
         for level in self.grid:
-            if self.__is_too_close(level['price'], too_close_ref):
+            if self.__is_too_close(level['price'], fill_price):
                 level['side'] = GridSideType.WAIT
             elif last_close < level['price']:
                 level['side'] = GridSideType.SELL
             elif last_close > level['price']:
                 level['side'] = GridSideType.BUY
-
-    def _shift_grid(self, n_steps: int, direction: str) -> None:
-        """Walk the grid by n_steps levels. Side placeholder is not meaningful;
-        the caller must follow up with _assign_sides()."""
-        step = self.grid_step / 100
-        if direction == 'up':
-            for _ in range(n_steps):
-                self.grid.pop(0)
-                new_top = self._round_price(self.grid[-1]['price'] * (1 + step))
-                self.grid.append({'side': GridSideType.SELL, 'price': new_top})
-        elif direction == 'down':
-            for _ in range(n_steps):
-                self.grid.pop()
-                new_bot = self._round_price(self.grid[0]['price'] * (1 - step))
-                self.grid.insert(0, {'side': GridSideType.BUY, 'price': new_bot})
-        else:
-            raise ValueError(f"direction must be 'up' or 'down', got {direction!r}")
-
-    def recenter_if_drifted(self, last_close: float) -> RecenterResult:
-        """Per-tick drift detector: walk the grid by N steps toward last_close
-        when it has moved more than one grid_step from the current WAIT-band
-        center. Falls back to a full rebuild when N >= grid_count // 2.
-
-        Independent of last_filled_price, so it fires on cold restart and after
-        WS reconnect even before the first fill of the session.
-
-        Below-threshold ticks are TRUE no-ops: no side reassignment, no anchor
-        update. This preserves the plan's Step 2 contract and prevents the
-        WAIT band from silently migrating when last_close drifts within one
-        grid_step per tick — a sequence of sub-step ticks must still trigger
-        a walk once cumulative drift from the current WAIT center exceeds the
-        threshold.
-
-        Drift is measured against the current `wait_center()` per plan Q1
-        (the detector self-adjusts as the grid walks or as `update_grid()`
-        expands the WAIT band after a fill).
-
-        Returns a RecenterResult that is truthy only when the grid was mutated."""
-        if not self.grid:
-            return RecenterResult(False, 0.0, 0)
-
-        wait_center = self.wait_center()
-        if wait_center == 0:
-            logger.warning('wait_center is zero, cannot calculate drift')
-            return RecenterResult(False, 0.0, 0)
-        deviation_pct = abs(last_close - wait_center) / wait_center * 100
-        if deviation_pct <= self.grid_step:
-            return RecenterResult(False, deviation_pct, 0)
-
-        if self.grid_step == 0:
-            logger.warning('grid_step is zero, cannot compute n_steps')
-            return RecenterResult(False, deviation_pct, 0)
-        n_steps = int(deviation_pct / self.grid_step)
-
-        if n_steps >= self.grid_count // 2:
-            # Walk would push the entire grid past one side — rebuild instead.
-            self.__rebuild_grid(last_close)
-            # __rebuild_grid -> build_grid already fires _notify_change.
-            return RecenterResult(True, deviation_pct, n_steps)
-
-        direction = 'up' if last_close > wait_center else 'down'
-        self._shift_grid(n_steps, direction)
-        self._assign_sides(last_close)
-        self._original_anchor_price = self.wait_center()
-        self._notify_change()
-        return RecenterResult(True, deviation_pct, n_steps)
 
     def __center_grid(self) -> None:
         """
@@ -569,11 +486,10 @@ class Grid:
         """
         Get anchor price (WAIT zone center price).
 
-        Tracks the build-time center until a drift walk updates it: a fill via
-        `update_grid` does NOT mutate the anchor (post-fill WAIT marks are not
-        reflected here), but `recenter_if_drifted` DOES re-seed it to the new
-        WAIT-band center after an incremental walk (feature 0022, Step 5.5).
-        On `restore_grid`, the anchor is derived from the restored WAIT center.
+        Tracks the build/restore center. Updated on `build_grid` and
+        `__rebuild_grid` only — not on fills (`update_grid` does not mutate
+        the anchor). On `restore_grid`, the anchor is derived from the restored
+        WAIT center. Use `wait_center()` for the live WAIT-band center.
 
         Returns:
             Current anchor price, or None if grid was never built
