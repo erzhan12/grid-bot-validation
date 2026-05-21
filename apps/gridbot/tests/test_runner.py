@@ -4456,8 +4456,9 @@ class TestOnGridChangeExchangeTsPropagation:
             "short": [],
         })
 
-        # Second ticker at the same price — bounds OK, no recenter, but
-        # _check_and_place sees too many long orders and rebuilds.
+        # Second ticker at the same price — bounds OK, no grid mutation from
+        # the tick path itself, but _check_and_place sees too many long orders
+        # and rebuilds.
         ticker_ts = datetime(2026, 1, 1, 12, 1, 0, tzinfo=UTC)
         runner.on_ticker(self._ticker(50000.0, ticker_ts))
 

@@ -767,38 +767,6 @@ class TestZeroDivisionGuards:
     make these unreachable in production, but the guards are exercised here
     to lock in the contract."""
 
-    def test_recenter_no_op_when_wait_center_is_zero(self, caplog):
-        """If the WAIT band is symmetric around zero (e.g. [-1, 1]), wait_center
-        returns 0. recenter_if_drifted must early-return rather than divide."""
-        grid = Grid(tick_size=Decimal('0.01'), grid_count=10, grid_step=1.0)
-        # Bypass build_grid validation by setting grid directly.
-        grid.grid = [
-            {'side': GridSideType.WAIT, 'price': -1.0},
-            {'side': GridSideType.WAIT, 'price': 1.0},
-        ]
-        assert grid.wait_center() == 0.0
-
-        with caplog.at_level('WARNING'):
-            result = grid.recenter_if_drifted(5.0)
-
-        assert bool(result) is False
-        assert result.n_steps == 0
-        assert any('wait_center is zero' in r.message for r in caplog.records)
-
-    def test_recenter_no_op_when_grid_step_is_zero(self, caplog):
-        """grid_step == 0 would crash int(deviation_pct / 0). Guard returns
-        a no-op RecenterResult."""
-        grid = Grid(tick_size=Decimal('0.01'), grid_count=10, grid_step=1.0)
-        grid.build_grid(100.0)
-        grid.grid_step = 0  # break GridConfig invariant for the test
-
-        with caplog.at_level('WARNING'):
-            result = grid.recenter_if_drifted(105.0)
-
-        assert bool(result) is False
-        assert result.n_steps == 0
-        assert any('grid_step is zero' in r.message for r in caplog.records)
-
     def test_is_too_close_returns_false_on_zero_price(self):
         """__is_too_close divides by price1 — guard short-circuits on zero."""
         grid = Grid(tick_size=Decimal('0.01'), grid_count=10, grid_step=1.0)
@@ -812,132 +780,13 @@ class TestZeroDivisionGuards:
         assert grid._Grid__is_too_close(100.0, 100.0) is False
 
 
-class TestRecenterIfDrifted:
-    """Tests for Grid.recenter_if_drifted (feature 0022)."""
+class TestAssignSides:
+    """Tests for Grid._assign_sides (fill-keyed WAIT marking, feature 0048)."""
 
     def _make_grid(self, anchor=100.0, grid_count=20, grid_step=1.0):
         grid = Grid(tick_size=Decimal('0.01'), grid_count=grid_count, grid_step=grid_step)
         grid.build_grid(anchor)
         return grid
-
-    def test_no_action_when_grid_empty(self):
-        grid = Grid(tick_size=Decimal('0.01'), grid_count=10, grid_step=1.0)
-        walked, dev, n = grid.recenter_if_drifted(100.0)
-        assert walked is False
-        assert n == 0
-
-    def test_no_action_when_deviation_below_grid_step(self):
-        grid = self._make_grid(anchor=100.0, grid_step=1.0)
-        # 0.5% deviation < 1.0% grid_step
-        walked, dev, n = grid.recenter_if_drifted(100.5)
-        assert walked is False
-        assert n == 0
-        assert dev < 1.0
-
-    def test_no_action_at_exact_grid_step(self):
-        grid = self._make_grid(anchor=100.0, grid_step=1.0)
-        # exactly at threshold; trigger uses '>', not '>='
-        walked, dev, n = grid.recenter_if_drifted(101.0)
-        assert walked is False
-        assert n == 0
-
-    def test_walks_n_steps_up_when_price_above_band(self):
-        grid = self._make_grid(anchor=100.0, grid_count=20, grid_step=1.0)
-        original_min = grid.grid[0]['price']
-        original_max = grid.grid[-1]['price']
-        original_len = len(grid.grid)
-        # 3.5% deviation → n_steps = 3
-        walked, dev, n = grid.recenter_if_drifted(103.5)
-        assert walked is True
-        assert n == 3
-        assert len(grid.grid) == original_len  # length preserved
-        assert grid.grid[0]['price'] > original_min  # bottom raised
-        assert grid.grid[-1]['price'] > original_max  # top raised
-
-    def test_walks_n_steps_down_when_price_below_band(self):
-        grid = self._make_grid(anchor=100.0, grid_count=20, grid_step=1.0)
-        original_min = grid.grid[0]['price']
-        original_max = grid.grid[-1]['price']
-        original_len = len(grid.grid)
-        # -2.5% deviation → n_steps = 2 (deviation_pct ≈ 2.439, floor = 2)
-        walked, dev, n = grid.recenter_if_drifted(97.5)
-        assert walked is True
-        assert n == 2
-        assert len(grid.grid) == original_len
-        assert grid.grid[0]['price'] < original_min
-        assert grid.grid[-1]['price'] < original_max
-
-    def test_round_trip_outside_walked_region(self):
-        """Walk-up by N: levels at indices [0..len-N-1] post-walk == levels at [N..len-1] pre-walk."""
-        grid = self._make_grid(anchor=100.0, grid_count=20, grid_step=1.0)
-        pre_prices = [g['price'] for g in grid.grid]
-        walked, _, n = grid.recenter_if_drifted(103.5)
-        assert walked is True
-        post_prices = [g['price'] for g in grid.grid]
-        assert post_prices[: len(pre_prices) - n] == pre_prices[n:]
-
-    def test_full_rebuild_fallback_when_n_steps_exceeds_half(self):
-        grid = self._make_grid(anchor=100.0, grid_count=20, grid_step=1.0)
-        original_prices = {g['price'] for g in grid.grid}
-        # 15% deviation → n_steps = 15 > grid_count // 2 = 10 → fallback
-        walked, dev, n = grid.recenter_if_drifted(115.0)
-        assert walked is True
-        assert n >= grid.grid_count // 2
-        # Grid is rebuilt around 115.0; very few (if any) shared prices with original
-        new_prices = {g['price'] for g in grid.grid}
-        # Rebuilt grid is centered far from original — bulk of prices differ.
-        overlap = original_prices & new_prices
-        assert len(overlap) <= 1
-
-    def test_anchor_updated_to_wait_center_after_walk(self):
-        grid = self._make_grid(anchor=100.0, grid_count=20, grid_step=1.0)
-        walked, _, _ = grid.recenter_if_drifted(103.5)
-        assert walked is True
-        # _original_anchor_price should now equal new wait_center (close to 103.5)
-        assert grid._original_anchor_price == grid.wait_center()
-        assert abs(grid._original_anchor_price - 103.5) < 1.0
-
-    def test_assign_sides_post_walk(self):
-        grid = self._make_grid(anchor=100.0, grid_count=20, grid_step=1.0)
-        walked, _, _ = grid.recenter_if_drifted(103.5)
-        assert walked is True
-        last_close = 103.5
-        for level in grid.grid:
-            diff_pct = abs(level['price'] - last_close) / level['price'] * 100
-            if diff_pct < grid.grid_step / 4:
-                assert level['side'] == GridSideType.WAIT
-            elif level['price'] > last_close:
-                assert level['side'] == GridSideType.SELL
-            elif level['price'] < last_close:
-                assert level['side'] == GridSideType.BUY
-
-    def test_notify_change_called_on_walk(self):
-        calls = []
-        grid = Grid(
-            tick_size=Decimal('0.01'),
-            grid_count=20,
-            grid_step=1.0,
-            on_change=lambda g, ts: calls.append(len(g)),
-        )
-        grid.build_grid(100.0)
-        calls_after_build = len(calls)
-        walked, _, _ = grid.recenter_if_drifted(103.5)
-        assert walked is True
-        assert len(calls) == calls_after_build + 1
-
-    def test_notify_change_not_called_when_no_action(self):
-        calls = []
-        grid = Grid(
-            tick_size=Decimal('0.01'),
-            grid_count=20,
-            grid_step=1.0,
-            on_change=lambda g, ts: calls.append(len(g)),
-        )
-        grid.build_grid(100.0)
-        calls_after_build = len(calls)
-        walked, _, _ = grid.recenter_if_drifted(100.2)
-        assert walked is False
-        assert len(calls) == calls_after_build  # no extra notify
 
     def test_assign_sides_with_fill_price_preserves_legacy(self):
         """_assign_sides(last_close, fill_price=fp) preserves update_grid semantics:
@@ -953,3 +802,57 @@ class TestRecenterIfDrifted:
         # fill_price as reference, not last_close. (If it were last_close, this
         # level would also be WAIT.)
         assert grid.grid[12]['side'] != GridSideType.WAIT
+
+    def test_assign_sides_requires_fill_price(self):
+        """fill_price is a required keyword-only argument (no last_close WAIT path)."""
+        grid = self._make_grid(anchor=100.0, grid_count=20, grid_step=1.0)
+        with pytest.raises(TypeError):
+            grid._assign_sides(100.0)
+
+
+class TestUpdateGridSidewayOscillation:
+    """Grid-level regression tests for post-fill WAIT stability (feature 0048)."""
+
+    def _make_grid(self, anchor=54.0, grid_count=20, grid_step=0.2):
+        grid = Grid(tick_size=Decimal('0.01'), grid_count=grid_count, grid_step=grid_step)
+        grid.build_grid(anchor)
+        return grid
+
+    def test_update_grid_marks_wait_at_fill_price(self):
+        grid = self._make_grid(anchor=54.0, grid_step=0.2)
+        fill_idx = len(grid.grid) // 2 + 2
+        fp = grid.grid[fill_idx]['price']
+        last_close = grid.grid[-3]['price']
+        grid.update_grid(fp, last_close)
+        filled = next(g for g in grid.grid if g['price'] == fp)
+        assert filled['side'] == GridSideType.WAIT
+        # Unrelated levels follow price-vs-level rules
+        for level in grid.grid:
+            if level['price'] == fp:
+                continue
+            if last_close < level['price']:
+                assert level['side'] == GridSideType.SELL
+            elif last_close > level['price']:
+                assert level['side'] == GridSideType.BUY
+
+    def test_update_grid_remarks_wait_on_repeat_fill_at_same_price(self):
+        """Second update_grid at the same fill_price re-marks that level WAIT."""
+        grid = self._make_grid(anchor=54.0, grid_step=0.2)
+        fill_idx = len(grid.grid) // 2 + 2
+        fill_price = grid.grid[fill_idx]['price']
+        grid.update_grid(fill_price, fill_price)
+        filled = next(g for g in grid.grid if g['price'] == fill_price)
+        assert filled['side'] == GridSideType.WAIT
+
+        drift_close = fill_price * 1.004
+        grid.update_grid(fill_price, drift_close)
+        refilled_level = next(g for g in grid.grid if g['price'] == fill_price)
+        assert refilled_level is filled
+        assert refilled_level['side'] == GridSideType.WAIT
+
+    def test_out_of_bounds_triggers_rebuild_not_oscillation(self):
+        grid = self._make_grid(anchor=54.0, grid_step=0.2)
+        grid.update_grid(100.0, 100.0)
+        assert grid.anchor_price == 100.0
+        stale_wait = next((g for g in grid.grid if g['price'] == 54.0), None)
+        assert stale_wait is None or stale_wait['side'] != GridSideType.WAIT
