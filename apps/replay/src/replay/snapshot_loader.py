@@ -282,7 +282,7 @@ def load_grid_state_from_snapshots(
     Mirrors ``load_grid_state`` (file path) but pulls the row written by
     gridbot's ``GridStateWriter`` at the latest ``exchange_ts`` ≤ ``at_ts``.
     Returns ``None`` on no-row-found or on step/count mismatch (engine
-    falls back to file path, then to a fresh blank-build).
+    falls through to live-run DB lookup, then file path, then fail-loud).
 
     ``grid_step`` comparison uses ``Decimal(str(...))`` normalisation so a
     binary-imprecise float (e.g. ``0.1`` literal vs ``Decimal('0.10000000')``
@@ -314,6 +314,60 @@ def load_grid_state_from_snapshots(
     if row is None:
         logger.info(
             "%s: no grid snapshot at-or-before %s", strat_id, at_ts,
+        )
+        return None
+    if int(row.grid_count) != int(expected_count):
+        logger.info(
+            "%s: saved grid_count=%d differs from replay config %d; falling back",
+            strat_id, row.grid_count, expected_count,
+        )
+        return None
+    if Decimal(str(row.grid_step)) != Decimal(str(expected_step)):
+        logger.info(
+            "%s: saved grid_step=%s differs from replay config %s; falling back",
+            strat_id, row.grid_step, expected_step,
+        )
+        return None
+    return GridStateSeed(
+        strat_id=strat_id,
+        grid=row.grid_json,
+        grid_step=float(row.grid_step),
+        grid_count=int(row.grid_count),
+    )
+
+
+def load_grid_state_from_live_snapshots(
+    db_session: Session,
+    account_id: str,
+    strat_id: str,
+    at_ts: datetime,
+    expected_step: float,
+    expected_count: int,
+) -> Optional[GridStateSeed]:
+    """Load a grid snapshot written by gridbot's live/shadow run (Phase 4).
+
+    Recorder data is scoped to a ``run_type='recording'`` run, but gridbot's
+    DB grid snapshots are written by the live/shadow process under its own
+    run_id. Use this as a replay fallback after the recorder-run lookup misses.
+    """
+    if not sa_inspect(db_session.connection()).has_table(
+        GridStateSnapshot.__tablename__,
+    ):
+        logger.info(
+            "%s: grid_state_snapshots table not present (pre-0047 DB); "
+            "falling back to file path / fresh build",
+            strat_id,
+        )
+        return None
+
+    row = GridStateSnapshotRepository(db_session).get_live_at_or_before(
+        account_id, strat_id, at_ts,
+    )
+    if row is None:
+        logger.info(
+            "%s: no live/shadow grid snapshot at-or-before %s",
+            strat_id,
+            at_ts,
         )
         return None
     if int(row.grid_count) != int(expected_count):
@@ -609,6 +663,7 @@ __all__ = [
     "SeedConfigMismatchError",
     "SeedDataQualityError",
     "load_grid_state",
+    "load_grid_state_from_live_snapshots",
     "load_grid_state_from_snapshots",
     "load_position_snapshots",
     "load_wallet_seed_full",

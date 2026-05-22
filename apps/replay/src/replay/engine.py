@@ -63,6 +63,7 @@ from replay.snapshot_loader import (
     WalletSeed,
     load_active_orders,
     load_grid_state,
+    load_grid_state_from_live_snapshots,
     load_grid_state_from_snapshots,
     load_position_snapshots,
     load_wallet_seed_full,
@@ -622,9 +623,10 @@ class ReplayEngine:
            values must be ``<= seed.at_ts - 5s``. ``orders`` is excluded
            from the pre-check because a clean grid legitimately has no
            open orders at recorder start.
-        2. Loads grid state from the shared ``GridStateStore`` JSON file
-           (returns ``None`` on no-entry / legacy / step-or-count
-           mismatch — replay then falls back to fresh-build).
+        2. Loads grid state from DB snapshots (recording run first, then
+           live/shadow run for Phase 4 shared DBs) or the shared
+           ``GridStateStore`` JSON file. A miss after all configured sources
+           raises instead of fresh-building a grid with seeded live state.
         3. Loads position pair, full 0042 wallet seed, and active orders
            inside a single DB session.
 
@@ -661,6 +663,17 @@ class ReplayEngine:
                 expected_count=config.strategy.grid_count,
             )
             grid_source = "db"
+            if grid_seed is None:
+                grid_seed = load_grid_state_from_live_snapshots(
+                    db_session,
+                    seed.account_id,
+                    seed.strat_id,
+                    seed.at_ts,
+                    expected_step=config.strategy.grid_step,
+                    expected_count=config.strategy.grid_count,
+                )
+                if grid_seed is not None:
+                    grid_source = "db-live"
             if grid_seed is None and seed.grid_state_path is not None:
                 grid_seed = load_grid_state(
                     GridStateStore(file_path=seed.grid_state_path),
@@ -669,8 +682,17 @@ class ReplayEngine:
                     expected_count=config.strategy.grid_count,
                 )
                 grid_source = "file" if grid_seed is not None else "fresh"
-            elif grid_seed is None:
-                grid_source = "fresh"
+            if grid_seed is None:
+                raise ValueError(
+                    "Seed pre-check failed for grid state: no DB grid snapshot "
+                    f"for run_id={run_id} or active live/shadow run "
+                    f"(account_id={seed.account_id}, strat_id={seed.strat_id}) "
+                    f"at-or-before seed.at_ts={seed.at_ts}, and no usable "
+                    "grid_state_path fallback. Refusing to combine seeded "
+                    "wallet/position/order state with a fresh grid; provide a "
+                    "valid grid_state_path, record a grid_state_snapshots row, "
+                    "or disable seed.enabled for blank-start replay."
+                )
             logger.info(
                 "%s: grid seed source=%s", seed.strat_id, grid_source,
             )

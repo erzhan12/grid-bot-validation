@@ -130,7 +130,8 @@ class SeedConfig(BaseModel):
             "Path to legacy grid-state JSON file (feature 0021). With 0047 "
             "the engine prefers ``grid_state_snapshots`` in DB and only "
             "falls back to this file when a path is set AND no DB snapshot "
-            "covers ``at_ts``. None disables the file fallback entirely."
+            "covers ``at_ts``. None disables the file fallback entirely; "
+            "seed-enabled replay fails loud if DB also has no usable grid."
         ),
     )
     wallet_coin: str = Field(

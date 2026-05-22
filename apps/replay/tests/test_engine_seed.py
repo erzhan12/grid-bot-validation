@@ -392,6 +392,67 @@ class TestReplayEngineSeedingPipeline:
         # File fixture has 4 levels starting at 99600.0 (see grid_state_path).
         assert grid_seed.grid[0]["price"] == 99600.0
 
+    def test_load_seed_uses_live_grid_snapshot_for_recording_run(
+        self, seeded_db, seed_ts, snapshot_ts, mock_instrument,
+    ):
+        """0047/0049: replay's recorder run_id differs from gridbot's live run_id."""
+        live_grid = [
+            {"side": "Buy", "price": 90000.0},
+            {"side": "Buy", "price": 90200.0},
+            {"side": "Sell", "price": 90600.0},
+            {"side": "Sell", "price": 90800.0},
+        ]
+        with seeded_db.get_session() as session:
+            session.add(Run(
+                run_id="live-run",
+                user_id="user-1",
+                account_id="acc-1",
+                strategy_id="strat-1",
+                run_type="live",
+                status="running",
+                start_ts=snapshot_ts - timedelta(minutes=1),
+                end_ts=None,
+            ))
+            session.flush()
+            GridStateSnapshotRepository(session).insert(
+                GridStateSnapshot(
+                    run_id="live-run", account_id="acc-1", strat_id=STRAT_ID,
+                    symbol=SYMBOL,
+                    exchange_ts=snapshot_ts, local_ts=snapshot_ts,
+                    grid_json=live_grid, grid_step=Decimal("0.2"), grid_count=4,
+                    raw_fingerprint=grid_fingerprint_hash(live_grid, 0.2, 4),
+                )
+            )
+
+        replay_config = ReplayConfig(
+            database_url="sqlite:///:memory:",
+            run_id="seed-run",
+            symbol=SYMBOL,
+            start_ts=seed_ts,
+            end_ts=seed_ts + timedelta(hours=1),
+            strategy=ReplayStrategyConfig(
+                tick_size=Decimal("0.1"),
+                grid_count=4,
+                grid_step=0.2,
+                enable_risk_multipliers=True,
+            ),
+            initial_balance=Decimal("10000"),
+            enable_funding=False,
+            seed=SeedConfig(
+                enabled=True,
+                at_ts=seed_ts,
+                account_id="acc-1",
+                strat_id=STRAT_ID,
+                grid_state_path=None,
+                wallet_coin="USDT",
+            ),
+        )
+        engine = ReplayEngine(config=replay_config, db=seeded_db)
+        run_id, *_ = engine._resolve_run(replay_config)
+        _, _, _, grid_seed, _ = engine._load_seed(replay_config, run_id)
+        assert grid_seed is not None
+        assert grid_seed.grid == live_grid
+
     def test_load_seed_falls_back_to_file_when_table_missing(
         self, seeded_db, replay_config, mock_instrument,
     ):
@@ -412,10 +473,10 @@ class TestReplayEngineSeedingPipeline:
         # File fixture has 4 levels starting at 99600.0.
         assert grid_seed.grid[0]["price"] == 99600.0
 
-    def test_load_seed_falls_back_to_fresh_when_no_db_and_no_file(
+    def test_load_seed_rejects_fresh_grid_when_no_db_and_no_file(
         self, seeded_db, seed_ts, mock_instrument,
     ):
-        """0047: no DB row AND grid_state_path is None → grid_seed is None."""
+        """Seeded replay must not combine live wallet/position/order state with a fresh grid."""
         seed_config = SeedConfig(
             enabled=True,
             at_ts=seed_ts,
@@ -442,8 +503,8 @@ class TestReplayEngineSeedingPipeline:
         )
         engine = ReplayEngine(config=replay_config, db=seeded_db)
         run_id, *_ = engine._resolve_run(replay_config)
-        _, _, _, grid_seed, _ = engine._load_seed(replay_config, run_id)
-        assert grid_seed is None
+        with pytest.raises(ValueError, match="no DB grid snapshot"):
+            engine._load_seed(replay_config, run_id)
 
 
 # ---------------------------------------------------------------------------
