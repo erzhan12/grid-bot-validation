@@ -392,6 +392,91 @@ class TestLoadGridStateFromSnapshots:
         )
         assert seed is None
 
+    def test_falls_back_to_active_live_run_for_shared_db(
+        self, session, sample_user, sample_account, sample_strategy, sample_run,
+        base_ts, caplog,
+    ):
+        """Recorder seed run and gridbot snapshot run differ in shared DB mode."""
+        live_run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="live",
+            status="running",
+            start_ts=base_ts - timedelta(minutes=30),
+        )
+        session.add(live_run)
+        session.flush()
+        repo = GridStateSnapshotRepository(session)
+        repo.insert(
+            _make_grid_row(
+                live_run,
+                sample_account,
+                grid=[
+                    {"side": "Buy", "price": 200.0},
+                    {"side": "Wait", "price": 201.0},
+                    {"side": "Sell", "price": 202.0},
+                ],
+                exchange_ts=base_ts,
+            )
+        )
+        session.flush()
+
+        with caplog.at_level(logging.INFO):
+            seed = load_grid_state_from_snapshots(
+                session,
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                strat_id="strat-A",
+                at_ts=base_ts + timedelta(minutes=1),
+                expected_step=0.2,
+                expected_count=3,
+            )
+
+        assert seed is not None
+        assert seed.grid[0]["price"] == 200.0
+        assert any(
+            "active gridbot run_id" in rec.message for rec in caplog.records
+        )
+
+    def test_live_fallback_ignores_run_not_active_at_seed(
+        self, session, sample_user, sample_account, sample_strategy, sample_run,
+        base_ts,
+    ):
+        """Historical live snapshots must not leak into a later recording."""
+        old_live_run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="live",
+            status="completed",
+            start_ts=base_ts - timedelta(hours=2),
+            end_ts=base_ts - timedelta(hours=1),
+        )
+        session.add(old_live_run)
+        session.flush()
+        repo = GridStateSnapshotRepository(session)
+        repo.insert(
+            _make_grid_row(
+                old_live_run,
+                sample_account,
+                exchange_ts=base_ts - timedelta(hours=1, minutes=30),
+            )
+        )
+        session.flush()
+
+        seed = load_grid_state_from_snapshots(
+            session,
+            run_id=sample_run.run_id,
+            account_id=str(sample_account.account_id),
+            strat_id="strat-A",
+            at_ts=base_ts,
+            expected_step=0.2,
+            expected_count=3,
+        )
+
+        assert seed is None
+
     def test_cross_strat_isolation(
         self, session, sample_account, sample_run, base_ts
     ):

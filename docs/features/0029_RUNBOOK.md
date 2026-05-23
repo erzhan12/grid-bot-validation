@@ -241,7 +241,8 @@ The script (post-Feature 0049):
    file-level deletes).
 5. Removes `/tmp/recorder.log`.
 6. Starts a fresh recorder in the background, waits up to 15s for the
-   "Initial REST snapshot" line, and prints PID + next-step commands.
+   "Initial REST snapshot" line, and exits non-zero if the snapshot is
+   missing or logged as incomplete.
 
 If the DB file does not yet exist (first Phase 4 run on a clean
 machine), the SQL wipe step is skipped and the recorder creates the
@@ -364,31 +365,27 @@ Verify nothing's left running:
 ps aux | grep -E "gridbot|recorder" | grep -v grep   # expect: empty
 ```
 
-**Grid-state snapshot — always provide the file fallback until the
-replay lookup is fixed**:
+**Grid-state snapshot — DB first, file fallback optional**:
 
-Even on Feature 0047+ runs (where gridbot is writing
-``grid_state_snapshots`` to the shared DB), replay cannot currently
-read those rows for the recording session — its wallet, position,
-order, and execution loaders use the *recording* ``run_id`` captured
-above, while ``grid_state_snapshots`` rows are written by gridbot
-under the *live gridbot* ``run_id``. Replay calls
-``load_grid_state_from_snapshots(..., run_id, ...)`` with the
-recording ``run_id`` and matches no row, so DB-seeded grid state
-silently falls back to file or fresh build. Sharing the DB does not
-fix this lookup mismatch; a follow-up must resolve grid state by the
-live ``run_id`` (or another stable association).
+On Feature 0047+ shared-DB runs, replay first looks for
+``grid_state_snapshots`` under the supplied ``run_id`` and then falls
+back to an active live/shadow gridbot run for the same
+``(account_id, strat_id)`` at ``seed.at_ts``. This bridges the normal
+Phase 4 split where recorder-owned seed rows use the recording
+``run_id`` while gridbot-owned grid rows use the live gridbot
+``run_id``.
 
-Until that follow-up lands, do the file copy on **every** Phase 4
-run, regardless of vintage:
+For old datasets or emergency fallback, you may still copy the latest
+file-backed grid state:
 
 ```bash
 cp db/grid_anchor.json db/grid_anchor.phase4.json
 ```
 
 and set ``seed.grid_state_path: "db/grid_anchor.phase4.json"`` in
-your Step 8 YAML. This is the deterministic grid seed path today.
-The 2026-05-18 18 h dataset used the same approach.
+your Step 8 YAML. The DB snapshot path wins when a suitable row exists;
+the file is only a fallback. The 2026-05-18 18 h dataset used the file
+approach before DB cross-run lookup was available.
 
 ## Step 8 — Replay config
 
@@ -434,7 +431,7 @@ seed:
   at_ts: "<paste $SEED_AT_TS>"
   account_id: "<paste $ACCOUNT_ID>"
   strat_id: "ltcusdt_test"
-  grid_state_path: "db/grid_anchor.phase4.json"
+  grid_state_path: "db/grid_anchor.phase4.json"  # optional file fallback; DB wins
   wallet_coin: "USDT"
 
 fill_simulator:
@@ -546,10 +543,10 @@ record.
 - [ ] Stop live, close positions, cancel orders
 - [ ] `mv db/grid_anchor.json db/grid_anchor.json.bak.*`
 - [ ] Create `apps/recorder/conf/recorder_ltcusdt.yaml` with private creds
-- [ ] Start recorder; wait for `"Initial REST snapshot"` log (no WARNING)
+- [ ] Start recorder; script must exit 0 after `"Initial REST snapshot"` with no incomplete warning
 - [ ] Start gridbot; record `START_TS`, compute `SEED_AT_TS = START_TS + 60s`
 - [ ] Accumulate ≥30 trades (~30–60 min on LTCUSDT)
-- [ ] Stop both; capture `RUN_ID`, `ACCOUNT_ID`, `END_TS`; copy `grid_anchor.json`
+- [ ] Stop both; capture `RUN_ID`, `ACCOUNT_ID`, `END_TS`; optionally copy `grid_anchor.json` as file fallback
 - [ ] Create `apps/replay/conf/replay_ltcusdt_phase4.yaml` with seed block
 - [ ] Run `replay.main` → check `Seeded run_id=...` log
 - [ ] Run `comparator.main` → check `match_rate`

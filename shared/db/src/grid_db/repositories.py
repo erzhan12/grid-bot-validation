@@ -1296,3 +1296,35 @@ class GridStateSnapshotRepository(BaseRepository[GridStateSnapshot]):
             )
             .first()
         )
+
+    def get_active_live_at_or_before(
+        self,
+        account_id: str,
+        strat_id: str,
+        at_ts: datetime,
+    ) -> Optional[GridStateSnapshot]:
+        """Latest grid snapshot from a live/shadow run active at ``at_ts``.
+
+        Recorder runs own wallet/position/order seed rows, but gridbot owns
+        ``grid_state_snapshots`` and writes them under its live/shadow run_id.
+        This lookup bridges that shared-DB split without leaking snapshots from
+        completed historical runs.
+        """
+        return (
+            self.session.query(GridStateSnapshot)
+            .join(Run, GridStateSnapshot.run_id == Run.run_id)
+            .filter(
+                GridStateSnapshot.account_id == account_id,
+                GridStateSnapshot.strat_id == strat_id,
+                GridStateSnapshot.exchange_ts <= at_ts,
+                Run.account_id == account_id,
+                Run.run_type.in_(("live", "shadow")),
+                Run.start_ts <= at_ts,
+                (Run.end_ts.is_(None) | (Run.end_ts >= at_ts)),
+            )
+            .order_by(
+                GridStateSnapshot.exchange_ts.desc(),
+                GridStateSnapshot.id.desc(),
+            )
+            .first()
+        )

@@ -33,6 +33,7 @@ seed:
   at_ts: "<paste $SEED_AT_TS>"
   account_id: "<paste $ACCOUNT_ID>"
   strat_id: "ltcusdt_test"
+  # Optional legacy file fallback; DB grid_state_snapshots are tried first.
   grid_state_path: "db/grid_anchor.phase4.json"
   wallet_coin: "USDT"
 

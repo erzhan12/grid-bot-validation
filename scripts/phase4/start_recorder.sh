@@ -104,11 +104,17 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
   sleep 1
 done
 
-if ! grep -aq "Initial REST snapshot" "$LOG_FILE" 2>/dev/null; then
-  echo "WARNING: no 'Initial REST snapshot' line in $LOG_FILE after 15s." >&2
-  echo "         Recorder may still be starting. Check log:" >&2
-  echo "           tail -f $LOG_FILE" >&2
-  echo "         Process is alive: $(ps -p $RECORDER_PID -o pid= 2>/dev/null && echo yes || echo no)" >&2
+if grep -aq "Initial REST snapshot incomplete" "$LOG_FILE" 2>/dev/null; then
+  echo "ERROR: recorder initial REST snapshot is incomplete." >&2
+  echo "       Seed-aware replay from this run_id will fail; check API credentials / permissions." >&2
+  grep -aE "Initial REST snapshot|wallet_rows" "$LOG_FILE" >&2
+  exit 1
+elif ! grep -aq "Initial REST snapshot" "$LOG_FILE" 2>/dev/null; then
+  echo "ERROR: no 'Initial REST snapshot' line in $LOG_FILE after 15s." >&2
+  echo "       Recorder may still be starting or may have crashed. Check log:" >&2
+  echo "         tail -f $LOG_FILE" >&2
+  echo "       Process is alive: $(ps -p $RECORDER_PID -o pid= 2>/dev/null && echo yes || echo no)" >&2
+  exit 1
 else
   grep -aE "Initial REST snapshot|wallet_rows" "$LOG_FILE"
 fi

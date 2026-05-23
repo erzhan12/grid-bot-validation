@@ -281,8 +281,10 @@ def load_grid_state_from_snapshots(
 
     Mirrors ``load_grid_state`` (file path) but pulls the row written by
     gridbot's ``GridStateWriter`` at the latest ``exchange_ts`` ≤ ``at_ts``.
-    Returns ``None`` on no-row-found or on step/count mismatch (engine
-    falls back to file path, then to a fresh blank-build).
+    It first checks the supplied ``run_id`` and then, for Phase 4 shared DBs,
+    falls back to a live/shadow gridbot run for the same account/strategy that
+    was active at ``at_ts``. Returns ``None`` on no-row-found or on step/count
+    mismatch (engine falls back to file path, then to a fresh blank-build).
 
     ``grid_step`` comparison uses ``Decimal(str(...))`` normalisation so a
     binary-imprecise float (e.g. ``0.1`` literal vs ``Decimal('0.10000000')``
@@ -308,9 +310,16 @@ def load_grid_state_from_snapshots(
             strat_id,
         )
         return None
-    row = GridStateSnapshotRepository(db_session).get_at_or_before(
-        run_id, account_id, strat_id, at_ts,
-    )
+    repo = GridStateSnapshotRepository(db_session)
+    row = repo.get_at_or_before(run_id, account_id, strat_id, at_ts)
+    if row is None:
+        row = repo.get_active_live_at_or_before(account_id, strat_id, at_ts)
+        if row is not None:
+            logger.info(
+                "%s: grid snapshot loaded from active gridbot run_id=%s "
+                "for recorder run_id=%s",
+                strat_id, row.run_id, run_id,
+            )
     if row is None:
         logger.info(
             "%s: no grid snapshot at-or-before %s", strat_id, at_ts,
