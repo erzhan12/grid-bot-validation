@@ -2,7 +2,7 @@
 
 from typing import Generic, TypeVar, Optional, List
 
-from sqlalchemy import func, tuple_
+from sqlalchemy import func, or_, tuple_
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -1289,6 +1289,36 @@ class GridStateSnapshotRepository(BaseRepository[GridStateSnapshot]):
                 GridStateSnapshot.account_id == account_id,
                 GridStateSnapshot.strat_id == strat_id,
                 GridStateSnapshot.exchange_ts <= at_ts,
+            )
+            .order_by(
+                GridStateSnapshot.exchange_ts.desc(),
+                GridStateSnapshot.id.desc(),
+            )
+            .first()
+        )
+
+    def get_active_run_at_or_before(
+        self,
+        strat_id: str,
+        symbol: str,
+        at_ts: datetime,
+    ) -> Optional[GridStateSnapshot]:
+        """Latest live/shadow grid snapshot for ``strat_id`` at-or-before ``at_ts``.
+
+        Replay's recorder-owned seed rows use the recording run/account, while
+        gridbot writes grid snapshots under the live/shadow run. This lookup
+        finds the gridbot-owned row whose run covers the seed instant.
+        """
+        return (
+            self.session.query(GridStateSnapshot)
+            .join(Run, Run.run_id == GridStateSnapshot.run_id)
+            .filter(
+                GridStateSnapshot.strat_id == strat_id,
+                GridStateSnapshot.symbol == symbol,
+                GridStateSnapshot.exchange_ts <= at_ts,
+                Run.run_type.in_(("live", "shadow")),
+                Run.start_ts <= at_ts,
+                or_(Run.end_ts.is_(None), Run.end_ts >= at_ts),
             )
             .order_by(
                 GridStateSnapshot.exchange_ts.desc(),

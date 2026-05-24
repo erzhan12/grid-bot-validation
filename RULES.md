@@ -350,7 +350,7 @@ Live writes the same `grid.grid` payload to **two parallel sinks** from `_on_gri
 
 Both backends are independent guards in `runner._on_grid_change(grid, exchange_ts)` — file fires whenever `state_store` is configured; DB fires only when `grid_state_writer` is set AND `exchange_ts is not None`. The `on_change` callback signature is `(grid, exchange_ts)`; constructor-time `restore_grid` produces `exchange_ts=None` and DB drops the write (file is unaffected because it doesn't time-index).
 
-**Replay loader priority** (`apps/replay/src/replay/engine.py:_load_seed`): DB row at-or-before `seed.at_ts` → file path if `seed.grid_state_path is not None` → fresh blank-build. `Grid.restore_grid` consumes both DB and file payloads identically (same `list[{side, price}]` shape).
+**Replay loader priority** (`apps/replay/src/replay/engine.py:_load_seed`): exact DB row at-or-before `seed.at_ts` for the supplied recorder `run_id/account_id` → active live/shadow gridbot DB row for the same `strat_id`/`symbol` whose run covers `seed.at_ts` → file path if `seed.grid_state_path is not None` → fresh blank-build. The active-run fallback is required in shared Phase 4 DBs because recorder-owned wallet/position/order rows live under a `recording` run while `grid_state_snapshots` are gridbot-owned and written under live/shadow runs. `Grid.restore_grid` consumes both DB and file payloads identically (same `list[{side, price}]` shape).
 
 **Pitfalls**
 
