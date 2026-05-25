@@ -342,7 +342,7 @@ class TestGridStateWriter:
         with db.get_session() as sess:
             repo = GridStateSnapshotRepository(sess)
             picked = repo.get_at_or_before(
-                "run1", "acc1", "strat1", datetime(2026, 1, 2, tzinfo=UTC),
+                "acc1", "strat1", "LTCUSDT", datetime(2026, 1, 2, tzinfo=UTC),
             )
             assert picked is not None
             assert picked.grid_json == final

@@ -270,17 +270,29 @@ def load_grid_state(
 
 def load_grid_state_from_snapshots(
     db_session: Session,
-    run_id: str,
     account_id: str,
     strat_id: str,
+    symbol: str,
     at_ts: datetime,
     expected_step: float,
     expected_count: int,
 ) -> Optional[GridStateSeed]:
     """Load grid state from the ``grid_state_snapshots`` DB table (0047).
 
-    Mirrors ``load_grid_state`` (file path) but pulls the row written by
-    gridbot's ``GridStateWriter`` at the latest ``exchange_ts`` ≤ ``at_ts``.
+    Pulls the latest snapshot at ``exchange_ts <= at_ts`` for
+    ``(account_id, strat_id, symbol)``. The lookup is **cross-run** by
+    design: gridbot's ``GridStateWriter`` runs under gridbot's own live
+    ``run_id`` (``run_type='live'``), while the recorder — whose
+    ``run_id`` reaches replay via ``seed.at_ts`` — uses an independent
+    ``run_id`` (``run_type='recording'``). Scoping by recorder's
+    ``run_id`` matched zero rows in production (0052).
+
+    The ``symbol`` predicate prevents cross-symbol bleed-through for
+    accounts whose ``strat_id`` was retained across a symbol rename
+    (e.g. ``strat_id='ltcusdt_test'`` was preserved to avoid orphaning
+    live grid state — the loader must not rely on ``strat_id`` alone as
+    a symbol proxy).
+
     Returns ``None`` on no-row-found or on step/count mismatch (engine
     falls back to file path, then to a fresh blank-build).
 
@@ -309,7 +321,7 @@ def load_grid_state_from_snapshots(
         )
         return None
     row = GridStateSnapshotRepository(db_session).get_at_or_before(
-        run_id, account_id, strat_id, at_ts,
+        account_id, strat_id, symbol, at_ts,
     )
     if row is None:
         logger.info(
@@ -328,6 +340,10 @@ def load_grid_state_from_snapshots(
             strat_id, row.grid_step, expected_step,
         )
         return None
+    logger.info(
+        "%s: grid snapshot loaded from run_id=%s exchange_ts=%s",
+        strat_id, row.run_id, row.exchange_ts,
+    )
     return GridStateSeed(
         strat_id=strat_id,
         grid=row.grid_json,

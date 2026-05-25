@@ -364,31 +364,37 @@ Verify nothing's left running:
 ps aux | grep -E "gridbot|recorder" | grep -v grep   # expect: empty
 ```
 
-**Grid-state snapshot — always provide the file fallback until the
-replay lookup is fixed**:
+**Grid-state snapshot — DB seeding is the primary path (feature 0052)**:
 
-Even on Feature 0047+ runs (where gridbot is writing
-``grid_state_snapshots`` to the shared DB), replay cannot currently
-read those rows for the recording session — its wallet, position,
-order, and execution loaders use the *recording* ``run_id`` captured
-above, while ``grid_state_snapshots`` rows are written by gridbot
-under the *live gridbot* ``run_id``. Replay calls
-``load_grid_state_from_snapshots(..., run_id, ...)`` with the
-recording ``run_id`` and matches no row, so DB-seeded grid state
-silently falls back to file or fresh build. Sharing the DB does not
-fix this lookup mismatch; a follow-up must resolve grid state by the
-live ``run_id`` (or another stable association).
+As of feature 0052, replay loads grid state directly from
+``grid_state_snapshots`` via a **cross-run** lookup keyed by
+``(account_id, strat_id, symbol, exchange_ts <= seed.at_ts)``. The
+recorder's ``run_id`` is no longer used to scope the grid-state
+lookup, so rows written by gridbot under its *live* ``run_id`` are
+visible to replay using the *recording* ``run_id``. Wallet, position,
+order, and execution loaders still scope to the recording ``run_id``
+(they read recorder-written rows).
 
-Until that follow-up lands, do the file copy on **every** Phase 4
-run, regardless of vintage:
+The legacy file path (``seed.grid_state_path``) remains a fallback
+and is **only used** when:
 
-```bash
-cp db/grid_anchor.json db/grid_anchor.phase4.json
-```
+  * the recorder DB is pre-0047 (table missing), or
+  * no ``grid_state_snapshots`` row exists at-or-before ``seed.at_ts``
+    for ``(account_id, strat_id, symbol)``, or
+  * the saved ``grid_step`` / ``grid_count`` doesn't match the replay
+    config (mismatch → ``None`` with INFO).
 
-and set ``seed.grid_state_path: "db/grid_anchor.phase4.json"`` in
-your Step 8 YAML. This is the deterministic grid seed path today.
-The 2026-05-18 18 h dataset used the same approach.
+For Feature 0047+ runs against a shared DB, you can **omit** the
+``grid_anchor.phase4.json`` copy. Replay will emit
+``grid seed source=db`` and
+``grid snapshot loaded from run_id=<live-gridbot-run> exchange_ts=…``
+in the seed logs — confirm those lines appear before relying on the
+DB path. The file fallback is still useful for offline replays
+against datasets that pre-date 0047 or for synthetic anchors during
+development.
+
+The 2026-05-18 18 h dataset used the file path; modern Phase 4 runs
+on the shared DB should use the DB path.
 
 ## Step 8 — Replay config
 
