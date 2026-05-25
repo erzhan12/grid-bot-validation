@@ -63,6 +63,7 @@ from replay.snapshot_loader import (
     WalletSeed,
     load_active_orders,
     load_grid_state,
+    load_grid_state_from_active_gridbot_snapshots,
     load_grid_state_from_snapshots,
     load_position_snapshots,
     load_wallet_seed_full,
@@ -645,8 +646,9 @@ class ReplayEngine:
                 "seed.enabled=True but at_ts/account_id/strat_id are unset"
             )
 
-        # 0047: try the DB grid-state snapshot first, fall back to the file
-        # path, then to a blank build. DB lookup needs a session, so open it
+        # 0047/0049: try the exact recorder-run DB grid snapshot first, then
+        # the active live/shadow gridbot run in the shared DB, then the legacy
+        # file path, then a blank build. DB lookup needs a session, so open it
         # FIRST and run all loaders inside.
         with self._db.get_session() as db_session:
             self._seed_pre_check(db_session, run_id, seed.at_ts)
@@ -660,7 +662,20 @@ class ReplayEngine:
                 expected_step=config.strategy.grid_step,
                 expected_count=config.strategy.grid_count,
             )
-            grid_source = "db"
+            grid_source = "db_recorder" if grid_seed is not None else "missing"
+            if grid_seed is None:
+                grid_seed = load_grid_state_from_active_gridbot_snapshots(
+                    db_session,
+                    seed.account_id,
+                    seed.strat_id,
+                    config.symbol,
+                    seed.at_ts,
+                    expected_step=config.strategy.grid_step,
+                    expected_count=config.strategy.grid_count,
+                )
+                if grid_seed is not None:
+                    grid_source = "db_gridbot"
+
             if grid_seed is None and seed.grid_state_path is not None:
                 grid_seed = load_grid_state(
                     GridStateStore(file_path=seed.grid_state_path),

@@ -2,7 +2,7 @@
 
 from typing import Generic, TypeVar, Optional, List
 
-from sqlalchemy import func, tuple_
+from sqlalchemy import func, or_, tuple_
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -1289,6 +1289,41 @@ class GridStateSnapshotRepository(BaseRepository[GridStateSnapshot]):
                 GridStateSnapshot.account_id == account_id,
                 GridStateSnapshot.strat_id == strat_id,
                 GridStateSnapshot.exchange_ts <= at_ts,
+            )
+            .order_by(
+                GridStateSnapshot.exchange_ts.desc(),
+                GridStateSnapshot.id.desc(),
+            )
+            .first()
+        )
+
+    def get_active_gridbot_at_or_before(
+        self,
+        account_id: str,
+        strat_id: str,
+        symbol: str,
+        at_ts: datetime,
+    ) -> Optional[GridStateSnapshot]:
+        """Latest live/shadow grid snapshot for an active gridbot run at ``at_ts``.
+
+        Phase 4 replay seeds private recorder data from a ``recording`` run,
+        but gridbot writes ``grid_state_snapshots`` under its own ``live`` or
+        ``shadow`` run. This lookup bridges that ownership split while keeping
+        the scope tight to the same account, strat_id, symbol, and active run
+        window.
+        """
+        return (
+            self.session.query(GridStateSnapshot)
+            .join(Run, GridStateSnapshot.run_id == Run.run_id)
+            .filter(
+                GridStateSnapshot.account_id == account_id,
+                GridStateSnapshot.strat_id == strat_id,
+                GridStateSnapshot.symbol == symbol,
+                GridStateSnapshot.exchange_ts <= at_ts,
+                Run.account_id == account_id,
+                Run.run_type.in_(("live", "shadow")),
+                Run.start_ts <= at_ts,
+                or_(Run.end_ts.is_(None), Run.end_ts >= at_ts),
             )
             .order_by(
                 GridStateSnapshot.exchange_ts.desc(),

@@ -445,6 +445,77 @@ class TestReplayEngineSeedingPipeline:
         _, _, _, grid_seed, _ = engine._load_seed(replay_config, run_id)
         assert grid_seed is None
 
+    def test_load_seed_uses_active_gridbot_snapshot_when_recorder_run_has_none(
+        self, seeded_db, seed_ts, snapshot_ts, mock_instrument,
+    ):
+        """Shared DB: recorder owns private rows, live gridbot owns grid rows."""
+        live_grid = [
+            {"side": "Buy", "price": 91000.0},
+            {"side": "Buy", "price": 91200.0},
+            {"side": "Sell", "price": 91600.0},
+            {"side": "Sell", "price": 91800.0},
+        ]
+        with seeded_db.get_session() as session:
+            session.add(
+                Run(
+                    run_id="live-gridbot-run",
+                    user_id="user-1",
+                    account_id="acc-1",
+                    strategy_id="strat-1",
+                    run_type="live",
+                    status="running",
+                    start_ts=snapshot_ts - timedelta(minutes=5),
+                    end_ts=None,
+                )
+            )
+            session.flush()
+            GridStateSnapshotRepository(session).insert(
+                GridStateSnapshot(
+                    run_id="live-gridbot-run",
+                    account_id="acc-1",
+                    strat_id=STRAT_ID,
+                    symbol=SYMBOL,
+                    exchange_ts=snapshot_ts,
+                    local_ts=snapshot_ts,
+                    grid_json=live_grid,
+                    grid_step=Decimal("0.2"),
+                    grid_count=4,
+                    raw_fingerprint=grid_fingerprint_hash(live_grid, 0.2, 4),
+                )
+            )
+
+        seed_config = SeedConfig(
+            enabled=True,
+            at_ts=seed_ts,
+            account_id="acc-1",
+            strat_id=STRAT_ID,
+            grid_state_path=None,
+            wallet_coin="USDT",
+        )
+        replay_config = ReplayConfig(
+            database_url="sqlite:///:memory:",
+            run_id="seed-run",
+            symbol=SYMBOL,
+            start_ts=seed_ts,
+            end_ts=seed_ts + timedelta(hours=1),
+            strategy=ReplayStrategyConfig(
+                tick_size=Decimal("0.1"),
+                grid_count=4,
+                grid_step=0.2,
+                enable_risk_multipliers=True,
+            ),
+            initial_balance=Decimal("10000"),
+            enable_funding=False,
+            seed=seed_config,
+        )
+
+        engine = ReplayEngine(config=replay_config, db=seeded_db)
+        run_id, *_ = engine._resolve_run(replay_config)
+        _, _, _, grid_seed, _ = engine._load_seed(replay_config, run_id)
+
+        assert grid_seed is not None
+        assert grid_seed.grid == live_grid
+
 
 # ---------------------------------------------------------------------------
 # B. Pre-check: seed.at_ts too early relative to initial REST snapshot

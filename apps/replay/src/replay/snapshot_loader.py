@@ -268,6 +268,45 @@ def load_grid_state(
     )
 
 
+def _grid_seed_from_snapshot(
+    row: GridStateSnapshot,
+    strat_id: str,
+    expected_step: float,
+    expected_count: int,
+) -> Optional[GridStateSeed]:
+    """Validate a snapshot row and convert it into a replay grid seed."""
+    if int(row.grid_count) != int(expected_count):
+        logger.info(
+            "%s: saved grid_count=%d differs from replay config %d; falling back",
+            strat_id, row.grid_count, expected_count,
+        )
+        return None
+    if Decimal(str(row.grid_step)) != Decimal(str(expected_step)):
+        logger.info(
+            "%s: saved grid_step=%s differs from replay config %s; falling back",
+            strat_id, row.grid_step, expected_step,
+        )
+        return None
+    return GridStateSeed(
+        strat_id=strat_id,
+        grid=row.grid_json,
+        grid_step=float(row.grid_step),
+        grid_count=int(row.grid_count),
+    )
+
+
+def _grid_snapshots_table_exists(db_session: Session) -> bool:
+    """Return whether the 0047 grid snapshot table exists in this DB."""
+    # Use ``session.connection()`` (NOT ``get_bind()``) so the inspector
+    # shares the session's open transaction. ``inspect(engine).has_table``
+    # would acquire a fresh connection from the pool — on SQLite
+    # ``:memory:`` + StaticPool this issues a ROLLBACK that wipes the
+    # session's uncommitted writes.
+    return sa_inspect(db_session.connection()).has_table(
+        GridStateSnapshot.__tablename__,
+    )
+
+
 def load_grid_state_from_snapshots(
     db_session: Session,
     run_id: str,
@@ -294,14 +333,7 @@ def load_grid_state_from_snapshots(
     Return ``None`` (with INFO) when the table is missing so the engine's
     file fallback at ``engine.py:_load_seed`` runs.
     """
-    # Use ``session.connection()`` (NOT ``get_bind()``) so the inspector
-    # shares the session's open transaction. ``inspect(engine).has_table``
-    # would acquire a fresh connection from the pool — on SQLite
-    # ``:memory:`` + StaticPool this issues a ROLLBACK that wipes the
-    # session's uncommitted writes.
-    if not sa_inspect(db_session.connection()).has_table(
-        GridStateSnapshot.__tablename__,
-    ):
+    if not _grid_snapshots_table_exists(db_session):
         logger.info(
             "%s: grid_state_snapshots table not present (pre-0047 DB); "
             "falling back to file path / fresh build",
@@ -316,23 +348,43 @@ def load_grid_state_from_snapshots(
             "%s: no grid snapshot at-or-before %s", strat_id, at_ts,
         )
         return None
-    if int(row.grid_count) != int(expected_count):
+    return _grid_seed_from_snapshot(row, strat_id, expected_step, expected_count)
+
+
+def load_grid_state_from_active_gridbot_snapshots(
+    db_session: Session,
+    account_id: str,
+    strat_id: str,
+    symbol: str,
+    at_ts: datetime,
+    expected_step: float,
+    expected_count: int,
+) -> Optional[GridStateSeed]:
+    """Load grid state from an active live/shadow gridbot run.
+
+    In the shared Phase 4 DB, the recorder run owns wallet/position/order
+    rows, while grid snapshots are written by the live/shadow gridbot run.
+    This fallback is used after the exact recorder-run lookup misses.
+    """
+    if not _grid_snapshots_table_exists(db_session):
         logger.info(
-            "%s: saved grid_count=%d differs from replay config %d; falling back",
-            strat_id, row.grid_count, expected_count,
+            "%s: grid_state_snapshots table not present (pre-0047 DB); "
+            "falling back to file path / fresh build",
+            strat_id,
         )
         return None
-    if Decimal(str(row.grid_step)) != Decimal(str(expected_step)):
+
+    row = GridStateSnapshotRepository(db_session).get_active_gridbot_at_or_before(
+        account_id, strat_id, symbol, at_ts,
+    )
+    if row is None:
         logger.info(
-            "%s: saved grid_step=%s differs from replay config %s; falling back",
-            strat_id, row.grid_step, expected_step,
+            "%s: no active live/shadow grid snapshot for %s at-or-before %s",
+            strat_id, symbol, at_ts,
         )
         return None
-    return GridStateSeed(
-        strat_id=strat_id,
-        grid=row.grid_json,
-        grid_step=float(row.grid_step),
-        grid_count=int(row.grid_count),
+
+    return _grid_seed_from_snapshot(row, strat_id, expected_step, expected_count)
     )
 
 
@@ -609,6 +661,7 @@ __all__ = [
     "SeedConfigMismatchError",
     "SeedDataQualityError",
     "load_grid_state",
+    "load_grid_state_from_active_gridbot_snapshots",
     "load_grid_state_from_snapshots",
     "load_position_snapshots",
     "load_wallet_seed_full",
