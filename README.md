@@ -50,7 +50,7 @@ Holds grid-level math (`greed.py`), the event-driven strategy engine (`strat.py`
 
 **`gridbot`** — The live multi-tenant grid trading bot. Reads a YAML config of accounts + strategies, attaches `gridcore` engines to live Bybit streams, places/cancels orders, and persists every state transition via `grid-db`. Supports hedge mode, dynamic risk multipliers, and Telegram notifications.
 
-**`backtest`** — Offline historical backtester. Drives `gridcore` against recorded ticker snapshots and fills with a configurable fill simulator (`book_touch`, `trade_through_at_limit`, `strict_cross`), accurate maintenance-margin tiers, funding accrual, and an honest hedge-aware pair-liquidation model. Outputs per-strategy reports (PnL curve, drawdown, fill log).
+**`backtest`** — Offline historical backtester. Drives `gridcore` against recorded ticker snapshots and fills with a configurable fill simulator (`book_touch`, `trade_through_at_limit`, `strict_cross`, `last_cross`), accurate maintenance-margin tiers, funding accrual, and an honest hedge-aware pair-liquidation model. Outputs per-strategy reports (PnL curve, drawdown, fill log).
 
 **`recorder`** — A standalone process that subscribes to Bybit mainnet WebSocket streams and writes them to SQLite for later replay. Captures L1 ticker snapshots, public trades (optional), and — when API keys are provided — private orders, executions, positions, and wallet snapshots. Tracks gaps and reconciles via REST.
 

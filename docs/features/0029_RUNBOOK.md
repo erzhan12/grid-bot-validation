@@ -439,6 +439,8 @@ seed:
 
 fill_simulator:
   mode: book_touch
+  # last_cross (feature 0051) is the opt-in candidate replacement for
+  # book_touch — switch once v7 re-validation hits >=95% match-rate.
 
 # Fallback when seed-wallet returns None (shouldn't happen if Step 4
 # succeeded with a non-empty wallet on the account)

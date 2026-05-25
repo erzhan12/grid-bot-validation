@@ -525,3 +525,162 @@ class TestBacktestOrderManager:
     def test_get_order_by_client_id_not_found(self, order_manager):
         """Get non-existent client_order_id returns None."""
         assert order_manager.get_order_by_client_id("nonexistent") is None
+
+
+class TestLastCrossOrderManagerIntegration:
+    """Feature 0051 integration: advance_market hook in check_fills."""
+
+    @staticmethod
+    def _ticker(
+        symbol: str,
+        last: Decimal,
+        *,
+        tick_index: int,
+    ) -> TickerEvent:
+        from datetime import datetime, timedelta, timezone
+
+        base = datetime(2026, 5, 11, 4, 49, 58, tzinfo=timezone.utc)
+        ts = base + timedelta(milliseconds=tick_index)
+        return TickerEvent(
+            event_type=EventType.TICKER,
+            symbol=symbol,
+            exchange_ts=ts,
+            local_ts=ts,
+            last_price=last,
+            mark_price=last,
+            bid1_price=Decimal("0"),
+            ask1_price=Decimal("0"),
+            funding_rate=Decimal("0"),
+        )
+
+    @pytest.fixture
+    def last_cross_order_manager(self, order_manager):
+        order_manager.fill_simulator = TradeThroughFillSimulator(
+            mode=FillMode.LAST_CROSS
+        )
+        return order_manager
+
+    def test_two_orders_same_symbol_tick_both_see_cross(
+        self,
+        last_cross_order_manager,
+        sample_timestamp,
+    ):
+        """Test #8: advance once per tick; both orders read same prev/curr."""
+        last_cross_order_manager.place_order(
+            client_order_id="c1",
+            symbol="LTCUSDT",
+            side="Buy",
+            price=Decimal("54.20"),
+            qty=Decimal("0.1"),
+            direction="long",
+            grid_level=0,
+            timestamp=sample_timestamp,
+        )
+        last_cross_order_manager.place_order(
+            client_order_id="c2",
+            symbol="LTCUSDT",
+            side="Buy",
+            price=Decimal("54.20"),
+            qty=Decimal("0.1"),
+            direction="long",
+            grid_level=1,
+            timestamp=sample_timestamp,
+        )
+
+        ticker_prev = self._ticker("LTCUSDT", Decimal("54.30"), tick_index=0)
+        ticker_curr = self._ticker("LTCUSDT", Decimal("54.10"), tick_index=1)
+        # T0: stash None, commit 54.30. No fills (prev_last is None).
+        fills_prev = last_cross_order_manager.check_fills(ticker_prev)
+        assert fills_prev == []
+        # T1: stash 54.30, commit 54.10. Both orders observe the cross.
+        fills_curr = last_cross_order_manager.check_fills(ticker_curr)
+
+        assert len(fills_curr) == 2
+        assert {f.order_link_id for f in fills_curr} == {"c1", "c2"}
+        assert all(f.price == Decimal("54.20") for f in fills_curr)
+
+    def test_advance_market_idempotent_for_same_tick(
+        self,
+        last_cross_order_manager,
+        sample_timestamp,
+    ):
+        """Test #8b: re-stash on same token is a no-op; third order still fills."""
+        last_cross_order_manager.place_order(
+            client_order_id="c1",
+            symbol="LTCUSDT",
+            side="Buy",
+            price=Decimal("54.20"),
+            qty=Decimal("0.1"),
+            direction="long",
+            grid_level=0,
+            timestamp=sample_timestamp,
+        )
+        last_cross_order_manager.place_order(
+            client_order_id="c2",
+            symbol="LTCUSDT",
+            side="Buy",
+            price=Decimal("54.20"),
+            qty=Decimal("0.1"),
+            direction="long",
+            grid_level=1,
+            timestamp=sample_timestamp,
+        )
+        simulator = last_cross_order_manager.fill_simulator
+        ticker_prev = self._ticker("LTCUSDT", Decimal("54.30"), tick_index=0)
+        ticker_curr = self._ticker("LTCUSDT", Decimal("54.10"), tick_index=1)
+        last_cross_order_manager.check_fills(ticker_prev)
+        last_cross_order_manager.check_fills(ticker_curr)
+
+        # Redundant advance on the same TickerEvent must not re-stash.
+        simulator.advance_market(ticker_curr)
+        assert simulator._prev_last_price["LTCUSDT"] == Decimal("54.10")
+        assert simulator._tick_prev_last["LTCUSDT"] == Decimal("54.30")
+
+        # A late-arriving third order on the same tick still sees the cross.
+        last_cross_order_manager.place_order(
+            client_order_id="c3",
+            symbol="LTCUSDT",
+            side="Buy",
+            price=Decimal("54.20"),
+            qty=Decimal("0.1"),
+            direction="long",
+            grid_level=2,
+            timestamp=sample_timestamp,
+        )
+        fills = last_cross_order_manager.check_fills(ticker_curr)
+        assert len(fills) == 1
+        assert fills[0].order_link_id == "c3"
+
+    def test_state_advances_on_ticks_with_no_active_orders(
+        self,
+        last_cross_order_manager,
+        sample_timestamp,
+    ):
+        """Test #15: advance_market runs unconditionally on orderless ticks."""
+        # Three orderless ticks: 54.30, 54.10, 54.10.
+        t0 = self._ticker("LTCUSDT", Decimal("54.30"), tick_index=0)
+        t1 = self._ticker("LTCUSDT", Decimal("54.10"), tick_index=1)
+        t2 = self._ticker("LTCUSDT", Decimal("54.10"), tick_index=2)
+        last_cross_order_manager.check_fills(t0)
+        last_cross_order_manager.check_fills(t1)
+        last_cross_order_manager.check_fills(t2)
+
+        # Place a SELL @ 54.20 after the no-order ticks.
+        last_cross_order_manager.place_order(
+            client_order_id="c1",
+            symbol="LTCUSDT",
+            side="Sell",
+            price=Decimal("54.20"),
+            qty=Decimal("0.1"),
+            direction="short",
+            grid_level=0,
+            timestamp=sample_timestamp,
+        )
+
+        # T3: prev=54.10 (committed from orderless t2), curr=54.30 -> SELL fires.
+        t3 = self._ticker("LTCUSDT", Decimal("54.30"), tick_index=3)
+        fills = last_cross_order_manager.check_fills(t3)
+
+        assert len(fills) == 1
+        assert fills[0].order_link_id == "c1"
+        assert fills[0].price == Decimal("54.20")
