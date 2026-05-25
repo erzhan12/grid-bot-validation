@@ -385,7 +385,6 @@ def load_grid_state_from_active_gridbot_snapshots(
         return None
 
     return _grid_seed_from_snapshot(row, strat_id, expected_step, expected_count)
-    )
 
 
 def load_position_snapshots(
