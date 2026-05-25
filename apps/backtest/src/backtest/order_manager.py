@@ -272,6 +272,13 @@ class BacktestOrderManager:
             market = current_price
 
         if isinstance(market, TickerEvent):
+            # Advance per-tick simulator state for LAST_CROSS before the
+            # per-order loop. Runs unconditionally on every TickerEvent so
+            # the T -> T+1 transition signal is never lost on orderless
+            # ticks (grid fully filled one side, gaps between cascades).
+            # Legacy bare-Decimal path below intentionally never calls
+            # advance_market (no symbol/exchange_ts available).
+            self.fill_simulator.advance_market(market)
             fill_timestamp = timestamp or market.exchange_ts
             symbol_filter = market.symbol
         else:

@@ -91,7 +91,7 @@ class TestReplayConfig:
 
     @pytest.mark.parametrize(
         "mode",
-        ["strict_cross", "trade_through_at_limit", "book_touch"],
+        ["strict_cross", "trade_through_at_limit", "book_touch", "last_cross"],
     )
     def test_fill_simulator_explicit_modes(self, mode):
         config = ReplayConfig(

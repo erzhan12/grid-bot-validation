@@ -162,14 +162,24 @@ class SeedConfig(BaseModel):
 class FillSimulatorConfig(BaseModel):
     """Replay fill simulator configuration."""
 
-    mode: Literal["strict_cross", "trade_through_at_limit", "book_touch"] = Field(
+    mode: Literal[
+        "strict_cross",
+        "trade_through_at_limit",
+        "book_touch",
+        "last_cross",
+    ] = Field(
         default="book_touch",
         description=(
             "Fill simulator mode for replay. Default is 'book_touch' because "
             "the recorder always supplies L1 bid/ask and book_touch closes "
             "the at-limit-fill gap that strict_cross misses (feature 0033 "
             "Phase 4 smoke: match_rate 91.3% -> 97.8%). Override to "
-            "'strict_cross' for backward-compat parity runs."
+            "'strict_cross' for backward-compat parity runs. "
+            "'last_cross' (feature 0051) detects aggressor crossings via "
+            "last_price transitions across consecutive ticks and is the "
+            "candidate replacement for 'book_touch' once v7 re-validation "
+            "hits >=95%; addresses the +12.6s lag observed in book_touch "
+            "shadow runs."
         ),
     )
 
