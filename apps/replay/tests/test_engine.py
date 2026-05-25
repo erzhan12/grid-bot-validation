@@ -95,7 +95,7 @@ class TestReplayEngine:
         assert result.symbol == "BTCUSDT"
         assert result.start_ts == replay_config.start_ts
         assert result.end_ts == replay_config.end_ts
-        assert result.fill_mode == FillMode.BOOK_TOUCH
+        assert result.fill_mode == FillMode.LAST_CROSS
 
     @patch("replay.engine.InstrumentInfoProvider")
     def test_replay_empty_data(self, mock_provider_cls, db, seeded_run_account, replay_config):

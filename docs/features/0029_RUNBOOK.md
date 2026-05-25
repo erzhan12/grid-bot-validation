@@ -438,9 +438,11 @@ seed:
   wallet_coin: "USDT"
 
 fill_simulator:
-  mode: book_touch
-  # last_cross (feature 0051) is the opt-in candidate replacement for
-  # book_touch — switch once v7 re-validation hits >=95% match-rate.
+  mode: last_cross
+  # last_cross is the default replay fill mode since feature 0051's v7
+  # A/B re-validation cut fill-timing |delta| from 19.0s -> 5.1s at
+  # match_rate=100% (issue #117). Override to 'book_touch' for legacy
+  # L1-touch parity or 'strict_cross' for the conservative baseline.
 
 # Fallback when seed-wallet returns None (shouldn't happen if Step 4
 # succeeded with a non-empty wallet on the account)
