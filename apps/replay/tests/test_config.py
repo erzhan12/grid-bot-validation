@@ -54,7 +54,7 @@ class TestReplayConfig:
         assert config.output_dir == "results/replay"
         assert config.price_tolerance == Decimal("0")
         assert config.qty_tolerance == Decimal("0.001")
-        assert config.fill_simulator.mode == "book_touch"
+        assert config.fill_simulator.mode == "last_cross"
 
     def test_initial_balance_string(self):
         config = ReplayConfig(
@@ -72,22 +72,22 @@ class TestReplayConfig:
         )
         assert config.initial_balance == Decimal("5000")
 
-    def test_fill_simulator_omitted_defaults_to_book_touch(self):
+    def test_fill_simulator_omitted_defaults_to_last_cross(self):
         config = ReplayConfig(
             symbol="BTCUSDT",
             strategy=ReplayStrategyConfig(tick_size=Decimal("0.1")),
         )
 
-        assert config.fill_simulator == FillSimulatorConfig(mode="book_touch")
+        assert config.fill_simulator == FillSimulatorConfig(mode="last_cross")
 
-    def test_fill_simulator_empty_block_defaults_to_book_touch(self):
+    def test_fill_simulator_empty_block_defaults_to_last_cross(self):
         config = ReplayConfig(
             symbol="BTCUSDT",
             strategy=ReplayStrategyConfig(tick_size=Decimal("0.1")),
             fill_simulator={},
         )
 
-        assert config.fill_simulator.mode == "book_touch"
+        assert config.fill_simulator.mode == "last_cross"
 
     @pytest.mark.parametrize(
         "mode",
