@@ -1757,3 +1757,91 @@ class TestGridStateSnapshotRepository:
         assert latest.exchange_ts.replace(tzinfo=UTC) == ts_new
         assert latest.grid_json[0]["price"] == 98.0
         assert latest.id == all_rows[-1].id
+
+    def test_get_at_or_before_cross_run(
+        self, session, sample_user, sample_account, sample_strategy, sample_run,
+    ):
+        """0052: ``get_at_or_before`` ignores ``run_id`` — picks the most
+        recent row in (account_id, strat_id, symbol, ts) regardless of
+        which process wrote it.
+        """
+        repo = GridStateSnapshotRepository(session)
+        other_run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="recording",
+            status="running",
+            start_ts=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        session.add(other_run)
+        session.flush()
+
+        grid = [
+            {"side": "Buy", "price": 100.0},
+            {"side": "Wait", "price": 101.0},
+            {"side": "Sell", "price": 102.0},
+        ]
+        ts_old = datetime(2026, 1, 1, tzinfo=UTC)
+        ts_new = datetime(2026, 1, 2, tzinfo=UTC)
+        # Older row under ``sample_run``, newer row under ``other_run``.
+        repo.insert(GridStateSnapshot(
+            run_id=sample_run.run_id,
+            account_id=sample_run.account_id,
+            strat_id="strat_a",
+            symbol="BTCUSDT",
+            exchange_ts=ts_old, local_ts=ts_old,
+            grid_json=grid, grid_step=Decimal("0.5"), grid_count=3,
+            raw_fingerprint=grid_fingerprint_hash(grid, 0.5, 3),
+        ))
+        newer_grid = [
+            {"side": "Buy", "price": 200.0}, *grid[1:],
+        ]
+        repo.insert(GridStateSnapshot(
+            run_id=other_run.run_id,
+            account_id=sample_run.account_id,
+            strat_id="strat_a",
+            symbol="BTCUSDT",
+            exchange_ts=ts_new, local_ts=ts_new,
+            grid_json=newer_grid, grid_step=Decimal("0.5"), grid_count=3,
+            raw_fingerprint=grid_fingerprint_hash(newer_grid, 0.5, 3),
+        ))
+        session.flush()
+
+        picked = repo.get_at_or_before(
+            sample_run.account_id, "strat_a", "BTCUSDT",
+            ts_new + timedelta(hours=1),
+        )
+        assert picked is not None
+        assert picked.grid_json[0]["price"] == 200.0
+        assert picked.run_id == other_run.run_id
+
+    def test_get_at_or_before_filters_by_symbol(
+        self, session, sample_run,
+    ):
+        """0052 F-1-2: rows for a different ``symbol`` must NOT match,
+        even when ``(account_id, strat_id)`` is identical.
+        """
+        repo = GridStateSnapshotRepository(session)
+        grid = [
+            {"side": "Buy", "price": 100.0},
+            {"side": "Wait", "price": 101.0},
+            {"side": "Sell", "price": 102.0},
+        ]
+        ts = datetime(2026, 1, 2, tzinfo=UTC)
+        repo.insert(GridStateSnapshot(
+            run_id=sample_run.run_id,
+            account_id=sample_run.account_id,
+            strat_id="strat_a",
+            symbol="ETHUSDT",
+            exchange_ts=ts, local_ts=ts,
+            grid_json=grid, grid_step=Decimal("0.5"), grid_count=3,
+            raw_fingerprint=grid_fingerprint_hash(grid, 0.5, 3),
+        ))
+        session.flush()
+
+        picked = repo.get_at_or_before(
+            sample_run.account_id, "strat_a", "BTCUSDT",
+            ts + timedelta(hours=1),
+        )
+        assert picked is None

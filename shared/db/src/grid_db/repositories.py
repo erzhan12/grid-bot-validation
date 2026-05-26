@@ -1254,7 +1254,22 @@ class GridStateSnapshotRepository(BaseRepository[GridStateSnapshot]):
         account_id: str,
         strat_id: str,
     ) -> Optional[GridStateSnapshot]:
-        """Latest grid snapshot for the scope — same ``ORDER BY`` as ``get_at_or_before`` without the ts predicate."""
+        """Latest grid snapshot for the scope — **per-run** by design.
+
+        Consumed by ``GridStateWriter.get_last_fingerprint`` and the
+        orchestrator bootstrap probe (``_bootstrap_grid_snapshots``,
+        issue #108). Both deliberately depend on per-``run_id`` scoping:
+        the writer's in-memory dedupe gate must seed from the CURRENT
+        run, and the bootstrap probe alerts when a stale row from a
+        prior process appears under the same run_id (run_id reuse).
+
+        Note the intentional asymmetry with ``get_at_or_before``: the
+        replay seed loader uses cross-run lookup by
+        ``(account_id, strat_id, symbol)`` because gridbot and recorder
+        run under independent ``run_id``s.
+
+        ``ORDER BY`` matches ``get_at_or_before`` (without the ts predicate).
+        """
         return (
             self.session.query(GridStateSnapshot)
             .filter(
@@ -1271,12 +1286,23 @@ class GridStateSnapshotRepository(BaseRepository[GridStateSnapshot]):
 
     def get_at_or_before(
         self,
-        run_id: str,
         account_id: str,
         strat_id: str,
+        symbol: str,
         at_ts: datetime,
     ) -> Optional[GridStateSnapshot]:
-        """Latest grid snapshot for the scope at-or-before ``at_ts``.
+        """Latest grid snapshot at-or-before ``at_ts`` — **cross-run** lookup.
+
+        Filters on ``(account_id, strat_id, symbol, exchange_ts <= at_ts)``
+        with NO ``run_id`` predicate. Used by the replay seed loader
+        (0052): gridbot (live ``run_id``) and recorder (recording
+        ``run_id``) are independent processes — scoping by recorder's
+        ``run_id`` matches zero rows because gridbot wrote under its own.
+
+        Intentional asymmetry with ``get_latest``: see that method's
+        docstring. The ``symbol`` predicate prevents cross-symbol bleed
+        for accounts whose ``strat_id`` was retained after a symbol
+        rename.
 
         ``ORDER BY exchange_ts DESC, id DESC`` — the secondary ``id`` sort
         picks the final notify of a multi-notify outer mutation when both
@@ -1285,9 +1311,9 @@ class GridStateSnapshotRepository(BaseRepository[GridStateSnapshot]):
         return (
             self.session.query(GridStateSnapshot)
             .filter(
-                GridStateSnapshot.run_id == run_id,
                 GridStateSnapshot.account_id == account_id,
                 GridStateSnapshot.strat_id == strat_id,
+                GridStateSnapshot.symbol == symbol,
                 GridStateSnapshot.exchange_ts <= at_ts,
             )
             .order_by(

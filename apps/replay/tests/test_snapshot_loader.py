@@ -260,9 +260,9 @@ class TestLoadGridStateFromSnapshots:
 
         seed = load_grid_state_from_snapshots(
             session,
-            run_id=sample_run.run_id,
             account_id=str(sample_account.account_id),
             strat_id="strat-A",
+            symbol="BTCUSDT",
             at_ts=base_ts + timedelta(minutes=1),
             expected_step=0.2,
             expected_count=3,
@@ -279,9 +279,9 @@ class TestLoadGridStateFromSnapshots:
         with caplog.at_level(logging.INFO):
             seed = load_grid_state_from_snapshots(
                 session,
-                run_id=sample_run.run_id,
                 account_id=str(sample_account.account_id),
                 strat_id="missing",
+                symbol="BTCUSDT",
                 at_ts=base_ts,
                 expected_step=0.2,
                 expected_count=3,
@@ -321,9 +321,9 @@ class TestLoadGridStateFromSnapshots:
 
         seed = load_grid_state_from_snapshots(
             session,
-            run_id=sample_run.run_id,
             account_id=str(sample_account.account_id),
             strat_id="strat-A",
+            symbol="BTCUSDT",
             at_ts=base_ts + timedelta(minutes=1),
             expected_step=0.2,
             expected_count=2,
@@ -351,9 +351,9 @@ class TestLoadGridStateFromSnapshots:
 
         seed = load_grid_state_from_snapshots(
             session,
-            run_id=sample_run.run_id,
             account_id=str(sample_account.account_id),
             strat_id="strat-A",
+            symbol="BTCUSDT",
             at_ts=base_ts + timedelta(minutes=5),
             expected_step=0.2,
             expected_count=3,
@@ -362,16 +362,20 @@ class TestLoadGridStateFromSnapshots:
         # First row (base_ts) wins — later row (+10m) is past the at_ts upper bound.
         assert seed.grid[0]["price"] == 100.0
 
-    def test_cross_run_isolation(
+    def test_cross_run_match_succeeds(
         self, session, sample_user, sample_account, sample_strategy, sample_run,
         base_ts,
     ):
-        """Snapshot present for another run only → loader returns None."""
+        """0052: snapshot written under a DIFFERENT ``run_id`` (e.g.
+        gridbot's live run vs the recorder's recording run) must still
+        be returned. Locks in the cross-run lookup contract — replacing
+        the old ``test_cross_run_isolation`` which encoded the bug.
+        """
         other_run = Run(
             user_id=sample_user.user_id,
             account_id=sample_account.account_id,
             strategy_id=sample_strategy.strategy_id,
-            run_type="recording",
+            run_type="live",
             status="running",
             start_ts=base_ts,
         )
@@ -383,9 +387,77 @@ class TestLoadGridStateFromSnapshots:
 
         seed = load_grid_state_from_snapshots(
             session,
-            run_id=sample_run.run_id,
             account_id=str(sample_account.account_id),
             strat_id="strat-A",
+            symbol="BTCUSDT",
+            at_ts=base_ts + timedelta(minutes=1),
+            expected_step=0.2,
+            expected_count=3,
+        )
+        assert seed is not None
+        assert seed.grid[0]["side"] == "Buy"
+
+    def test_cross_run_logs_actual_run_id(
+        self, session, sample_user, sample_account, sample_strategy, sample_run,
+        base_ts, caplog,
+    ):
+        """0052: success-path INFO log must include the actual ``run_id``
+        from the snapshot row (the live gridbot run), not the caller's
+        recorder run_id."""
+        other_run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="live",
+            status="running",
+            start_ts=base_ts,
+        )
+        session.add(other_run)
+        session.flush()
+        repo = GridStateSnapshotRepository(session)
+        repo.insert(_make_grid_row(other_run, sample_account, exchange_ts=base_ts))
+        session.flush()
+
+        with caplog.at_level(logging.INFO):
+            seed = load_grid_state_from_snapshots(
+                session,
+                account_id=str(sample_account.account_id),
+                strat_id="strat-A",
+                symbol="BTCUSDT",
+                at_ts=base_ts + timedelta(minutes=1),
+                expected_step=0.2,
+                expected_count=3,
+            )
+        assert seed is not None
+        assert any(
+            f"run_id={other_run.run_id}" in rec.message for rec in caplog.records
+        )
+        # And NOT the caller's recorder run_id.
+        assert not any(
+            f"run_id={sample_run.run_id}" in rec.message for rec in caplog.records
+        )
+
+    def test_cross_symbol_isolation(
+        self, session, sample_account, sample_run, base_ts
+    ):
+        """0052 F-1-2: same ``(account_id, strat_id)`` but different
+        ``symbol`` must NOT match. Guards against cross-symbol bleed
+        for accounts whose ``strat_id`` was retained across a rename.
+        """
+        # _make_grid_row pins symbol="BTCUSDT"; build a row for a different
+        # symbol by writing directly through the repo.
+        repo = GridStateSnapshotRepository(session)
+        row = _make_grid_row(sample_run, sample_account, exchange_ts=base_ts)
+        row.symbol = "ETHUSDT"
+        # Refresh the fingerprint isn't needed (insert collision is per-run).
+        repo.insert(row)
+        session.flush()
+
+        seed = load_grid_state_from_snapshots(
+            session,
+            account_id=str(sample_account.account_id),
+            strat_id="strat-A",
+            symbol="BTCUSDT",
             at_ts=base_ts + timedelta(minutes=1),
             expected_step=0.2,
             expected_count=3,
@@ -405,9 +477,9 @@ class TestLoadGridStateFromSnapshots:
         session.flush()
         seed = load_grid_state_from_snapshots(
             session,
-            run_id=sample_run.run_id,
             account_id=str(sample_account.account_id),
             strat_id="strat-A",
+            symbol="BTCUSDT",
             at_ts=base_ts + timedelta(minutes=1),
             expected_step=0.2,
             expected_count=3,
@@ -423,15 +495,20 @@ class TestLoadGridStateFromSnapshots:
         with caplog.at_level(logging.INFO):
             seed = load_grid_state_from_snapshots(
                 session,
-                run_id=sample_run.run_id,
                 account_id=str(sample_account.account_id),
                 strat_id="strat-A",
+                symbol="BTCUSDT",
                 at_ts=base_ts + timedelta(minutes=1),
                 expected_step=0.2,
                 expected_count=99,  # Mismatch.
             )
         assert seed is None
         assert any("grid_count" in rec.message for rec in caplog.records)
+        # 0052 N3: success-path log must NOT fire on the mismatch branch.
+        assert not any(
+            "grid snapshot loaded from run_id" in rec.message
+            for rec in caplog.records
+        )
 
     def test_pre_0047_db_missing_table_returns_none(
         self, db, sample_account, sample_run, base_ts, caplog
@@ -451,9 +528,9 @@ class TestLoadGridStateFromSnapshots:
                 with caplog.at_level(logging.INFO):
                     seed = load_grid_state_from_snapshots(
                         sess,
-                        run_id=sample_run.run_id,
                         account_id=str(sample_account.account_id),
                         strat_id="strat-A",
+                        symbol="BTCUSDT",
                         at_ts=base_ts,
                         expected_step=0.2,
                         expected_count=3,
@@ -484,15 +561,20 @@ class TestLoadGridStateFromSnapshots:
         with caplog.at_level(logging.INFO):
             seed = load_grid_state_from_snapshots(
                 session,
-                run_id=sample_run.run_id,
                 account_id=str(sample_account.account_id),
                 strat_id="strat-A",
+                symbol="BTCUSDT",
                 at_ts=base_ts + timedelta(minutes=1),
                 expected_step=0.5,  # Mismatch — distinct decimal value.
                 expected_count=3,
             )
         assert seed is None
         assert any("grid_step" in rec.message for rec in caplog.records)
+        # 0052 N3: success-path log must NOT fire on the mismatch branch.
+        assert not any(
+            "grid snapshot loaded from run_id" in rec.message
+            for rec in caplog.records
+        )
 
     def test_loader_output_round_trips_through_restore_grid(
         self, session, sample_account, sample_run, base_ts
@@ -525,9 +607,9 @@ class TestLoadGridStateFromSnapshots:
         session.flush()
         seed = load_grid_state_from_snapshots(
             session,
-            run_id=sample_run.run_id,
             account_id=str(sample_account.account_id),
             strat_id="strat-A",
+            symbol="BTCUSDT",
             at_ts=base_ts + timedelta(minutes=1),
             expected_step=0.5,
             expected_count=5,
@@ -562,9 +644,9 @@ class TestLoadGridStateFromSnapshots:
         session.flush()
         seed = load_grid_state_from_snapshots(
             session,
-            run_id=sample_run.run_id,
             account_id=str(sample_account.account_id),
             strat_id="strat-A",
+            symbol="BTCUSDT",
             at_ts=base_ts + timedelta(minutes=1),
             expected_step=0.1,
             expected_count=3,

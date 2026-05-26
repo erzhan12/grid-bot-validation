@@ -381,6 +381,68 @@ class TestReplayEngineSeedingPipeline:
         assert grid_seed is not None
         assert grid_seed.grid == db_grid
 
+    def test_load_seed_prefers_db_snapshot_from_other_run_id(
+        self, seeded_db, replay_config, snapshot_ts, mock_instrument, caplog,
+    ):
+        """0052 regression guard: gridbot's live ``run_id`` differs from
+        the recorder's ``run_id``. The replay engine must still load the
+        snapshot via the cross-run lookup.
+
+        The pre-0052 ``test_load_seed_prefers_db_over_file`` happened to
+        insert under the same ``run_id="seed-run"`` that the replay
+        resolves, so it passed under the broken per-run filter and did
+        not catch the production failure mode.
+        """
+        import logging
+
+        live_run_id = "gridbot-live-run"
+        db_grid = [
+            {"side": "Buy", "price": 91000.0},
+            {"side": "Buy", "price": 91200.0},
+            {"side": "Sell", "price": 91600.0},
+            {"side": "Sell", "price": 91800.0},
+        ]
+        with seeded_db.get_session() as session:
+            # Run row for the FK; gridbot ran under its own ``live`` run.
+            session.add(
+                Run(
+                    run_id=live_run_id,
+                    user_id="user-1",
+                    account_id="acc-1",
+                    strategy_id="strat-1",
+                    run_type="live",
+                    status="running",
+                    start_ts=snapshot_ts - timedelta(minutes=30),
+                    end_ts=None,
+                )
+            )
+            session.flush()
+            GridStateSnapshotRepository(session).insert(
+                GridStateSnapshot(
+                    run_id=live_run_id, account_id="acc-1", strat_id=STRAT_ID,
+                    symbol=SYMBOL,
+                    exchange_ts=snapshot_ts, local_ts=snapshot_ts,
+                    grid_json=db_grid, grid_step=Decimal("0.2"), grid_count=4,
+                    raw_fingerprint=grid_fingerprint_hash(db_grid, 0.2, 4),
+                )
+            )
+            session.commit()
+
+        engine = ReplayEngine(config=replay_config, db=seeded_db)
+        run_id, *_ = engine._resolve_run(replay_config)
+        assert run_id == "seed-run"  # recorder's run_id, not the gridbot one.
+
+        with caplog.at_level(logging.INFO):
+            _, _, _, grid_seed, _ = engine._load_seed(replay_config, run_id)
+
+        assert grid_seed is not None
+        assert grid_seed.grid == db_grid
+        # End-to-end engine wiring: the "grid seed source=db" line must
+        # fire (confirms engine took the DB branch, not just the loader).
+        assert any(
+            "grid seed source=db" in rec.message for rec in caplog.records
+        )
+
     def test_load_seed_falls_back_to_file_when_no_db_snapshot(
         self, seeded_db, replay_config, mock_instrument,
     ):

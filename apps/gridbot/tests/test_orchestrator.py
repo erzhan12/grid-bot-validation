@@ -2150,7 +2150,7 @@ class TestOrchestratorBootstrapGridSnapshots:
             repo = GridStateSnapshotRepository(sess)
             latest = repo.get_latest(str(run_id), account_id, self.STRAT_ID)
             at_start = repo.get_at_or_before(
-                str(run_id), account_id, self.STRAT_ID, run_start_ts,
+                account_id, self.STRAT_ID, runner.symbol, run_start_ts,
             )
             assert latest.grid_json == runner.engine.grid.grid
             assert latest.exchange_ts.replace(tzinfo=UTC) == run_start_ts

@@ -653,9 +653,9 @@ class ReplayEngine:
 
             grid_seed = load_grid_state_from_snapshots(
                 db_session,
-                run_id,
                 seed.account_id,
                 seed.strat_id,
+                config.symbol,
                 seed.at_ts,
                 expected_step=config.strategy.grid_step,
                 expected_count=config.strategy.grid_count,
