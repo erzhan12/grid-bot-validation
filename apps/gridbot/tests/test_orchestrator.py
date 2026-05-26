@@ -13,6 +13,7 @@ from gridbot.config import GridbotConfig, AccountConfig, StrategyConfig
 from gridbot.notifier import Notifier
 from gridbot.orchestrator import Orchestrator
 from gridbot.reconciler import ReconciliationResult
+from grid_db.identity import account_id_for
 
 
 @pytest.fixture
@@ -1790,7 +1791,6 @@ class TestOrchestratorGridStateWriterWiring:
         """``_init_strategy`` passes the shared writer + uuid5 account_id
         into every ``StrategyRunner`` so ``_on_grid_change`` can fire the
         DB write path."""
-        from uuid import UUID, uuid5
         from grid_db import DatabaseFactory, DatabaseSettings
 
         db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
@@ -1803,11 +1803,9 @@ class TestOrchestratorGridStateWriterWiring:
         runner = orchestrator._runners["btcusdt_test"]
         # Same instance — one writer shared by every runner.
         assert runner._grid_state_writer is orchestrator._grid_state_writer
-        # account_id must match the orchestrator's UUID5 formula or
+        # account_id must come from the shared identity helper or
         # snapshots FK-mismatch replay's account scope.
-        namespace = UUID("12345678-1234-5678-1234-567812345678")
-        expected = str(uuid5(namespace, f"account:{account_config.name}"))
-        assert runner._account_id == expected
+        assert runner._account_id == account_id_for(account_config.name)
 
     @patch("gridbot.orchestrator.BybitRestClient")
     @patch("gridbot.orchestrator.PublicWebSocketClient")
@@ -1996,7 +1994,7 @@ class TestOrchestratorBootstrapGridSnapshots:
         orchestrator._create_run_records()
         run_id = orchestrator._run_ids[self.STRAT_ID]
         run_start_ts = orchestrator._run_start_ts[self.STRAT_ID]
-        account_id = orchestrator._account_id_for(account_config.name)
+        account_id = account_id_for(account_config.name)
         if pre_seed is not None:
             pre_seed(db, run_id, run_start_ts, account_id, runner)
         orchestrator._grid_state_writer.start()

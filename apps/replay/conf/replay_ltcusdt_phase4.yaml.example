@@ -31,6 +31,11 @@ strategy:
 seed:
   enabled: true
   at_ts: "<paste $SEED_AT_TS>"
+  # After feature 0053, $ACCOUNT_ID captured in Step 7 from
+  # `SELECT account_id FROM runs WHERE run_type='recording'` is the uuid5
+  # value (e.g. 9bdb9748-... for mainnet_live), NOT the legacy placeholder
+  # "00000000-0000-0000-0000-000000000002". Must equal
+  # `grid_db.identity.account_id_for("<gridbot accounts[].name>")`.
   account_id: "<paste $ACCOUNT_ID>"
   strat_id: "ltcusdt_test"
   grid_state_path: "db/grid_anchor.phase4.json"

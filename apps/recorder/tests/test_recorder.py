@@ -6,6 +6,7 @@ from datetime import datetime, UTC
 from decimal import Decimal
 from typing import Optional, Union
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
 import pytest
 
@@ -19,7 +20,12 @@ from gridcore.events import (
 
 from grid_db import PublicTrade, Run
 from recorder.config import RecorderConfig
-from recorder.recorder import Recorder, _RECORDER_USER_ID, _RECORDER_ACCOUNT_ID
+from recorder.recorder import Recorder
+
+# Local sentinels for fallback-mode tests (no account: block configured).
+# Match the placeholder UUIDs the recorder uses when self._config.account is None.
+TEST_RECORDER_USER_ID = UUID("00000000-0000-0000-0000-000000000001")
+TEST_RECORDER_ACCOUNT_ID = UUID("00000000-0000-0000-0000-000000000002")
 
 
 async def await_future(fut: Union[Optional[Future], list[Future]]) -> None:
@@ -153,7 +159,7 @@ class TestRecorderStartStop:
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
     async def test_start_with_account_creates_private_collector(
-        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db, db_with_gridbot_seed
     ):
         mock_pub = MagicMock()
         mock_pub.start = AsyncMock()
@@ -277,7 +283,7 @@ class TestRecorderHandlers:
                 qty=Decimal("0.001"),
             ))
         elif args == "order":
-            handler(_RECORDER_ACCOUNT_ID, OrderUpdateEvent(
+            handler(TEST_RECORDER_ACCOUNT_ID, OrderUpdateEvent(
                 event_type=EventType.ORDER_UPDATE,
                 symbol="BTCUSDT",
                 exchange_ts=now,
@@ -289,9 +295,9 @@ class TestRecorderHandlers:
                 qty=Decimal("0.001"),
             ))
         elif args == "position":
-            handler(_RECORDER_ACCOUNT_ID, {"data": []})
+            handler(TEST_RECORDER_ACCOUNT_ID, {"data": []})
         elif args == "wallet":
-            handler(_RECORDER_ACCOUNT_ID, {"data": []})
+            handler(TEST_RECORDER_ACCOUNT_ID, {"data": []})
         elif args == "gap":
             if handler_name == "_handle_public_gap":
                 handler("BTCUSDT", now, now)
@@ -437,7 +443,7 @@ class TestRecorderHandlers:
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
     async def test_handle_execution_routes_to_writer(
-        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db, db_with_gridbot_seed
     ):
         mock_pub = MagicMock()
         mock_pub.start = AsyncMock()
@@ -476,7 +482,7 @@ class TestRecorderHandlers:
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
     async def test_handle_order_routes_to_writer(
-        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db, db_with_gridbot_seed
     ):
         mock_pub = MagicMock()
         mock_pub.start = AsyncMock()
@@ -503,7 +509,7 @@ class TestRecorderHandlers:
             price=Decimal("50000"),
             qty=Decimal("0.001"),
         )
-        fut = recorder._handle_order(_RECORDER_ACCOUNT_ID, event)
+        fut = recorder._handle_order(recorder._account_id, event)
         await await_future(fut)
 
         stats = recorder._order_writer.get_stats()
@@ -515,7 +521,7 @@ class TestRecorderHandlers:
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
     async def test_handle_position_routes_to_writer(
-        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db, db_with_gridbot_seed
     ):
         mock_pub = MagicMock()
         mock_pub.start = AsyncMock()
@@ -531,7 +537,7 @@ class TestRecorderHandlers:
         recorder = Recorder(config=config_with_account, db=db)
         await recorder.start()
 
-        fut = recorder._handle_position(_RECORDER_ACCOUNT_ID, {
+        fut = recorder._handle_position(recorder._account_id, {
             "data": [{
                 "symbol": "BTCUSDT",
                 "side": "Buy",
@@ -553,7 +559,7 @@ class TestRecorderHandlers:
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
     async def test_handle_wallet_routes_to_writer(
-        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db, db_with_gridbot_seed
     ):
         mock_pub = MagicMock()
         mock_pub.start = AsyncMock()
@@ -569,7 +575,7 @@ class TestRecorderHandlers:
         recorder = Recorder(config=config_with_account, db=db)
         await recorder.start()
 
-        fut = recorder._handle_wallet(_RECORDER_ACCOUNT_ID, {
+        fut = recorder._handle_wallet(recorder._account_id, {
             "data": [{
                 "coin": [{
                     "coin": "USDT",
@@ -628,7 +634,7 @@ class TestRecorderHandlers:
     @patch("recorder.recorder.BybitRestClient")
     async def test_handle_private_gap_triggers_reconciler(
         self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
-        mock_reconciler_cls, config_with_account, db
+        mock_reconciler_cls, config_with_account, db, db_with_gridbot_seed
     ):
         mock_pub = MagicMock()
         mock_pub.start = AsyncMock()
@@ -658,8 +664,8 @@ class TestRecorderHandlers:
         await await_future(futs)
 
         mock_reconciler.reconcile_executions.assert_awaited_once_with(
-            user_id=_RECORDER_USER_ID,
-            account_id=_RECORDER_ACCOUNT_ID,
+            user_id=recorder._user_id,
+            account_id=recorder._account_id,
             run_id=recorder._run_id,
             symbol="BTCUSDT",
             gap_start=gap_start,
@@ -728,7 +734,7 @@ class TestRecorderStats:
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
     async def test_stats_include_private_writers_when_account(
-        self, mock_rest_cls, mock_pub_cls, config_with_account, db
+        self, mock_rest_cls, mock_pub_cls, config_with_account, db, db_with_gridbot_seed
     ):
         mock_pub = MagicMock()
         mock_pub.start = AsyncMock()
@@ -791,7 +797,7 @@ class TestRecorderRunPersistence:
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
     async def test_seed_creates_run_with_valid_id(
-        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db, db_with_gridbot_seed
     ):
         mock_pub = MagicMock()
         mock_pub.start = AsyncMock()
@@ -821,7 +827,7 @@ class TestRecorderRunPersistence:
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
     async def test_run_record_exists_in_db(
-        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db, db_with_gridbot_seed
     ):
         mock_pub = MagicMock()
         mock_pub.start = AsyncMock()

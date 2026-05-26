@@ -168,6 +168,8 @@ health_log_interval: 60   # frequent heartbeat for visibility
 # These are READ-ONLY credentials, distinct from gridbot's live
 # trading keys (BYBIT_API_KEY / BYBIT_API_SECRET).
 account:
+  name: mainnet_live       # must match gridbot accounts[].name (conf/gridbot_test.yaml)
+  strat_id: ltcusdt_test   # must match gridbot strategies[].strat_id for that account
   api_key: "${BYBIT_READONLY_API_KEY}"
   api_secret: "${BYBIT_READONLY_API_SECRET}"
 
@@ -182,6 +184,11 @@ capture_public_trades: false
 from `.env` via `dotenv`. Do NOT swap these for the live trading keys —
 the recorder must never authenticate with a key that has trade
 permissions.
+
+`name` and `strat_id` drive uuid5 identity (`grid_db.identity`) and
+**must match** the gridbot config used in Step 5 (`--gridbot-config` in
+the bootstrap script). Mismatches surface as `SharedDbParentError` at
+`prepare_recorder_session.py` preflight before the recorder launches.
 
 ## Step 4 — Install all workspace packages into the venv (one-time)
 
@@ -207,7 +214,7 @@ uv pip list | grep -iE "recorder|replay|comparator|gridbot|pytest|ruff"
 # expect six lines: recorder, replay, comparator, gridbot, pytest, ruff
 ```
 
-## Step 4b — Start recorder FIRST
+## Step 4b — Start recorder FIRST (with identity bootstrap)
 
 Recorder must complete its initial REST snapshot before gridbot
 starts placing orders. The seed pre-check requires `MIN(exchange_ts)`
@@ -220,38 +227,69 @@ stale DB rows from prior runs, log file inheritance):
 
 ```bash
 scripts/phase4/start_recorder.sh
-# Optionally: scripts/phase4/start_recorder.sh path/to/other_config.yaml
+# Optional second arg overrides gridbot config:
+#   scripts/phase4/start_recorder.sh apps/recorder/conf/recorder_ltcusdt.yaml conf/gridbot_test.yaml
+# Or via env: GRIDBOT_CONFIG_PATH=conf/gridbot_test.yaml scripts/phase4/start_recorder.sh
 ```
 
-The script (post-Feature 0049):
+The script (post-Feature 0053):
 
 1. Stops any prior recorder for the same config (15s graceful, then
    SIGTERM escalation).
-2. Performs a **surgical recorder-owned data wipe** on the shared DB
-   via SQL DELETEs inside a single transaction: clears
-   `private_executions`, `orders`, `wallet_snapshots`,
-   `position_snapshots WHERE source='live'`, `ticker_snapshots`, and
-   `runs WHERE run_type='recording'`.
+2. Runs `scripts/phase4/prepare_recorder_session.py`, which:
+   - Resolves the DB path via `recorder.config.load_config`
+     (env-var expansion respected — no shell YAML grep).
+   - **§5.1 + §5.2 surgical wipe** in one transaction: §5.1 removes
+     any rows still stamped with the legacy placeholder
+     `account_id=00000000-...-002` (one-time migration; idempotent
+     thereafter); §5.2 clears the broad recorder-owned tables and
+     `runs WHERE run_type='recording'` (the per-restart 0049 reset).
+     `ticker_snapshots` is **preserved** — public ticker history has
+     no `account_id` and is reusable across recorder restarts.
+   - **Identity bootstrap (when `account:` is set)**: insert-if-missing
+     gridbot-style `User` / `BybitAccount` / `Strategy` rows derived
+     from `--gridbot-config` so the recorder's verify-only
+     `_seed_db_records` succeeds on a clean DB without requiring
+     gridbot to start first. Does NOT create any `runs` row — gridbot
+     still owns live runs and the recorder still creates its own
+     `run_type='recording'` row on startup.
+   - **Preflight verify (when `account:` is set)**: runs the same
+     `verify_shared_db_parents` contract the recorder uses
+     (3 existence + 5 metadata checks). Stale preserved rows with
+     mismatched `environment`, `strategy_type`, `symbol`, or owner
+     fail here, so the recorder never launches into a guaranteed
+     `_seed_db_records` failure.
 3. **Preserves** `grid_state_snapshots`, live `runs`
-   (`run_type='live'`), `bybit_accounts`, `strategies`, and `users` —
-   none of those are recorder-owned, and Feature 0047 grid-state
-   seeding depends on `grid_state_snapshots` surviving recorder
-   restarts.
-4. Leaves `$DB_PATH-wal` and `$DB_PATH-shm` sidecars intact (no
-   file-level deletes).
+   (`run_type='live'`), `bybit_accounts`, `strategies`, `users`,
+   and `ticker_snapshots` — none of those are recorder-owned, and
+   Feature 0047 grid-state seeding depends on `grid_state_snapshots`
+   surviving recorder restarts.
+4. Leaves the SQLite `-wal` / `-shm` sidecars intact (no file-level
+   deletes; only row-level DELETEs).
 5. Removes `/tmp/recorder.log`.
 6. Starts a fresh recorder in the background, waits up to 15s for the
    "Initial REST snapshot" line, and prints PID + next-step commands.
 
 If the DB file does not yet exist (first Phase 4 run on a clean
-machine), the SQL wipe step is skipped and the recorder creates the
-schema via `db.create_tables()` on startup.
+machine), the SQL wipe step is a no-op; `prepare_recorder_session`
+calls `db.create_tables()` before inserting parent rows, and the
+recorder reuses the schema on startup.
+
+If prepare exits non-zero (config mismatch, missing/stale parents),
+the script aborts BEFORE the recorder is launched. Fix the recorder
+or gridbot config and re-run.
 
 To monitor: `scripts/phase4/status.sh` or `tail -f /tmp/recorder.log`.
 
 **Manual equivalent** (shown for reference; prefer the script):
 
 ```bash
+uv run python scripts/phase4/prepare_recorder_session.py \
+  apps/recorder/conf/recorder_ltcusdt.yaml \
+  --gridbot-config "${GRIDBOT_CONFIG_PATH:-conf/gridbot_test.yaml}"
+# prepare_recorder_session does the wipe + bootstrap + verify; no
+# separate `sqlite3` wipe and no shell YAML grep are needed.
+
 uv run recorder \
   --config apps/recorder/conf/recorder_ltcusdt.yaml \
   > /tmp/recorder.log 2>&1 \
@@ -281,6 +319,11 @@ orders for `category=linear` `settleCoin=USDT`. Fix the credentials
 and restart from Step 4.
 
 ## Step 5 — Start gridbot
+
+After Step 4b, the shared DB already has gridbot-style
+`User` / `BybitAccount` / `Strategy` rows from `prepare_recorder_session`.
+Gridbot's `_create_run_records` is insert-if-missing — it sees those rows
+and only creates its own `run_type='live'` `Run` row.
 
 ```bash
 # Run immediately after the initial-snapshot WARNING-free confirmation
@@ -357,6 +400,12 @@ ACCOUNT_ID=$(sqlite3 /<abs-path>/data/recorder_ltcusdt_phase4.db \
 echo "RUN_ID:     $RUN_ID"
 echo "ACCOUNT_ID: $ACCOUNT_ID"
 ```
+
+Post-feature 0053 `$ACCOUNT_ID` is the uuid5 of `accounts[].name`
+(`9bdb9748-f9e0-5c13-b144-0ad6a8dbcaba` for `mainnet_live`) — **not**
+the legacy placeholder `00000000-0000-0000-0000-000000000002`. If you
+are migrating a local gitignored replay YAML, update its
+`seed.account_id` to the captured value before Step 8.
 
 Verify nothing's left running:
 
@@ -556,7 +605,7 @@ record.
 - [ ] Stop live, close positions, cancel orders
 - [ ] `mv db/grid_anchor.json db/grid_anchor.json.bak.*`
 - [ ] Create `apps/recorder/conf/recorder_ltcusdt.yaml` with private creds
-- [ ] Start recorder; wait for `"Initial REST snapshot"` log (no WARNING)
+- [ ] Start recorder (`start_recorder.sh` — includes identity bootstrap); wait for `"Initial REST snapshot"` log (no WARNING)
 - [ ] Start gridbot; record `START_TS`, compute `SEED_AT_TS = START_TS + 60s`
 - [ ] Accumulate ≥30 trades (~30–60 min on LTCUSDT)
 - [ ] Stop both; capture `RUN_ID`, `ACCOUNT_ID`, `END_TS`; copy `grid_anchor.json`

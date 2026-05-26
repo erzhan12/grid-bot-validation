@@ -22,6 +22,12 @@ from grid_db.models import (
     GridStateSnapshot,
 )
 from grid_db.enums import RunType
+from grid_db.identity import (
+    UUID_NAMESPACE,
+    account_id_for,
+    strategy_id_for,
+    user_id_for,
+)
 from grid_db.utils import redact_db_url
 from grid_db.repositories import (
     BaseRepository,
@@ -75,6 +81,11 @@ __all__ = [
     "PositionSnapshotRepository",
     "WalletSnapshotRepository",
     "GridStateSnapshotRepository",
+    # Identity
+    "UUID_NAMESPACE",
+    "account_id_for",
+    "strategy_id_for",
+    "user_id_for",
     # Utils
     "redact_db_url",
 ]

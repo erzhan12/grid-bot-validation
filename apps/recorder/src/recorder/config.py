@@ -16,6 +16,22 @@ from pydantic import BaseModel, Field, SecretStr, field_validator
 class AccountConfig(BaseModel):
     """Optional exchange account for private stream capture."""
 
+    name: str = Field(
+        ...,
+        description=(
+            "Account name; must match gridbot accounts[].name. Drives uuid5 "
+            "identity (grid_db.identity.account_id_for / user_id_for) so "
+            "recorder and gridbot write to the same User/BybitAccount rows."
+        ),
+    )
+    strat_id: str = Field(
+        ...,
+        description=(
+            "Gridbot strategy id; must match gridbot strategies[].strat_id "
+            "for this account. Drives strategy_id_for so the recorder Run "
+            "rows FK to gridbot's Strategy row."
+        ),
+    )
     api_key: SecretStr = Field(..., description="Bybit API key")
     api_secret: SecretStr = Field(..., description="Bybit API secret")
 
