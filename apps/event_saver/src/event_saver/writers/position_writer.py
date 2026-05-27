@@ -247,6 +247,11 @@ class PositionWriter:
                                 if pos.get("cumRealisedPnl")
                                 else None
                             ),
+                            cur_realised_pnl=(
+                                Decimal(str(pos.get("curRealisedPnl")))
+                                if pos.get("curRealisedPnl") not in (None, "")
+                                else None
+                            ),
                             raw_json=pos,
                         )
                     )

@@ -523,6 +523,11 @@ class Recorder:
                                     if pos.get("cumRealisedPnl") not in (None, "")
                                     else None
                                 ),
+                                cur_realised_pnl=(
+                                    Decimal(str(pos.get("curRealisedPnl")))
+                                    if pos.get("curRealisedPnl") not in (None, "")
+                                    else None
+                                ),
                                 raw_json=pos,
                             )
                         )
@@ -551,6 +556,7 @@ class Recorder:
                         position_im=None,
                         position_mm=None,
                         cum_realised_pnl=None,
+                        cur_realised_pnl=None,
                         raw_json=None,
                     )
                 )

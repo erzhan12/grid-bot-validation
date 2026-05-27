@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from backtest.position_tracker import BacktestPositionTracker, PositionState
+from backtest.position_tracker import BacktestPositionTracker
 
 
 class TestBacktestPositionTracker:
@@ -393,3 +393,111 @@ class TestMarginCalculation:
         """Default leverage is 10."""
         tracker = BacktestPositionTracker(direction="long")
         assert tracker.leverage == Decimal("10")
+
+
+class TestCurRealisedPnlCycleCounter:
+    """0056: cycle-scoped realized PnL counter (`curRealisedPnl` parity)."""
+
+    def test_single_cycle_accumulates_through_partial_and_full_close(
+        self, long_position_tracker,
+    ):
+        """Cycle counter accumulates on every fill including the closing fill."""
+        tracker = long_position_tracker
+
+        # Open at 100, accumulate 0 (no realized).
+        tracker.process_fill(side="Buy", qty=Decimal("0.2"), price=Decimal("100"))
+        assert tracker.state.cur_realised_pnl == Decimal("0")
+
+        # Partial reduce: 0.1 @ 110 → realized = 1.0.
+        tracker.process_fill(side="Sell", qty=Decimal("0.1"), price=Decimal("110"))
+        assert tracker.state.cur_realised_pnl == Decimal("1.0")
+
+        # Full close: remaining 0.1 @ 105 → realized = 0.5. Cycle total = 1.5.
+        # Crucially: not reset on close — the closing-fill snapshot must
+        # capture the cycle total.
+        tracker.process_fill(side="Sell", qty=Decimal("0.1"), price=Decimal("105"))
+        assert tracker.state.size == Decimal("0")
+        assert tracker.state.cur_realised_pnl == Decimal("1.5")
+
+    def test_two_cycles_reset_on_next_open(self, long_position_tracker):
+        """Second cycle accumulates independently; reset fires at next open."""
+        tracker = long_position_tracker
+
+        tracker.process_fill(side="Buy", qty=Decimal("0.1"), price=Decimal("100"))
+        tracker.process_fill(side="Sell", qty=Decimal("0.1"), price=Decimal("110"))
+        # Cycle 1 closed with +1.0; counter retains it.
+        assert tracker.state.size == Decimal("0")
+        assert tracker.state.cur_realised_pnl == Decimal("1.0")
+
+        # Next opening fill on a zero-sized position triggers the reset.
+        tracker.process_fill(side="Buy", qty=Decimal("0.1"), price=Decimal("100"))
+        assert tracker.state.cur_realised_pnl == Decimal("0")
+
+        # Cycle 2 accumulates with a loss.
+        tracker.process_fill(side="Sell", qty=Decimal("0.1"), price=Decimal("95"))
+        assert tracker.state.size == Decimal("0")
+        assert tracker.state.cur_realised_pnl == Decimal("-0.5")
+
+        # cum_realised_pnl is the lifetime sum and was NOT reset.
+        assert tracker.state.cum_realised_pnl == Decimal("0.5")
+
+    def test_seed_state_copies_cur_realised_pnl(self, long_position_tracker):
+        """seed_state seeds the cycle counter from the snapshot value."""
+        tracker = long_position_tracker
+
+        from dataclasses import dataclass
+
+        @dataclass
+        class _Seed:
+            size: Decimal
+            entry_price: Decimal
+            liquidation_price: Decimal
+            cum_realised_pnl: Decimal
+            cur_realised_pnl: Decimal
+
+        seed = _Seed(
+            size=Decimal("0.5"),
+            entry_price=Decimal("100"),
+            liquidation_price=Decimal("50"),
+            cum_realised_pnl=Decimal("42.5"),
+            cur_realised_pnl=Decimal("7.25"),
+        )
+        tracker.seed_state(seed)
+        assert tracker.state.cur_realised_pnl == Decimal("7.25")
+
+    def test_seed_state_defaults_missing_attribute_to_zero(
+        self, long_position_tracker,
+    ):
+        """Legacy seed lacking the attribute resets the cycle counter to zero."""
+        tracker = long_position_tracker
+        tracker.state.cur_realised_pnl = Decimal("99")
+
+        from dataclasses import dataclass
+
+        @dataclass
+        class _LegacySeed:
+            size: Decimal
+            entry_price: Decimal
+            liquidation_price: Decimal
+
+        seed = _LegacySeed(
+            size=Decimal("0.5"),
+            entry_price=Decimal("100"),
+            liquidation_price=Decimal("50"),
+        )
+        tracker.seed_state(seed)
+        assert tracker.state.cur_realised_pnl == Decimal("0")
+
+    def test_short_cycle_accumulates_and_resets(self, short_position_tracker):
+        """Cycle reset semantics apply symmetrically to the short side."""
+        tracker = short_position_tracker
+
+        # Open short @ 100, cover @ 90 → realized = 1.0.
+        tracker.process_fill(side="Sell", qty=Decimal("0.1"), price=Decimal("100"))
+        tracker.process_fill(side="Buy", qty=Decimal("0.1"), price=Decimal("90"))
+        assert tracker.state.size == Decimal("0")
+        assert tracker.state.cur_realised_pnl == Decimal("1.0")
+
+        # Re-open: counter resets at the next opening fill.
+        tracker.process_fill(side="Sell", qty=Decimal("0.1"), price=Decimal("100"))
+        assert tracker.state.cur_realised_pnl == Decimal("0")

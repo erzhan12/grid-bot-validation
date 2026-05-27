@@ -33,6 +33,7 @@ def _snap(
     position_im: Decimal = Decimal("10"),
     position_mm: Decimal = Decimal("0.5"),
     cum_realised_pnl: Decimal = Decimal("0"),
+    cur_realised_pnl: Decimal = Decimal("0"),
     source: str = "live",
 ) -> PositionSnapshot:
     return PositionSnapshot(
@@ -51,6 +52,7 @@ def _snap(
         position_im=position_im,
         position_mm=position_mm,
         cum_realised_pnl=cum_realised_pnl,
+        cur_realised_pnl=cur_realised_pnl,
     )
 
 
@@ -237,6 +239,59 @@ def test_cum_realised_pnl_final_delta_only_short_diverges(base_ts):
     assert metrics.cum_realised_pnl_final_delta == Decimal("-2")
 
 
+def test_cur_realised_pnl_final_delta_aggregates_both_sides(base_ts):
+    """0056: cycle-scoped final delta sums per-side last-pair deltas."""
+    live = [
+        _snap("Buy", base_ts, cur_realised_pnl=Decimal("4"), source="live"),
+        _snap("Sell", base_ts + timedelta(seconds=1), cur_realised_pnl=Decimal("0"), source="live"),
+    ]
+    bt = [
+        _snap("Buy", base_ts, cur_realised_pnl=Decimal("6"), source="backtest"),
+        _snap("Sell", base_ts + timedelta(seconds=1), cur_realised_pnl=Decimal("-1"), source="backtest"),
+    ]
+    pairs = PositionComparator().pair_and_compare(live, bt)
+    metrics = ValidationMetrics()
+    PositionComparator().fold_metrics_into(metrics, pairs)
+    # Long delta = +2, Short delta = -1 → sum = +1.
+    assert metrics.cur_realised_pnl_final_delta == Decimal("1")
+
+
+def test_cur_realised_pnl_delta_null_pair_skipped_in_aggregate(base_ts):
+    """Pre-0056 NULL pairs are skipped during cur_realised_pnl aggregation."""
+    live = [_snap("Buy", base_ts, cur_realised_pnl=None, source="live")]  # type: ignore[arg-type]
+    bt = [_snap("Buy", base_ts, cur_realised_pnl=None, source="backtest")]  # type: ignore[arg-type]
+    pairs = PositionComparator().pair_and_compare(live, bt)
+    metrics = ValidationMetrics()
+    PositionComparator().fold_metrics_into(metrics, pairs)
+    assert metrics.cur_realised_pnl_final_delta == Decimal("0")
+
+
+def test_cur_realised_pnl_null_does_not_trigger_missing_telemetry(base_ts):
+    """0056: NULL cur_realised_pnl delta alone must NOT set has_missing_telemetry.
+
+    Pre-0056 rows ship with NULL in this column; treating that as missing
+    telemetry would universally trip the flag for legacy replay sessions.
+    """
+    live = [_snap("Buy", base_ts, cur_realised_pnl=None, source="live")]  # type: ignore[arg-type]
+    bt = [_snap("Buy", base_ts, cur_realised_pnl=None, source="backtest")]  # type: ignore[arg-type]
+    pairs = PositionComparator().pair_and_compare(live, bt)
+    assert len(pairs) == 1
+    assert pairs[0].cur_realised_pnl_delta is None
+    assert pairs[0].has_missing_telemetry is False
+
+
+def test_cur_realised_pnl_delta_none_on_unmatched_bt_marker(base_ts):
+    """0056: unmatched-bt sentinel sets cur_realised_pnl_delta = None."""
+    bt_only = base_ts
+    live_far = base_ts + timedelta(seconds=PAIR_TOLERANCE_S + 30)
+    live = [_snap("Buy", live_far, source="live")]
+    bt = [_snap("Buy", bt_only, source="backtest")]
+    pairs = PositionComparator().pair_and_compare(live, bt)
+    unmatched = [p for p in pairs if p.live is None]
+    assert len(unmatched) == 1
+    assert unmatched[0].cur_realised_pnl_delta is None
+
+
 def test_fold_metrics_idempotent(base_ts):
     """Calling fold_metrics_into twice yields the same final values."""
     live = [_snap("Buy", base_ts, source="live")]
@@ -283,6 +338,50 @@ def test_un_migrated_db_raises():
     Session = sessionmaker(bind=engine)
     with Session() as session:
         with pytest.raises(PositionTelemetryNotMigratedError):
+            load_position_snapshots(
+                session, run_id="r", symbol="LTCUSDT", source="live",
+            )
+
+
+def test_un_migrated_0056_raises():
+    """0056: 0034 columns present but cur_realised_pnl missing → raise.
+
+    Mirrors the 0034 un-migrated test but constructs a DB that already
+    has the 0034 columns. The probe should reach the 0056 check and
+    raise with the 0056 migration message.
+    """
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.orm import sessionmaker
+
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE position_snapshots ("
+            "  id INTEGER PRIMARY KEY,"
+            "  run_id TEXT,"
+            "  account_id TEXT NOT NULL,"
+            "  symbol TEXT NOT NULL,"
+            "  exchange_ts TIMESTAMP NOT NULL,"
+            "  local_ts TIMESTAMP NOT NULL,"
+            "  side TEXT NOT NULL,"
+            "  size NUMERIC NOT NULL,"
+            "  entry_price NUMERIC NOT NULL,"
+            "  liq_price NUMERIC,"
+            "  unrealised_pnl NUMERIC,"
+            "  source TEXT NOT NULL DEFAULT 'live',"
+            "  mark_price NUMERIC,"
+            "  position_im NUMERIC,"
+            "  position_mm NUMERIC,"
+            "  cum_realised_pnl NUMERIC,"
+            "  raw_json TEXT"
+            ")"
+        ))
+
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        with pytest.raises(
+            PositionTelemetryNotMigratedError, match="0056",
+        ):
             load_position_snapshots(
                 session, run_id="r", symbol="LTCUSDT", source="live",
             )

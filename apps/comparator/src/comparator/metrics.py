@@ -99,6 +99,11 @@ class ValidationMetrics:
     unrealised_pnl_mean_abs_delta: Decimal = field(default_factory=lambda: Decimal("0"))
     unrealised_pnl_max_abs_delta: Decimal = field(default_factory=lambda: Decimal("0"))
     cum_realised_pnl_final_delta: Decimal = field(default_factory=lambda: Decimal("0"))
+    # 0056: cycle-scoped realized PnL parity. Sum of the last per-side delta
+    # across matched pairs — captures either the in-progress cycle or the
+    # just-closed cycle total at session end (Bybit holds the closed total
+    # until the next opening fill).
+    cur_realised_pnl_final_delta: Decimal = field(default_factory=lambda: Decimal("0"))
     position_pairs_compared: int = 0
     position_pairs_unmatched_bt: int = 0
     position_pairs_missing_telemetry: int = 0

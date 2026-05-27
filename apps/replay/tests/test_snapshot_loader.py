@@ -815,6 +815,86 @@ class TestLoadPositionSnapshots:
         assert long_seed.liquidation_price == Decimal("0")
         assert short_seed.liquidation_price == Decimal("0")
 
+    def test_cur_realised_pnl_carries_into_seed(
+        self, session, sample_account, sample_run, base_ts,
+    ):
+        """0056: snapshot ``cur_realised_pnl`` flows into PositionStateSeed."""
+        repo = PositionSnapshotRepository(session)
+        repo.bulk_insert([
+            PositionSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                symbol="BTCUSDT",
+                exchange_ts=base_ts, local_ts=base_ts,
+                side="Buy",
+                size=Decimal("1.0"),
+                entry_price=Decimal("50000"),
+                liq_price=Decimal("45000"),
+                cur_realised_pnl=Decimal("7.5"),
+            ),
+            PositionSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                symbol="BTCUSDT",
+                exchange_ts=base_ts, local_ts=base_ts,
+                side="Sell",
+                size=Decimal("0"),
+                entry_price=Decimal("0"),
+                liq_price=None,
+                cur_realised_pnl=Decimal("-1.25"),
+            ),
+        ])
+
+        long_seed, short_seed = load_position_snapshots(
+            session,
+            sample_run.run_id,
+            str(sample_account.account_id),
+            "BTCUSDT",
+            base_ts + timedelta(seconds=1),
+        )
+        assert long_seed.cur_realised_pnl == Decimal("7.5")
+        assert short_seed.cur_realised_pnl == Decimal("-1.25")
+
+    def test_cur_realised_pnl_null_coerces_to_zero(
+        self, session, sample_account, sample_run, base_ts,
+    ):
+        """Pre-0056 NULL column maps to Decimal('0') in the seed."""
+        repo = PositionSnapshotRepository(session)
+        repo.bulk_insert([
+            PositionSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                symbol="BTCUSDT",
+                exchange_ts=base_ts, local_ts=base_ts,
+                side="Buy",
+                size=Decimal("0"),
+                entry_price=Decimal("0"),
+                liq_price=None,
+                cur_realised_pnl=None,
+            ),
+            PositionSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                symbol="BTCUSDT",
+                exchange_ts=base_ts, local_ts=base_ts,
+                side="Sell",
+                size=Decimal("0"),
+                entry_price=Decimal("0"),
+                liq_price=None,
+                cur_realised_pnl=None,
+            ),
+        ])
+
+        long_seed, short_seed = load_position_snapshots(
+            session,
+            sample_run.run_id,
+            str(sample_account.account_id),
+            "BTCUSDT",
+            base_ts + timedelta(seconds=1),
+        )
+        assert long_seed.cur_realised_pnl == Decimal("0")
+        assert short_seed.cur_realised_pnl == Decimal("0")
+
 
 # ---------------------------------------------------------------------------
 # load_wallet_snapshot

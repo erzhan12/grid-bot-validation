@@ -55,6 +55,8 @@ from grid_db import (
     WalletSnapshotRepository,
 )
 
+from comparator.position_loader import _probe_schema as _probe_position_schema
+
 from gridcore.intents import extract_client_order_prefix
 from gridcore.persistence import GridStateStore
 
@@ -105,6 +107,7 @@ class PositionStateSeed:
     entry_price: Decimal
     liquidation_price: Decimal
     cum_realised_pnl: Decimal = Decimal("0")
+    cur_realised_pnl: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -404,6 +407,7 @@ def load_position_snapshots(
     Raises:
         SeedDataQualityError: Exactly one side has no rows for this run.
     """
+    _probe_position_schema(db_session)
     repo = PositionSnapshotRepository(db_session)
     buy_snap = repo.get_latest_before(run_id, account_id, symbol, "Buy", at_ts)
     sell_snap = repo.get_latest_before(run_id, account_id, symbol, "Sell", at_ts)
@@ -428,6 +432,9 @@ def load_position_snapshots(
         cum_realised_pnl=(
             buy_snap.cum_realised_pnl if buy_snap.cum_realised_pnl is not None else Decimal("0")
         ),
+        cur_realised_pnl=(
+            buy_snap.cur_realised_pnl if buy_snap.cur_realised_pnl is not None else Decimal("0")
+        ),
     )
     short_seed = PositionStateSeed(
         direction="short",
@@ -436,6 +443,9 @@ def load_position_snapshots(
         liquidation_price=sell_snap.liq_price if sell_snap.liq_price is not None else Decimal("0"),
         cum_realised_pnl=(
             sell_snap.cum_realised_pnl if sell_snap.cum_realised_pnl is not None else Decimal("0")
+        ),
+        cur_realised_pnl=(
+            sell_snap.cur_realised_pnl if sell_snap.cur_realised_pnl is not None else Decimal("0")
         ),
     )
     return long_seed, short_seed

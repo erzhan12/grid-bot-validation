@@ -475,3 +475,186 @@ class TestInitialRestSnapshot:
         )
 
         await recorder.stop()
+
+    # 0056: REST snapshot ``curRealisedPnl`` parsing into ``cur_realised_pnl``.
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_cur_realised_pnl_parsed_from_rest_payload(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
+        config_with_account, db, db_with_gridbot_seed,
+    ):
+        """0056: REST ``curRealisedPnl`` populates the new column for both sides."""
+        from decimal import Decimal
+
+        mock_pub_cls.return_value = _make_pub_mock()
+        mock_priv_cls.return_value = _make_priv_mock()
+
+        snapshot_client = _stub_rest_client(
+            wallet_response={"list": []},
+            positions_by_symbol={
+                "BTCUSDT": [
+                    {
+                        "symbol": "BTCUSDT", "side": "Buy", "size": "0.5",
+                        "entryPrice": "50000", "liqPrice": "45000",
+                        "unrealisedPnl": "0", "curRealisedPnl": "12.5",
+                    },
+                    {
+                        "symbol": "BTCUSDT", "side": "Sell", "size": "0.25",
+                        "entryPrice": "51000", "liqPrice": "55000",
+                        "unrealisedPnl": "0", "curRealisedPnl": "-3.75",
+                    },
+                ]
+            },
+            open_orders_by_symbol={"BTCUSDT": []},
+        )
+        mock_rest_cls.side_effect = [MagicMock(), snapshot_client]
+
+        recorder = Recorder(config=config_with_account, db=db)
+        await recorder.start()
+
+        with db.get_session() as session:
+            rows = (
+                session.query(PositionSnapshot)
+                .filter(PositionSnapshot.run_id == str(recorder._run_id))
+                .filter(PositionSnapshot.symbol == "BTCUSDT")
+                .all()
+            )
+            by_side = {r.side: r for r in rows}
+            assert by_side["Buy"].cur_realised_pnl == Decimal("12.5")
+            assert by_side["Sell"].cur_realised_pnl == Decimal("-3.75")
+
+        await recorder.stop()
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_cur_realised_pnl_missing_yields_none(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
+        config_with_account, db, db_with_gridbot_seed,
+    ):
+        """0056: REST payload without curRealisedPnl writes NULL (not 0)."""
+        mock_pub_cls.return_value = _make_pub_mock()
+        mock_priv_cls.return_value = _make_priv_mock()
+
+        snapshot_client = _stub_rest_client(
+            wallet_response={"list": []},
+            positions_by_symbol={
+                "BTCUSDT": [
+                    {
+                        "symbol": "BTCUSDT", "side": "Buy", "size": "0.5",
+                        "entryPrice": "50000", "liqPrice": "45000",
+                        "unrealisedPnl": "0",
+                    }
+                ]
+            },
+            open_orders_by_symbol={"BTCUSDT": []},
+        )
+        mock_rest_cls.side_effect = [MagicMock(), snapshot_client]
+
+        recorder = Recorder(config=config_with_account, db=db)
+        await recorder.start()
+
+        with db.get_session() as session:
+            buy_row = (
+                session.query(PositionSnapshot)
+                .filter(PositionSnapshot.run_id == str(recorder._run_id))
+                .filter(PositionSnapshot.symbol == "BTCUSDT")
+                .filter(PositionSnapshot.side == "Buy")
+                .one()
+            )
+            assert buy_row.cur_realised_pnl is None
+
+        await recorder.stop()
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_cur_realised_pnl_preserves_explicit_zero(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
+        config_with_account, db, db_with_gridbot_seed,
+    ):
+        """0056: ``"0"`` curRealisedPnl is preserved as Decimal("0"), not NULL.
+
+        Bybit emits ``"0"`` immediately after a position open before any
+        cycle-realized PnL exists. Distinguishing zero from missing matters
+        for parity recomputation.
+        """
+        from decimal import Decimal
+
+        mock_pub_cls.return_value = _make_pub_mock()
+        mock_priv_cls.return_value = _make_priv_mock()
+
+        snapshot_client = _stub_rest_client(
+            wallet_response={"list": []},
+            positions_by_symbol={
+                "BTCUSDT": [
+                    {
+                        "symbol": "BTCUSDT", "side": "Buy", "size": "0.5",
+                        "entryPrice": "50000", "liqPrice": "45000",
+                        "unrealisedPnl": "0", "curRealisedPnl": "0",
+                    }
+                ]
+            },
+            open_orders_by_symbol={"BTCUSDT": []},
+        )
+        mock_rest_cls.side_effect = [MagicMock(), snapshot_client]
+
+        recorder = Recorder(config=config_with_account, db=db)
+        await recorder.start()
+
+        with db.get_session() as session:
+            buy_row = (
+                session.query(PositionSnapshot)
+                .filter(PositionSnapshot.run_id == str(recorder._run_id))
+                .filter(PositionSnapshot.symbol == "BTCUSDT")
+                .filter(PositionSnapshot.side == "Buy")
+                .one()
+            )
+            assert buy_row.cur_realised_pnl == Decimal("0")
+
+        await recorder.stop()
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_zero_row_placeholder_has_null_cur_realised_pnl(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
+        config_with_account, db, db_with_gridbot_seed,
+    ):
+        """0056: when REST omits a side, the synthetic zero-row stores NULL."""
+        mock_pub_cls.return_value = _make_pub_mock()
+        mock_priv_cls.return_value = _make_priv_mock()
+
+        # REST returns only a Buy row; recorder synthesizes a zero Sell row.
+        snapshot_client = _stub_rest_client(
+            wallet_response={"list": []},
+            positions_by_symbol={
+                "BTCUSDT": [
+                    {
+                        "symbol": "BTCUSDT", "side": "Buy", "size": "0.5",
+                        "entryPrice": "50000", "liqPrice": "45000",
+                        "unrealisedPnl": "0", "curRealisedPnl": "12.5",
+                    }
+                ]
+            },
+            open_orders_by_symbol={"BTCUSDT": []},
+        )
+        mock_rest_cls.side_effect = [MagicMock(), snapshot_client]
+
+        recorder = Recorder(config=config_with_account, db=db)
+        await recorder.start()
+
+        with db.get_session() as session:
+            sell_row = (
+                session.query(PositionSnapshot)
+                .filter(PositionSnapshot.run_id == str(recorder._run_id))
+                .filter(PositionSnapshot.symbol == "BTCUSDT")
+                .filter(PositionSnapshot.side == "Sell")
+                .one()
+            )
+            assert sell_row.size == sell_row.size.__class__("0")
+            assert sell_row.cur_realised_pnl is None
+
+        await recorder.stop()

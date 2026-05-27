@@ -31,12 +31,14 @@ class PositionTelemetryNotMigratedError(RuntimeError):
 
 
 def _probe_schema(session: Session) -> None:
-    """Raise ``PositionTelemetryNotMigratedError`` if the 0034 columns are missing.
+    """Raise ``PositionTelemetryNotMigratedError`` if 0034 or 0056 columns are missing.
 
-    Uses a trivial ``SELECT source FROM position_snapshots LIMIT 1`` —
-    cheap on any backend, and fails loudly with ``OperationalError``
+    Uses trivial ``SELECT <col> FROM position_snapshots LIMIT 1`` queries —
+    cheap on any backend, and fail loudly with ``OperationalError``
     (SQLite) or ``ProgrammingError`` (Postgres) when the column does
-    not exist.
+    not exist. The 0034 probe (``source``) runs first; if it passes, the
+    0056 probe (``cur_realised_pnl``) runs next so the operator sees the
+    correct migration message for whichever migration was skipped.
     """
     try:
         session.execute(
@@ -51,6 +53,25 @@ def _probe_schema(session: Session) -> None:
                 "Run the 0034 schema migration before comparing position "
                 "telemetry. Position_snapshots is missing the 'source' column. "
                 "See scripts/migrate_0034_position_telemetry.py."
+            ) from exc
+        raise
+
+    try:
+        session.execute(
+            PositionSnapshot.__table__.select()
+            .with_only_columns(PositionSnapshot.cur_realised_pnl)
+            .limit(1)
+        ).first()
+    except (OperationalError, ProgrammingError) as exc:
+        msg = str(exc).lower()
+        if "cur_realised_pnl" in msg and (
+            "no such column" in msg or "does not exist" in msg
+        ):
+            raise PositionTelemetryNotMigratedError(
+                "Run the 0056 schema migration before loading position "
+                "snapshots. Position_snapshots is missing the "
+                "'cur_realised_pnl' column. "
+                "See scripts/migrate_0056_cur_realised_pnl.py."
             ) from exc
         raise
 
