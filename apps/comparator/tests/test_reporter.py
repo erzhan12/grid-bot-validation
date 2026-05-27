@@ -65,6 +65,32 @@ class TestComparatorReporter:
         assert "pnl_correlation" in metrics_dict
         assert "meta.fill_mode" not in metrics_dict
 
+    def test_export_metrics_includes_cur_realised_pnl_final_delta(
+        self, sample_match_result, tmp_path,
+    ):
+        """0056: export_metrics emits cur_realised_pnl_final_delta row."""
+        metrics = calculate_metrics(sample_match_result)
+        metrics.cur_realised_pnl_final_delta = Decimal("3.25")
+        reporter = ComparatorReporter(sample_match_result, metrics)
+        path = tmp_path / "metrics.csv"
+        reporter.export_metrics(path)
+        with open(path) as f:
+            rows = list(csv.DictReader(f))
+        metrics_dict = {r["metric"]: r["value"] for r in rows}
+        assert metrics_dict["cur_realised_pnl_final_delta"] == "3.25"
+
+    def test_print_summary_includes_cur_realised_final(
+        self, sample_match_result, capsys,
+    ):
+        """0056: print_summary surfaces the cur_realised_pnl_final_delta line."""
+        metrics = calculate_metrics(sample_match_result)
+        metrics.cur_realised_pnl_final_delta = Decimal("-0.75")
+        reporter = ComparatorReporter(sample_match_result, metrics)
+        reporter.print_summary()
+        captured = capsys.readouterr()
+        assert "Cur realised final" in captured.out
+        assert "-0.75" in captured.out
+
     def test_export_metrics_includes_metadata(self, sample_match_result, tmp_path):
         """Metrics CSV includes optional metadata with meta. prefix."""
         metrics = calculate_metrics(sample_match_result)
@@ -181,6 +207,10 @@ class TestComparatorReporter:
         assert "liq_delta" in header
         assert "unrealised_delta" in header
         assert "cum_realised_delta" in header
+        # 0056: cycle-scoped realized PnL columns.
+        assert "live_cur_realised" in header
+        assert "bt_cur_realised" in header
+        assert "cur_realised_delta" in header
         assert len(rows) == 1
         assert rows[0]["side"] == "Buy"
 

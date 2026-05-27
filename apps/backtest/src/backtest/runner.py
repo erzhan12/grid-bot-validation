@@ -690,6 +690,7 @@ class BacktestRunner:
             position_im=position_im,
             position_mm=position_mm,
             cum_realised_pnl=tracker.state.cum_realised_pnl,
+            cur_realised_pnl=tracker.state.cur_realised_pnl,
         )
 
     def _build_position_state(

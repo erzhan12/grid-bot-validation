@@ -211,6 +211,7 @@ class ComparatorReporter:
             ("unrealised_pnl_mean_abs_delta", str(m.unrealised_pnl_mean_abs_delta)),
             ("unrealised_pnl_max_abs_delta", str(m.unrealised_pnl_max_abs_delta)),
             ("cum_realised_pnl_final_delta", str(m.cum_realised_pnl_final_delta)),
+            ("cur_realised_pnl_final_delta", str(m.cur_realised_pnl_final_delta)),
             ("position_pairs_compared", str(m.position_pairs_compared)),
             ("position_pairs_unmatched_bt", str(m.position_pairs_unmatched_bt)),
             ("position_pairs_state_diverged", str(m.position_pairs_state_diverged)),
@@ -291,6 +292,9 @@ class ComparatorReporter:
                 "live_cum_realised",
                 "bt_cum_realised",
                 "cum_realised_delta",
+                "live_cur_realised",
+                "bt_cur_realised",
+                "cur_realised_delta",
                 "state_diverged",
             ])
 
@@ -323,6 +327,9 @@ class ComparatorReporter:
                     str(live.cum_realised_pnl) if live.cum_realised_pnl is not None else "",
                     str(bt.cum_realised_pnl) if bt.cum_realised_pnl is not None else "",
                     str(pair.cum_realised_pnl_delta) if pair.cum_realised_pnl_delta is not None else "",
+                    str(live.cur_realised_pnl) if live.cur_realised_pnl is not None else "",
+                    str(bt.cur_realised_pnl) if bt.cur_realised_pnl is not None else "",
+                    str(pair.cur_realised_pnl_delta) if pair.cur_realised_pnl_delta is not None else "",
                     "1" if pair.state_diverged else "0",
                 ])
 
@@ -436,6 +443,7 @@ class ComparatorReporter:
             f"    Unrealised mean:       {m.unrealised_pnl_mean_abs_delta}",
             f"    Unrealised max:        {m.unrealised_pnl_max_abs_delta}",
             f"    Cum realised final:    {m.cum_realised_pnl_final_delta}",
+            f"    Cur realised final:    {m.cur_realised_pnl_final_delta}",
             "",
             "=" * 60,
         ]

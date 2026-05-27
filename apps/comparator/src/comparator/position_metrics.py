@@ -73,6 +73,11 @@ class PositionComparisonPair:
     liq_price_delta: Optional[Decimal] = None
     unrealised_pnl_delta: Optional[Decimal] = None
     cum_realised_pnl_delta: Optional[Decimal] = None
+    # 0056: per-pair delta of the cycle-scoped realized PnL counter. NOT
+    # included in the `has_missing_telemetry` NULL-detection block below —
+    # pre-0056 rows have NULL here and treating that as missing telemetry
+    # would universally trip the flag for legacy replays.
+    cur_realised_pnl_delta: Optional[Decimal] = None
 
     # True when any per-field delta is None due to NULL telemetry on either
     # side (other fields may still have populated deltas).
@@ -113,6 +118,7 @@ def _build_pair(
         position_mm_delta=_safe_sub(bt.position_mm, live.position_mm),
         liq_price_delta=_safe_sub(bt.liq_price, live.liq_price),
         cum_realised_pnl_delta=_safe_sub(bt.cum_realised_pnl, live.cum_realised_pnl),
+        cur_realised_pnl_delta=_safe_sub(bt.cur_realised_pnl, live.cur_realised_pnl),
     )
 
     if mark is not None:
@@ -312,6 +318,20 @@ class PositionComparator:
             per_side_final.values(), Decimal("0"),
         )
 
+        # 0056: same per-side last-pair aggregation as `cum_realised_pnl`.
+        # The cycle counter retains the just-closed cycle total between
+        # close and the next opening fill, so the last observed delta per
+        # side captures either an in-progress cycle or a just-completed
+        # one. NULL pairs (pre-0056 rows) are skipped.
+        cur_per_side_final: dict[str, Decimal] = {}
+        for pair in matched:
+            if pair.cur_realised_pnl_delta is None:
+                continue
+            cur_per_side_final[pair.side] = pair.cur_realised_pnl_delta
+        metrics.cur_realised_pnl_final_delta = sum(
+            cur_per_side_final.values(), Decimal("0"),
+        )
+
 
 def _unmatched_bt_marker(bt: PositionSnapshot) -> PositionComparisonPair:
     """Sentinel pair for an unmatched backtest snapshot.
@@ -335,6 +355,7 @@ def _unmatched_bt_marker(bt: PositionSnapshot) -> PositionComparisonPair:
     pair.liq_price_delta = None
     pair.unrealised_pnl_delta = None
     pair.cum_realised_pnl_delta = None
+    pair.cur_realised_pnl_delta = None
     pair.has_missing_telemetry = True
     return pair
 

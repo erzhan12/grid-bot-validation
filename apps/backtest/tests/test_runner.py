@@ -1914,6 +1914,38 @@ class TestPositionSnapshotEmission:
         # And realized_pnl (window-scoped) is zeroed
         assert tracker.state.realized_pnl == Decimal("0")
 
+    def test_cur_realised_pnl_closing_snapshot_retains_cycle_total(
+        self, runner, sample_timestamp,
+    ):
+        """0056: closing-fill snapshot captures the cycle total (deferred reset)."""
+        runner.long_tracker.process_fill("Buy", Decimal("0.01"), Decimal("100"))
+        runner.long_tracker.process_fill("Sell", Decimal("0.01"), Decimal("110"))
+        snap = runner._emit_position_snapshot(
+            DirectionType.LONG, sample_timestamp, Decimal("110"),
+        )
+        # Closing fill: size returned to zero but cur_realised_pnl holds
+        # the just-completed cycle's total.
+        assert snap.size == Decimal("0")
+        assert snap.cur_realised_pnl == Decimal("0.1")
+
+    def test_cur_realised_pnl_second_cycle_accumulates_independently(
+        self, runner, sample_timestamp,
+    ):
+        """0056: second cycle's snapshot reflects only the new cycle's realized."""
+        runner.long_tracker.process_fill("Buy", Decimal("0.01"), Decimal("100"))
+        runner.long_tracker.process_fill("Sell", Decimal("0.01"), Decimal("110"))
+
+        # New opening fill — counter resets, then accumulates fresh.
+        runner.long_tracker.process_fill("Buy", Decimal("0.01"), Decimal("100"))
+        runner.long_tracker.process_fill("Sell", Decimal("0.01"), Decimal("105"))
+        snap = runner._emit_position_snapshot(
+            DirectionType.LONG, sample_timestamp, Decimal("105"),
+        )
+        # Second cycle realized = 0.05; the first cycle's 0.1 is gone from
+        # cur_realised_pnl but remains in cum_realised_pnl.
+        assert snap.cur_realised_pnl == Decimal("0.05")
+        assert snap.cum_realised_pnl == Decimal("0.15")
+
     def test_process_fill_refreshes_session_equity_before_snapshot_emit(
         self, sample_strategy_config, sample_timestamp,
     ):

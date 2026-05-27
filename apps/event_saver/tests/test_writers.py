@@ -995,6 +995,107 @@ class TestPositionWriter:
         assert snap.cum_realised_pnl is None
         assert snap.source == "live"
 
+    @pytest.mark.asyncio
+    async def test_parses_cur_realised_pnl(self, mock_db):
+        """0056: curRealisedPnl populates cur_realised_pnl as Decimal."""
+        from decimal import Decimal
+
+        writer = PositionWriter(db=mock_db, batch_size=100)
+        messages = [{
+            "data": [{
+                "symbol": "LTCUSDT",
+                "side": "Buy",
+                "size": "1.0",
+                "entryPrice": "100.0",
+                "liqPrice": "90.0",
+                "unrealisedPnl": "1.0",
+                "curRealisedPnl": "7.89",
+                "updatedTime": "1700000000000",
+            }]
+        }]
+        await writer.write(uuid4(), messages)
+        snap = writer._buffer[0]
+        assert snap.cur_realised_pnl == Decimal("7.89")
+
+    @pytest.mark.asyncio
+    async def test_missing_cur_realised_pnl_yields_none(self, mock_db):
+        """0056: a payload without curRealisedPnl writes None."""
+        writer = PositionWriter(db=mock_db, batch_size=100)
+        messages = [{
+            "data": [{
+                "symbol": "LTCUSDT",
+                "side": "Buy",
+                "size": "1.0",
+                "entryPrice": "100.0",
+                "liqPrice": "90.0",
+                "unrealisedPnl": "1.0",
+                "updatedTime": "1700000000000",
+            }]
+        }]
+        await writer.write(uuid4(), messages)
+        snap = writer._buffer[0]
+        assert snap.cur_realised_pnl is None
+
+    @pytest.mark.asyncio
+    async def test_cur_realised_pnl_preserves_zero(self, mock_db):
+        """0056: ``not in (None, "")`` guard preserves explicit "0" and 0."""
+        from decimal import Decimal
+
+        writer = PositionWriter(db=mock_db, batch_size=100)
+        messages = [{
+            "data": [{
+                "symbol": "LTCUSDT",
+                "side": "Buy",
+                "size": "1.0",
+                "entryPrice": "100.0",
+                "liqPrice": "90.0",
+                "unrealisedPnl": "1.0",
+                "curRealisedPnl": "0",
+                "updatedTime": "1700000000000",
+            }]
+        }]
+        await writer.write(uuid4(), messages)
+        snap = writer._buffer[0]
+        assert snap.cur_realised_pnl == Decimal("0")
+
+        # Numeric 0 (not stringified) also preserved.
+        writer2 = PositionWriter(db=mock_db, batch_size=100)
+        messages2 = [{
+            "data": [{
+                "symbol": "LTCUSDT",
+                "side": "Buy",
+                "size": "1.0",
+                "entryPrice": "100.0",
+                "liqPrice": "90.0",
+                "unrealisedPnl": "1.0",
+                "curRealisedPnl": 0,
+                "updatedTime": "1700000000000",
+            }]
+        }]
+        await writer2.write(uuid4(), messages2)
+        snap2 = writer2._buffer[0]
+        assert snap2.cur_realised_pnl == Decimal("0")
+
+    @pytest.mark.asyncio
+    async def test_empty_string_cur_realised_pnl_yields_none(self, mock_db):
+        """0056: empty-string curRealisedPnl is treated as absent → None."""
+        writer = PositionWriter(db=mock_db, batch_size=100)
+        messages = [{
+            "data": [{
+                "symbol": "LTCUSDT",
+                "side": "Buy",
+                "size": "1.0",
+                "entryPrice": "100.0",
+                "liqPrice": "90.0",
+                "unrealisedPnl": "1.0",
+                "curRealisedPnl": "",
+                "updatedTime": "1700000000000",
+            }]
+        }]
+        await writer.write(uuid4(), messages)
+        snap = writer._buffer[0]
+        assert snap.cur_realised_pnl is None
+
 
 class TestWalletWriter:
     """Test WalletWriter buffering and bulk insert."""

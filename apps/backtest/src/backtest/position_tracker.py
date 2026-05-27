@@ -55,6 +55,13 @@ class PositionState:
     # in ``seed_state`` — it represents the absolute exchange-side total.
     cum_realised_pnl: Decimal = field(default_factory=lambda: Decimal("0"))
 
+    # 0056: cycle-scoped running total of realized PnL for the current
+    # position cycle. Mirrors Bybit's ``curRealisedPnl``: accumulates on
+    # every fill (including the close) and resets to zero only on the
+    # *next* opening fill of a zero-sized position — not on the closing
+    # fill itself. Seeded from ``PositionSnapshot.cur_realised_pnl``.
+    cur_realised_pnl: Decimal = field(default_factory=lambda: Decimal("0"))
+
 
 class BacktestPositionTracker:
     """Track position and calculate PnL for backtest.
@@ -137,6 +144,12 @@ class BacktestPositionTracker:
         self.state.cum_realised_pnl = getattr(
             seed, "cum_realised_pnl", Decimal("0")
         )
+        # 0056: cycle-scoped counter seeded from the snapshot. Legacy seeds
+        # without the attribute (or pre-0056 snapshot rows that mapped to
+        # ``Decimal("0")`` upstream) reset the cycle counter to zero.
+        self.state.cur_realised_pnl = getattr(
+            seed, "cur_realised_pnl", Decimal("0")
+        )
 
     def process_fill(
         self,
@@ -164,6 +177,14 @@ class BacktestPositionTracker:
         # Determine if this fill opens or closes position
         is_opening = self._is_opening_fill(side)
 
+        # 0056: deferred reset of the cycle-scoped realized counter. Bybit's
+        # ``curRealisedPnl`` holds the just-closed cycle total until the
+        # next opening fill resets it. Reset here — at the top of an
+        # opening fill on a zero-sized position, before any accumulation
+        # — so the closing-fill snapshot still captured the full cycle.
+        if is_opening and self.state.size == Decimal("0"):
+            self.state.cur_realised_pnl = Decimal("0")
+
         if is_opening:
             realized = self._add_to_position(qty, price)
         else:
@@ -174,6 +195,9 @@ class BacktestPositionTracker:
         # is zeroed by seed_state; `cum_realised_pnl` is NOT zeroed and
         # carries the absolute total used for parity comparison.
         self.state.cum_realised_pnl += realized
+        # 0056: cycle-scoped counter accumulates on every fill (including
+        # close). Reset happens above on the next opening fill.
+        self.state.cur_realised_pnl += realized
         return realized
 
     def _is_opening_fill(self, side: str) -> bool:
