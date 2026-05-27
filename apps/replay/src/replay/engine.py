@@ -657,7 +657,6 @@ class ReplayEngine:
         with self._db.get_session() as db_session:
             self._seed_pre_check(db_session, run_id, seed.at_ts)
 
-            grid_source: Optional[str] = "db"
             grid_seed = load_grid_state_from_snapshots(
                 db_session,
                 seed.account_id,
@@ -667,6 +666,7 @@ class ReplayEngine:
                 expected_step=config.strategy.grid_step,
                 expected_count=config.strategy.grid_count,
             )
+            grid_source: Optional[str] = "db" if grid_seed is not None else None
             if grid_seed is None and seed.grid_state_path is not None:
                 grid_seed = load_grid_state(
                     GridStateStore(file_path=seed.grid_state_path),
@@ -675,8 +675,6 @@ class ReplayEngine:
                     expected_count=config.strategy.grid_count,
                 )
                 grid_source = "file" if grid_seed is not None else None
-            elif grid_seed is None:
-                grid_source = None
 
             if grid_source is None:
                 raise SeedDataQualityError(

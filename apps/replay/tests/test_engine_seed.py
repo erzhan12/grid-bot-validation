@@ -825,7 +825,10 @@ class TestReplayEngineSeedFailLoud:
             account_id="acc-1",
             strat_id=STRAT_ID,
             grid_state_path=grid_state_path,
-            wallet_coin="BTC",  # no BTC snapshot in seeded_db
+            # BTC has no snapshot in seeded_db (only USDT). USDT row stays so
+            # the pre-check passes; the loader returns None for BTC, exercising
+            # the wallet-missing WARNING path without tripping _seed_pre_check.
+            wallet_coin="BTC",
         )
         replay_config_btc = ReplayConfig(
             database_url="sqlite:///:memory:",
