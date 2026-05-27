@@ -32,6 +32,13 @@ health_log_interval: 60   # frequent heartbeat for visibility
 
 # Private streams — REQUIRED for seed-aware replay
 account:
+  # MUST match gridbot accounts[].name (conf/gridbot_test.yaml).
+  # Drives uuid5 identity (grid_db.identity) — recorder writes to the same
+  # User/BybitAccount rows gridbot creates so replay seed lookups resolve.
+  name: mainnet_live
+  # MUST match gridbot strategies[].strat_id for this account.
+  # Drives strategy_id_for so recorder Runs FK to gridbot's Strategy row.
+  strat_id: ltcusdt_test
   api_key: "${BYBIT_READONLY_API_KEY}"
   api_secret: "${BYBIT_READONLY_API_SECRET}"
 

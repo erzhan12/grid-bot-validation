@@ -66,7 +66,7 @@ class TestInitialRestSnapshot:
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
     async def test_writes_two_rows_per_symbol_even_when_no_position(
-        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db, db_with_gridbot_seed
     ):
         """REST returns only a Buy row → recorder writes 2 rows (Buy + Sell @ size=0)."""
         mock_pub_cls.return_value = _make_pub_mock()
@@ -126,7 +126,7 @@ class TestInitialRestSnapshot:
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
     async def test_wallet_writes_per_coin(
-        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db, db_with_gridbot_seed
     ):
         """Wallet response with USDT + BTC → 2 wallet rows."""
         mock_pub_cls.return_value = _make_pub_mock()
@@ -203,7 +203,7 @@ class TestInitialRestSnapshot:
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
     async def test_open_orders_capture_reduce_only(
-        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db, db_with_gridbot_seed
     ):
         """Open order with reduceOnly=True → row.reduce_only is True."""
         mock_pub_cls.return_value = _make_pub_mock()
@@ -254,7 +254,7 @@ class TestInitialRestSnapshot:
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
     async def test_rest_failure_does_not_abort_recorder(
-        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, config_with_account, db, db_with_gridbot_seed
     ):
         """All REST calls raise → recorder.start() still completes; private collector started."""
         mock_pub_cls.return_value = _make_pub_mock()
@@ -297,7 +297,7 @@ class TestInitialRestSnapshot:
     @patch("recorder.recorder.BybitRestClient")
     async def test_warning_emitted_when_wallet_snapshot_empty(
         self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
-        config_with_account, db, caplog,
+        config_with_account, db, db_with_gridbot_seed, caplog,
     ):
         """When wallet REST returns empty (e.g. credential issue), an explicit
         WARNING is logged so operator catches the seeding-blocker at recorder

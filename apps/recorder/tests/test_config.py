@@ -38,7 +38,12 @@ class TestRecorderConfig:
     def test_with_account(self):
         config = RecorderConfig(
             symbols=["BTCUSDT"],
-            account=AccountConfig(api_key="key1", api_secret="secret1"),
+            account=AccountConfig(
+                name="test_account",
+                strat_id="test_strat",
+                api_key="key1",
+                api_secret="secret1",
+            ),
         )
         assert config.account is not None
         assert config.account.api_key.get_secret_value() == "key1"
@@ -47,7 +52,12 @@ class TestRecorderConfig:
     def test_account_secrets_redacted_in_repr(self):
         config = RecorderConfig(
             symbols=["BTCUSDT"],
-            account=AccountConfig(api_key="key1", api_secret="secret1"),
+            account=AccountConfig(
+                name="test_account",
+                strat_id="test_strat",
+                api_key="key1",
+                api_secret="secret1",
+            ),
         )
         text = repr(config)
         assert "key1" not in text
@@ -87,6 +97,8 @@ class TestLoadConfig:
         config_file.write_text(yaml.dump({
             "symbols": ["BTCUSDT"],
             "account": {
+                "name": "test_account",
+                "strat_id": "test_strat",
                 "api_key": "mykey",
                 "api_secret": "mysecret",
             },
@@ -159,6 +171,8 @@ class TestLoadConfig:
         config_file.write_text(yaml.dump({
             "symbols": ["BTCUSDT"],
             "account": {
+                "name": "test_account",
+                "strat_id": "test_strat",
                 "api_key": "${BYBIT_RECORDER_TEST_EMPTY}",
                 "api_secret": "secret",
             },
@@ -173,6 +187,8 @@ class TestLoadConfig:
         config_file.write_text(yaml.dump({
             "symbols": ["BTCUSDT"],
             "account": {
+                "name": "test_account",
+                "strat_id": "test_strat",
                 "api_key": "${BYBIT_RECORDER_TEST_UNSET}",
                 "api_secret": "secret",
             },

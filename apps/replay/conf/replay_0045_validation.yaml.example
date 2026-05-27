@@ -29,7 +29,12 @@ strategy:
 seed:
   enabled: true
   at_ts: "2026-05-18T08:55:00Z"
-  account_id: "00000000-0000-0000-0000-000000000002"
+  # Must equal `grid_db.identity.account_id_for("<gridbot accounts[].name>")`.
+  # Post-feature-0053, recorder child rows carry this uuid5 ID (e.g. for
+  # mainnet_live: 9bdb9748-f9e0-5c13-b144-0ad6a8dbcaba). Replays against DBs
+  # recorded BEFORE the 0053 migration may still need the legacy placeholder
+  # "00000000-0000-0000-0000-000000000002".
+  account_id: "9bdb9748-f9e0-5c13-b144-0ad6a8dbcaba"
   strat_id: "ltcusdt_test"
   grid_state_path: "db/grid_anchor.phase4.json"
   wallet_coin: "USDT"

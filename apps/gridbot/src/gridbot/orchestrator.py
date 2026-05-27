@@ -14,13 +14,14 @@ import time
 from collections import deque
 from datetime import datetime, UTC
 from typing import Optional
-from uuid import UUID, uuid5
+from uuid import UUID
 
 from bybit_adapter.rest_client import BybitRestClient
 from bybit_adapter.ws_client import PublicWebSocketClient, PrivateWebSocketClient
 from bybit_adapter.normalizer import BybitNormalizer
 from grid_db import DatabaseFactory
 from grid_db import Run, Strategy, BybitAccount, User
+from grid_db.identity import account_id_for, strategy_id_for, user_id_for
 from gridcore import (
     GridStateStore,
     InstrumentInfo,
@@ -696,16 +697,6 @@ class Orchestrator:
 
         logger.info(f"Initialized account: {name}")
 
-    # 0047: shared UUID5 namespace for deterministic account/user/run/strategy
-    # IDs. Must match _create_run_records exactly or grid-state-writer FK
-    # validation against runs.account_id will fail.
-    _UUID_NAMESPACE = UUID("12345678-1234-5678-1234-567812345678")
-
-    @classmethod
-    def _account_id_for(cls, account_name: str) -> str:
-        """UUID5 derivation matching _create_run_records (orchestrator.py:1156-1162)."""
-        return str(uuid5(cls._UUID_NAMESPACE, f"account:{account_name}"))
-
     def _init_strategy(self, strategy_config: StrategyConfig) -> None:
         """Initialize a strategy runner."""
         strat_id = strategy_config.strat_id
@@ -742,7 +733,7 @@ class Orchestrator:
         runner = StrategyRunner(
             strategy_config=strategy_config,
             executor=executor,
-            account_id=self._account_id_for(account_name),
+            account_id=account_id_for(account_name),
             instrument_info=instrument_info,
             state_store=self._state_store,
             grid_state_writer=self._grid_state_writer,
@@ -1227,13 +1218,11 @@ class Orchestrator:
         if self._db is None:
             return
 
-        namespace = UUID("12345678-1234-5678-1234-567812345678")
-
         try:
             with self._db.get_session() as session:
                 for account_config in self._config.accounts:
-                    user_id = str(uuid5(namespace, f"user:{account_config.name}"))
-                    account_id = str(uuid5(namespace, f"account:{account_config.name}"))
+                    user_id = user_id_for(account_config.name)
+                    account_id = account_id_for(account_config.name)
                     environment = "testnet" if account_config.testnet else "mainnet"
 
                     # Upsert User
@@ -1259,9 +1248,7 @@ class Orchestrator:
                     for strat_config in self._config.get_strategies_for_account(
                         account_config.name
                     ):
-                        strategy_id = str(
-                            uuid5(namespace, f"strategy:{strat_config.strat_id}")
-                        )
+                        strategy_id = strategy_id_for(strat_config.strat_id)
 
                         # Upsert Strategy
                         strategy = session.get(Strategy, strategy_id)
@@ -1315,7 +1302,7 @@ class Orchestrator:
                 run_id = str(self._run_ids[strat_id])
                 run_start_ts = _ensure_utc_aware(self._run_start_ts[strat_id])
                 account_name = self._get_account_for_strategy(strat_id)
-                account_id = self._account_id_for(account_name)
+                account_id = account_id_for(account_name)
 
                 grid_step = runner._config.grid_step
                 grid_count = runner._config.grid_count

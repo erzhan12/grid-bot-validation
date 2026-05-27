@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Phase 4 recorder launcher: idempotent stop-of-prior + surgical DB reset + fresh start.
+# Phase 4 recorder launcher: idempotent stop-of-prior + prepare_session
+# (surgical wipe + identity bootstrap + preflight verify) + fresh start.
 #
 # Why this script: bare `uv run recorder &` is a footgun.
 #   - $RECORDER_PID gets shadowed if the start command is re-run; old kill -INT no-ops.
@@ -7,16 +8,15 @@
 #   - Stale recorder rows from a prior run contaminate the new run_id.
 # This script does the full reset cycle in one call.
 #
-# Feature 0049: Phase 4 default is a SHARED SQLite DB used by gridbot, recorder,
-# replay, and comparator. The old "rm -f $DB_PATH $DB_PATH-wal $DB_PATH-shm" wipe
-# is unsafe under that model — it removes gridbot-owned grid_state_snapshots,
-# live runs, and shared setup rows (bybit_accounts, strategies, users).
-# Instead, this script performs a surgical recorder-owned data wipe via SQL
-# DELETEs inside a single transaction, and leaves the DB file and WAL/SHM
-# sidecars in place.
+# Feature 0049 + Feature 0053: Phase 4 default is a SHARED SQLite DB used by
+# gridbot, recorder, replay, and comparator. Wipe + identity bootstrap run
+# inside recorder.prepare_session on the `load_config`-resolved DB URL so
+# both Python code and shell agree on the path (no shell YAML grep).
 #
-# Usage: scripts/phase4/start_recorder.sh [config_path]
-#   config_path: defaults to apps/recorder/conf/recorder_ltcusdt.yaml
+# Usage: scripts/phase4/start_recorder.sh [recorder_config_path] [gridbot_config_path]
+#   recorder_config_path: defaults to apps/recorder/conf/recorder_ltcusdt.yaml
+#   gridbot_config_path:  defaults to conf/gridbot_test.yaml
+#                         override via 2nd arg OR GRIDBOT_CONFIG_PATH env (2nd arg wins)
 
 set -euo pipefail
 
@@ -24,23 +24,15 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
 CONFIG="${1:-apps/recorder/conf/recorder_ltcusdt.yaml}"
+GRIDBOT_CONFIG="${2:-${GRIDBOT_CONFIG_PATH:-conf/gridbot_test.yaml}}"
 LOG_FILE="/tmp/recorder.log"
 
 if [[ ! -f "$CONFIG" ]]; then
   echo "ERROR: config not found: $CONFIG" >&2
   exit 1
 fi
-
-# Derive DB path from yaml `database_url` so we wipe the right file.
-# Supported forms:
-#   - relative: sqlite:///data/recorder_ltcusdt_phase4.db
-#   - absolute: sqlite:////<abs-path>/data/recorder_ltcusdt_phase4.db
-# Stripping `sqlite:///` from a four-slash absolute URL leaves the
-# leading `/` of the absolute path, so the same expansion handles both.
-DB_URL="$(grep -E '^database_url:' "$CONFIG" | sed -E 's/^database_url:[[:space:]]*"?([^"]+)"?$/\1/')"
-DB_PATH="${DB_URL#sqlite:///}"
-if [[ -z "$DB_PATH" || "$DB_PATH" == "$DB_URL" ]]; then
-  echo "ERROR: cannot parse database_url from $CONFIG" >&2
+if [[ ! -f "$GRIDBOT_CONFIG" ]]; then
+  echo "ERROR: gridbot config not found: $GRIDBOT_CONFIG" >&2
   exit 1
 fi
 
@@ -65,28 +57,12 @@ if pgrep -f "recorder --config $CONFIG" > /dev/null; then
 fi
 echo "    no recorder running for this config."
 
-echo "==> Wiping prior recorder-owned data (surgical, shared-DB safe)..."
-if [[ -f "$DB_PATH" ]]; then
-  echo "    db exists: $DB_PATH"
-  echo "    deleting recorder-owned rows: private_executions, orders, wallet_snapshots,"
-  echo "    position_snapshots WHERE source='live', ticker_snapshots, runs WHERE run_type='recording'"
-  echo "    preserving: grid_state_snapshots, live runs, bybit_accounts, strategies, users"
-  sqlite3 "$DB_PATH" <<'SQL'
-.bail on
-PRAGMA foreign_keys = ON;
-BEGIN IMMEDIATE;
-DELETE FROM private_executions;
-DELETE FROM orders;
-DELETE FROM wallet_snapshots;
-DELETE FROM position_snapshots WHERE source = 'live';
-DELETE FROM ticker_snapshots;
-DELETE FROM runs WHERE run_type = 'recording';
-COMMIT;
-SQL
-  echo "    surgical wipe complete (WAL/SHM left intact)."
-else
-  echo "    no DB at $DB_PATH; recorder will create it on startup."
+echo "==> Preparing DB (surgical wipe + identity bootstrap)..."
+if ! uv run python scripts/phase4/prepare_recorder_session.py "$CONFIG" --gridbot-config "$GRIDBOT_CONFIG"; then
+  echo "ERROR: prepare_recorder_session failed; aborting recorder start" >&2
+  exit 1
 fi
+
 rm -f "$LOG_FILE"
 echo "    removed: $LOG_FILE"
 

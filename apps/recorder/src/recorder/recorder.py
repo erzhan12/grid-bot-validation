@@ -29,6 +29,7 @@ from grid_db import (
     WalletSnapshotRepository,
 )
 from grid_db._decimal import WALLET_ACCOUNT_JSON_KEYS, decimal_or_zero
+from grid_db.identity import account_id_for, strategy_id_for, user_id_for
 from gridcore.events import PublicTradeEvent, ExecutionEvent, OrderUpdateEvent, TickerEvent
 
 from event_saver.collectors import PublicCollector, PrivateCollector, AccountContext
@@ -43,17 +44,10 @@ from event_saver.writers import (
 from event_saver.reconciler import GapReconciler
 
 from recorder.config import RecorderConfig
+from recorder.shared_db_parents import verify_shared_db_parents
 
 
 logger = logging.getLogger(__name__)
-
-# Fixed UUIDs for standalone recorder (stable across restarts).
-# Intentionally shared: multiple instances against the same DB will reuse
-# these User/Account/Strategy rows (via session.merge), but each session
-# gets its own unique Run row, so recorded data stays isolated.
-_RECORDER_USER_ID = UUID("00000000-0000-0000-0000-000000000001")
-_RECORDER_ACCOUNT_ID = UUID("00000000-0000-0000-0000-000000000002")
-_RECORDER_STRATEGY_ID = UUID("00000000-0000-0000-0000-000000000003")
 
 
 class Recorder:
@@ -99,6 +93,15 @@ class Recorder:
         self._gap_lock = threading.Lock()
         self._run_id: Optional[UUID] = None
         self._health_check_complete = asyncio.Event()
+
+        # Identity attrs — sentinels overwritten by _seed_db_records when
+        # config.account is set (shared-DB / Phase 4 mode). Fallback mode
+        # (no account: block) keeps these legacy placeholder UUIDs so the
+        # standalone recorder path is unchanged. Declared here so cleanup /
+        # except paths never hit AttributeError on partial init.
+        self._account_id: UUID = UUID("00000000-0000-0000-0000-000000000002")
+        self._user_id: UUID = UUID("00000000-0000-0000-0000-000000000001")
+        self._strategy_id: UUID = UUID("00000000-0000-0000-0000-000000000003")
 
     async def start(self) -> None:
         """Start all recording components."""
@@ -216,8 +219,8 @@ class Recorder:
         if self._config.account:
             environment = "testnet" if self._config.testnet else "mainnet"
             context = AccountContext(
-                account_id=_RECORDER_ACCOUNT_ID,
-                user_id=_RECORDER_USER_ID,
+                account_id=self._account_id,
+                user_id=self._user_id,
                 run_id=self._run_id,
                 api_key=self._config.account.api_key.get_secret_value(),
                 api_secret=self._config.account.api_secret.get_secret_value(),
@@ -228,13 +231,13 @@ class Recorder:
                 context=context,
                 on_execution=self._handle_execution,
                 on_order=lambda event: self._handle_order(
-                    _RECORDER_ACCOUNT_ID, event
+                    self._account_id, event
                 ),
                 on_position=lambda msg: self._handle_position(
-                    _RECORDER_ACCOUNT_ID, msg
+                    self._account_id, msg
                 ),
                 on_wallet=lambda msg: self._handle_wallet(
-                    _RECORDER_ACCOUNT_ID, msg
+                    self._account_id, msg
                 ),
                 on_gap_detected=self._handle_private_gap,
             )
@@ -289,7 +292,7 @@ class Recorder:
             return
 
         run_id_str = str(self._run_id)
-        account_id_str = str(_RECORDER_ACCOUNT_ID)
+        account_id_str = str(self._account_id)
         snapshot_ts = datetime.now(UTC)
 
         wallet_count = await self._snapshot_wallet(
@@ -699,12 +702,21 @@ class Recorder:
         await self.stop()
 
     def _seed_db_records(self) -> UUID:
-        """Create parent DB records for this recording session.
+        """Create / verify parent DB records and a Run for this session.
 
-        Ensures User, BybitAccount, Strategy, and Run rows exist.
-        The Run row tracks the recording time range so the replay engine
-        can auto-discover it. Uses fixed UUIDs so parent rows are reused
-        across recorder restarts; each session gets a unique Run.
+        Two modes:
+
+        - **Shared-DB (Phase 4)**: `config.account` is set with `name` /
+          `strat_id`. Derive uuid5 IDs matching gridbot's
+          `_create_run_records`; verify gridbot's User / BybitAccount /
+          Strategy rows exist with compatible metadata
+          (`verify_shared_db_parents`); insert only the Run row. The
+          recorder is a *consumer* of gridbot's parent rows — never a
+          co-writer (PK-driven `session.merge` would silently mutate
+          gridbot metadata).
+        - **Fallback (standalone / ticker-only)**: keep legacy placeholder
+          UUIDs and upsert recorder-owned User / BybitAccount / Strategy
+          rows. No co-located gridbot expected.
 
         Returns:
             The run_id UUID for this recording session.
@@ -715,37 +727,57 @@ class Recorder:
         # full list goes in config_json for reference.
         primary_symbol = self._config.symbols[0]
 
+        if self._config.account is not None:
+            account_name = self._config.account.name
+            strat_id = self._config.account.strat_id
+            self._account_id = UUID(account_id_for(account_name))
+            self._user_id = UUID(user_id_for(account_name))
+            self._strategy_id = UUID(strategy_id_for(strat_id))
+
         try:
             with self._db.get_session() as session:
-                # Upsert User (merge = insert or update)
-                session.merge(User(
-                    user_id=str(_RECORDER_USER_ID),
-                    username="recorder",
-                ))
-                # Upsert BybitAccount
-                session.merge(BybitAccount(
-                    account_id=str(_RECORDER_ACCOUNT_ID),
-                    user_id=str(_RECORDER_USER_ID),
-                    account_name="recorder",
-                    environment=environment,
-                ))
-                # Upsert Strategy
-                session.merge(Strategy(
-                    strategy_id=str(_RECORDER_STRATEGY_ID),
-                    account_id=str(_RECORDER_ACCOUNT_ID),
-                    strategy_type="recorder",
-                    symbol=primary_symbol,
-                    config_json={
-                        "mode": "recorder",
-                        "symbols": self._config.symbols,
-                    },
-                ))
-                # Create new Run for this session
+                if self._config.account is not None:
+                    # Shared-DB: verify gridbot parents exist (no upsert).
+                    verify_shared_db_parents(
+                        session,
+                        user_id=str(self._user_id),
+                        account_id=str(self._account_id),
+                        strategy_id=str(self._strategy_id),
+                        account_name=self._config.account.name,
+                        strat_id=self._config.account.strat_id,
+                        primary_symbol=primary_symbol,
+                        recorder_testnet=self._config.testnet,
+                    )
+                else:
+                    # Fallback: standalone recorder; upsert recorder-owned
+                    # parent rows under the legacy placeholder UUIDs.
+                    session.merge(User(
+                        user_id=str(self._user_id),
+                        username="recorder",
+                    ))
+                    session.merge(BybitAccount(
+                        account_id=str(self._account_id),
+                        user_id=str(self._user_id),
+                        account_name="recorder",
+                        environment=environment,
+                    ))
+                    session.merge(Strategy(
+                        strategy_id=str(self._strategy_id),
+                        account_id=str(self._account_id),
+                        strategy_type="recorder",
+                        symbol=primary_symbol,
+                        config_json={
+                            "mode": "recorder",
+                            "symbols": self._config.symbols,
+                        },
+                    ))
+                # Create new Run for this session — FK resolves to the
+                # bootstrapped (shared-DB) or recorder-owned (fallback) parents.
                 session.add(Run(
                     run_id=str(run_id),
-                    user_id=str(_RECORDER_USER_ID),
-                    account_id=str(_RECORDER_ACCOUNT_ID),
-                    strategy_id=str(_RECORDER_STRATEGY_ID),
+                    user_id=str(self._user_id),
+                    account_id=str(self._account_id),
+                    strategy_id=str(self._strategy_id),
                     run_type="recording",
                     status="running",
                 ))
@@ -895,8 +927,8 @@ class Recorder:
             for symbol in self._config.symbols:
                 fut = asyncio.run_coroutine_threadsafe(
                     self._reconciler.reconcile_executions(
-                        user_id=_RECORDER_USER_ID,
-                        account_id=_RECORDER_ACCOUNT_ID,
+                        user_id=self._user_id,
+                        account_id=self._account_id,
                         run_id=self._run_id,
                         symbol=symbol,
                         gap_start=gap_start,

@@ -205,7 +205,7 @@ class StrategyRunner:
             raise ValueError(
                 "StrategyRunner.account_id must be set explicitly when "
                 "grid_state_writer is provided; got the placeholder default. "
-                "Orchestrator derives it via Orchestrator._account_id_for("
+                "Orchestrator derives it via grid_db.identity.account_id_for("
                 "account_name) (uuid5(NAMESPACE, 'account:<name>'))."
             )
 
