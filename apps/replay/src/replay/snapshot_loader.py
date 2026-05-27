@@ -8,9 +8,11 @@ just adapts the persistence layer to the seed contract documented in
 
 Seed loaders, one per seed dimension:
 
-* :func:`load_grid_state` — wraps :class:`GridStateStore` with a tolerant
-  ``None``-on-mismatch fallback that mirrors live's behaviour at
-  ``apps/gridbot/src/gridbot/runner.py:248-263``.
+* :func:`load_grid_state` — wraps :class:`GridStateStore` and returns
+  ``None`` on absence / legacy format / step-or-count mismatch. The
+  caller decides what to do: under ``seed.enabled=True`` the engine
+  raises :class:`SeedDataQualityError` (see ``engine._load_seed``);
+  under ``seed.enabled=False`` replay still fresh-builds.
 * :func:`load_position_snapshots` — always returns a ``(long, short)``
   pair. Both-absent maps to ``(zero, zero)`` (caught upstream by Phase 4
   pre-check); one-side-only is a corrupt run and raises
@@ -171,12 +173,20 @@ class SeedConfigMismatchError(SeedError):
 
 
 class SeedDataQualityError(SeedError):
-    """Exactly one position side is present for a run when both are
-    required by the recorder's initial-REST-snapshot contract.
+    """Seed input is incomplete in a way that makes the replay unsafe.
 
-    The recorder writes BOTH sides (``Buy`` and ``Sell``, including
-    zero-size rows) on private-stream connect; missing one side means
-    the run is corrupt and seeding from it is unsafe.
+    Two raise sites today:
+
+    * Loader-local: exactly one position side is present for a run when
+      both are required by the recorder's initial-REST-snapshot contract.
+      The recorder writes BOTH sides (``Buy`` and ``Sell``, including
+      zero-size rows) on private-stream connect; missing one side means
+      the run is corrupt and seeding from it is unsafe.
+    * Engine-level (0054): ``seed.enabled=True`` but no grid state could
+      be loaded — both ``load_grid_state_from_snapshots`` (DB) and
+      ``load_grid_state`` (file) returned ``None``. The engine raises
+      this from ``_load_seed`` rather than silently falling back to a
+      fresh blank-build grid (which masked the 0052 bug for 3 days).
     """
 
 
@@ -218,7 +228,7 @@ def load_grid_state(
     expected_step: float,
     expected_count: int,
 ) -> Optional[GridStateSeed]:
-    """Load saved grid state for a strategy, with tolerant fallback.
+    """Load saved grid state for a strategy.
 
     Returns ``None`` (with an INFO log) on any of:
 
@@ -227,10 +237,12 @@ def load_grid_state(
       ``None`` and emits its own INFO log; we just propagate).
     * ``grid_step`` / ``grid_count`` differ from the replay config.
 
-    The replay engine treats ``None`` as "blank-build a fresh grid",
-    matching live's tolerant behaviour at
-    ``apps/gridbot/src/gridbot/runner.py:248-263``. JSON / IO errors from
-    the store itself propagate.
+    ``None`` is the contract for the caller to handle. Under
+    ``seed.enabled=True`` the replay engine raises
+    :class:`SeedDataQualityError` from ``_load_seed`` once both the DB
+    snapshot and this file loader return ``None`` (0054). Under
+    ``seed.enabled=False`` replay may still fresh-build. JSON / IO
+    errors from the store itself propagate.
 
     Args:
         state_store: Read-only handle to the grid-state JSON file.
@@ -293,8 +305,11 @@ def load_grid_state_from_snapshots(
     live grid state — the loader must not rely on ``strat_id`` alone as
     a symbol proxy).
 
-    Returns ``None`` on no-row-found or on step/count mismatch (engine
-    falls back to file path, then to a fresh blank-build).
+    Returns ``None`` on no-row-found or on step/count mismatch. The
+    engine tries the file path next when ``seed.grid_state_path`` is
+    set, then applies the ``seed.enabled`` policy: under ``True`` it
+    raises :class:`SeedDataQualityError`; under ``False`` it may still
+    fresh-build (see ``engine._load_seed``).
 
     ``grid_step`` comparison uses ``Decimal(str(...))`` normalisation so a
     binary-imprecise float (e.g. ``0.1`` literal vs ``Decimal('0.10000000')``
