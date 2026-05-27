@@ -307,7 +307,11 @@ class Recorder:
                 testnet=self._config.testnet,
             )
         except Exception as e:
-            logger.error(f"Failed to construct authenticated REST client for initial snapshot: {e}")
+            logger.error(
+                f"Failed to construct authenticated REST client for initial snapshot: {e}. "
+                "Check: API key/secret format and pairing, network connectivity to Bybit "
+                "(mainnet vs testnet matches config.testnet), and Bybit service status."
+            )
             logger.warning("RECORDER_SNAPSHOT_INCOMPLETE")
             return
 

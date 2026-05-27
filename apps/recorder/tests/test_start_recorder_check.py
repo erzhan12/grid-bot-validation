@@ -258,6 +258,50 @@ class TestStopRecorderPattern:
             f"pkill rc=1 (no match) must not fail the helper; got {result.returncode}"
         )
 
+    def test_pkill_failed_and_process_still_alive(self) -> None:
+        """pkill returns non-zero (signal delivery failed) AND pgrep keeps
+        matching → helper still returns 1 with diagnostic.
+
+        Documents that the helper's stuck-process detection is driven by
+        pgrep alone — the pkill return code never gates the result. This
+        guards against a future refactor that might add `pkill || return ...`
+        and silently swallow the still-alive case.
+        """
+        # pkill rc=1 (e.g., permission denied or signal queue full),
+        # pgrep keeps matching across loop iterations + post-loop probe.
+        result = _run_stop(pkill_rc=1, pgrep_sequence=[0, 0, 0, 0], wait_seconds=3)
+
+        assert result.returncode == 1, (
+            f"pkill failure + still-alive must return 1; got {result.returncode}\n"
+            f"stderr={result.stderr!r}"
+        )
+        assert "recorder --config" in result.stderr, (
+            "stuck-process branch must emit ps diagnostic to stderr"
+        )
+
+    def test_empty_pattern_refused(self) -> None:
+        """Calling _stop_recorder_pattern with an empty pattern returns 2
+        without invoking pkill. Prevents `pkill -f ""` from matching every
+        process on the system.
+        """
+        # No stubs — function must short-circuit before any pkill call.
+        script = f"""
+            source "{STOP_LIB_PATH}"
+            _stop_recorder_pattern ""
+        """
+        result = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        assert result.returncode == 2, (
+            f"empty pattern must return 2; got {result.returncode}\n"
+            f"stderr={result.stderr!r}"
+        )
+        assert "refusing to pkill" in result.stderr
+
 
 class TestStartRecorderLauncherIntegration:
     """Sanity checks that start_recorder.sh sources both lib files and

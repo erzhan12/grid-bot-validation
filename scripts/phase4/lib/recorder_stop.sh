@@ -31,8 +31,16 @@
 #   - WAIT_SECONDS=0 skips the loop entirely and returns based on a single
 #     post-pkill `pgrep` probe — used by tests for the still-alive branch.
 _stop_recorder_pattern() {
-  local pattern="${1:?pattern required}"
+  local pattern="${1-}"
   local wait_seconds="${2:-10}"
+
+  # Guard: refuse empty pattern. `pkill -f ""` matches every process on the
+  # system, so a caller bug passing an unset/empty arg must fail loud
+  # (return 2) rather than wipe out unrelated processes.
+  if [[ -z "$pattern" ]]; then
+    echo "ERROR: _stop_recorder_pattern called with empty pattern; refusing to pkill" >&2
+    return 2
+  fi
 
   pkill -INT -f "$pattern" || true
 
