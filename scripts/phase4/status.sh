@@ -39,7 +39,7 @@ fi
 echo ""
 echo "==> Recent notable log events (last 5):"
 if [[ -f "$LOG_FILE" ]]; then
-  tail -n 50 "$LOG_FILE" | grep -aE "WARN|ERROR|disconnect|reconnect|gap|Initial REST snapshot" | tail -5 || echo "    (none)"
+  tail -n 50 "$LOG_FILE" | grep -aE "WARN|ERROR|disconnect|reconnect|gap|Initial REST snapshot|RECORDER_SNAPSHOT_(OK|INCOMPLETE)" | tail -5 || echo "    (none)"
 else
   echo "    (log not present: $LOG_FILE)"
 fi

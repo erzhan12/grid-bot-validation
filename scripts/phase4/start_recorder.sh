@@ -17,8 +17,21 @@
 #   recorder_config_path: defaults to apps/recorder/conf/recorder_ltcusdt.yaml
 #   gridbot_config_path:  defaults to conf/gridbot_test.yaml
 #                         override via 2nd arg OR GRIDBOT_CONFIG_PATH env (2nd arg wins)
+#
+# Exit codes (feature 0055):
+#   0 — initial REST snapshot emitted RECORDER_SNAPSHOT_OK; recorder running.
+#   1 — RECORDER_SNAPSHOT_INCOMPLETE, 15s sentinel timeout, or any other
+#       failure path (config not found, prepare_recorder_session failed,
+#       prior recorder did not stop, unexpected classifier rc).
+# Callers (cron, CI, wrappers) MUST treat any non-zero exit as "recorder not
+# running for this config" — no `Recorder PID:` tail is printed on failure.
 
 set -euo pipefail
+
+# shellcheck source=lib/recorder_snapshot_check.sh
+. "$(dirname "$0")/lib/recorder_snapshot_check.sh"
+# shellcheck source=lib/recorder_stop.sh
+. "$(dirname "$0")/lib/recorder_stop.sh"
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
@@ -37,22 +50,10 @@ if [[ ! -f "$GRIDBOT_CONFIG" ]]; then
 fi
 
 echo "==> Stopping any prior recorder for this config..."
-# pkill -INT by command-line pattern. Matches both `uv run recorder` parent
-# and the Python child. Returns 0 if killed, 1 if no match — both fine.
-pkill -INT -f "recorder --config $CONFIG" || true
-
-# Wait up to ~10s for graceful shutdown.
-for i in 1 2 3 4 5 6 7 8 9 10; do
-  if pgrep -f "recorder --config $CONFIG" > /dev/null; then
-    sleep 1
-  else
-    break
-  fi
-done
-
-if pgrep -f "recorder --config $CONFIG" > /dev/null; then
+# pkill -INT by command-line pattern via shared helper (lib/recorder_stop.sh).
+# Matches both `uv run recorder` parent and the Python child. Waits up to 10s.
+if ! _stop_recorder_pattern "recorder --config $CONFIG"; then
   echo "ERROR: recorder did not stop after 10s; manual intervention needed" >&2
-  ps aux | grep -E "recorder --config $CONFIG" | grep -v grep >&2
   exit 1
 fi
 echo "    no recorder running for this config."
@@ -71,26 +72,62 @@ nohup uv run recorder --config "$CONFIG" > "$LOG_FILE" 2>&1 &
 RECORDER_PID=$!
 disown $RECORDER_PID 2>/dev/null || true
 
-# Wait for the initial REST snapshot to land (recorder logs it within ~5-10s).
+# Wait for a terminal snapshot sentinel. Recorder emits one of:
+#   RECORDER_SNAPSHOT_OK         — snapshot complete
+#   RECORDER_SNAPSHOT_INCOMPLETE — auth failed, zero wallet/position rows, etc.
+# Do NOT break on human-readable "Initial REST snapshot:" — that line is
+# emitted before the zero-count WARNING and would race the failure path.
 echo "==> Waiting for initial REST snapshot..."
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-  if grep -aq "Initial REST snapshot" "$LOG_FILE" 2>/dev/null; then
+  if grep -aqE "RECORDER_SNAPSHOT_OK|RECORDER_SNAPSHOT_INCOMPLETE" "$LOG_FILE" 2>/dev/null; then
     break
   fi
   sleep 1
 done
 
-if ! grep -aq "Initial REST snapshot" "$LOG_FILE" 2>/dev/null; then
-  echo "WARNING: no 'Initial REST snapshot' line in $LOG_FILE after 15s." >&2
-  echo "         Recorder may still be starting. Check log:" >&2
-  echo "           tail -f $LOG_FILE" >&2
-  echo "         Process is alive: $(ps -p $RECORDER_PID -o pid= 2>/dev/null && echo yes || echo no)" >&2
-else
-  grep -aE "Initial REST snapshot|wallet_rows" "$LOG_FILE"
-fi
+# Dispatch on classifier exit code (not stdout — it prints diagnostic lines).
+set +e
+_classify_recorder_snapshot "$LOG_FILE"
+_rc=$?
+set -e
 
-echo ""
-echo "Recorder PID: $RECORDER_PID"
-echo "Tail logs:    tail -f $LOG_FILE"
-echo "Stop:         scripts/phase4/stop_recorder.sh"
-echo "Status:       scripts/phase4/status.sh"
+case "$_rc" in
+  1)
+    # Incomplete snapshot — fail loud. Classifier already printed diagnostics.
+    if ! _stop_recorder_pattern "recorder --config $CONFIG"; then
+      echo "ERROR: recorder did not stop after 10s; manual intervention needed" >&2
+      exit 1
+    fi
+    echo "ERROR: recorder initial REST snapshot is incomplete (auth failure or zero wallet/position rows)." \
+         "See the classifier diagnostic above for the specific cause." \
+         "Check API credentials and network. Recorder stopped." >&2
+    exit 1
+    ;;
+  0)
+    # Success — print operator tail.
+    echo ""
+    echo "Recorder PID: $RECORDER_PID"
+    echo "Tail logs:    tail -f $LOG_FILE"
+    echo "Stop:         scripts/phase4/stop_recorder.sh"
+    echo "Status:       scripts/phase4/status.sh"
+    ;;
+  2)
+    # Timeout — no sentinel after 15s. Classifier already printed diagnostics.
+    # Kill the recorder so a retrying caller (cron/CI) does not race a second
+    # one onto the same SQLite DB.
+    echo "       Process is alive: $(ps -p $RECORDER_PID -o pid= 2>/dev/null && echo yes || echo no)" >&2
+    if ! _stop_recorder_pattern "recorder --config $CONFIG"; then
+      echo "ERROR: recorder did not stop after 10s; manual intervention needed" >&2
+      exit 1
+    fi
+    echo "ERROR: recorder initial REST snapshot timed out after 15s with no sentinel." \
+         "Recorder stopped." >&2
+    exit 1
+    ;;
+  *)
+    # Fail loud on any unexpected classifier return — silent fallthrough here
+    # would reintroduce the exact bug class feature 0055 eliminates.
+    echo "ERROR: snapshot classifier returned unexpected rc=$_rc" >&2
+    exit 1
+    ;;
+esac

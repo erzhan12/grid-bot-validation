@@ -351,3 +351,127 @@ class TestInitialRestSnapshot:
         assert "position_rows=" in warnings[0].message
 
         await recorder.stop()
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_sentinel_ok_on_success(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
+        config_with_account, db, db_with_gridbot_seed, caplog,
+    ):
+        """0055: success path emits RECORDER_SNAPSHOT_OK (shell sentinel).
+
+        Used by scripts/phase4/lib/recorder_snapshot_check.sh to distinguish
+        success from incomplete (zero counts) and timeout.
+        """
+        import logging
+
+        mock_pub_cls.return_value = _make_pub_mock()
+        mock_priv_cls.return_value = _make_priv_mock()
+
+        snapshot_client = _stub_rest_client(
+            wallet_response={
+                "list": [
+                    {
+                        "accountType": "UNIFIED",
+                        "coin": [
+                            {"coin": "USDT", "walletBalance": "10000", "availableToWithdraw": "9000"},
+                        ],
+                    }
+                ]
+            },
+            positions_by_symbol={
+                "BTCUSDT": [
+                    {
+                        "symbol": "BTCUSDT", "side": "Buy", "size": "0.5",
+                        "entryPrice": "50000", "liqPrice": "45000", "unrealisedPnl": "0",
+                    }
+                ]
+            },
+            open_orders_by_symbol={"BTCUSDT": []},
+        )
+        mock_rest_cls.side_effect = [MagicMock(), snapshot_client]
+
+        recorder = Recorder(config=config_with_account, db=db)
+        with caplog.at_level(logging.INFO, logger="recorder.recorder"):
+            await recorder.start()
+
+        ok = [r for r in caplog.records if r.message == "RECORDER_SNAPSHOT_OK"]
+        incomplete = [r for r in caplog.records if r.message == "RECORDER_SNAPSHOT_INCOMPLETE"]
+        assert len(ok) == 1, f"expected RECORDER_SNAPSHOT_OK once; got {len(ok)}"
+        assert incomplete == [], f"unexpected INCOMPLETE on success path: {incomplete}"
+
+        await recorder.stop()
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_sentinel_incomplete_on_zero_counts(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
+        config_with_account, db, db_with_gridbot_seed, caplog,
+    ):
+        """0055: zero-count failure path emits RECORDER_SNAPSHOT_INCOMPLETE."""
+        import logging
+
+        mock_pub_cls.return_value = _make_pub_mock()
+        mock_priv_cls.return_value = _make_priv_mock()
+
+        snapshot_client = _stub_rest_client(
+            wallet_response={"list": []},
+            positions_by_symbol={"BTCUSDT": []},
+            open_orders_by_symbol={"BTCUSDT": []},
+        )
+        mock_rest_cls.side_effect = [MagicMock(), snapshot_client]
+
+        recorder = Recorder(config=config_with_account, db=db)
+        with caplog.at_level(logging.WARNING, logger="recorder.recorder"):
+            await recorder.start()
+
+        incomplete = [r for r in caplog.records if r.message == "RECORDER_SNAPSHOT_INCOMPLETE"]
+        ok = [r for r in caplog.records if r.message == "RECORDER_SNAPSHOT_OK"]
+        assert len(incomplete) == 1, (
+            f"expected RECORDER_SNAPSHOT_INCOMPLETE once; got {len(incomplete)}"
+        )
+        assert ok == [], f"unexpected OK on incomplete path: {ok}"
+
+        await recorder.stop()
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_sentinel_incomplete_on_auth_client_failure(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
+        config_with_account, db, db_with_gridbot_seed, caplog,
+    ):
+        """0055: BybitRestClient construction raises → INCOMPLETE sentinel emitted
+        without reaching the count-based branch (no INFO 'Initial REST snapshot:').
+        """
+        import logging
+
+        mock_pub_cls.return_value = _make_pub_mock()
+        mock_priv_cls.return_value = _make_priv_mock()
+
+        # First call (public reconciler) succeeds with a plain MagicMock; second
+        # call (authenticated snapshot client) raises.
+        mock_rest_cls.side_effect = [MagicMock(), RuntimeError("bad credentials")]
+
+        recorder = Recorder(config=config_with_account, db=db)
+        with caplog.at_level(logging.WARNING, logger="recorder.recorder"):
+            await recorder.start()
+
+        incomplete = [r for r in caplog.records if r.message == "RECORDER_SNAPSHOT_INCOMPLETE"]
+        assert len(incomplete) == 1, (
+            f"expected RECORDER_SNAPSHOT_INCOMPLETE once on auth failure; "
+            f"got {len(incomplete)}"
+        )
+        # Must NOT have reached the count-based logging branch.
+        snapshot_info = [
+            r for r in caplog.records
+            if r.message.startswith("Initial REST snapshot:")
+        ]
+        assert snapshot_info == [], (
+            f"auth failure must short-circuit before count INFO line; "
+            f"got {[r.message for r in snapshot_info]}"
+        )
+
+        await recorder.stop()
