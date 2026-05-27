@@ -35,6 +35,7 @@ from gridcore.persistence import GridStateStore, grid_fingerprint_hash
 
 from replay.config import ReplayConfig, ReplayStrategyConfig, SeedConfig
 from replay.engine import ReplayEngine
+from replay.snapshot_loader import SeedDataQualityError
 
 
 # ---------------------------------------------------------------------------
@@ -474,40 +475,6 @@ class TestReplayEngineSeedingPipeline:
         # File fixture has 4 levels starting at 99600.0.
         assert grid_seed.grid[0]["price"] == 99600.0
 
-    def test_load_seed_falls_back_to_fresh_when_no_db_and_no_file(
-        self, seeded_db, seed_ts, mock_instrument,
-    ):
-        """0047: no DB row AND grid_state_path is None → grid_seed is None."""
-        seed_config = SeedConfig(
-            enabled=True,
-            at_ts=seed_ts,
-            account_id="acc-1",
-            strat_id=STRAT_ID,
-            grid_state_path=None,
-            wallet_coin="USDT",
-        )
-        replay_config = ReplayConfig(
-            database_url="sqlite:///:memory:",
-            run_id="seed-run",
-            symbol=SYMBOL,
-            start_ts=seed_ts,
-            end_ts=seed_ts + timedelta(hours=1),
-            strategy=ReplayStrategyConfig(
-                tick_size=Decimal("0.1"),
-                grid_count=4,
-                grid_step=0.2,
-                enable_risk_multipliers=True,
-            ),
-            initial_balance=Decimal("10000"),
-            enable_funding=False,
-            seed=seed_config,
-        )
-        engine = ReplayEngine(config=replay_config, db=seeded_db)
-        run_id, *_ = engine._resolve_run(replay_config)
-        _, _, _, grid_seed, _ = engine._load_seed(replay_config, run_id)
-        assert grid_seed is None
-
-
 # ---------------------------------------------------------------------------
 # B. Pre-check: seed.at_ts too early relative to initial REST snapshot
 # ---------------------------------------------------------------------------
@@ -693,3 +660,209 @@ class TestReplayEngineSeedDisabled:
         engine = ReplayEngine(config=config, db=db)
         result = engine._load_seed(config, "any-run")
         assert result == (None, None, None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# D. Fail-loud on missing grid seed (feature 0054)
+# ---------------------------------------------------------------------------
+
+
+class TestReplayEngineSeedFailLoud:
+    """``seed.enabled=True`` requires a loadable grid; wallet is soft."""
+
+    def test_load_seed_raises_when_no_grid_db_and_no_file_path(
+        self, seeded_db, seed_ts, mock_instrument,
+    ):
+        """No DB row AND ``grid_state_path is None`` → SeedDataQualityError.
+
+        Primary regression for the 0052 silent-fallback bug: replay used
+        to log ``grid seed source=fresh`` and march on.
+        """
+        seed_config = SeedConfig(
+            enabled=True,
+            at_ts=seed_ts,
+            account_id="acc-1",
+            strat_id=STRAT_ID,
+            grid_state_path=None,
+            wallet_coin="USDT",
+        )
+        replay_config = ReplayConfig(
+            database_url="sqlite:///:memory:",
+            run_id="seed-run",
+            symbol=SYMBOL,
+            start_ts=seed_ts,
+            end_ts=seed_ts + timedelta(hours=1),
+            strategy=ReplayStrategyConfig(
+                tick_size=Decimal("0.1"),
+                grid_count=4,
+                grid_step=0.2,
+                enable_risk_multipliers=True,
+            ),
+            initial_balance=Decimal("10000"),
+            enable_funding=False,
+            seed=seed_config,
+        )
+        engine = ReplayEngine(config=replay_config, db=seeded_db)
+        run_id, *_ = engine._resolve_run(replay_config)
+
+        with pytest.raises(SeedDataQualityError) as excinfo:
+            engine._load_seed(replay_config, run_id)
+
+        msg = str(excinfo.value)
+        assert seed_ts.isoformat() in msg
+        assert "acc-1" in msg
+        assert STRAT_ID in msg
+        assert SYMBOL in msg
+        assert "grid_state_path=None" in msg
+
+    def test_load_seed_raises_when_no_grid_db_and_file_path_missing(
+        self, seeded_db, seed_ts, tmp_path, mock_instrument,
+    ):
+        """grid_state_path points at a missing file → loader returns None
+        → SeedDataQualityError (no DB row either)."""
+        missing_path = str(tmp_path / "does_not_exist.json")
+        seed_config = SeedConfig(
+            enabled=True,
+            at_ts=seed_ts,
+            account_id="acc-1",
+            strat_id=STRAT_ID,
+            grid_state_path=missing_path,
+            wallet_coin="USDT",
+        )
+        replay_config = ReplayConfig(
+            database_url="sqlite:///:memory:",
+            run_id="seed-run",
+            symbol=SYMBOL,
+            start_ts=seed_ts,
+            end_ts=seed_ts + timedelta(hours=1),
+            strategy=ReplayStrategyConfig(
+                tick_size=Decimal("0.1"),
+                grid_count=4,
+                grid_step=0.2,
+                enable_risk_multipliers=True,
+            ),
+            initial_balance=Decimal("10000"),
+            enable_funding=False,
+            seed=seed_config,
+        )
+        engine = ReplayEngine(config=replay_config, db=seeded_db)
+        run_id, *_ = engine._resolve_run(replay_config)
+
+        with pytest.raises(SeedDataQualityError):
+            engine._load_seed(replay_config, run_id)
+
+    def test_load_seed_raises_when_grid_step_count_mismatch(
+        self, seeded_db, seed_ts, snapshot_ts, mock_instrument,
+    ):
+        """DB snapshot exists with mismatched grid_step/grid_count → loader
+        returns None (same contract as absence) → SeedDataQualityError.
+
+        Regression for the explicit ``mismatch ≡ absence`` rule.
+        """
+        mismatched_grid = [
+            {"side": "Buy", "price": 99600.0},
+            {"side": "Buy", "price": 99800.0},
+            {"side": "Sell", "price": 100200.0},
+            {"side": "Sell", "price": 100400.0},
+        ]
+        with seeded_db.get_session() as session:
+            GridStateSnapshotRepository(session).insert(
+                GridStateSnapshot(
+                    run_id="seed-run", account_id="acc-1", strat_id=STRAT_ID,
+                    symbol=SYMBOL,
+                    exchange_ts=snapshot_ts, local_ts=snapshot_ts,
+                    grid_json=mismatched_grid,
+                    grid_step=Decimal("0.5"),  # config expects 0.2 → mismatch
+                    grid_count=8,              # config expects 4   → mismatch
+                    raw_fingerprint=grid_fingerprint_hash(
+                        mismatched_grid, 0.5, 8,
+                    ),
+                )
+            )
+
+        seed_config = SeedConfig(
+            enabled=True,
+            at_ts=seed_ts,
+            account_id="acc-1",
+            strat_id=STRAT_ID,
+            grid_state_path=None,  # exercise DB-only path
+            wallet_coin="USDT",
+        )
+        replay_config = ReplayConfig(
+            database_url="sqlite:///:memory:",
+            run_id="seed-run",
+            symbol=SYMBOL,
+            start_ts=seed_ts,
+            end_ts=seed_ts + timedelta(hours=1),
+            strategy=ReplayStrategyConfig(
+                tick_size=Decimal("0.1"),
+                grid_count=4,
+                grid_step=0.2,
+                enable_risk_multipliers=True,
+            ),
+            initial_balance=Decimal("10000"),
+            enable_funding=False,
+            seed=seed_config,
+        )
+        engine = ReplayEngine(config=replay_config, db=seeded_db)
+        run_id, *_ = engine._resolve_run(replay_config)
+
+        with pytest.raises(SeedDataQualityError):
+            engine._load_seed(replay_config, run_id)
+
+    def test_load_seed_warns_when_wallet_seed_missing(
+        self, seeded_db, replay_config, seed_ts, grid_state_path,
+        mock_instrument, caplog,
+    ):
+        """Wallet is soft-required: missing coin row → WARNING + fallback,
+        no exception. Pre-check (USDT row present) stays happy because we
+        leave the USDT row alone and set ``seed.wallet_coin='BTC'``."""
+        import logging
+
+        seed_config = SeedConfig(
+            enabled=True,
+            at_ts=seed_ts,
+            account_id="acc-1",
+            strat_id=STRAT_ID,
+            grid_state_path=grid_state_path,
+            wallet_coin="BTC",  # no BTC snapshot in seeded_db
+        )
+        replay_config_btc = ReplayConfig(
+            database_url="sqlite:///:memory:",
+            run_id="seed-run",
+            symbol=SYMBOL,
+            start_ts=seed_ts,
+            end_ts=seed_ts + timedelta(hours=1),
+            strategy=ReplayStrategyConfig(
+                tick_size=Decimal("0.1"),
+                grid_count=4,
+                grid_step=0.2,
+                enable_risk_multipliers=True,
+            ),
+            initial_balance=Decimal("10000"),
+            enable_funding=False,
+            seed=seed_config,
+        )
+        engine = ReplayEngine(config=replay_config_btc, db=seeded_db)
+        run_id, *_ = engine._resolve_run(replay_config_btc)
+
+        with caplog.at_level(logging.WARNING, logger="replay.engine"):
+            wallet_seed, _, _, grid_seed, _ = engine._load_seed(
+                replay_config_btc, run_id,
+            )
+
+        assert wallet_seed is None
+        assert grid_seed is not None
+
+        engine_warnings = [
+            r for r in caplog.records
+            if r.name == "replay.engine" and r.levelno == logging.WARNING
+        ]
+        matched = [
+            r for r in engine_warnings
+            if "defaulting to initial_balance" in r.getMessage()
+        ]
+        assert len(matched) == 1, (
+            f"expected exactly one wallet warning, got {len(matched)}: "
+            f"{[r.getMessage() for r in engine_warnings]}"
+        )

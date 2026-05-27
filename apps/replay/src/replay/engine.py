@@ -60,6 +60,7 @@ from replay.snapshot_loader import (
     ActiveOrderSeed,
     GridStateSeed,
     PositionStateSeed,
+    SeedDataQualityError,
     WalletSeed,
     load_active_orders,
     load_grid_state,
@@ -622,11 +623,15 @@ class ReplayEngine:
            values must be ``<= seed.at_ts - 5s``. ``orders`` is excluded
            from the pre-check because a clean grid legitimately has no
            open orders at recorder start.
-        2. Loads grid state from the shared ``GridStateStore`` JSON file
-           (returns ``None`` on no-entry / legacy / step-or-count
-           mismatch — replay then falls back to fresh-build).
+        2. Loads grid state — DB snapshot first, then file when
+           ``seed.grid_state_path`` is set. Both loaders fold step/count
+           mismatch into a ``None`` return (treated the same as absence).
+           If both return ``None``, raises :class:`SeedDataQualityError`:
+           grid state is hard-required when ``seed.enabled=True`` (0054).
         3. Loads position pair, full 0042 wallet seed, and active orders
-           inside a single DB session.
+           inside a single DB session. Wallet is soft-required: when
+           ``load_wallet_seed_full`` returns ``None``, the engine falls
+           back to ``initial_balance`` and emits a ``WARNING``.
 
         Args:
             config: Full replay config (read for ``seed`` and ``symbol``).
@@ -645,12 +650,14 @@ class ReplayEngine:
                 "seed.enabled=True but at_ts/account_id/strat_id are unset"
             )
 
-        # 0047: try the DB grid-state snapshot first, fall back to the file
-        # path, then to a blank build. DB lookup needs a session, so open it
-        # FIRST and run all loaders inside.
+        # 0047 + 0054: try the DB grid-state snapshot first, fall back to the
+        # file path when ``grid_state_path`` is set, then raise
+        # ``SeedDataQualityError`` if both return ``None``. DB lookup needs a
+        # session, so open it FIRST and run all loaders inside.
         with self._db.get_session() as db_session:
             self._seed_pre_check(db_session, run_id, seed.at_ts)
 
+            grid_source: Optional[str] = "db"
             grid_seed = load_grid_state_from_snapshots(
                 db_session,
                 seed.account_id,
@@ -660,7 +667,6 @@ class ReplayEngine:
                 expected_step=config.strategy.grid_step,
                 expected_count=config.strategy.grid_count,
             )
-            grid_source = "db"
             if grid_seed is None and seed.grid_state_path is not None:
                 grid_seed = load_grid_state(
                     GridStateStore(file_path=seed.grid_state_path),
@@ -668,9 +674,19 @@ class ReplayEngine:
                     expected_step=config.strategy.grid_step,
                     expected_count=config.strategy.grid_count,
                 )
-                grid_source = "file" if grid_seed is not None else "fresh"
+                grid_source = "file" if grid_seed is not None else None
             elif grid_seed is None:
-                grid_source = "fresh"
+                grid_source = None
+
+            if grid_source is None:
+                raise SeedDataQualityError(
+                    f"seed.enabled=True but no grid state found for "
+                    f"strat_id={seed.strat_id!r} "
+                    f"account_id={seed.account_id!r} "
+                    f"symbol={config.symbol!r} "
+                    f"at_ts={seed.at_ts.isoformat()} "
+                    f"grid_state_path={seed.grid_state_path!r}"
+                )
             logger.info(
                 "%s: grid seed source=%s", seed.strat_id, grid_source,
             )
@@ -695,6 +711,12 @@ class ReplayEngine:
                 seed.account_id,
                 config.symbol,
                 seed.at_ts,
+            )
+
+        if wallet_seed is None:
+            logger.warning(
+                "%s: wallet seed missing, defaulting to initial_balance",
+                seed.strat_id,
             )
 
         return wallet_seed, long_seed, short_seed, grid_seed, order_seeds
