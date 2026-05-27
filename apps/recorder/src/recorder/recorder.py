@@ -273,8 +273,27 @@ class Recorder:
 
         Errors per call are logged and swallowed: the recorder must still
         capture the WS stream even when REST is degraded.
+
+        Shell sentinel contract (feature 0055):
+        When a snapshot is attempted (i.e. ``self._config.account`` is set),
+        every exit path of this method MUST emit exactly one of:
+        - ``logger.info("RECORDER_SNAPSHOT_OK")`` — wallet_count > 0 AND
+          position_count > 0; replay seed will succeed.
+        - ``logger.warning("RECORDER_SNAPSHOT_INCOMPLETE")`` — auth-client
+          construction failure OR zero wallet/position rows.
+        ``scripts/phase4/start_recorder.sh`` waits for one of these sentinels
+        and dispatches via ``scripts/phase4/lib/recorder_snapshot_check.sh``.
+        Adding a new early ``return`` after the account guard without
+        emitting a sentinel will hang the shell wait loop until its 15s
+        timeout. Never emit both sentinels in a single invocation — the
+        classifier treats INCOMPLETE as terminal regardless of any later OK.
+
+        The no-account case (``self._config.account is None``) returns
+        without emitting a sentinel — Phase 4's ``start_recorder.sh`` is
+        only used with accounts configured (``prepare_recorder_session``
+        aborts otherwise), so the wait-loop hang cannot occur in practice.
         """
-        if not self._config.account or not self._run_id:
+        if not self._config.account:
             return
 
         # Authenticated REST client for private endpoints. The recorder's
@@ -288,7 +307,12 @@ class Recorder:
                 testnet=self._config.testnet,
             )
         except Exception as e:
-            logger.error(f"Failed to construct authenticated REST client for initial snapshot: {e}")
+            logger.error(
+                f"Failed to construct authenticated REST client for initial snapshot: {e}. "
+                "Check: API key/secret format and pairing, network connectivity to Bybit "
+                "(mainnet vs testnet matches config.testnet), and Bybit service status."
+            )
+            logger.warning("RECORDER_SNAPSHOT_INCOMPLETE")
             return
 
         run_id_str = str(self._run_id)
@@ -324,6 +348,9 @@ class Recorder:
                 "run_id will fail Phase 4 pre-check; check API credentials / "
                 "permissions / category=linear settleCoin=USDT scope)"
             )
+            logger.warning("RECORDER_SNAPSHOT_INCOMPLETE")
+        else:
+            logger.info("RECORDER_SNAPSHOT_OK")
 
     async def _snapshot_wallet(
         self,

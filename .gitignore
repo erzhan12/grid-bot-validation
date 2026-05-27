@@ -12,6 +12,12 @@ eggs/
 .eggs/
 lib/
 lib64/
+# Feature 0055: keep recorder snapshot shell libs (not a Python build dir).
+# Whitelist the dir, re-ignore everything inside, then whitelist only *.sh.
+# Any non-shell artifact dropped here (logs, tmp files) stays ignored.
+!scripts/phase4/lib/
+scripts/phase4/lib/*
+!scripts/phase4/lib/*.sh
 parts/
 sdist/
 var/
