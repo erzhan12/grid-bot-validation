@@ -18,6 +18,18 @@ strategies:
     increase_same_position_on_low_margin: true
     shadow_mode: false  # start with shadow mode to avoid real orders
 
+  - strat_id: solusdt_test
+    account: mainnet_live
+    symbol: SOLUSDT
+    tick_size: "0.01"
+    grid_count: 30
+    grid_step: 1.0
+    amount: "x0.0005"
+    max_margin: 3.0
+    min_total_margin: 2.5
+    increase_same_position_on_low_margin: true
+    shadow_mode: false
+
 database_url: "${DATABASE_URL}"
 
 auth_cooldown_minutes: 30

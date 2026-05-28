@@ -17,6 +17,7 @@
 
 symbols:
   - "LTCUSDT"
+  - "SOLUSDT"
 
 # Store in project-root data/ directory
 database_url: "sqlite:///data/recorder_ltcusdt_phase4.db"
