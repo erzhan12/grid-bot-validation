@@ -884,6 +884,37 @@ class TestStrategyRunnerPositionUpdate:
             runner.get_amount_multiplier("short", "Unknown")
 
 
+class TestBuildPositionStateRealizedPnl:
+    """_build_position_state plumbs Bybit cum/curRealisedPnl into PositionState."""
+
+    def test_realised_pnls_parsed(self, runner):
+        pos = {"size": "1.0", "avgPrice": "50000",
+               "cumRealisedPnl": "123.45", "curRealisedPnl": "5.50"}
+        state = runner._build_position_state(pos, 10000.0, "long")
+        assert state.cum_realized_pnl == Decimal("123.45")
+        assert state.cur_realized_pnl == Decimal("5.50")
+
+    def test_realised_pnls_negative(self, runner):
+        pos = {"size": "1.0", "avgPrice": "50000",
+               "cumRealisedPnl": "-16.74", "curRealisedPnl": "-2.00"}
+        state = runner._build_position_state(pos, 10000.0, "short")
+        assert state.cum_realized_pnl == Decimal("-16.74")
+        assert state.cur_realized_pnl == Decimal("-2.00")
+
+    def test_realised_pnls_absent_default_zero(self, runner):
+        pos = {"size": "1.0", "avgPrice": "50000"}
+        state = runner._build_position_state(pos, 10000.0, "long")
+        assert state.cum_realized_pnl == Decimal("0")
+        assert state.cur_realized_pnl == Decimal("0")
+
+    def test_realised_pnls_empty_string_default_zero(self, runner):
+        pos = {"size": "1.0", "avgPrice": "50000",
+               "cumRealisedPnl": "", "curRealisedPnl": ""}
+        state = runner._build_position_state(pos, 10000.0, "long")
+        assert state.cum_realized_pnl == Decimal("0")
+        assert state.cur_realized_pnl == Decimal("0")
+
+
 class TestStrategyRunnerOrderUpdate:
     """Tests for order update events."""
     def test_on_order_update_fills_tracked(self, runner, mock_executor):

@@ -45,6 +45,13 @@ class PositionState:
     liquidation_price: Decimal = Decimal('0')
     leverage: int = 1
     position_value: Decimal = Decimal('0')
+    # Bybit cumRealisedPnl: lifetime cumulative realised PnL; does NOT reset
+    # per cycle (~80x the Web UI "Realized" value).
+    cum_realized_pnl: Decimal = Decimal('0')
+    # Bybit curRealisedPnl: realised PnL for the current position cycle — what
+    # the Bybit Web UI "Realized" column shows. Retains the completed cycle
+    # total until the next opening fill resets it.
+    cur_realized_pnl: Decimal = Decimal('0')
 
 
 @dataclass
@@ -269,11 +276,16 @@ class Position:
         # Log position state (matches reference position.py:24-31)
         logger.debug(
             '%s margin=%.2f liq_ratio=%.2f unrealized_pnl=%.2f%% '
+            'upnl_usdt=%.4f realized_usdt=%.4f cum_realized_usdt=%.4f pos_value_usdt=%.2f '
             'multiplier=%s position_ratio=%.2f total_margin=%.2f',
             self.direction,
             float(position.margin),
             liq_ratio,
             unrealized_pnl_pct,
+            float(position.unrealized_pnl),
+            float(position.cur_realized_pnl),
+            float(position.cum_realized_pnl),
+            float(position.position_value),
             self.amount_multiplier,
             self.position_ratio,
             total_margin
