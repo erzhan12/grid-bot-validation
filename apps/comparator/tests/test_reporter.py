@@ -91,6 +91,60 @@ class TestComparatorReporter:
         assert "Cur realised final" in captured.out
         assert "-0.75" in captured.out
 
+    def test_export_metrics_includes_0059_rows(
+        self, sample_match_result, tmp_path,
+    ):
+        """0059: export_metrics emits the nine new per-snapshot rows."""
+        metrics = calculate_metrics(sample_match_result)
+        metrics.upnl_usdt_mean_abs_delta = Decimal("1.1")
+        metrics.upnl_usdt_max_abs_delta = Decimal("2.2")
+        metrics.cur_realised_usdt_mean_abs_delta = Decimal("3.3")
+        metrics.cur_realised_usdt_max_abs_delta = Decimal("4.4")
+        metrics.cum_realised_usdt_mean_abs_delta = Decimal("5.5")
+        metrics.cum_realised_usdt_max_abs_delta = Decimal("6.6")
+        metrics.pos_value_usdt_mean_abs_delta = Decimal("7.7")
+        metrics.pos_value_usdt_max_abs_delta = Decimal("8.8")
+        metrics.pos_value_final_delta = Decimal("9.9")
+        reporter = ComparatorReporter(sample_match_result, metrics)
+        path = tmp_path / "metrics.csv"
+        reporter.export_metrics(path)
+        with open(path) as f:
+            rows = list(csv.DictReader(f))
+        d = {r["metric"]: r["value"] for r in rows}
+        assert d["upnl_usdt_mean_abs_delta"] == "1.1"
+        assert d["upnl_usdt_max_abs_delta"] == "2.2"
+        assert d["cur_realised_usdt_mean_abs_delta"] == "3.3"
+        assert d["cur_realised_usdt_max_abs_delta"] == "4.4"
+        assert d["cum_realised_usdt_mean_abs_delta"] == "5.5"
+        assert d["cum_realised_usdt_max_abs_delta"] == "6.6"
+        assert d["pos_value_usdt_mean_abs_delta"] == "7.7"
+        assert d["pos_value_usdt_max_abs_delta"] == "8.8"
+        assert d["pos_value_final_delta"] == "9.9"
+        # Pre-existing final-delta rows must remain distinct and unchanged.
+        assert "cur_realised_pnl_final_delta" in d
+        assert "cum_realised_pnl_final_delta" in d
+
+    def test_print_summary_includes_0059_lines(
+        self, sample_match_result, capsys,
+    ):
+        """0059: print_summary surfaces the new per-snapshot lines, distinctly."""
+        metrics = calculate_metrics(sample_match_result)
+        metrics.upnl_usdt_mean_abs_delta = Decimal("1.1")
+        metrics.pos_value_final_delta = Decimal("9.9")
+        reporter = ComparatorReporter(sample_match_result, metrics)
+        reporter.print_summary()
+        out = capsys.readouterr().out
+        assert "Upnl mean |delta|" in out
+        assert "Upnl max |delta|" in out
+        assert "Cur realised mean |delta|" in out
+        assert "Cum realised mean |delta|" in out
+        assert "Pos value mean |delta|" in out
+        assert "Pos value max |delta|" in out
+        assert "Pos value final" in out
+        # Labels must remain distinct from the pre-existing final-only lines.
+        assert "Cur realised final" in out
+        assert "Cum realised final" in out
+
     def test_export_metrics_includes_metadata(self, sample_match_result, tmp_path):
         """Metrics CSV includes optional metadata with meta. prefix."""
         metrics = calculate_metrics(sample_match_result)
@@ -187,6 +241,7 @@ class TestComparatorReporter:
                 source=source, mark_price=Decimal("101"),
                 position_im=Decimal("10"), position_mm=Decimal("0.5"),
                 cum_realised_pnl=Decimal("5"),
+                position_value=Decimal("100"),
             )
 
         pairs = PositionComparator().pair_and_compare(
@@ -211,6 +266,13 @@ class TestComparatorReporter:
         assert "live_cur_realised" in header
         assert "bt_cur_realised" in header
         assert "cur_realised_delta" in header
+        # 0059: stored upnl parity + position value columns.
+        assert "live_upnl_usdt" in header
+        assert "bt_upnl_usdt" in header
+        assert "upnl_usdt_delta" in header
+        assert "live_position_value" in header
+        assert "bt_position_value" in header
+        assert "pos_value_delta" in header
         assert len(rows) == 1
         assert rows[0]["side"] == "Buy"
 

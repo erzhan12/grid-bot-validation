@@ -212,6 +212,18 @@ class ComparatorReporter:
             ("unrealised_pnl_max_abs_delta", str(m.unrealised_pnl_max_abs_delta)),
             ("cum_realised_pnl_final_delta", str(m.cum_realised_pnl_final_delta)),
             ("cur_realised_pnl_final_delta", str(m.cur_realised_pnl_final_delta)),
+            # 0059: per-snapshot parity aggregates (distinct from the
+            # *_pnl_final_delta rows above — the _usdt_*_abs_delta suffix
+            # separates the per-snapshot family from the final-only scalars).
+            ("upnl_usdt_mean_abs_delta", str(m.upnl_usdt_mean_abs_delta)),
+            ("upnl_usdt_max_abs_delta", str(m.upnl_usdt_max_abs_delta)),
+            ("cur_realised_usdt_mean_abs_delta", str(m.cur_realised_usdt_mean_abs_delta)),
+            ("cur_realised_usdt_max_abs_delta", str(m.cur_realised_usdt_max_abs_delta)),
+            ("cum_realised_usdt_mean_abs_delta", str(m.cum_realised_usdt_mean_abs_delta)),
+            ("cum_realised_usdt_max_abs_delta", str(m.cum_realised_usdt_max_abs_delta)),
+            ("pos_value_usdt_mean_abs_delta", str(m.pos_value_usdt_mean_abs_delta)),
+            ("pos_value_usdt_max_abs_delta", str(m.pos_value_usdt_max_abs_delta)),
+            ("pos_value_final_delta", str(m.pos_value_final_delta)),
             ("position_pairs_compared", str(m.position_pairs_compared)),
             ("position_pairs_unmatched_bt", str(m.position_pairs_unmatched_bt)),
             ("position_pairs_state_diverged", str(m.position_pairs_state_diverged)),
@@ -295,6 +307,14 @@ class ComparatorReporter:
                 "live_cur_realised",
                 "bt_cur_realised",
                 "cur_realised_delta",
+                # 0059: stored upnl parity (NOT the recomputed-vs-mark
+                # columns above) + position notional.
+                "live_upnl_usdt",
+                "bt_upnl_usdt",
+                "upnl_usdt_delta",
+                "live_position_value",
+                "bt_position_value",
+                "pos_value_delta",
                 "state_diverged",
             ])
 
@@ -330,6 +350,13 @@ class ComparatorReporter:
                     str(live.cur_realised_pnl) if live.cur_realised_pnl is not None else "",
                     str(bt.cur_realised_pnl) if bt.cur_realised_pnl is not None else "",
                     str(pair.cur_realised_pnl_delta) if pair.cur_realised_pnl_delta is not None else "",
+                    # 0059: stored upnl parity + position value.
+                    str(live.unrealised_pnl) if live.unrealised_pnl is not None else "",
+                    str(bt.unrealised_pnl) if bt.unrealised_pnl is not None else "",
+                    str(pair.upnl_usdt_delta) if pair.upnl_usdt_delta is not None else "",
+                    str(live.position_value) if live.position_value is not None else "",
+                    str(bt.position_value) if bt.position_value is not None else "",
+                    str(pair.pos_value_delta) if pair.pos_value_delta is not None else "",
                     "1" if pair.state_diverged else "0",
                 ])
 
@@ -444,6 +471,17 @@ class ComparatorReporter:
             f"    Unrealised max:        {m.unrealised_pnl_max_abs_delta}",
             f"    Cum realised final:    {m.cum_realised_pnl_final_delta}",
             f"    Cur realised final:    {m.cur_realised_pnl_final_delta}",
+            # 0059: per-snapshot |delta| families. Labels deliberately differ
+            # from the "* final" lines above so the two cannot be conflated.
+            f"    Upnl mean |delta|:        {m.upnl_usdt_mean_abs_delta}",
+            f"    Upnl max |delta|:         {m.upnl_usdt_max_abs_delta}",
+            f"    Cur realised mean |delta|:{m.cur_realised_usdt_mean_abs_delta}",
+            f"    Cur realised max |delta|: {m.cur_realised_usdt_max_abs_delta}",
+            f"    Cum realised mean |delta|:{m.cum_realised_usdt_mean_abs_delta}",
+            f"    Cum realised max |delta|: {m.cum_realised_usdt_max_abs_delta}",
+            f"    Pos value mean |delta|:   {m.pos_value_usdt_mean_abs_delta}",
+            f"    Pos value max |delta|:    {m.pos_value_usdt_max_abs_delta}",
+            f"    Pos value final:          {m.pos_value_final_delta}",
             "",
             "=" * 60,
         ]

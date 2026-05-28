@@ -528,6 +528,12 @@ class Recorder:
                                     if pos.get("curRealisedPnl") not in (None, "")
                                     else None
                                 ),
+                                # 0059: position notional (size * entry_price).
+                                position_value=(
+                                    Decimal(str(pos.get("positionValue")))
+                                    if pos.get("positionValue") not in (None, "")
+                                    else None
+                                ),
                                 raw_json=pos,
                             )
                         )
@@ -557,6 +563,7 @@ class Recorder:
                         position_mm=None,
                         cum_realised_pnl=None,
                         cur_realised_pnl=None,
+                        position_value=None,  # 0059: zero-row stays NULL.
                         raw_json=None,
                     )
                 )
