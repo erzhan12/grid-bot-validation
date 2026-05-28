@@ -444,6 +444,63 @@ class TestReplayEngineSeedingPipeline:
             "grid seed source=db" in rec.message for rec in caplog.records
         )
 
+    def test_load_seed_raises_when_only_ended_gridbot_run_has_snapshots(
+        self, seeded_db, replay_config, seed_ts, snapshot_ts, mock_instrument,
+    ):
+        """Completed live run snapshots must not seed replay after ``end_ts``.
+
+        When gridbot restarts, ``seed.at_ts`` is often after the new run's
+        ``start_ts`` but before its bootstrap snapshot. Without filtering out
+        ended runs, replay would load the previous run's grid and pass
+        validation with the wrong seed (0054 only raises when *no* row exists).
+        """
+        ended_grid = [
+            {"side": "Buy", "price": 88000.0},
+            {"side": "Buy", "price": 88200.0},
+            {"side": "Sell", "price": 88600.0},
+            {"side": "Sell", "price": 88800.0},
+        ]
+        with seeded_db.get_session() as session:
+            ended_run = Run(
+                run_id="ended-gridbot-run",
+                user_id="user-1",
+                account_id="acc-1",
+                strategy_id="strat-1",
+                run_type="live",
+                status="completed",
+                start_ts=seed_ts - timedelta(hours=2),
+                end_ts=seed_ts - timedelta(minutes=5),
+            )
+            session.add(ended_run)
+            session.flush()
+            GridStateSnapshotRepository(session).insert(
+                GridStateSnapshot(
+                    run_id="ended-gridbot-run",
+                    account_id="acc-1",
+                    strat_id=STRAT_ID,
+                    symbol=SYMBOL,
+                    exchange_ts=snapshot_ts,
+                    local_ts=snapshot_ts,
+                    grid_json=ended_grid,
+                    grid_step=Decimal("0.2"),
+                    grid_count=4,
+                    raw_fingerprint=grid_fingerprint_hash(ended_grid, 0.2, 4),
+                )
+            )
+            session.commit()
+
+        config = replay_config.model_copy(
+            update={
+                "seed": replay_config.seed.model_copy(
+                    update={"grid_state_path": None},
+                ),
+            },
+        )
+        engine = ReplayEngine(config=config, db=seeded_db)
+        run_id, *_ = engine._resolve_run(config)
+        with pytest.raises(SeedDataQualityError):
+            engine._load_seed(config, run_id)
+
     def test_load_seed_falls_back_to_file_when_no_db_snapshot(
         self, seeded_db, replay_config, mock_instrument,
     ):
