@@ -83,6 +83,10 @@ apps/gridbot/conf/gridbot.yaml
 # Per-recording replay configs (run_id/timestamps change every recorder run).
 # Canonical template lives at apps/replay/conf/replay_ltcusdt_phase4.yaml.example.
 apps/replay/conf/replay_*.yaml
+# Per-window iterative replay configs (e.g. iterative_v9.yaml,
+# iterative_v10_ltc.yaml) — each run targets a specific recorded window
+# with its own run_id and timestamps; not meant for the repo.
+apps/replay/conf/iterative_*.yaml
 
 # Recorded data
 data/
