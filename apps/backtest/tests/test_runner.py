@@ -182,25 +182,166 @@ class TestBacktestRunner:
         assert total == Decimal("150")
 
     def test_emit_position_snapshot_sets_position_value(self, runner, sample_timestamp):
-        """0059: snapshot carries tracker.state.position_value when in position."""
+        """0060: snapshot position_value is mark-based; tracker stays entry-based."""
+        entry = Decimal("100000")
+        mark = Decimal("100000")
         runner._long_tracker.process_fill(
             side="Buy",
             qty=Decimal("0.1"),
-            price=Decimal("100000"),
+            price=entry,
         )
         # Real flow refreshes margin (which sets state.position_value) before
         # snapshot emit; replicate that here.
-        runner._long_tracker.calculate_unrealized_pnl(Decimal("100000"))
+        runner._long_tracker.calculate_unrealized_pnl(mark)
         snap = runner._emit_position_snapshot(
             direction=DirectionType.LONG,
             timestamp=sample_timestamp,
-            mark_price=Decimal("100000"),
+            mark_price=mark,
             liq_long=Decimal("0"),
             liq_short=Decimal("0"),
         )
-        assert snap.position_value == runner._long_tracker.state.position_value
-        # size 0.1 * entry 100000 = 10000 notional.
-        assert snap.position_value == Decimal("10000")
+        size = runner._long_tracker.state.size
+        assert snap.position_value == abs(size) * mark
+        assert runner._long_tracker.state.position_value == abs(size) * entry
+
+    def test_snapshot_position_value_uses_mark_not_entry_underwater_long(
+        self, runner, sample_timestamp,
+    ):
+        """0060: underwater long snapshot uses mark, not entry, for position_value."""
+        entry = Decimal("120")
+        mark = Decimal("100")
+        qty = Decimal("10")
+        tracker = runner._long_tracker
+        tracker.process_fill(side="Buy", qty=qty, price=entry)
+        tracker.calculate_unrealized_pnl(mark)
+        entry_im = tracker.state.initial_margin
+        entry_mm = tracker.state.maintenance_margin
+        snap = runner._emit_position_snapshot(
+            direction=DirectionType.LONG,
+            timestamp=sample_timestamp,
+            mark_price=mark,
+            liq_long=Decimal("0"),
+            liq_short=Decimal("0"),
+        )
+        assert snap.position_value == abs(qty) * mark
+        assert snap.position_value != abs(qty) * entry
+        assert tracker.state.position_value == abs(qty) * entry
+        assert tracker.state.initial_margin == entry_im
+        assert tracker.state.maintenance_margin == entry_mm
+
+    def test_snapshot_position_value_uses_mark_not_entry_in_profit_long(
+        self, runner, sample_timestamp,
+    ):
+        """0060: in-profit long snapshot uses mark for position_value."""
+        entry = Decimal("100")
+        mark = Decimal("120")
+        qty = Decimal("10")
+        tracker = runner._long_tracker
+        tracker.process_fill(side="Buy", qty=qty, price=entry)
+        tracker.calculate_unrealized_pnl(mark)
+        entry_im = tracker.state.initial_margin
+        entry_mm = tracker.state.maintenance_margin
+        snap = runner._emit_position_snapshot(
+            direction=DirectionType.LONG,
+            timestamp=sample_timestamp,
+            mark_price=mark,
+            liq_long=Decimal("0"),
+            liq_short=Decimal("0"),
+        )
+        assert snap.position_value == abs(qty) * mark
+        assert snap.position_value != abs(qty) * entry
+        assert tracker.state.position_value == abs(qty) * entry
+        assert tracker.state.initial_margin == entry_im
+        assert tracker.state.maintenance_margin == entry_mm
+
+    def test_snapshot_position_value_uses_mark_not_entry_underwater_short(
+        self, runner, sample_timestamp,
+    ):
+        """0060: underwater short snapshot uses mark via the short tracker path."""
+        entry = Decimal("100")
+        mark = Decimal("120")
+        qty = Decimal("10")
+        tracker = runner._short_tracker
+        tracker.process_fill(side="Sell", qty=qty, price=entry)
+        tracker.calculate_unrealized_pnl(mark)
+        entry_im = tracker.state.initial_margin
+        entry_mm = tracker.state.maintenance_margin
+        snap = runner._emit_position_snapshot(
+            direction=DirectionType.SHORT,
+            timestamp=sample_timestamp,
+            mark_price=mark,
+            liq_long=Decimal("0"),
+            liq_short=Decimal("0"),
+        )
+        assert snap.side == "Sell"
+        assert snap.position_value == abs(qty) * mark
+        assert snap.position_value != abs(qty) * entry
+        assert tracker.state.position_value == abs(qty) * entry
+        assert tracker.state.initial_margin == entry_im
+        assert tracker.state.maintenance_margin == entry_mm
+
+    def test_snapshot_position_value_mark_parity_with_live_style_notional(
+        self, runner, sample_timestamp,
+    ):
+        """0060: Bybit-style live positionValue matches backtest snapshot → delta 0."""
+        from grid_db.models import PositionSnapshot
+
+        from comparator.position_metrics import _build_pair
+
+        entry = Decimal("100")
+        mark = Decimal("115")
+        qty = Decimal("5")
+        tracker = runner._long_tracker
+        tracker.process_fill(side="Buy", qty=qty, price=entry)
+        tracker.calculate_unrealized_pnl(mark)
+        bt_snap = runner._emit_position_snapshot(
+            direction=DirectionType.LONG,
+            timestamp=sample_timestamp,
+            mark_price=mark,
+            liq_long=Decimal("0"),
+            liq_short=Decimal("0"),
+        )
+        live_pv = abs(qty) * mark
+        live = PositionSnapshot(
+            run_id="run-test",
+            account_id="acct-1",
+            symbol="BTCUSDT",
+            exchange_ts=sample_timestamp,
+            local_ts=sample_timestamp,
+            side="Buy",
+            size=qty,
+            entry_price=entry,
+            liq_price=Decimal("0"),
+            unrealised_pnl=Decimal("0"),
+            source="live",
+            mark_price=mark,
+            position_im=Decimal("0"),
+            position_mm=Decimal("0"),
+            cum_realised_pnl=Decimal("0"),
+            cur_realised_pnl=Decimal("0"),
+            position_value=live_pv,
+        )
+        bt = PositionSnapshot(
+            run_id="run-test",
+            account_id="acct-1",
+            symbol="BTCUSDT",
+            exchange_ts=sample_timestamp,
+            local_ts=sample_timestamp,
+            side=bt_snap.side,
+            size=bt_snap.size,
+            entry_price=bt_snap.entry_price,
+            liq_price=bt_snap.liq_price,
+            unrealised_pnl=bt_snap.unrealised_pnl,
+            source="backtest",
+            mark_price=bt_snap.mark_price,
+            position_im=bt_snap.position_im,
+            position_mm=bt_snap.position_mm,
+            cum_realised_pnl=bt_snap.cum_realised_pnl,
+            cur_realised_pnl=bt_snap.cur_realised_pnl,
+            position_value=bt_snap.position_value,
+        )
+        pair = _build_pair(live, bt)
+        assert pair.pos_value_delta == Decimal("0")
 
     def test_emit_position_snapshot_flat_branch_zero(self, runner, sample_timestamp):
         """0059: flat (no position) snapshot reports Decimal('0') position value."""

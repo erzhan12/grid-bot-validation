@@ -98,7 +98,7 @@ class TestCalcPositionValue:
     """Test position value calculation."""
 
     def test_basic(self):
-        """Position value = size * entry_price."""
+        """Entry-based notional (size * entry_price) for local margin helpers."""
         result = calc_position_value(Decimal("0.1"), Decimal("50000"))
         assert result == Decimal("5000")
 

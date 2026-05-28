@@ -395,7 +395,9 @@ class PositionSnapshot(Base):
     position_mm: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8))
     cum_realised_pnl: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8))
     cur_realised_pnl: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8))
-    # 0059: position notional (size * entry_price), Bybit `positionValue`.
+    # 0059/0060: Bybit `positionValue` = |size| * mark_price. Live stores it verbatim;
+    # backtest snapshot is mark-based as of 0060 (local margin still uses entry-based
+    # notional separately). NULL on zero-rows.
     position_value: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8))
     raw_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
 

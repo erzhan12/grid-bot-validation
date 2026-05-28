@@ -54,7 +54,7 @@ class PositionCalcResult:
     unrealised_pnl_pct_bybit: Decimal  # Bybit standard: unrealised / IM * 100
 
     # Position value and margin
-    position_value: Decimal  # size * avg_entry_price (matches Bybit positionValue)
+    position_value: Decimal  # local entry-based notional for IM/MM calc; NOT Bybit positionValue
     initial_margin: Decimal  # tier-based IM (position_value * imr_rate)
     imr_rate: Decimal  # tier IMR rate used
     maintenance_margin: Decimal  # tier-based MM amount

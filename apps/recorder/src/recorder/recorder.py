@@ -528,7 +528,7 @@ class Recorder:
                                     if pos.get("curRealisedPnl") not in (None, "")
                                     else None
                                 ),
-                                # 0059: position notional (size * entry_price).
+                                # 0059/0060: Bybit positionValue verbatim (mark-based); not size * entry_price.
                                 position_value=(
                                     Decimal(str(pos.get("positionValue")))
                                     if pos.get("positionValue") not in (None, "")

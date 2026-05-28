@@ -1584,7 +1584,7 @@ class TestPositionSnapshotSourceFiltering0034:
         assert loaded.cum_realised_pnl == Decimal("5")
         # 0056: cycle-scoped realized PnL round-trips via bulk_insert.
         assert loaded.cur_realised_pnl == Decimal("1.75")
-        # 0059: position value (size * entry_price) round-trips via bulk_insert.
+        # 0059: position_value column round-trips via bulk_insert (value is opaque storage).
         assert loaded.position_value == Decimal("100.50")
 
     def test_bulk_insert_round_trips_null_cur_realised_pnl(

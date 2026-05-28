@@ -82,7 +82,8 @@ class PositionComparisonPair:
     # 1:1 with the 0058 `upnl_usdt` log line. Distinct from
     # `unrealised_pnl_delta`, which is recomputed against `live.mark_price`.
     upnl_usdt_delta: Optional[Decimal] = None
-    # 0059: per-snapshot delta of position notional (size * entry_price).
+    # 0059/0060: per-snapshot delta of stored position_value (Bybit positionValue =
+    # mark-based on both sides after 0060). NOT size * entry_price.
     # Like `cur_realised_pnl_delta`, NOT in the has_missing_telemetry block:
     # pre-0059 rows are NULL and would universally trip the flag.
     pos_value_delta: Optional[Decimal] = None

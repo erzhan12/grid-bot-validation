@@ -132,9 +132,16 @@ def calc_unrealised_pnl_pct(
 
 
 def calc_position_value(size: Decimal, entry_price: Decimal) -> Decimal:
-    """Calculate position value (notional at entry).
+    """Position notional at ENTRY = size * entry_price.
 
-    Matches Bybit's ``positionValue`` field: size * avgEntryPrice.
+    Used as the notional input to this project's local margin/IM/MM helpers
+    (``calc_initial_margin``, ``calc_maintenance_margin``, risk margin ratio).
+    This is NOT Bybit's reported ``positionValue`` field (mark-based:
+    |size| * markPrice). Bybit UTA IM uses mark price and hedge optimization
+    (``RULES.md:2184``); our local formulas intentionally use entry-based
+    notional — a known mismatch, out of scope for 0060. Snapshot/parity code
+    that needs Bybit/live ``positionValue`` parity must compute
+    ``abs(size) * mark_price`` separately (feature 0060).
 
     Args:
         size: Position size
