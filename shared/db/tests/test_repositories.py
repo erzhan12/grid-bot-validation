@@ -1565,6 +1565,7 @@ class TestPositionSnapshotSourceFiltering0034:
             position_mm=Decimal("0.5"),
             cum_realised_pnl=Decimal("5"),
             cur_realised_pnl=Decimal("1.75"),
+            position_value=Decimal("100.50"),
         )
 
     def test_bulk_insert_round_trips_new_columns(self, session, sample_account):
@@ -1583,6 +1584,8 @@ class TestPositionSnapshotSourceFiltering0034:
         assert loaded.cum_realised_pnl == Decimal("5")
         # 0056: cycle-scoped realized PnL round-trips via bulk_insert.
         assert loaded.cur_realised_pnl == Decimal("1.75")
+        # 0059: position value (size * entry_price) round-trips via bulk_insert.
+        assert loaded.position_value == Decimal("100.50")
 
     def test_bulk_insert_round_trips_null_cur_realised_pnl(
         self, session, sample_account,
@@ -1598,6 +1601,21 @@ class TestPositionSnapshotSourceFiltering0034:
 
         loaded = session.query(PositionSnapshot).one()
         assert loaded.cur_realised_pnl is None
+
+    def test_bulk_insert_round_trips_null_position_value(
+        self, session, sample_account,
+    ):
+        """0059: an explicit None position_value round-trips as NULL."""
+        from grid_db import PositionSnapshotRepository, PositionSnapshot
+
+        ts = datetime.now(UTC)
+        snap = self._make_snap(sample_account.account_id, ts, "live")
+        snap.position_value = None
+        repo = PositionSnapshotRepository(session)
+        repo.bulk_insert([snap])
+
+        loaded = session.query(PositionSnapshot).one()
+        assert loaded.position_value is None
 
     def test_get_latest_by_account_symbol_defaults_live(self, session, sample_account):
         from grid_db import PositionSnapshotRepository

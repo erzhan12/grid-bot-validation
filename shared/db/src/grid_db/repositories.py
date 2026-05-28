@@ -977,6 +977,7 @@ class PositionSnapshotRepository(BaseRepository[PositionSnapshot]):
                 "position_mm": s.position_mm,
                 "cum_realised_pnl": s.cum_realised_pnl,
                 "cur_realised_pnl": s.cur_realised_pnl,
+                "position_value": s.position_value,  # 0059
                 "raw_json": s.raw_json,
             }
             for s in snapshots

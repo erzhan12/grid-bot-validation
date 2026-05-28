@@ -5,10 +5,10 @@ Reads ``position_snapshots`` rows filtered by ``source`` (``'live'`` or
 ``(side, exchange_ts)`` so the pairing pass can stream them per-side
 with a monotonic two-pointer.
 
-Raises ``PositionTelemetryNotMigratedError`` when the ``source`` column
-is missing — that is the only signal that the operator forgot to apply
-the 0034 schema migration. We never silently mask un-migrated DBs as
-zero-pair scenarios.
+Raises ``PositionTelemetryNotMigratedError`` when the ``source`` (0034),
+``cur_realised_pnl`` (0056), or ``position_value`` (0059) column is
+missing — the signal that the operator forgot to apply that schema
+migration. We never silently mask un-migrated DBs as zero-pair scenarios.
 """
 
 from __future__ import annotations
@@ -31,14 +31,15 @@ class PositionTelemetryNotMigratedError(RuntimeError):
 
 
 def _probe_schema(session: Session) -> None:
-    """Raise ``PositionTelemetryNotMigratedError`` if 0034 or 0056 columns are missing.
+    """Raise ``PositionTelemetryNotMigratedError`` if 0034/0056/0059 columns are missing.
 
     Uses trivial ``SELECT <col> FROM position_snapshots LIMIT 1`` queries —
     cheap on any backend, and fail loudly with ``OperationalError``
     (SQLite) or ``ProgrammingError`` (Postgres) when the column does
     not exist. The 0034 probe (``source``) runs first; if it passes, the
-    0056 probe (``cur_realised_pnl``) runs next so the operator sees the
-    correct migration message for whichever migration was skipped.
+    0056 probe (``cur_realised_pnl``) runs, then the 0059 probe
+    (``position_value``), so the operator sees the correct migration
+    message for whichever migration was skipped.
     """
     try:
         session.execute(
@@ -75,6 +76,25 @@ def _probe_schema(session: Session) -> None:
             ) from exc
         raise
 
+    try:
+        session.execute(
+            PositionSnapshot.__table__.select()
+            .with_only_columns(PositionSnapshot.position_value)
+            .limit(1)
+        ).first()
+    except (OperationalError, ProgrammingError) as exc:
+        msg = str(exc).lower()
+        if "position_value" in msg and (
+            "no such column" in msg or "does not exist" in msg
+        ):
+            raise PositionTelemetryNotMigratedError(
+                "Run the 0059 schema migration before loading position "
+                "snapshots. Position_snapshots is missing the "
+                "'position_value' column. "
+                "See scripts/migrate_0059_position_value.py."
+            ) from exc
+        raise
+
 
 def load_position_snapshots(
     session: Session,
@@ -101,7 +121,9 @@ def load_position_snapshots(
         List of :class:`PositionSnapshot` ordered by ``(side, exchange_ts)``.
 
     Raises:
-        PositionTelemetryNotMigratedError: If 0034 columns are absent.
+        PositionTelemetryNotMigratedError: If the 0034 (``source``), 0056
+            (``cur_realised_pnl``), or 0059 (``position_value``) columns
+            are absent.
     """
     _probe_schema(session)
 

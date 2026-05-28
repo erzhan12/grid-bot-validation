@@ -629,6 +629,8 @@ class BacktestRunner:
         (both return tuples — first element is the amount). Unrealized PnL is
         computed via ``calc_unrealised_pnl`` so the short-side sign is correct
         (the naive ``(mark-entry)*size`` formula is wrong for shorts).
+        ``position_value`` (0059) is read from ``tracker.state.position_value``
+        in the in-position branch and set to ``Decimal("0")`` when flat.
 
         ``run_id`` / ``account_id`` are NOT set here — the caller (writer)
         owns those fields per the run context.
@@ -670,11 +672,19 @@ class BacktestRunner:
                     self._session.total_equity,
                 )
             liq_price = liq_long if direction == DirectionType.LONG else liq_short
+            # 0059: tracker keeps this in sync via _update_margin
+            # (= size * avg_entry_price). Read it for the in-position branch.
+            position_value = tracker.state.position_value
         else:
             unrealised = Decimal("0")
             position_im = Decimal("0")
             position_mm = Decimal("0")
             liq_price = Decimal("0")
+            # 0059: explicit zero for the flat branch, matching the other
+            # zero-branch fields. Do NOT read tracker.state.position_value
+            # here — a caller emitting a flat snapshot without a prior margin
+            # refresh could otherwise leak a stale value.
+            position_value = Decimal("0")
 
         return PositionSnapshot(
             # run_id / account_id / source filled by the writer.
@@ -691,6 +701,7 @@ class BacktestRunner:
             position_mm=position_mm,
             cum_realised_pnl=tracker.state.cum_realised_pnl,
             cur_realised_pnl=tracker.state.cur_realised_pnl,
+            position_value=position_value,  # 0059
         )
 
     def _build_position_state(

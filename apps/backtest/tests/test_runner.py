@@ -181,6 +181,36 @@ class TestBacktestRunner:
         # (When set directly, no commission is deducted)
         assert total == Decimal("150")
 
+    def test_emit_position_snapshot_sets_position_value(self, runner, sample_timestamp):
+        """0059: snapshot carries tracker.state.position_value when in position."""
+        runner._long_tracker.process_fill(
+            side="Buy",
+            qty=Decimal("0.1"),
+            price=Decimal("100000"),
+        )
+        # Real flow refreshes margin (which sets state.position_value) before
+        # snapshot emit; replicate that here.
+        runner._long_tracker.calculate_unrealized_pnl(Decimal("100000"))
+        snap = runner._emit_position_snapshot(
+            direction=DirectionType.LONG,
+            timestamp=sample_timestamp,
+            mark_price=Decimal("100000"),
+            liq_long=Decimal("0"),
+            liq_short=Decimal("0"),
+        )
+        assert snap.position_value == runner._long_tracker.state.position_value
+        # size 0.1 * entry 100000 = 10000 notional.
+        assert snap.position_value == Decimal("10000")
+
+    def test_emit_position_snapshot_flat_branch_zero(self, runner, sample_timestamp):
+        """0059: flat (no position) snapshot reports Decimal('0') position value."""
+        snap = runner._emit_position_snapshot(
+            direction=DirectionType.LONG,
+            timestamp=sample_timestamp,
+            mark_price=Decimal("100000"),
+        )
+        assert snap.position_value == Decimal("0")
+
 
 class TestBacktestRunnerRiskMultipliers:
     """Tests for risk multiplier integration in BacktestRunner."""

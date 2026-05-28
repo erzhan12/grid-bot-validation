@@ -395,6 +395,8 @@ class PositionSnapshot(Base):
     position_mm: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8))
     cum_realised_pnl: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8))
     cur_realised_pnl: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8))
+    # 0059: position notional (size * entry_price), Bybit `positionValue`.
+    position_value: Mapped[Optional[Decimal]] = mapped_column(Numeric(20, 8))
     raw_json: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
 
     __table_args__ = (

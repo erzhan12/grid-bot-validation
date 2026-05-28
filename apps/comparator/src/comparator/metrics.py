@@ -104,6 +104,23 @@ class ValidationMetrics:
     # just-closed cycle total at session end (Bybit holds the closed total
     # until the next opening fill).
     cur_realised_pnl_final_delta: Decimal = field(default_factory=lambda: Decimal("0"))
+    # 0059: per-snapshot parity for the four USDT values the 0058 log line
+    # emits (upnl_usdt, cur/cum realised, pos_value). Unlike the *_final_delta
+    # fields above (last per-side value only), these sum |delta| across ALL
+    # matched pairs so intermediate drift that cancels out at session end is
+    # still visible. upnl_usdt_* compares the STORED unrealised_pnl 1:1 (not
+    # the recompute-vs-mark unrealised_pnl_* family). cur/cum_realised_usdt_*
+    # are the per-snapshot complements of the cur/cum_realised_pnl_final_delta
+    # scalars. pos_value_final_delta mirrors the cur/cum final-delta scalars.
+    upnl_usdt_mean_abs_delta: Decimal = field(default_factory=lambda: Decimal("0"))
+    upnl_usdt_max_abs_delta: Decimal = field(default_factory=lambda: Decimal("0"))
+    cur_realised_usdt_mean_abs_delta: Decimal = field(default_factory=lambda: Decimal("0"))
+    cur_realised_usdt_max_abs_delta: Decimal = field(default_factory=lambda: Decimal("0"))
+    cum_realised_usdt_mean_abs_delta: Decimal = field(default_factory=lambda: Decimal("0"))
+    cum_realised_usdt_max_abs_delta: Decimal = field(default_factory=lambda: Decimal("0"))
+    pos_value_usdt_mean_abs_delta: Decimal = field(default_factory=lambda: Decimal("0"))
+    pos_value_usdt_max_abs_delta: Decimal = field(default_factory=lambda: Decimal("0"))
+    pos_value_final_delta: Decimal = field(default_factory=lambda: Decimal("0"))
     position_pairs_compared: int = 0
     position_pairs_unmatched_bt: int = 0
     position_pairs_missing_telemetry: int = 0

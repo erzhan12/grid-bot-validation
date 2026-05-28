@@ -1096,6 +1096,47 @@ class TestPositionWriter:
         snap = writer._buffer[0]
         assert snap.cur_realised_pnl is None
 
+    @pytest.mark.asyncio
+    async def test_parses_position_value(self, mock_db):
+        """0059: positionValue populates position_value as Decimal."""
+        from decimal import Decimal
+
+        writer = PositionWriter(db=mock_db, batch_size=100)
+        messages = [{
+            "data": [{
+                "symbol": "LTCUSDT",
+                "side": "Buy",
+                "size": "1.0",
+                "entryPrice": "100.0",
+                "liqPrice": "90.0",
+                "unrealisedPnl": "1.0",
+                "positionValue": "100.0",
+                "updatedTime": "1700000000000",
+            }]
+        }]
+        await writer.write(uuid4(), messages)
+        snap = writer._buffer[0]
+        assert snap.position_value == Decimal("100.0")
+
+    @pytest.mark.asyncio
+    async def test_missing_position_value_yields_none(self, mock_db):
+        """0059: a payload without positionValue writes None."""
+        writer = PositionWriter(db=mock_db, batch_size=100)
+        messages = [{
+            "data": [{
+                "symbol": "LTCUSDT",
+                "side": "Buy",
+                "size": "1.0",
+                "entryPrice": "100.0",
+                "liqPrice": "90.0",
+                "unrealisedPnl": "1.0",
+                "updatedTime": "1700000000000",
+            }]
+        }]
+        await writer.write(uuid4(), messages)
+        snap = writer._buffer[0]
+        assert snap.position_value is None
+
 
 class TestWalletWriter:
     """Test WalletWriter buffering and bulk insert."""

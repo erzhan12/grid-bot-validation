@@ -78,6 +78,14 @@ class PositionComparisonPair:
     # pre-0056 rows have NULL here and treating that as missing telemetry
     # would universally trip the flag for legacy replays.
     cur_realised_pnl_delta: Optional[Decimal] = None
+    # 0059: per-snapshot delta of the STORED unrealised_pnl (bt - live),
+    # 1:1 with the 0058 `upnl_usdt` log line. Distinct from
+    # `unrealised_pnl_delta`, which is recomputed against `live.mark_price`.
+    upnl_usdt_delta: Optional[Decimal] = None
+    # 0059: per-snapshot delta of position notional (size * entry_price).
+    # Like `cur_realised_pnl_delta`, NOT in the has_missing_telemetry block:
+    # pre-0059 rows are NULL and would universally trip the flag.
+    pos_value_delta: Optional[Decimal] = None
 
     # True when any per-field delta is None due to NULL telemetry on either
     # side (other fields may still have populated deltas).
@@ -119,6 +127,9 @@ def _build_pair(
         liq_price_delta=_safe_sub(bt.liq_price, live.liq_price),
         cum_realised_pnl_delta=_safe_sub(bt.cum_realised_pnl, live.cum_realised_pnl),
         cur_realised_pnl_delta=_safe_sub(bt.cur_realised_pnl, live.cur_realised_pnl),
+        # 0059: stored-value parity (NOT recomputed) + position notional.
+        upnl_usdt_delta=_safe_sub(bt.unrealised_pnl, live.unrealised_pnl),
+        pos_value_delta=_safe_sub(bt.position_value, live.position_value),
     )
 
     if mark is not None:
@@ -254,7 +265,16 @@ class PositionComparator:
         metrics: ValidationMetrics,
         pairs: list[PositionComparisonPair],
     ) -> None:
-        """Mutate ``metrics`` with the 12 new aggregate fields (idempotent)."""
+        """Mutate ``metrics`` with the 21 telemetry aggregate fields (idempotent).
+
+        21 total = 12 pre-existing + 9 from 0059.
+        0059 adds nine per-snapshot aggregates (upnl/cur/cum/pos-value
+        mean+max |delta| and pos_value_final_delta) alongside the original
+        12. The new per-snapshot mean/max families sum |delta| across ALL
+        matched pairs, whereas the ``*_final_delta`` fields keep only the
+        last per-side value; both are retained because intermediate drift
+        that cancels out is invisible to a final-only comparison.
+        """
         all_matched = [
             p for p in pairs if p.backtest is not None and p.live is not None
         ]
@@ -302,6 +322,20 @@ class PositionComparator:
         metrics.unrealised_pnl_mean_abs_delta, metrics.unrealised_pnl_max_abs_delta = _agg(
             "unrealised_pnl_delta"
         )
+        # 0059: per-snapshot mean/max |delta| families. cur/cum reuse the
+        # existing per-pair delta fields; upnl/pos_value use the new ones.
+        metrics.upnl_usdt_mean_abs_delta, metrics.upnl_usdt_max_abs_delta = _agg(
+            "upnl_usdt_delta"
+        )
+        metrics.cur_realised_usdt_mean_abs_delta, metrics.cur_realised_usdt_max_abs_delta = _agg(
+            "cur_realised_pnl_delta"
+        )
+        metrics.cum_realised_usdt_mean_abs_delta, metrics.cum_realised_usdt_max_abs_delta = _agg(
+            "cum_realised_pnl_delta"
+        )
+        metrics.pos_value_usdt_mean_abs_delta, metrics.pos_value_usdt_max_abs_delta = _agg(
+            "pos_value_delta"
+        )
 
         # cum_realised_pnl: compare the FINAL value delta only (per Step 4
         # design — per-pair rounding noise accumulates over long sessions).
@@ -332,6 +366,20 @@ class PositionComparator:
             cur_per_side_final.values(), Decimal("0"),
         )
 
+        # 0059: same per-side last-pair aggregation for position value.
+        # Reporting tradeoff: equal-and-opposite long/short position-value
+        # drift can cancel in this scalar sum, so operators should rely on
+        # pos_value_usdt_mean/max_abs_delta (which sum |delta| across all
+        # matched pairs) for hedge-mode diagnosis, not this scalar alone.
+        pos_value_per_side_final: dict[str, Decimal] = {}
+        for pair in matched:
+            if pair.pos_value_delta is None:
+                continue
+            pos_value_per_side_final[pair.side] = pair.pos_value_delta
+        metrics.pos_value_final_delta = sum(
+            pos_value_per_side_final.values(), Decimal("0"),
+        )
+
 
 def _unmatched_bt_marker(bt: PositionSnapshot) -> PositionComparisonPair:
     """Sentinel pair for an unmatched backtest snapshot.
@@ -356,6 +404,8 @@ def _unmatched_bt_marker(bt: PositionSnapshot) -> PositionComparisonPair:
     pair.unrealised_pnl_delta = None
     pair.cum_realised_pnl_delta = None
     pair.cur_realised_pnl_delta = None
+    pair.upnl_usdt_delta = None  # 0059
+    pair.pos_value_delta = None  # 0059
     pair.has_missing_telemetry = True
     return pair
 
