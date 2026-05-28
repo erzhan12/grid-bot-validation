@@ -2,6 +2,7 @@
 Unit tests for Position module.
 """
 
+import logging
 from decimal import Decimal
 from gridcore.position import PositionState, PositionRiskManager, RiskConfig, Position
 
@@ -31,6 +32,22 @@ class TestPositionState:
         assert pos.direction == 'short'
         assert pos.size == Decimal('1.5')
         assert pos.leverage == 10
+
+    def test_position_state_realized_pnl_default(self):
+        """cum/cur realized_pnl default to Decimal('0')."""
+        pos = PositionState(direction=Position.DIRECTION_LONG)
+        assert pos.cum_realized_pnl == Decimal('0')
+        assert pos.cur_realized_pnl == Decimal('0')
+
+    def test_position_state_realized_pnl_value(self):
+        """cum/cur realized_pnl hold the supplied values."""
+        pos = PositionState(
+            direction=Position.DIRECTION_LONG,
+            cum_realized_pnl=Decimal('123.45'),
+            cur_realized_pnl=Decimal('5.50'),
+        )
+        assert pos.cum_realized_pnl == Decimal('123.45')
+        assert pos.cur_realized_pnl == Decimal('5.50')
 
 
 class TestPositionRiskManager:
@@ -145,6 +162,89 @@ class TestPositionRiskManager:
         # Should return multipliers dict
         assert 'Buy' in short_multipliers
         assert 'Sell' in short_multipliers
+
+    def test_log_line_includes_usdt_fields(self, caplog):
+        """Per-tick DEBUG log line carries upnl/realized/cum_realized/pos_value USDT fields.
+
+        realized_usdt mirrors curRealisedPnl (the UI 'Realized' value);
+        cum_realized_usdt mirrors cumRealisedPnl (lifetime).
+        """
+        risk_config = RiskConfig(
+            min_liq_ratio=0.8,
+            max_liq_ratio=1.2,
+            max_margin=5.0,
+            min_total_margin=1.0,
+        )
+        long_manager, _ = PositionRiskManager.create_linked_pair(risk_config)
+
+        position = PositionState(
+            direction=Position.DIRECTION_LONG,
+            size=Decimal('1.0'),
+            entry_price=Decimal('100000.0'),
+            unrealized_pnl=Decimal('6.37'),
+            cum_realized_pnl=Decimal('123.45'),
+            cur_realized_pnl=Decimal('5.50'),
+            margin=Decimal('2.0'),
+            liquidation_price=Decimal('50000.0'),
+            leverage=10,
+            position_value=Decimal('1500.0'),
+        )
+        opposite = PositionState(
+            direction=Position.DIRECTION_SHORT,
+            size=Decimal('1.0'),
+            entry_price=Decimal('100000.0'),
+            margin=Decimal('2.0'),
+            liquidation_price=Decimal('150000.0'),
+            leverage=10,
+        )
+
+        with caplog.at_level(logging.DEBUG, logger='gridcore.position'):
+            long_manager.calculate_amount_multiplier(
+                position, opposite, last_close=100000.0
+            )
+
+        assert 'upnl_usdt=6.3700' in caplog.text
+        assert 'realized_usdt=5.5000' in caplog.text
+        assert 'cum_realized_usdt=123.4500' in caplog.text
+        assert 'pos_value_usdt=1500.00' in caplog.text
+
+    def test_log_line_unrealized_sign_preserved(self, caplog):
+        """Negative Bybit unrealisedPnl is logged with its sign in upnl_usdt."""
+        risk_config = RiskConfig(
+            min_liq_ratio=0.8,
+            max_liq_ratio=1.2,
+            max_margin=5.0,
+            min_total_margin=1.0,
+        )
+        _, short_manager = PositionRiskManager.create_linked_pair(risk_config)
+
+        short_position = PositionState(
+            direction=Position.DIRECTION_SHORT,
+            size=Decimal('1.0'),
+            entry_price=Decimal('100000.0'),
+            unrealized_pnl=Decimal('-16.74'),
+            cum_realized_pnl=Decimal('0'),
+            cur_realized_pnl=Decimal('0'),
+            margin=Decimal('2.0'),
+            liquidation_price=Decimal('150000.0'),
+            leverage=10,
+            position_value=Decimal('1500.0'),
+        )
+        long_opposite = PositionState(
+            direction=Position.DIRECTION_LONG,
+            size=Decimal('1.0'),
+            entry_price=Decimal('100000.0'),
+            margin=Decimal('2.0'),
+            liquidation_price=Decimal('50000.0'),
+            leverage=10,
+        )
+
+        with caplog.at_level(logging.DEBUG, logger='gridcore.position'):
+            short_manager.calculate_amount_multiplier(
+                short_position, long_opposite, last_close=100000.0
+            )
+
+        assert 'upnl_usdt=-16.7400' in caplog.text
 
 
 class TestRiskConfig:

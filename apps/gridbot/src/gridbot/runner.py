@@ -836,6 +836,11 @@ class StrategyRunner:
         entry_price = float(position_data.get("avgPrice", 0) or position_data.get("entryPrice", 0))
         liq_price = float(position_data.get("liqPrice", 0) or 0)
         unrealized_pnl = float(position_data.get("unrealisedPnl", 0) or 0)
+        # cumRealisedPnl: lifetime cumulative realised PnL (does NOT reset per
+        # cycle; ~80x the UI value). curRealisedPnl: current-cycle realised PnL
+        # = the Bybit Web UI "Realized" column.
+        cum_realized_pnl = float(position_data.get("cumRealisedPnl", 0) or 0)
+        cur_realized_pnl = float(position_data.get("curRealisedPnl", 0) or 0)
 
         # Calculate margin
         size_d = Decimal(str(size))
@@ -851,6 +856,8 @@ class StrategyRunner:
             margin=margin,
             liquidation_price=Decimal(str(liq_price)),
             position_value=position_value,
+            cum_realized_pnl=Decimal(str(cum_realized_pnl)),
+            cur_realized_pnl=Decimal(str(cur_realized_pnl)),
         )
 
     def _execute_intents(
