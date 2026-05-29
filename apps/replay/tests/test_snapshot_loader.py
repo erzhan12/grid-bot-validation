@@ -97,9 +97,10 @@ def sample_run(session, sample_user, sample_account, sample_strategy):
         user_id=sample_user.user_id,
         account_id=sample_account.account_id,
         strategy_id=sample_strategy.strategy_id,
-        run_type="recording",
+        run_type="live",
         status="running",
         start_ts=datetime(2026, 5, 7, 9, 0, 0, tzinfo=timezone.utc),
+        end_ts=None,
     )
     session.add(run)
     session.flush()

@@ -100,7 +100,8 @@ def sample_run(session, sample_user, sample_account, sample_strategy):
         strategy_id=sample_strategy.strategy_id,
         run_type="live",
         status="running",
-        start_ts=datetime.now(UTC),
+        start_ts=datetime(2020, 1, 1, tzinfo=UTC),
+        end_ts=None,
     )
     session.add(run)
     session.flush()

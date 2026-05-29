@@ -1806,9 +1806,10 @@ class TestGridStateSnapshotRepository:
             user_id=sample_user.user_id,
             account_id=sample_account.account_id,
             strategy_id=sample_strategy.strategy_id,
-            run_type="recording",
+            run_type="live",
             status="running",
             start_ts=datetime(2026, 1, 1, tzinfo=UTC),
+            end_ts=None,
         )
         session.add(other_run)
         session.flush()
@@ -1879,5 +1880,53 @@ class TestGridStateSnapshotRepository:
         picked = repo.get_at_or_before(
             sample_run.account_id, "strat_a", "BTCUSDT",
             ts + timedelta(hours=1),
+        )
+        assert picked is None
+
+    def test_get_at_or_before_excludes_run_ended_before_at_ts(
+        self, session, sample_user, sample_account, sample_strategy,
+    ):
+        """Snapshots from a completed run must not seed replay after it ended.
+
+        Without the runs join, the latest ``exchange_ts <= at_ts`` row from
+        an old live run would win even when ``at_ts`` is after that run's
+        ``end_ts`` and a new gridbot process has not written yet.
+        """
+        repo = GridStateSnapshotRepository(session)
+        ended_run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="live",
+            status="completed",
+            start_ts=datetime(2026, 1, 1, 8, 0, tzinfo=UTC),
+            end_ts=datetime(2026, 1, 1, 10, 0, tzinfo=UTC),
+        )
+        session.add(ended_run)
+        session.flush()
+
+        grid = [
+            {"side": "Buy", "price": 100.0},
+            {"side": "Wait", "price": 101.0},
+            {"side": "Sell", "price": 102.0},
+        ]
+        snap_ts = datetime(2026, 1, 1, 9, 30, tzinfo=UTC)
+        repo.insert(GridStateSnapshot(
+            run_id=ended_run.run_id,
+            account_id=sample_account.account_id,
+            strat_id="strat_a",
+            symbol="BTCUSDT",
+            exchange_ts=snap_ts,
+            local_ts=snap_ts,
+            grid_json=grid,
+            grid_step=Decimal("0.5"),
+            grid_count=3,
+            raw_fingerprint=grid_fingerprint_hash(grid, 0.5, 3),
+        ))
+        session.flush()
+
+        at_ts = datetime(2026, 1, 1, 11, 0, tzinfo=UTC)
+        picked = repo.get_at_or_before(
+            sample_account.account_id, "strat_a", "BTCUSDT", at_ts,
         )
         assert picked is None

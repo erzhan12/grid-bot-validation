@@ -2,7 +2,7 @@
 
 from typing import Generic, TypeVar, Optional, List
 
-from sqlalchemy import func, tuple_
+from sqlalchemy import func, or_, tuple_
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -1301,6 +1301,16 @@ class GridStateSnapshotRepository(BaseRepository[GridStateSnapshot]):
         ``run_id``) are independent processes — scoping by recorder's
         ``run_id`` matches zero rows because gridbot wrote under its own.
 
+        Joins ``runs`` and requires the writer run to have been **active**
+        at ``at_ts`` (``start_ts <= at_ts`` and ``end_ts`` is NULL or
+        ``>= at_ts``). Without this, a completed gridbot run's last
+        snapshot could seed replay after a restart before the new run's
+        bootstrap snapshot lands — silently wrong grid state under
+        ``seed.enabled=True``.
+
+        Only ``live`` / ``shadow`` runs are considered; recording runs do
+        not write grid snapshots today but are excluded defensively.
+
         Intentional asymmetry with ``get_latest``: see that method's
         docstring. The ``symbol`` predicate prevents cross-symbol bleed
         for accounts whose ``strat_id`` was retained after a symbol
@@ -1312,11 +1322,15 @@ class GridStateSnapshotRepository(BaseRepository[GridStateSnapshot]):
         """
         return (
             self.session.query(GridStateSnapshot)
+            .join(Run, Run.run_id == GridStateSnapshot.run_id)
             .filter(
                 GridStateSnapshot.account_id == account_id,
                 GridStateSnapshot.strat_id == strat_id,
                 GridStateSnapshot.symbol == symbol,
                 GridStateSnapshot.exchange_ts <= at_ts,
+                Run.run_type.in_(("live", "shadow")),
+                Run.start_ts <= at_ts,
+                or_(Run.end_ts.is_(None), Run.end_ts >= at_ts),
             )
             .order_by(
                 GridStateSnapshot.exchange_ts.desc(),
