@@ -2,7 +2,7 @@
 
 from typing import Generic, TypeVar, Optional, List
 
-from sqlalchemy import func, tuple_
+from sqlalchemy import func, or_, tuple_
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -1306,17 +1306,38 @@ class GridStateSnapshotRepository(BaseRepository[GridStateSnapshot]):
         for accounts whose ``strat_id`` was retained after a symbol
         rename.
 
+        **Run-active guard (feature 0062).** INNER JOINs ``runs`` and
+        requires the writer run was **active at ``at_ts``**
+        (``start_ts <= at_ts`` AND ``end_ts`` NULL or ``>= at_ts``) AND its
+        ``run_type`` is a grid-writing type (``live``/``shadow``; the
+        recorder's ``recording`` run never writes grid snapshots). Without
+        this guard, after a graceful gridbot restart a completed run's last
+        snapshot could seed replay in the gap before the new run's bootstrap
+        write — a silently WRONG grid, since feature 0054 only raises when
+        *no* row is found. ``end_ts`` is **inclusive**: a run that ended
+        exactly at ``at_ts`` still owns the grid state at that instant.
+        Known gap: an *unclean* shutdown can leave the old run
+        ``end_ts=NULL`` (still matching) until startup orphan cleanup closes
+        it — see RULES.md / feature 0062 §4.6.
+
+        Overlapping live+shadow on the same key are both eligible; the
+        ``ORDER BY`` below deterministically picks the most recent.
+
         ``ORDER BY exchange_ts DESC, id DESC`` — the secondary ``id`` sort
         picks the final notify of a multi-notify outer mutation when both
         snapshots share the same ``exchange_ts``.
         """
         return (
             self.session.query(GridStateSnapshot)
+            .join(Run, Run.run_id == GridStateSnapshot.run_id)
             .filter(
                 GridStateSnapshot.account_id == account_id,
                 GridStateSnapshot.strat_id == strat_id,
                 GridStateSnapshot.symbol == symbol,
                 GridStateSnapshot.exchange_ts <= at_ts,
+                Run.run_type.in_(("live", "shadow")),
+                Run.start_ts <= at_ts,
+                or_(Run.end_ts.is_(None), Run.end_ts >= at_ts),
             )
             .order_by(
                 GridStateSnapshot.exchange_ts.desc(),

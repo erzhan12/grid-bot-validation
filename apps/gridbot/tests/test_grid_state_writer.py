@@ -44,6 +44,11 @@ def db() -> DatabaseFactory:
             Run(
                 run_id="run1", user_id="u1", account_id="acc1",
                 strategy_id="s1", run_type="live",
+                # 0062: explicit past start_ts so get_at_or_before's
+                # ``start_ts <= at_ts`` guard doesn't exclude this run for
+                # the fixed-past ``at_ts`` queried below (default utc_now()
+                # would be > at_ts).
+                start_ts=datetime(2026, 1, 1, tzinfo=UTC),
             ),
         ])
     return db

@@ -302,6 +302,16 @@ def load_grid_state_from_snapshots(
     ``run_id`` (``run_type='recording'``). Scoping by recorder's
     ``run_id`` matched zero rows in production (0052).
 
+    **Run-active guard (feature 0062).** ``get_at_or_before`` additionally
+    requires the writer run was **active at ``at_ts``** — not merely
+    ``exchange_ts <= at_ts``: it joins ``runs`` and demands
+    ``start_ts <= at_ts``, ``end_ts`` NULL or ``>= at_ts``, and
+    ``run_type`` in ``('live', 'shadow')``. This keeps the recorder-vs-live
+    ``run_id`` split above (the recording run is excluded by ``run_type``)
+    and, crucially, stops a completed gridbot run's last snapshot from
+    seeding replay after a graceful restart, before the new run's bootstrap
+    write.
+
     The ``symbol`` predicate prevents cross-symbol bleed-through for
     accounts whose ``strat_id`` was retained across a symbol rename
     (e.g. ``strat_id='ltcusdt_test'`` was preserved to avoid orphaning

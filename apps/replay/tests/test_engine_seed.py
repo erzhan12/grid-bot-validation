@@ -366,9 +366,27 @@ class TestReplayEngineSeedingPipeline:
             {"side": "Sell", "price": 90800.0},
         ]
         with seeded_db.get_session() as session:
+            # 0062: grid snapshots must be written under a live/shadow run
+            # active at ``at_ts`` (the recorder's ``seed-run`` is excluded by
+            # the run_type guard). Use a distinct run_id to avoid colliding
+            # with ``gridbot-live-run`` used by the cross-run test below.
+            session.add(
+                Run(
+                    run_id="prefers-db-live-run",
+                    user_id="user-1",
+                    account_id="acc-1",
+                    strategy_id="strat-1",
+                    run_type="live",
+                    status="running",
+                    start_ts=snapshot_ts - timedelta(minutes=30),
+                    end_ts=None,
+                )
+            )
+            session.flush()
             GridStateSnapshotRepository(session).insert(
                 GridStateSnapshot(
-                    run_id="seed-run", account_id="acc-1", strat_id=STRAT_ID,
+                    run_id="prefers-db-live-run", account_id="acc-1",
+                    strat_id=STRAT_ID,
                     symbol=SYMBOL,
                     exchange_ts=snapshot_ts, local_ts=snapshot_ts,
                     grid_json=db_grid, grid_step=Decimal("0.2"), grid_count=4,
@@ -766,9 +784,26 @@ class TestReplayEngineSeedFailLoud:
             {"side": "Sell", "price": 100400.0},
         ]
         with seeded_db.get_session() as session:
+            # 0062: seed under a live run active at ``at_ts`` so the row is
+            # FOUND (passes the run-active JOIN) and rejected on step/count
+            # mismatch — the intended path — not excluded by run_type.
+            session.add(
+                Run(
+                    run_id="mismatch-live-run",
+                    user_id="user-1",
+                    account_id="acc-1",
+                    strategy_id="strat-1",
+                    run_type="live",
+                    status="running",
+                    start_ts=snapshot_ts - timedelta(minutes=30),
+                    end_ts=None,
+                )
+            )
+            session.flush()
             GridStateSnapshotRepository(session).insert(
                 GridStateSnapshot(
-                    run_id="seed-run", account_id="acc-1", strat_id=STRAT_ID,
+                    run_id="mismatch-live-run", account_id="acc-1",
+                    strat_id=STRAT_ID,
                     symbol=SYMBOL,
                     exchange_ts=snapshot_ts, local_ts=snapshot_ts,
                     grid_json=mismatched_grid,
@@ -786,6 +821,81 @@ class TestReplayEngineSeedFailLoud:
             account_id="acc-1",
             strat_id=STRAT_ID,
             grid_state_path=None,  # exercise DB-only path
+            wallet_coin="USDT",
+        )
+        replay_config = ReplayConfig(
+            database_url="sqlite:///:memory:",
+            run_id="seed-run",
+            symbol=SYMBOL,
+            start_ts=seed_ts,
+            end_ts=seed_ts + timedelta(hours=1),
+            strategy=ReplayStrategyConfig(
+                tick_size=Decimal("0.1"),
+                grid_count=4,
+                grid_step=0.2,
+                enable_risk_multipliers=True,
+            ),
+            initial_balance=Decimal("10000"),
+            enable_funding=False,
+            seed=seed_config,
+        )
+        engine = ReplayEngine(config=replay_config, db=seeded_db)
+        run_id, *_ = engine._resolve_run(replay_config)
+
+        with pytest.raises(SeedDataQualityError):
+            engine._load_seed(replay_config, run_id)
+
+    def test_load_seed_raises_when_only_ended_gridbot_run_has_snapshots(
+        self, seeded_db, seed_ts, snapshot_ts, mock_instrument,
+    ):
+        """0062 engine-level reproducer: the only matching grid snapshot was
+        written by a gridbot run that ENDED before ``at_ts`` (graceful stop
+        before restart). The run-active guard makes ``get_at_or_before``
+        return ``None``; with ``grid_state_path=None`` and ``seed.enabled``,
+        the engine raises ``SeedDataQualityError`` instead of silently
+        seeding the stale grid.
+        """
+        db_grid = [
+            {"side": "Buy", "price": 99600.0},
+            {"side": "Buy", "price": 99800.0},
+            {"side": "Sell", "price": 100200.0},
+            {"side": "Sell", "price": 100400.0},
+        ]
+        with seeded_db.get_session() as session:
+            session.add(
+                Run(
+                    run_id="ended-gridbot-run",
+                    user_id="user-1",
+                    account_id="acc-1",
+                    strategy_id="strat-1",
+                    run_type="live",
+                    status="completed",
+                    start_ts=snapshot_ts - timedelta(minutes=30),
+                    # Realistic ordering: snapshot written during the run
+                    # (exchange_ts == snapshot_ts), run then ended AFTER the
+                    # snapshot but BEFORE at_ts (graceful stop, then restart).
+                    end_ts=snapshot_ts + timedelta(seconds=30),  # < seed_ts (at_ts)
+                )
+            )
+            session.flush()
+            GridStateSnapshotRepository(session).insert(
+                GridStateSnapshot(
+                    run_id="ended-gridbot-run", account_id="acc-1",
+                    strat_id=STRAT_ID,
+                    symbol=SYMBOL,
+                    exchange_ts=snapshot_ts, local_ts=snapshot_ts,
+                    grid_json=db_grid, grid_step=Decimal("0.2"), grid_count=4,
+                    raw_fingerprint=grid_fingerprint_hash(db_grid, 0.2, 4),
+                )
+            )
+            session.commit()
+
+        seed_config = SeedConfig(
+            enabled=True,
+            at_ts=seed_ts,
+            account_id="acc-1",
+            strat_id=STRAT_ID,
+            grid_state_path=None,  # DB-only: no file fallback
             wallet_coin="USDT",
         )
         replay_config = ReplayConfig(

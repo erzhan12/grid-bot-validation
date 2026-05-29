@@ -1806,7 +1806,7 @@ class TestGridStateSnapshotRepository:
             user_id=sample_user.user_id,
             account_id=sample_account.account_id,
             strategy_id=sample_strategy.strategy_id,
-            run_type="recording",
+            run_type="live",
             status="running",
             start_ts=datetime(2026, 1, 1, tzinfo=UTC),
         )
@@ -1853,21 +1853,34 @@ class TestGridStateSnapshotRepository:
         assert picked.run_id == other_run.run_id
 
     def test_get_at_or_before_filters_by_symbol(
-        self, session, sample_run,
+        self, session, sample_user, sample_account, sample_strategy,
     ):
         """0052 F-1-2: rows for a different ``symbol`` must NOT match,
         even when ``(account_id, strat_id)`` is identical.
         """
         repo = GridStateSnapshotRepository(session)
+        ts = datetime(2026, 1, 2, tzinfo=UTC)
+        # 0062: seed under a live run active at ``at_ts`` so the only reason
+        # the lookup returns None is the symbol mismatch (not the run-active
+        # guard excluding a wall-clock-``start_ts`` ``sample_run``).
+        writer_run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="live",
+            status="running",
+            start_ts=datetime(2026, 1, 1, tzinfo=UTC),
+        )
+        session.add(writer_run)
+        session.flush()
         grid = [
             {"side": "Buy", "price": 100.0},
             {"side": "Wait", "price": 101.0},
             {"side": "Sell", "price": 102.0},
         ]
-        ts = datetime(2026, 1, 2, tzinfo=UTC)
         repo.insert(GridStateSnapshot(
-            run_id=sample_run.run_id,
-            account_id=sample_run.account_id,
+            run_id=writer_run.run_id,
+            account_id=writer_run.account_id,
             strat_id="strat_a",
             symbol="ETHUSDT",
             exchange_ts=ts, local_ts=ts,
@@ -1877,7 +1890,195 @@ class TestGridStateSnapshotRepository:
         session.flush()
 
         picked = repo.get_at_or_before(
-            sample_run.account_id, "strat_a", "BTCUSDT",
+            writer_run.account_id, "strat_a", "BTCUSDT",
             ts + timedelta(hours=1),
         )
         assert picked is None
+
+    # ----- feature 0062: run-active guard on get_at_or_before -----
+
+    def _seed_grid_run(
+        self, session, sample_user, sample_account, sample_strategy,
+        *, run_type, start_ts, end_ts, exchange_ts, run_status="running",
+    ):
+        """Helper: create a Run + a single BTCUSDT grid snapshot under it.
+
+        Returns ``(run, snapshot)``. Each 0062 test builds its OWN run with
+        an explicit ``start_ts`` (never reuses ``sample_run``, whose
+        ``start_ts`` is wall-clock now and would be excluded by the new
+        ``start_ts <= at_ts`` predicate for a fixed-past ``at_ts``).
+        """
+        run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type=run_type,
+            status=run_status,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        session.add(run)
+        session.flush()
+        grid = [
+            {"side": "Buy", "price": 100.0},
+            {"side": "Wait", "price": 101.0},
+            {"side": "Sell", "price": 102.0},
+        ]
+        snap = GridStateSnapshot(
+            run_id=run.run_id,
+            account_id=sample_account.account_id,
+            strat_id="strat_a",
+            symbol="BTCUSDT",
+            exchange_ts=exchange_ts, local_ts=exchange_ts,
+            grid_json=grid, grid_step=Decimal("0.5"), grid_count=3,
+            raw_fingerprint=grid_fingerprint_hash(grid, 0.5, 3),
+        )
+        GridStateSnapshotRepository(session).insert(snap)
+        session.flush()
+        return run, snap
+
+    def test_get_at_or_before_excludes_run_ended_before_at_ts(
+        self, session, sample_user, sample_account, sample_strategy,
+    ):
+        """0062 reproducer: a graceful-stopped live run whose ``end_ts`` is
+        before ``at_ts`` must NOT seed replay even though its snapshot's
+        ``exchange_ts <= at_ts``. (FAILS pre-fix, PASSES after.)
+        """
+        at_ts = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+        self._seed_grid_run(
+            session, sample_user, sample_account, sample_strategy,
+            run_type="live",
+            start_ts=datetime(2026, 1, 1, tzinfo=UTC),
+            end_ts=datetime(2026, 1, 2, 9, 0, tzinfo=UTC),  # ended before at_ts
+            exchange_ts=datetime(2026, 1, 2, 8, 0, tzinfo=UTC),
+        )
+        picked = GridStateSnapshotRepository(session).get_at_or_before(
+            sample_account.account_id, "strat_a", "BTCUSDT", at_ts,
+        )
+        assert picked is None
+
+    def test_get_at_or_before_includes_active_run_null_end_ts(
+        self, session, sample_user, sample_account, sample_strategy,
+    ):
+        """A still-running live run (``end_ts IS NULL``) with
+        ``start_ts <= at_ts`` is selected.
+        """
+        at_ts = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+        run, _ = self._seed_grid_run(
+            session, sample_user, sample_account, sample_strategy,
+            run_type="live",
+            start_ts=datetime(2026, 1, 1, tzinfo=UTC),
+            end_ts=None,
+            exchange_ts=datetime(2026, 1, 2, 8, 0, tzinfo=UTC),
+        )
+        picked = GridStateSnapshotRepository(session).get_at_or_before(
+            sample_account.account_id, "strat_a", "BTCUSDT", at_ts,
+        )
+        assert picked is not None
+        assert picked.run_id == run.run_id
+
+    def test_get_at_or_before_includes_active_shadow_run(
+        self, session, sample_user, sample_account, sample_strategy,
+    ):
+        """0062: ``shadow`` is also a grid-writing run_type — an active
+        shadow run's snapshot is selected (locks the ``shadow`` branch of
+        the ``run_type.in_(("live","shadow"))`` predicate).
+        """
+        at_ts = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+        run, _ = self._seed_grid_run(
+            session, sample_user, sample_account, sample_strategy,
+            run_type="shadow",
+            start_ts=datetime(2026, 1, 1, tzinfo=UTC),
+            end_ts=None,
+            exchange_ts=datetime(2026, 1, 2, 8, 0, tzinfo=UTC),
+        )
+        picked = GridStateSnapshotRepository(session).get_at_or_before(
+            sample_account.account_id, "strat_a", "BTCUSDT", at_ts,
+        )
+        assert picked is not None
+        assert picked.run_id == run.run_id
+
+    def test_get_at_or_before_boundary_end_ts_inclusive(
+        self, session, sample_user, sample_account, sample_strategy,
+    ):
+        """``end_ts == at_ts`` is inclusive — the run still owns the grid
+        at that instant, so its snapshot is selected.
+        """
+        at_ts = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+        run, _ = self._seed_grid_run(
+            session, sample_user, sample_account, sample_strategy,
+            run_type="live",
+            start_ts=datetime(2026, 1, 1, tzinfo=UTC),
+            end_ts=at_ts,
+            exchange_ts=datetime(2026, 1, 2, 8, 0, tzinfo=UTC),
+        )
+        picked = GridStateSnapshotRepository(session).get_at_or_before(
+            sample_account.account_id, "strat_a", "BTCUSDT", at_ts,
+        )
+        assert picked is not None
+        assert picked.run_id == run.run_id
+
+    def test_get_at_or_before_boundary_start_ts_inclusive(
+        self, session, sample_user, sample_account, sample_strategy,
+    ):
+        """``start_ts == at_ts`` (end_ts NULL) is inclusive."""
+        at_ts = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+        run, _ = self._seed_grid_run(
+            session, sample_user, sample_account, sample_strategy,
+            run_type="live",
+            start_ts=at_ts,
+            end_ts=None,
+            exchange_ts=at_ts,
+        )
+        picked = GridStateSnapshotRepository(session).get_at_or_before(
+            sample_account.account_id, "strat_a", "BTCUSDT", at_ts,
+        )
+        assert picked is not None
+        assert picked.run_id == run.run_id
+
+    def test_get_at_or_before_excludes_recording_run(
+        self, session, sample_user, sample_account, sample_strategy,
+    ):
+        """A ``recording`` run active at ``at_ts`` is excluded by the
+        ``run_type`` guard (the recorder never writes grid snapshots).
+        """
+        at_ts = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+        self._seed_grid_run(
+            session, sample_user, sample_account, sample_strategy,
+            run_type="recording",
+            start_ts=datetime(2026, 1, 1, tzinfo=UTC),
+            end_ts=None,
+            exchange_ts=datetime(2026, 1, 2, 8, 0, tzinfo=UTC),
+        )
+        picked = GridStateSnapshotRepository(session).get_at_or_before(
+            sample_account.account_id, "strat_a", "BTCUSDT", at_ts,
+        )
+        assert picked is None
+
+    def test_get_at_or_before_two_active_runs_latest_wins(
+        self, session, sample_user, sample_account, sample_strategy,
+    ):
+        """Two live runs both active at ``at_ts`` with snapshots at
+        different ``exchange_ts`` — the later snapshot wins (``ORDER BY``
+        survives the JOIN).
+        """
+        at_ts = datetime(2026, 1, 3, 12, 0, tzinfo=UTC)
+        self._seed_grid_run(
+            session, sample_user, sample_account, sample_strategy,
+            run_type="live",
+            start_ts=datetime(2026, 1, 1, tzinfo=UTC),
+            end_ts=None,
+            exchange_ts=datetime(2026, 1, 2, 8, 0, tzinfo=UTC),
+        )
+        newer_run, _ = self._seed_grid_run(
+            session, sample_user, sample_account, sample_strategy,
+            run_type="live",
+            start_ts=datetime(2026, 1, 2, tzinfo=UTC),
+            end_ts=None,
+            exchange_ts=datetime(2026, 1, 3, 8, 0, tzinfo=UTC),
+        )
+        picked = GridStateSnapshotRepository(session).get_at_or_before(
+            sample_account.account_id, "strat_a", "BTCUSDT", at_ts,
+        )
+        assert picked is not None
+        assert picked.run_id == newer_run.run_id

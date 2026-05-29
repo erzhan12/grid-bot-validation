@@ -107,6 +107,26 @@ def sample_run(session, sample_user, sample_account, sample_strategy):
 
 
 @pytest.fixture
+def grid_writer_run(session, sample_user, sample_account, sample_strategy, base_ts):
+    """A live gridbot run active at ``base_ts`` — grid snapshots must be
+    written under a ``live``/``shadow`` run for the 0062 run-active guard in
+    ``get_at_or_before`` to select them (``sample_run`` is the ``recording``
+    run and is intentionally excluded by the ``run_type`` predicate)."""
+    run = Run(
+        user_id=sample_user.user_id,
+        account_id=sample_account.account_id,
+        strategy_id=sample_strategy.strategy_id,
+        run_type="live",
+        status="running",
+        start_ts=base_ts - timedelta(hours=1),
+        end_ts=None,
+    )
+    session.add(run)
+    session.flush()
+    return run
+
+
+@pytest.fixture
 def base_ts():
     return datetime(2026, 5, 7, 10, 0, 0, tzinfo=timezone.utc)
 
@@ -252,10 +272,10 @@ class TestLoadGridStateFromSnapshots:
     """Loader-level coverage for the 0047 DB grid-state path."""
 
     def test_happy_path_returns_seed(
-        self, session, sample_account, sample_run, base_ts
+        self, session, sample_account, grid_writer_run, base_ts
     ):
         repo = GridStateSnapshotRepository(session)
-        repo.insert(_make_grid_row(sample_run, sample_account, exchange_ts=base_ts))
+        repo.insert(_make_grid_row(grid_writer_run, sample_account, exchange_ts=base_ts))
         session.flush()
 
         seed = load_grid_state_from_snapshots(
@@ -292,7 +312,7 @@ class TestLoadGridStateFromSnapshots:
         )
 
     def test_same_exchange_ts_picks_latest_by_id(
-        self, session, sample_account, sample_run, base_ts
+        self, session, sample_account, grid_writer_run, base_ts
     ):
         """Two snapshots at the same exchange_ts (multi-notify simulation) →
         loader returns the row inserted second (larger id)."""
@@ -307,13 +327,13 @@ class TestLoadGridStateFromSnapshots:
         ]
         repo.insert(
             _make_grid_row(
-                sample_run, sample_account, grid=intermediate, grid_count=2,
+                grid_writer_run, sample_account, grid=intermediate, grid_count=2,
                 exchange_ts=base_ts,
             )
         )
         repo.insert(
             _make_grid_row(
-                sample_run, sample_account, grid=final, grid_count=2,
+                grid_writer_run, sample_account, grid=final, grid_count=2,
                 exchange_ts=base_ts,
             )
         )
@@ -332,13 +352,13 @@ class TestLoadGridStateFromSnapshots:
         assert seed.grid == final
 
     def test_picks_latest_at_or_before(
-        self, session, sample_account, sample_run, base_ts
+        self, session, sample_account, grid_writer_run, base_ts
     ):
         repo = GridStateSnapshotRepository(session)
-        repo.insert(_make_grid_row(sample_run, sample_account, exchange_ts=base_ts))
+        repo.insert(_make_grid_row(grid_writer_run, sample_account, exchange_ts=base_ts))
         repo.insert(
             _make_grid_row(
-                sample_run, sample_account,
+                grid_writer_run, sample_account,
                 grid=[
                     {"side": "Buy", "price": 200.0},
                     {"side": "Wait", "price": 201.0},
@@ -438,7 +458,7 @@ class TestLoadGridStateFromSnapshots:
         )
 
     def test_cross_symbol_isolation(
-        self, session, sample_account, sample_run, base_ts
+        self, session, sample_account, grid_writer_run, base_ts
     ):
         """0052 F-1-2: same ``(account_id, strat_id)`` but different
         ``symbol`` must NOT match. Guards against cross-symbol bleed
@@ -447,7 +467,7 @@ class TestLoadGridStateFromSnapshots:
         # _make_grid_row pins symbol="BTCUSDT"; build a row for a different
         # symbol by writing directly through the repo.
         repo = GridStateSnapshotRepository(session)
-        row = _make_grid_row(sample_run, sample_account, exchange_ts=base_ts)
+        row = _make_grid_row(grid_writer_run, sample_account, exchange_ts=base_ts)
         row.symbol = "ETHUSDT"
         # Refresh the fingerprint isn't needed (insert collision is per-run).
         repo.insert(row)
@@ -465,12 +485,12 @@ class TestLoadGridStateFromSnapshots:
         assert seed is None
 
     def test_cross_strat_isolation(
-        self, session, sample_account, sample_run, base_ts
+        self, session, sample_account, grid_writer_run, base_ts
     ):
         repo = GridStateSnapshotRepository(session)
         repo.insert(
             _make_grid_row(
-                sample_run, sample_account, strat_id="other-strat",
+                grid_writer_run, sample_account, strat_id="other-strat",
                 exchange_ts=base_ts,
             )
         )
@@ -487,10 +507,10 @@ class TestLoadGridStateFromSnapshots:
         assert seed is None
 
     def test_step_count_mismatch_returns_none(
-        self, session, sample_account, sample_run, base_ts, caplog
+        self, session, sample_account, grid_writer_run, base_ts, caplog
     ):
         repo = GridStateSnapshotRepository(session)
-        repo.insert(_make_grid_row(sample_run, sample_account, exchange_ts=base_ts))
+        repo.insert(_make_grid_row(grid_writer_run, sample_account, exchange_ts=base_ts))
         session.flush()
         with caplog.at_level(logging.INFO):
             seed = load_grid_state_from_snapshots(
@@ -544,7 +564,7 @@ class TestLoadGridStateFromSnapshots:
             GridStateSnapshot.__table__.create(db.engine)
 
     def test_step_value_mismatch_returns_none(
-        self, session, sample_account, sample_run, base_ts, caplog
+        self, session, sample_account, grid_writer_run, base_ts, caplog
     ):
         """Step branch is exercised independently of the count branch:
         stored step != expected step → None + INFO. Count is left equal
@@ -553,7 +573,7 @@ class TestLoadGridStateFromSnapshots:
         repo = GridStateSnapshotRepository(session)
         repo.insert(
             _make_grid_row(
-                sample_run, sample_account,
+                grid_writer_run, sample_account,
                 grid_step=0.2, grid_count=3, exchange_ts=base_ts,
             )
         )
@@ -577,7 +597,7 @@ class TestLoadGridStateFromSnapshots:
         )
 
     def test_loader_output_round_trips_through_restore_grid(
-        self, session, sample_account, sample_run, base_ts
+        self, session, sample_account, grid_writer_run, base_ts
     ):
         """The loader's payload must drop straight into
         ``Grid.restore_grid`` (live's restart API) without massaging.
@@ -599,7 +619,7 @@ class TestLoadGridStateFromSnapshots:
         repo = GridStateSnapshotRepository(session)
         repo.insert(
             _make_grid_row(
-                sample_run, sample_account,
+                grid_writer_run, sample_account,
                 grid=canonical_grid, grid_step=0.5, grid_count=5,
                 exchange_ts=base_ts,
             )
@@ -626,7 +646,7 @@ class TestLoadGridStateFromSnapshots:
         assert grid_obj.grid == canonical_grid
 
     def test_step_binary_imprecise_match_accepted(
-        self, session, sample_account, sample_run, base_ts
+        self, session, sample_account, grid_writer_run, base_ts
     ):
         """``expected_step=0.1`` (float) must accept ``Decimal('0.10000000')`` row.
 
@@ -636,7 +656,7 @@ class TestLoadGridStateFromSnapshots:
         repo = GridStateSnapshotRepository(session)
         repo.insert(
             _make_grid_row(
-                sample_run, sample_account,
+                grid_writer_run, sample_account,
                 grid_step=0.1,
                 exchange_ts=base_ts,
             )
