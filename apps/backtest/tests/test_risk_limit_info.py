@@ -169,7 +169,10 @@ class TestRiskLimitProvider:
             result = provider.load_from_cache("BTCUSDT")
 
         assert result is None
-        assert any("Cache file exceeds" in r.message for r in caplog.records)
+        assert any(
+            "Cache file size" in r.message and "exceeds" in r.message
+            for r in caplog.records
+        )
 
     # --- save_to_cache ---
 
@@ -736,41 +739,41 @@ class TestConcurrentCacheAccess:
 
     def test_lock_registry_released_when_instances_deleted(self, tmp_path):
         """In-process lock entry is cleaned up when providers are deleted."""
-        import backtest.risk_limit_info as risk_limit_info_module
+        import backtest.cache_lock as cache_lock_module
 
         cache_path = tmp_path / "cache.json"
         key = str(cache_path.resolve())
         provider_a = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
         provider_b = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
 
-        assert key in risk_limit_info_module._IN_PROCESS_LOCKS
-        assert risk_limit_info_module._IN_PROCESS_LOCKS[key][1] >= 2
+        assert key in cache_lock_module._IN_PROCESS_LOCKS
+        assert cache_lock_module._IN_PROCESS_LOCKS[key][1] >= 2
 
         del provider_a
         del provider_b
         gc.collect()
 
-        assert key not in risk_limit_info_module._IN_PROCESS_LOCKS
+        assert key not in cache_lock_module._IN_PROCESS_LOCKS
 
     def test_close_then_new_provider_keeps_lock_registry_consistent(self, tmp_path):
         """Closed providers cannot be reused; new providers share one lock entry."""
-        import backtest.risk_limit_info as risk_limit_info_module
+        import backtest.cache_lock as cache_lock_module
 
         cache_path = tmp_path / "cache.json"
         key = str(cache_path.resolve())
         provider_a = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
         provider_b = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
-        assert key in risk_limit_info_module._IN_PROCESS_LOCKS
-        assert risk_limit_info_module._IN_PROCESS_LOCKS[key][1] >= 2
+        assert key in cache_lock_module._IN_PROCESS_LOCKS
+        assert cache_lock_module._IN_PROCESS_LOCKS[key][1] >= 2
 
         provider_a.close()
-        assert risk_limit_info_module._IN_PROCESS_LOCKS[key][1] == 1
+        assert cache_lock_module._IN_PROCESS_LOCKS[key][1] == 1
 
         with pytest.raises(RuntimeError, match="closed"):
             provider_a.save_to_cache("AAAUSDT", SAMPLE_TIERS)
 
         provider_c = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
-        assert risk_limit_info_module._IN_PROCESS_LOCKS[key][1] == 2
+        assert cache_lock_module._IN_PROCESS_LOCKS[key][1] == 2
 
         provider_b.save_to_cache("BBBUSDT", SAMPLE_TIERS)
         provider_c.save_to_cache("CCCUSDT", SAMPLE_TIERS)
@@ -1218,8 +1221,6 @@ class TestAtomicCacheWrite:
         """Temp file is removed if json.dump fails mid-write."""
         cache_path = tmp_path / "cache.json"
         provider = RiskLimitProvider(cache_path=cache_path, allowed_cache_root=None)
-
-        original_dump = json.dump
 
         def failing_dump(*args, **kwargs):
             raise IOError("Simulated write failure")
