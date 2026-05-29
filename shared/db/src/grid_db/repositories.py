@@ -1337,6 +1337,9 @@ class GridStateSnapshotRepository(BaseRepository[GridStateSnapshot]):
                 GridStateSnapshot.exchange_ts <= at_ts,
                 Run.run_type.in_(("live", "shadow")),
                 Run.start_ts <= at_ts,
+                # TODO(0062 follow-up): unclean shutdown can leave end_ts=NULL
+                # on old runs, causing stale seeds until startup orphan cleanup
+                # is implemented.
                 or_(Run.end_ts.is_(None), Run.end_ts >= at_ts),
             )
             .order_by(

@@ -191,7 +191,7 @@ class Run(Base):
     )
     run_type: Mapped[str] = mapped_column(
         String(20), nullable=False
-    )  # 'live', 'backtest', 'shadow'
+    )  # 'live', 'backtest', 'shadow', 'recording'
     gridcore_version: Mapped[Optional[str]] = mapped_column(String(50))
     config_snapshot: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON)
     start_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
