@@ -2229,6 +2229,7 @@ Risk limit tiers determine maintenance margin (MM) and initial margin (IM) rates
 13. **rest_client `get_risk_limit()` structure**: Bybit API returns nested `{"list": [{"list": [tier, ...]}]}`. The parser unwraps the first symbol's inner list. Flat lists (missing inner `"list"` key) return empty `[]` and log an error — they are never passed through as-is.
 14. **_open_lock_file TOCTOU**: Uses `os.lstat()` (not `is_symlink()`) for pre-check and always validates path identity post-open via inode/device comparison, regardless of O_NOFOLLOW support.
 15. **Negative position_value**: `calc_initial_margin` logs a warning and returns zero for negative `position_value` (likely a data error).
+16. **In-process lock registry location**: `_IN_PROCESS_LOCKS` and `acquire_in_process_lock` / `release_in_process_lock` live in `cache_lock.py`, not `risk_limit_info.py`. Integration tests that assert ref-counts must import `backtest.cache_lock`; oversized-cache warnings log `CacheSizeExceededError` text (`"Cache file size"` … `"exceeds"`), not the legacy `"Cache file exceeds"` substring.
 
 ## Risk Limit Cache Format Evolution
 
