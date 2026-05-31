@@ -420,6 +420,38 @@ class RunRepository(BaseRepository[Run]):
             query = query.filter(Run.status.in_(statuses))
         return query.order_by(Run.start_ts.desc()).first()
 
+    def close_stale_running_runs(
+        self,
+        user_id: str,
+        account_id: str,
+        strategy_id: str,
+        run_type: str,
+        *,
+        end_ts: datetime,
+    ) -> int:
+        """Mark orphaned open runs completed before a new run starts (0062 / #148).
+
+        After crash/kill the prior process may leave ``status='running'`` and
+        ``end_ts=NULL``. Without closing those rows, replay's cross-run grid
+        seed lookup can still treat the stale run as active at ``at_ts``.
+        """
+        runs = (
+            self.session.query(Run)
+            .filter(
+                Run.user_id == user_id,
+                Run.account_id == account_id,
+                Run.strategy_id == strategy_id,
+                Run.run_type == run_type,
+                Run.status == "running",
+                Run.end_ts.is_(None),
+            )
+            .all()
+        )
+        for run in runs:
+            run.status = "completed"
+            run.end_ts = end_ts
+        return len(runs)
+
 
 class PublicTradeRepository(BaseRepository[PublicTrade]):
     """Repository for PublicTrade operations.
@@ -1337,9 +1369,8 @@ class GridStateSnapshotRepository(BaseRepository[GridStateSnapshot]):
                 GridStateSnapshot.exchange_ts <= at_ts,
                 Run.run_type.in_(("live", "shadow")),
                 Run.start_ts <= at_ts,
-                # TODO(#148): unclean shutdown can leave end_ts=NULL on old
-                # runs, causing stale seeds until gridbot startup orphan
-                # cleanup is implemented (feature 0062 §4.6 follow-up).
+                # Orphaned runs (crash/kill) are closed at gridbot startup
+                # via RunRepository.close_stale_running_runs (#148).
                 or_(Run.end_ts.is_(None), Run.end_ts >= at_ts),
             )
             .order_by(

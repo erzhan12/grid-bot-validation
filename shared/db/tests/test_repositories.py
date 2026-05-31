@@ -543,6 +543,92 @@ class TestRunRepository:
         assert runs[0].run_type == "live"
         assert runs[1].run_type == "backtest"
 
+    def test_close_stale_running_runs_marks_open_runs(
+        self, session, sample_user, sample_account, sample_strategy,
+    ):
+        """0062/#148: orphaned running rows are completed before a new run."""
+        from datetime import datetime, UTC
+
+        end_ts = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+        stale = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="live",
+            status="running",
+            start_ts=datetime(2026, 5, 1, tzinfo=UTC),
+            end_ts=None,
+        )
+        session.add(stale)
+        session.flush()
+
+        closed = RunRepository(session).close_stale_running_runs(
+            sample_user.user_id,
+            sample_account.account_id,
+            sample_strategy.strategy_id,
+            "live",
+            end_ts=end_ts,
+        )
+
+        assert closed == 1
+        assert stale.status == "completed"
+        assert stale.end_ts == end_ts
+
+    def test_close_stale_running_runs_scoped_by_strategy_and_run_type(
+        self, session, sample_user, sample_account, sample_strategy,
+    ):
+        """Only matching (strategy_id, run_type) rows are closed."""
+        from datetime import datetime, UTC
+
+        end_ts = datetime(2026, 6, 1, tzinfo=UTC)
+        other_strategy = Strategy(
+            strategy_id="other-strat-id",
+            account_id=sample_account.account_id,
+            strategy_type="GridStrategy",
+            symbol="ETHUSDT",
+            config_json={},
+        )
+        session.add(other_strategy)
+        live_stale = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="live",
+            status="running",
+            start_ts=datetime(2026, 5, 1, tzinfo=UTC),
+        )
+        shadow_stale = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="shadow",
+            status="running",
+            start_ts=datetime(2026, 5, 1, tzinfo=UTC),
+        )
+        other_strat_run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=other_strategy.strategy_id,
+            run_type="live",
+            status="running",
+            start_ts=datetime(2026, 5, 1, tzinfo=UTC),
+        )
+        session.add_all([live_stale, shadow_stale, other_strat_run])
+        session.flush()
+
+        closed = RunRepository(session).close_stale_running_runs(
+            sample_user.user_id,
+            sample_account.account_id,
+            sample_strategy.strategy_id,
+            "live",
+            end_ts=end_ts,
+        )
+
+        assert closed == 1
+        assert live_stale.status == "completed"
+        assert shadow_stale.status == "running"
+        assert other_strat_run.status == "running"
+
 
 class TestPublicTradeRepository:
     """Tests for PublicTradeRepository bulk operations."""
