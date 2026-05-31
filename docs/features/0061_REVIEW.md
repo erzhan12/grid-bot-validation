@@ -2,14 +2,14 @@
 
 **Plan:** `docs/features/0061_PLAN.md`  
 **Scope:** Fix three stale failures in `test_risk_limit_info.py` after `cache_lock` / `cache_validation` module split (issue #143)  
-**Implementation:** `92b12b3` on `main` (`Fix stale risk limit info tests`)  
+**Implementation:** applied to the test file on `main` (commit `Fix stale risk limit info tests`)  
 **Review pass:** 1
 
 ---
 
 ## Verdict
 
-**Approve.** The merged commit matches the plan’s test-only design: no production edits, correct import targets for `_IN_PROCESS_LOCKS`, and log assertions aligned with `CacheSizeExceededError`. All 94 tests in `test_risk_limit_info.py` and 13 in `test_cache_lock.py` pass. Optional `RULES.md` pitfall (plan Step 4) exists locally but is **not yet committed**; commit or drop before closing #143 documentation-only follow-ups.
+**Approve.** The merged commit matches the plan’s test-only design: no production edits, correct import targets for `_IN_PROCESS_LOCKS`, and log assertions aligned with `CacheSizeExceededError`. All 94 tests in `test_risk_limit_info.py` and 13 in `test_cache_lock.py` pass. The optional `RULES.md` pitfall (plan Step 4) is included in this PR.
 
 ---
 
@@ -24,20 +24,20 @@
 | **2** — Oversized load log assertion | Pass | `test_load_from_cache_oversized_logs_size_error` lines 172–175: `"Cache file size"` and `"exceeds"` in caplog |
 | **2** — Still assert `result is None` | Pass | Line 171 |
 | **3** — Verification | Pass | `uv run pytest apps/backtest/tests/test_risk_limit_info.py -q` → **94 passed**; `test_cache_lock.py` → **13 passed** |
-| **4** — RULES.md pitfall (optional) | Partial | Pitfall #16 present in working tree (`RULES.md:2232`) but **uncommitted** on `main` |
+| **4** — RULES.md pitfall (optional) | Pass | Pitfall #16 added in this PR (`RULES.md:2232`) |
 | **Out of scope** — No prod changes | Pass | Diff touches only `test_risk_limit_info.py` in `92b12b3` |
 
 ---
 
 ## Findings
 
-### N1 — Optional RULES.md not on `main` (Minor — housekeeping)
+### N1 — Optional RULES.md pitfall (Resolved in this PR)
 
-Plan Step 4 adds pitfall #16 under the backtest cache section. The text is correct and matches implementation, but it only exists as an unstaged local edit. Include it in the same PR/commit as `0061_PLAN.md` if you want docs and code fully aligned on `main`.
+Plan Step 4 adds pitfall #16 under the backtest cache section. The text is correct and matches implementation, and it is committed in this PR alongside `0061_PLAN.md`, so docs and the pitfall note land together.
 
-### N2 — Unrelated working-tree noise (Minor — pre-commit cleanup)
+### N2 — Unrelated working-tree change (context note — not part of this PR)
 
-`conf/gridbot_test.yaml` is modified (SOLUSDT `grid_step`) and is **not** part of 0061. Revert or split before any 0061-only commit.
+At review time the working tree also carried an unrelated `conf/gridbot_test.yaml` change (SOLUSDT `grid_step`). It is **not** part of feature 0061 and was deliberately excluded from this PR; it is mentioned here only so a future reader knows it was a separate concern, not an omission.
 
 ### N3 — Incidental diff in fix commit (Note — not a defect)
 
@@ -85,5 +85,5 @@ uv run pytest apps/backtest/tests/test_cache_lock.py -q
 
 ## Recommendation
 
-- **Merge status:** Fix is already on `main` via `92b12b3`; issue #143 is resolved for branches that include that commit.
-- **Follow-up (optional):** Commit `docs/features/0061_PLAN.md`, `RULES.md` pitfall #16, and revert unrelated `conf/gridbot_test.yaml` if preparing a docs-only housekeeping commit.
+- **Merge status:** the fix is already applied to the test file on `main`; issue #143 is resolved on branches that include it.
+- **Follow-up:** this PR commits `docs/features/0061_PLAN.md`, `docs/features/0061_REVIEW.md`, and `RULES.md` pitfall #16. The unrelated `conf/gridbot_test.yaml` change is intentionally not included.
