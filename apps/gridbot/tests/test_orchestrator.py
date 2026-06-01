@@ -1755,6 +1755,31 @@ class TestOrchestratorDbRecords:
         orchestrator._create_run_records()
         assert orchestrator._run_ids == {}
 
+    def test_create_run_records_closes_orphaned_run(self, gridbot_config):
+        """0062/#148: restart closes the prior open run before inserting a new one."""
+        from grid_db import DatabaseFactory, DatabaseSettings, Run
+
+        db = DatabaseFactory(DatabaseSettings(db_name=":memory:"))
+        db.create_tables()
+
+        orchestrator = Orchestrator(gridbot_config, db=db)
+        orchestrator._create_run_records()
+        first_run_id = orchestrator._run_ids["btcusdt_test"]
+
+        orchestrator._run_ids = {}
+        orchestrator._run_start_ts = {}
+        orchestrator._create_run_records()
+        second_run_id = orchestrator._run_ids["btcusdt_test"]
+
+        assert first_run_id != second_run_id
+        with db.get_session() as session:
+            first = session.get(Run, str(first_run_id))
+            second = session.get(Run, str(second_run_id))
+            assert first.status == "completed"
+            assert first.end_ts is not None
+            assert second.status == "running"
+            assert second.end_ts is None
+
 
 class TestOrchestratorGridStateWriterWiring:
     """Feature 0047 — regression coverage for the parallel DB grid-state writer.

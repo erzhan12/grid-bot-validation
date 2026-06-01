@@ -20,7 +20,7 @@ from bybit_adapter.rest_client import BybitRestClient
 from bybit_adapter.ws_client import PublicWebSocketClient, PrivateWebSocketClient
 from bybit_adapter.normalizer import BybitNormalizer
 from grid_db import DatabaseFactory
-from grid_db import Run, Strategy, BybitAccount, User
+from grid_db import Run, RunRepository, Strategy, BybitAccount, User
 from grid_db.identity import account_id_for, strategy_id_for, user_id_for
 from gridcore import (
     GridStateStore,
@@ -1264,6 +1264,23 @@ class Orchestrator:
 
                         # Create Run
                         run_type = "shadow" if strat_config.shadow_mode else "live"
+                        now = datetime.now(UTC)
+                        closed = RunRepository(session).close_stale_running_runs(
+                            user_id,
+                            account_id,
+                            strategy_id,
+                            run_type,
+                            end_ts=now,
+                        )
+                        if closed:
+                            logger.info(
+                                "Closed %d orphaned %s run(s) for strategy %s "
+                                "before starting a new run",
+                                closed,
+                                run_type,
+                                strat_config.strat_id,
+                            )
+
                         run = Run(
                             user_id=user_id,
                             account_id=account_id,
