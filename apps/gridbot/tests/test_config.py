@@ -61,6 +61,57 @@ class TestStrategyConfig:
         assert strategy.grid_step == 0.2  # default
         assert strategy.shadow_mode is False  # default
 
+    def test_truncate_breaker_defaults(self):
+        """Feature 0064 — dirty-refresh + circuit-breaker config defaults."""
+        strategy = StrategyConfig(
+            strat_id="btc_main",
+            account="main",
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+        )
+        assert strategy.dirty_refresh_enabled is True
+        assert strategy.dirty_rest_refresh_min_interval_seconds == 10.0
+        assert strategy.truncate_breaker_max_consecutive == 3
+        assert strategy.truncate_breaker_window_seconds == 60.0
+        assert strategy.truncate_breaker_cooldown_seconds == 60.0
+        assert strategy.truncate_breaker_reconcile is True
+
+    def test_truncate_breaker_overrides(self):
+        """Feature 0064 — config values are overridable from YAML."""
+        strategy = StrategyConfig(
+            strat_id="btc_main",
+            account="main",
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            dirty_refresh_enabled=False,
+            dirty_rest_refresh_min_interval_seconds=5.0,
+            truncate_breaker_max_consecutive=5,
+            truncate_breaker_window_seconds=30.0,
+            truncate_breaker_cooldown_seconds=120.0,
+            truncate_breaker_reconcile=False,
+        )
+        assert strategy.dirty_refresh_enabled is False
+        assert strategy.dirty_rest_refresh_min_interval_seconds == 5.0
+        assert strategy.truncate_breaker_max_consecutive == 5
+        assert strategy.truncate_breaker_window_seconds == 30.0
+        assert strategy.truncate_breaker_cooldown_seconds == 120.0
+        assert strategy.truncate_breaker_reconcile is False
+
+    def test_truncate_breaker_invalid_values_rejected(self):
+        """Feature 0064 — pydantic enforces the declared constraints (F6)."""
+        base = dict(
+            strat_id="btc_main", account="main", symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+        )
+        with pytest.raises(ValidationError):
+            StrategyConfig(**base, truncate_breaker_max_consecutive=0)  # ge=1
+        with pytest.raises(ValidationError):
+            StrategyConfig(**base, truncate_breaker_window_seconds=0)  # gt=0
+        with pytest.raises(ValidationError):
+            StrategyConfig(**base, truncate_breaker_cooldown_seconds=-1)  # gt=0
+        with pytest.raises(ValidationError):
+            StrategyConfig(**base, dirty_rest_refresh_min_interval_seconds=0)  # gt=0
+
     def test_increase_same_position_on_low_margin_defaults_false(self):
         """Test low-margin equal-position boost flag defaults off."""
         strategy = StrategyConfig(

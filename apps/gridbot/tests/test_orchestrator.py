@@ -779,6 +779,7 @@ class TestOrchestratorTick:
         mock_runner = Mock()
         mock_runner.strat_id = "btcusdt_test"
         mock_runner.symbol = "BTCUSDT"
+        mock_runner.truncate_breaker_reconcile_count = 0  # 0064 health sweep reads this
         orchestrator._runners = {"btcusdt_test": mock_runner}
 
         ev1, ev2 = Mock(), Mock()
@@ -808,6 +809,7 @@ class TestOrchestratorTick:
         mock_runner = Mock()
         mock_runner.strat_id = "btcusdt_test"
         mock_runner.symbol = "BTCUSDT"
+        mock_runner.truncate_breaker_reconcile_count = 0  # 0064 health sweep reads this
         orchestrator._runners = {"btcusdt_test": mock_runner}
 
         ev1 = Mock()
@@ -837,6 +839,7 @@ class TestOrchestratorTick:
         mock_runner = Mock()
         mock_runner.strat_id = "btcusdt_test"
         mock_runner.symbol = "BTCUSDT"
+        mock_runner.truncate_breaker_reconcile_count = 0  # 0064 health sweep reads this
         orchestrator._runners = {"btcusdt_test": mock_runner}
         orchestrator._symbol_to_runners = {"BTCUSDT": [mock_runner]}
 
@@ -876,6 +879,7 @@ class TestOrchestratorTick:
         mock_runner = Mock()
         mock_runner.strat_id = "btcusdt_test"
         mock_runner.symbol = "BTCUSDT"
+        mock_runner.truncate_breaker_reconcile_count = 0  # 0064 health sweep reads this
         mock_runner.on_execution.side_effect = ValueError("boom")
         orchestrator._runners = {"btcusdt_test": mock_runner}
         orchestrator._symbol_to_runners = {"BTCUSDT": [mock_runner]}
@@ -919,6 +923,7 @@ class TestOrchestratorWsPositionDrain:
         mock_runner.strat_id = "btcusdt_test"
         mock_runner.symbol = "BTCUSDT"
         mock_runner.engine.last_close = 42500.0
+        mock_runner.truncate_breaker_reconcile_count = 0  # 0064 health sweep reads this
         orchestrator._runners = {"btcusdt_test": mock_runner}
         orchestrator._account_to_runners = {"test_account": [mock_runner]}
         orchestrator._symbol_to_runners = {"BTCUSDT": [mock_runner]}
@@ -1071,6 +1076,7 @@ class TestOrchestratorWsPositionDrain:
         mock_runner.strat_id = "btcusdt_test"
         mock_runner.symbol = "BTCUSDT"
         mock_runner.engine.last_close = 42500.0
+        mock_runner.truncate_breaker_reconcile_count = 0  # 0064 health sweep reads this
         mock_runner.on_position_update.side_effect = ValueError("boom")
         orch._runners = {"btcusdt_test": mock_runner}
         orch._account_to_runners = {"test_account": [mock_runner]}
@@ -1229,6 +1235,7 @@ class TestOrchestratorTickPeriodicCheckIsolation:
         mock_runner = Mock()
         mock_runner.strat_id = "btcusdt_test"
         mock_runner.symbol = "BTCUSDT"
+        mock_runner.truncate_breaker_reconcile_count = 0  # 0064 health sweep reads this
         orchestrator._runners = {"btcusdt_test": mock_runner}
         orchestrator._symbol_to_runners = {"BTCUSDT": [mock_runner]}
 
@@ -3658,3 +3665,73 @@ class TestOnWsDisconnect:
             time.sleep(0.01)
 
         assert notifier.alert_exception.called
+
+
+class TestForcedReconcile:
+    """Feature 0064 — breaker-tripped forced position+order reconcile."""
+
+    def _wire(self, gridbot_config):
+        orchestrator = Orchestrator(gridbot_config)
+        runner = Mock()
+        runner.strat_id = "btcusdt_test"
+        reconciler = Mock()
+        reconciler.reconcile_reconnect = MagicMock(return_value=ReconciliationResult())
+        orchestrator._runners["btcusdt_test"] = runner
+        orchestrator._reconcilers["test_account"] = reconciler
+        return orchestrator, runner, reconciler
+
+    def test_force_reconcile_calls_reconcile_and_position_refresh(self, gridbot_config):
+        orchestrator, runner, reconciler = self._wire(gridbot_config)
+
+        orchestrator._force_reconcile_strat("btcusdt_test", "long")
+
+        reconciler.reconcile_reconnect.assert_called_once_with(runner)
+        runner._refresh_position_size_from_rest.assert_called_once_with("long", force=True)
+
+    def test_force_reconcile_rate_limited(self, gridbot_config, monkeypatch):
+        clock = {"now": 1000.0}
+        monkeypatch.setattr("gridbot.orchestrator.time.monotonic", lambda: clock["now"])
+        orchestrator, runner, reconciler = self._wire(gridbot_config)
+
+        orchestrator._force_reconcile_strat("btcusdt_test", "long")
+        orchestrator._force_reconcile_strat("btcusdt_test", "long")  # within cooldown
+        assert reconciler.reconcile_reconnect.call_count == 1  # rate-limited
+
+        clock["now"] = 1000.0 + 61.0  # past the 60s default cooldown
+        orchestrator._force_reconcile_strat("btcusdt_test", "long")
+        assert reconciler.reconcile_reconnect.call_count == 2
+
+    def test_force_reconcile_missing_runner_is_noop(self, gridbot_config):
+        orchestrator = Orchestrator(gridbot_config)
+        # No runner/reconciler wired — must not raise.
+        orchestrator._force_reconcile_strat("nonexistent", "long")
+
+    def test_force_reconcile_exception_is_caught_and_alerted(self, gridbot_config):
+        """F6 + P2: a raising order-reconcile is caught/alerted AND the
+        #149-critical position resync still runs (independent try blocks)."""
+        orchestrator, runner, reconciler = self._wire(gridbot_config)
+        notifier = Mock()
+        orchestrator._notifier = notifier
+        reconciler.reconcile_reconnect.side_effect = Exception("boom")
+
+        orchestrator._force_reconcile_strat("btcusdt_test", "long")  # must not raise
+
+        notifier.alert_exception.assert_called_once()
+        assert "force_reconcile" in notifier.alert_exception.call_args.kwargs.get("error_key", "")
+        # P2: order-reconcile failure must NOT skip the position resync.
+        runner._refresh_position_size_from_rest.assert_called_once_with("long", force=True)
+
+    def test_health_check_logs_breaker_trip_count(self, gridbot_config, caplog):
+        orchestrator = Orchestrator(gridbot_config)
+        runner = Mock()
+        runner.strat_id = "btcusdt_test"
+        runner.truncate_breaker_reconcile_count = 2
+        orchestrator._runners["btcusdt_test"] = runner
+
+        with caplog.at_level("DEBUG", logger="gridbot.orchestrator"):
+            orchestrator._health_check_once()
+
+        assert any(
+            "breaker" in r.message.lower() or "trip" in r.message.lower()
+            for r in caplog.records
+        )

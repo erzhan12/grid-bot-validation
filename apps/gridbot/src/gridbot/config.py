@@ -60,6 +60,46 @@ class StrategyConfig(BaseModel):
         ),
     )
 
+    # Feature 0064 — 110017 retry-storm self-heal + circuit-breaker (issue #149).
+    # All default-on so existing conf/*.yaml keep working unchanged.
+    dirty_refresh_enabled: bool = Field(
+        default=True,
+        description=(
+            "Master kill-switch for the dirty-mirror REST refresh-before-guard. "
+            "When True, a direction flagged dirty by a prior 110017 has its "
+            "position size REST-refreshed before _is_good_to_place so the guard "
+            "rejects oversized reduce-only closes against fresh data."
+        ),
+    )
+    dirty_rest_refresh_min_interval_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        description=(
+            "Minimum seconds between REST get_positions calls per direction while "
+            "that direction is dirty — bounds REST when the guard keeps rejecting "
+            "per-ticker re-emissions."
+        ),
+    )
+    truncate_breaker_max_consecutive: int = Field(
+        default=3,
+        ge=1,
+        description="Trip the 110017 circuit-breaker after this many within the window.",
+    )
+    truncate_breaker_window_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        description="Sliding window for counting consecutive 110017 errors per scope key.",
+    )
+    truncate_breaker_cooldown_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        description="After a trip, drop further intents on that scope key for this long.",
+    )
+    truncate_breaker_reconcile: bool = Field(
+        default=True,
+        description="Trigger one forced position+order reconcile when the breaker trips.",
+    )
+
     # Mode
     shadow_mode: bool = Field(default=False, description="Log intents without executing")
 

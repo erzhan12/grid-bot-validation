@@ -10,6 +10,7 @@ The runner is responsible for:
 
 import logging
 import math
+import time
 from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, UTC, timedelta
@@ -18,6 +19,7 @@ from typing import Optional, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from gridbot.writers.grid_state_writer import GridStateWriter
+    from bybit_adapter.rest_client import BybitRestClient
 
 from gridcore import (
     GridEngine,
@@ -41,9 +43,10 @@ from gridcore import (
 )
 
 from gridbot.config import StrategyConfig
-from gridbot.executor import IntentExecutor
+from gridbot.executor import IntentExecutor, is_truncate_error
 from gridbot.notifier import Notifier
 from gridbot.order_link_id import make_order_link_id
+from gridbot.truncate_breaker import TruncateBreaker
 
 
 logger = logging.getLogger(__name__)
@@ -171,6 +174,10 @@ class StrategyRunner:
         on_unknown_order: Optional[Callable[[str], None]] = None,
         notifier: Optional[Notifier] = None,
         on_retry_cancel_for_prefix: Optional[Callable[[str], int]] = None,
+        rest_client: Optional["BybitRestClient"] = None,
+        truncate_breaker: Optional[TruncateBreaker] = None,
+        on_truncate_breaker_tripped: Optional[Callable[[str, str], None]] = None,
+        clock: Optional[Callable[[], float]] = None,
     ):
         """Initialize strategy runner.
 
@@ -192,6 +199,18 @@ class StrategyRunner:
             notifier: Alert notifier for same-order error Telegram alerts.
             on_retry_cancel_for_prefix: Optional callback to cancel queued
                 placement retries after reconcile proves the order was accepted.
+            rest_client: Optional Bybit REST client for the dirty-mirror
+                position refresh (feature 0064). When None (unit tests/dry-run)
+                the dirty path logs a WARNING and falls back to the in-memory
+                mirror; the circuit-breaker still bounds the storm.
+            truncate_breaker: Optional 110017 circuit-breaker (feature 0064).
+                When None, one is constructed from ``strategy_config``'s
+                ``truncate_breaker_*`` fields (owned per-runner).
+            on_truncate_breaker_tripped: Optional callback fired once per breaker
+                trip (args: strat_id, direction) — wired to the orchestrator's
+                forced position+order reconcile.
+            clock: Monotonic clock for breaker windows / dirty-refresh throttle.
+                Defaults to ``time.monotonic``; injectable for tests.
         """
         # 0047: if a DB writer is wired, account_id MUST be explicitly set —
         # the dummy default would FK-mismatch with replay's account scope
@@ -218,6 +237,39 @@ class StrategyRunner:
         self._on_unknown_order = on_unknown_order
         self._notifier = notifier
         self._on_retry_cancel_for_prefix = on_retry_cancel_for_prefix
+
+        # Feature 0064 — 110017 retry-storm self-heal + circuit-breaker (#149).
+        self._rest_client = rest_client
+        self._clock = clock or time.monotonic
+        self._on_truncate_breaker_tripped = on_truncate_breaker_tripped
+        self._truncate_breaker = truncate_breaker or TruncateBreaker(
+            max_consecutive=strategy_config.truncate_breaker_max_consecutive,
+            window_seconds=strategy_config.truncate_breaker_window_seconds,
+            cooldown_seconds=strategy_config.truncate_breaker_cooldown_seconds,
+        )
+        # Per-direction divergence flag: set on the first 110017 for a
+        # direction; while True the mirror size is REST-refreshed before the
+        # guard. Cleared by a positive health signal (successful place, forced
+        # reconcile, or a WS size that matches the last REST read).
+        self._position_dirty: dict[str, bool] = {
+            DirectionType.LONG: False,
+            DirectionType.SHORT: False,
+        }
+        # REST refresh throttle per direction. None = never refreshed → the
+        # first dirty refresh bypasses the throttle (clock-independent: an init
+        # of 0.0 was brittle under fake clocks where now=0).
+        self._last_dirty_rest_at: dict[str, Optional[float]] = {
+            DirectionType.LONG: None,
+            DirectionType.SHORT: None,
+        }
+        # Size written by the most recent REST refresh per direction. None = no
+        # baseline yet; the WS dirty-gate only activates once a baseline exists.
+        self._last_rest_position_size: dict[str, Optional[Decimal]] = {
+            DirectionType.LONG: None,
+            DirectionType.SHORT: None,
+        }
+        # Monotonic count of breaker trips that fired a forced reconcile.
+        self._truncate_breaker_reconcile_count: int = 0
 
         # Qty computation
         self._instrument_info = instrument_info
@@ -299,6 +351,16 @@ class StrategyRunner:
     def strat_id(self) -> str:
         """Strategy identifier."""
         return self._config.strat_id
+
+    @property
+    def truncate_breaker_reconcile_count(self) -> int:
+        """Number of 110017 breaker trips that fired a forced reconcile.
+
+        Monotonic for the runner lifetime (resets only on process restart).
+        Read by ``Orchestrator._health_check_once`` for an operator/metrics
+        signal without per-occurrence ERROR spam.
+        """
+        return self._truncate_breaker_reconcile_count
 
     @property
     def symbol(self) -> str:
@@ -670,9 +732,20 @@ class StrategyRunner:
             long_state = self._build_position_state(long_position, wallet_balance, DirectionType.LONG)
             short_state = self._build_position_state(short_position, wallet_balance, DirectionType.SHORT)
 
-            # Update position sizes (used by _is_good_to_place)
-            self._long_position.size = long_state.size if long_state else Decimal('0')
-            self._short_position.size = short_state.size if short_state else Decimal('0')
+            # Update position sizes (used by _is_good_to_place). While a
+            # direction is dirty (feature 0064), the size write is gated so a
+            # stale/mis-ordered WS frame cannot clobber the REST-authoritative
+            # mirror and reopen the 110017 storm. Only the `.size` field is
+            # gated; the position_ratio / liquidation / multiplier calcs below
+            # read the freshly-built WS long_state / short_state directly.
+            long_ws_size = long_state.size if long_state else Decimal('0')
+            short_ws_size = short_state.size if short_state else Decimal('0')
+            self._long_position.size = self._apply_dirty_ws_size_gate(
+                DirectionType.LONG, long_ws_size
+            )
+            self._short_position.size = self._apply_dirty_ws_size_gate(
+                DirectionType.SHORT, short_ws_size
+            )
 
             # Convert Decimal sizes to float: position_ratio is stored as float (position.py:98)
             # and mixing Decimal/float in division raises TypeError
@@ -930,6 +1003,131 @@ class StrategyRunner:
                     return t
         return None
 
+    def _clear_dirty(self, direction: str) -> None:
+        """Clear a direction's dirty episode and its episode-scoped state (0064).
+
+        Invariant: ``_last_dirty_rest_at[d]`` and ``_last_rest_position_size[d]``
+        are meaningful ONLY while ``_position_dirty[d]`` is True. Every
+        dirty-clear path (successful reduce-only close, WS-size match, forced
+        reconcile) resets all three so a stale baseline/throttle from one episode
+        never leaks into the next (F3): a fresh episode always refreshes on its
+        first placement and establishes its own baseline.
+        """
+        self._position_dirty[direction] = False
+        self._last_dirty_rest_at[direction] = None
+        self._last_rest_position_size[direction] = None
+
+    def _apply_dirty_ws_size_gate(self, direction: str, ws_size: Decimal) -> Decimal:
+        """Gate a WS position-size write while a direction is dirty (0064).
+
+        Steady state (not dirty) → write the WS size unchanged. While dirty and
+        a REST baseline exists: an exact match clears dirty (WS recovered and
+        agrees with REST); a non-match keeps the REST-authoritative size and
+        leaves dirty set (a stale WS frame must not reopen the storm). While
+        dirty but no baseline yet (no refresh has run — `rest_client=None` or
+        `dirty_refresh_enabled=False`) → write the WS size normally; the gate
+        only protects a value REST has actually established.
+        """
+        if not self._position_dirty.get(direction, False):
+            return ws_size
+        baseline = self._last_rest_position_size.get(direction)
+        if baseline is None:
+            return ws_size
+        if ws_size == baseline:
+            self._clear_dirty(direction)
+            logger.info(
+                "%s: WS size %s matches last REST read for %s — clearing dirty",
+                self.strat_id, ws_size, direction,
+            )
+            return ws_size
+        logger.debug(
+            "%s: ignoring non-matching WS size %s for dirty %s "
+            "(REST baseline %s stays authoritative)",
+            self.strat_id, ws_size, direction, baseline,
+        )
+        return baseline
+
+    def _refresh_position_size_from_rest(
+        self, direction: str, *, force: bool = False
+    ) -> None:
+        """Refresh ONE direction's mirror ``size`` from a fresh REST read (0064).
+
+        Used on the dirty path before the guard, and by the forced reconcile
+        (``force=True``). Filters the flat ``get_positions`` list by
+        ``positionIdx`` (hedge mode: 1=long, 2=short) itself — unlike
+        ``on_position_update``, which receives already-split long/short dicts.
+        A missing/zero entry sets the mirror to ``0`` (position now flat),
+        mirroring ``_build_position_state``/``on_position_update``. Only the
+        ``size`` field is touched (multipliers/liq are out of scope).
+        """
+        # Throttle the ATTEMPT (success or failure) so a persistently failing
+        # get_positions / rest_client=None cannot re-fire the refresh on every
+        # tick (F2). The force path bypasses the throttle and resets the whole
+        # episode below.
+        if not force:
+            self._last_dirty_rest_at[direction] = self._clock()
+
+        if self._rest_client is None:
+            logger.warning(
+                "%s: dirty REST refresh for %s requested but no rest_client — "
+                "falling back to in-memory mirror",
+                self.strat_id, direction,
+            )
+            return
+
+        position_idx = 1 if direction == DirectionType.LONG else 2
+        try:
+            positions = self._rest_client.get_positions(self._config.symbol)
+        except Exception as e:
+            logger.warning(
+                "%s: dirty REST refresh get_positions failed for %s: %s — "
+                "keeping in-memory mirror",
+                self.strat_id, direction, e,
+            )
+            return
+
+        def _matches(p: dict) -> bool:
+            try:
+                return int(p.get("positionIdx", -1)) == position_idx
+            except (TypeError, ValueError):
+                # Malformed positionIdx in a (possibly partial) entry: skip it
+                # rather than crash the hot path — degrade to the mirror.
+                return False
+
+        entry = next((p for p in positions if _matches(p)), None)
+        if entry is None:
+            new_size = Decimal("0")
+        else:
+            try:
+                new_size = Decimal(str(entry.get("size", 0) or 0))
+            except (ArithmeticError, ValueError, TypeError):
+                logger.warning(
+                    "%s: dirty REST refresh got unparseable size %r for %s — "
+                    "keeping in-memory mirror",
+                    self.strat_id, entry.get("size"), direction,
+                )
+                return
+
+        if direction == DirectionType.LONG:
+            old = self._long_position.size
+            self._long_position.size = new_size
+        else:
+            old = self._short_position.size
+            self._short_position.size = new_size
+
+        logger.info(
+            "%s: dirty REST position refresh %s size %s -> %s (force=%s)",
+            self.strat_id, direction, old, new_size, force,
+        )
+        if force:
+            # Forced reconcile is a positive health signal: clear the whole
+            # episode (dirty + throttle + baseline) — the mirror written above
+            # is now authoritative and dirty is over.
+            self._clear_dirty(direction)
+        else:
+            # Establish the REST baseline the WS gate consults for THIS episode.
+            self._last_rest_position_size[direction] = new_size
+
     def _is_good_to_place(self, intent: PlaceLimitIntent, limits: dict[str, list[dict]]) -> bool:
         """Check if order can be placed (exact-duplicate + reduce-only checks).
 
@@ -994,14 +1192,58 @@ class StrategyRunner:
         return replace(intent, order_link_id=wire_id)
 
     def _execute_place_intent(self, intent: PlaceLimitIntent, limits: dict[str, list[dict]]) -> None:
-        """Execute a place order intent."""
-        # Resolve qty (engine emits qty=0, we fill it in)
+        """Execute a place order intent.
+
+        Pipeline (feature 0064 — explicit order, do not reorder):
+        1. resolve qty → qty<=0 early return.
+        2. breaker ``is_blocked`` → early return (no REST, no guard, no submit
+           while a scope key is in cooldown).
+        3. dirty-mirror REST refresh (reduce-only only, throttled) BEFORE the
+           guard, so step 4 evaluates fresh size.
+        4. ``_is_good_to_place`` → unchanged guard (now reads the freshened
+           mirror); oversized reduce-only is rejected here, nothing submitted.
+        5. duplicate-track + wire-link-id (existing).
+        6. ``execute_place`` → post-submit breaker bookkeeping.
+        """
+        # Step 1 — resolve qty (engine emits qty=0, we fill it in)
         intent = self._resolve_qty(intent)
         if intent.qty <= 0:
             logger.debug(f"{self.strat_id}: Skipping order with qty<=0 at {intent.price}")
             return
 
-        # Check duplicate and reduce-only constraints (bbu2 _is_good_to_place)
+        now = self._clock()
+
+        # Step 2 — circuit-breaker: drop while this scope key is in cooldown.
+        # Sits first so a tripped scope never triggers a REST refresh on
+        # per-ticker re-emission during cooldown.
+        if self._truncate_breaker.is_blocked(intent.side, intent.price, now):
+            logger.debug(
+                f"{self.strat_id}: 110017 breaker tripped — dropping "
+                f"{intent.side} @ {intent.price}"
+            )
+            return
+
+        # Step 3 — dirty-mirror REST refresh before the guard (reduce-only only).
+        # `dirty_refresh_enabled` is the FIRST term so flipping it off is a true
+        # kill-switch. intent.direction is the position being closed (a
+        # reduce-only Sell → LONG), so no side→direction inversion here.
+        if (
+            self._config.dirty_refresh_enabled
+            and intent.reduce_only
+            and self._position_dirty.get(intent.direction, False)
+        ):
+            last = self._last_dirty_rest_at.get(intent.direction)
+            interval = self._config.dirty_rest_refresh_min_interval_seconds
+            if last is None or (now - last) >= interval:
+                self._refresh_position_size_from_rest(intent.direction)
+            else:
+                logger.debug(
+                    f"{self.strat_id}: dirty REST refresh throttled for "
+                    f"{intent.direction} (last={last}, now={now})"
+                )
+
+        # Step 4 — duplicate + reduce-only guard (bbu2 _is_good_to_place,
+        # unchanged body; now reading the freshened-when-dirty mirror).
         if not self._is_good_to_place(intent, limits):
             logger.debug(
                 f"{self.strat_id}: Skipping order at {intent.price} - "
@@ -1009,9 +1251,8 @@ class StrategyRunner:
             )
             return
 
+        # Step 5 — duplicate-track + wire-link-id assignment (existing).
         reusable_order_link_id = None
-
-        # Check for duplicate
         if intent.client_order_id in self._tracked_orders:
             tracked = self._tracked_orders[intent.client_order_id]
             if tracked.status in ("pending", "placed"):
@@ -1039,15 +1280,60 @@ class StrategyRunner:
         )
         self._tracked_orders[assigned.client_order_id] = tracked
 
-        # Execute
+        # Step 6 — execute + breaker bookkeeping
         result = self._executor.execute_place(assigned)
 
         if result.success:
             tracked.mark_placed(result.order_id)
-        else:
-            tracked.mark_failed()
+            self._truncate_breaker.record_success(intent.side, intent.price)
+            # Only a successful reduce-only CLOSE proves position >= qty (it
+            # exercised the guard against fresh-enough state and Bybit accepted
+            # it). A successful OPEN on the same direction proves nothing about
+            # position-size divergence, so it must NOT clear dirty (F1) — else
+            # interleaved opens re-arm one 110017 per open until the breaker
+            # trips, defeating the silent self-heal.
+            if intent.reduce_only:
+                self._clear_dirty(intent.direction)  # divergence healed
+            return
+
+        tracked.mark_failed()
+
+        if not is_truncate_error(result.error):
+            # Non-110017 failure → existing retry-queue behaviour (feature 0032
+            # wire-id reuse preserved via the failed-tracked-order path above).
             if self._on_intent_failed:
                 self._on_intent_failed(assigned, result.error)
+            return
+
+        # --- 110017 (orderQty truncated to zero) handling ---
+        # Mark the direction dirty so the NEXT placement REST-refreshes the
+        # mirror before the guard (self-heal), even before the breaker trips.
+        self._position_dirty[intent.direction] = True
+
+        tripped = self._truncate_breaker.record_110017(intent.side, intent.price, now)
+
+        # Drop the wire-id reuse for 110017: the order was never created on
+        # Bybit (hard reject), so the feature-0032 reuse rationale (avoid a
+        # duplicate on an *ambiguous* outcome) does not apply. Reusing it could
+        # surface as 110072 — which the breaker does not count and the retry
+        # queue does not exclude — partially bypassing the backstop. Clearing
+        # the tracked intent's order_link_id forces a fresh id next emission.
+        tracked.intent = replace(tracked.intent, order_link_id=None)
+
+        # Do NOT enqueue 110017 to the retry queue — retrying is pointless
+        # (same qty, same clamp) and is part of the storm.
+
+        if tripped:
+            logger.warning(
+                "%s: 110017 circuit-breaker tripped for %s @ %s — dropping "
+                "intents for %.0fs (trip #%d)",
+                self.strat_id, intent.side, intent.price,
+                self._config.truncate_breaker_cooldown_seconds,
+                self._truncate_breaker_reconcile_count + 1,
+            )
+            self._truncate_breaker_reconcile_count += 1
+            if self._config.truncate_breaker_reconcile and self._on_truncate_breaker_tripped:
+                self._on_truncate_breaker_tripped(self.strat_id, intent.direction)
 
     def _execute_cancel_intent(self, intent: CancelIntent) -> None:
         """Execute a cancel order intent."""

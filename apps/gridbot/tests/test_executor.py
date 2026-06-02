@@ -7,7 +7,39 @@ from unittest.mock import Mock, MagicMock
 import pytest
 
 from gridcore.intents import PlaceLimitIntent, CancelIntent
-from gridbot.executor import IntentExecutor, OrderResult, CancelResult, AUTH_ERROR_CODES
+from gridbot.executor import (
+    IntentExecutor,
+    OrderResult,
+    CancelResult,
+    AUTH_ERROR_CODES,
+    is_truncate_error,
+)
+from bybit_adapter.error_codes import ORDER_QTY_TRUNCATED_TO_ZERO
+
+
+class TestIsTruncateError:
+    """Feature 0064 — classify ErrCode 110017 ('orderQty will be truncated to zero')."""
+
+    def test_constant_is_110017(self):
+        assert ORDER_QTY_TRUNCATED_TO_ZERO == 110017
+
+    def test_detects_check_response_format(self):
+        # _check_response format: "[110017] ..."
+        err = "Bybit API error in place_order: [110017] orderQty will be truncated to zero"
+        assert is_truncate_error(err) is True
+
+    def test_detects_pybit_native_format(self):
+        # pybit native: "(ErrCode: 110017) ..."
+        err = "place_order failed (ErrCode: 110017) orderQty will be truncated to zero"
+        assert is_truncate_error(err) is True
+
+    def test_other_error_code_is_not_truncate(self):
+        assert is_truncate_error("Bybit API error: [110001] params error") is False
+        assert is_truncate_error("Connection timeout") is False
+
+    def test_none_and_empty_are_not_truncate(self):
+        assert is_truncate_error(None) is False
+        assert is_truncate_error("") is False
 
 
 @pytest.fixture

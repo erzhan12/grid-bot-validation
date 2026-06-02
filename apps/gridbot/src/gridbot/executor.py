@@ -11,6 +11,7 @@ from datetime import datetime, UTC
 from typing import Callable, Optional
 
 from bybit_adapter.rest_client import BybitRestClient
+from bybit_adapter.error_codes import ORDER_QTY_TRUNCATED_TO_ZERO
 from gridcore.intents import PlaceLimitIntent, CancelIntent
 from gridcore.position import DirectionType
 from gridbot.order_link_id import make_order_link_id
@@ -23,6 +24,24 @@ AUTH_ERROR_CODES = {10003, 10004, 10005, 33004}
 
 # Matches both our _check_response format [NNNNN] and pybit's native format (ErrCode: NNNNN)
 _ERR_CODE_RE = re.compile(r"(?:\[(\d+)\]|\(ErrCode:\s*(\d+)\))")
+
+
+def is_truncate_error(error: Optional[str]) -> bool:
+    """Return True if an error string carries Bybit ErrCode 110017.
+
+    110017 ("orderQty will be truncated to zero") means a reduce-only qty was
+    clamped to zero against a smaller exchange-side position — the local mirror
+    diverged. Module-level (not a method) so callers branch on it without
+    routing through a mock executor instance (feature 0064). Reuses the shared
+    ``_ERR_CODE_RE`` so there is one regex for both wire formats.
+    """
+    if not error:
+        return False
+    match = _ERR_CODE_RE.search(error)
+    if match:
+        code = int(match.group(1) or match.group(2))
+        return code == ORDER_QTY_TRUNCATED_TO_ZERO
+    return False
 
 
 @dataclass

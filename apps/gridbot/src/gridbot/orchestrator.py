@@ -125,6 +125,10 @@ class Orchestrator:
         self._strategy_executors: dict[str, IntentExecutor] = {}  # strat_id -> executor
         self._reconcilers: dict[str, Reconciler] = {}  # account_name -> reconciler
         self._retry_queues: dict[str, RetryQueue] = {}  # strat_id -> queue
+        # Feature 0064 — rate-limit the breaker-triggered forced reconcile so a
+        # tripped breaker cannot itself spam REST during an outage. strat_id ->
+        # monotonic ts of the last forced reconcile.
+        self._force_reconcile_last_at: dict[str, float] = {}
 
         # Run tracking
         self._run_ids: dict[str, UUID] = {}  # strat_id -> run_id
@@ -741,6 +745,9 @@ class Orchestrator:
             on_retry_cancel_for_prefix=lambda prefix: retry_queue.cancel_for_prefix(prefix),
             on_unknown_order=self._request_immediate_order_sync,
             notifier=self._notifier,
+            # Feature 0064 — dirty-mirror REST refresh + breaker forced reconcile.
+            rest_client=self._rest_clients[account_name],
+            on_truncate_breaker_tripped=self._force_reconcile_strat,
         )
         self._runners[strat_id] = runner
         self._strategy_executors[strat_id] = executor
@@ -984,6 +991,15 @@ class Orchestrator:
         try:
             self._auth_cooldown.sweep_expired(datetime.now(UTC))
 
+            # Feature 0064 — surface 110017 breaker trip counts without
+            # per-occurrence ERROR spam. Monotonic per runner lifetime.
+            for runner in self._runners.values():
+                trips = runner.truncate_breaker_reconcile_count
+                if trips > 0:
+                    logger.debug(
+                        "%s: 110017 breaker trips=%d", runner.strat_id, trips
+                    )
+
             for account_name in list(self._public_ws.keys()):
                 # Check public WS
                 pub_ws = self._public_ws.get(account_name)
@@ -1160,6 +1176,63 @@ class Orchestrator:
         logger.info(
             "%s: Untracked order seen — fast-tracking order sync", strat_id,
         )
+
+    def _force_reconcile_strat(self, strat_id: str, direction: str) -> None:
+        """Breaker-triggered forced position + order reconcile (feature 0064).
+
+        Wired as the runner's ``on_truncate_breaker_tripped`` callback. Resyncs
+        the order book via ``reconcile_reconnect`` (handles untracked-on-exchange
+        / missing-in-memory) AND the position size via
+        ``_refresh_position_size_from_rest(force=True)`` — the piece
+        ``reconcile_reconnect`` does NOT do today — closing the stale-mirror gap
+        that defeated ``_is_good_to_place``. Rate-limited to at most once per
+        ``truncate_breaker_cooldown_seconds`` per strat so a tripped breaker
+        cannot itself spam REST during an outage. Designed to be reusable by the
+        broader divergence detector (issue #151).
+        """
+        runner = self._runners.get(strat_id)
+        if runner is None:
+            return
+        account_name = self._get_account_for_strategy(strat_id)
+        reconciler = self._reconcilers.get(account_name) if account_name else None
+
+        # Rate limit per strat using its configured cooldown.
+        cfg = next(
+            (c for c in self._config.strategies if c.strat_id == strat_id), None
+        )
+        cooldown = cfg.truncate_breaker_cooldown_seconds if cfg else 60.0
+        now = time.monotonic()
+        last = self._force_reconcile_last_at.get(strat_id)
+        if last is not None and (now - last) < cooldown:
+            logger.debug(
+                "%s: forced reconcile rate-limited (%.1fs since last < %.1fs)",
+                strat_id, now - last, cooldown,
+            )
+            return
+        self._force_reconcile_last_at[strat_id] = now
+
+        logger.warning(
+            "%s: 110017 breaker tripped — forcing %s position + order reconcile",
+            strat_id, direction,
+        )
+        if reconciler is not None:
+            try:
+                reconciler.reconcile_reconnect(runner)
+            except Exception as e:
+                self._notifier.alert_exception(
+                    f"forced reconcile orders {strat_id}", e,
+                    error_key=f"force_reconcile_orders_{strat_id}",
+                )
+        # Position-size resync is the #149-critical healing step — it closes the
+        # stale-mirror gap that defeats _is_good_to_place. Run it in its OWN
+        # try/except so an order-reconcile failure above never skips it (P2).
+        try:
+            runner._refresh_position_size_from_rest(direction, force=True)
+        except Exception as e:
+            self._notifier.alert_exception(
+                f"forced reconcile position {strat_id}", e,
+                error_key=f"force_reconcile_pos_{strat_id}",
+            )
 
     def _order_sync_once(self) -> None:
         """Single-shot order reconciliation sweep.

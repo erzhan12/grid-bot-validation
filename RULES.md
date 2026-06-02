@@ -255,6 +255,86 @@ make test-integration
 - **Decimal conversion safety**: Always use `Decimal(str(value))` — never bare `Decimal(value)` — when converting order dict fields (`price`, `qty`) or any variable that might be a float. `Decimal(0.5)` produces `0.500000000000000027...` which silently breaks equality checks. The `Decimal(str(...))` pattern is safe for strings, floats, and Decimals alike.
 - **Zero-size rejection is intentional, not a bug**: When `position_size == Decimal('0')` the reduce-only order is silently rejected (debug log only). This is bbu2-faithful — bbu2 expresses the same behavior implicitly via `position_size > limits_qty` arithmetic. A race can occur when the engine emits a close intent in the sub-tick window after a fill but before the position update lands; it self-heals on the next tick because the engine re-emits the same reduce-only intent every tick from scratch. **Do NOT "allow through on staleness"** — that would place orders against known-stale state and make things worse. If the position feed itself dies, fix it in the position-update path (heartbeat, REST reconcile), not here. See `runner.py:748-753`.
 
+### 110017 retry-storm self-heal + circuit-breaker (feature 0064, issue #149)
+
+The guard above is logically correct but trusts a **stale mirror**: during a WS
+outage `_long_position.size`/`_short_position.size` stay stale-high, so the strict
+`>` check passes and Bybit clamps the oversized reduce-only to zero → ErrCode
+**110017**. The engine re-emits that same close on (nearly) every `on_ticker`, so
+one divergence produced **535 identical rejected placements in <90min** (no
+circuit-breaker, retried via the queue each time). Two complementary mechanisms
+fix this; **do not collapse them into one**:
+
+1. **Dirty-mirror REST refresh BEFORE the guard (primary self-heal).** The first
+   110017 on a direction sets `_position_dirty[direction]=True`. On the *next*
+   reduce-only placement for that direction, `_refresh_position_size_from_rest`
+   REST-reads the true size into the mirror **before** `_is_good_to_place`, so the
+   *unchanged* guard rejects the oversized close locally (no submit, no second
+   110017). The storm collapses to one 110017. **The guard body is NOT modified
+   and there is NO qty-cap** — capping after a strict-`>` guard reading the same
+   source is a no-op; refreshing the source is the fix. Hedge-mode
+   reject-when-`position ≤ qty` convention is preserved (project memory).
+2. **`TruncateBreaker` (backstop).** Scope key `(side, price)` — NOT orderLinkId
+   (it carries a per-placement `-{millis}` suffix and never accumulates). After
+   N (default 3) 110017s within the window it trips: `is_blocked` drops further
+   intents for a cooldown, fires ONE forced reconcile, increments
+   `truncate_breaker_reconcile_count`. Bounds the undetected-divergence window and
+   residual races when the refresh can't heal (`dirty_refresh_enabled=False` /
+   `rest_client=None`).
+
+Pitfalls / invariants (all enforced + tested):
+- **Pipeline order in `_execute_place_intent` is load-bearing** (`runner.py`): resolve
+  qty → breaker `is_blocked` **first** (a tripped scope must not trigger a REST
+  refresh) → dirty refresh (gated by `dirty_refresh_enabled` as the **first**
+  term so it's a true kill-switch) → guard → submit → breaker bookkeeping.
+- **110017 is excluded from the retry queue** and **drops wire-`order_link_id`
+  reuse** (forces a fresh id next emission via `replace(order_link_id=None)`).
+  Reusing the id could surface as 110072 — which the breaker doesn't count and the
+  queue doesn't exclude — partially bypassing the backstop. Non-110017 failures
+  keep feature-0032 reuse + queue enqueue. Classifier is module-level
+  `executor.is_truncate_error()` (NOT a method — a `Mock(spec=IntentExecutor)`
+  auto-creates a truthy method and would misclassify every failure).
+- **Throttle uses a `None` sentinel** (`_last_dirty_rest_at`), not `0.0`: the first
+  dirty refresh always fires regardless of clock value (an init of `0.0` only
+  worked because real `time.monotonic()` is large; brittle under fake clocks).
+  Clock is injectable (`clock=` ctor arg) for tests.
+- **WS size write in `on_position_update` is gated while dirty** (only `.size`,
+  not ratio/liq/multipliers): exact WS==last-REST match clears dirty; a non-match
+  keeps the REST value authoritative (a stale WS frame must not reopen the storm);
+  no REST baseline yet (`_last_rest_position_size is None`) → WS passes through
+  normally (never restore a synthetic `0`, which would reject all closes when
+  refresh is disabled).
+- **Dirty clears only on a positive health signal**: a successful **reduce-only
+  close** (NOT an open — an open never exercises the position-size guard, so
+  clearing dirty on it would re-arm a 110017 on the next close), a forced
+  reconcile (`force=True`), or a WS-size match — or process restart. The 10s
+  throttle bounds REST while it stays dirty.
+- **Episode-scoped state invariant (`_clear_dirty`)**: `_position_dirty[d]`,
+  `_last_dirty_rest_at[d]`, and `_last_rest_position_size[d]` are reset *together*
+  on every dirty-clear path. Throttle + baseline are meaningful ONLY while dirty
+  is True, so a fresh episode always refreshes on its first placement and never
+  consults a prior episode's stale baseline. The REST refresh **arms the throttle
+  on every attempt (success OR failure)** — else a persistently failing
+  `get_positions` / `rest_client=None` re-fires every tick (the `None` sentinel
+  never advances).
+- **Forced reconcile** (`Orchestrator._force_reconcile_strat`) = `reconcile_reconnect`
+  (orders) **+** `_refresh_position_size_from_rest(force=True)` (position size —
+  the piece `reconcile_reconnect` does NOT do); rate-limited per
+  `truncate_breaker_cooldown_seconds` per strat. The two run in **independent
+  `try/except` blocks** so an order-reconcile failure never skips the position
+  resync — the position resync is the #149-critical healing step (closes the
+  stale-mirror gap). Designed to be reused by the broader divergence detector
+  (issue #151).
+- Config (all on `StrategyConfig`, default-on): `dirty_refresh_enabled`,
+  `dirty_rest_refresh_min_interval_seconds`, `truncate_breaker_{max_consecutive,
+  window_seconds,cooldown_seconds,reconcile}`. Constant
+  `bybit_adapter.error_codes.ORDER_QTY_TRUNCATED_TO_ZERO = 110017`.
+- Files: new `apps/gridbot/src/gridbot/truncate_breaker.py`,
+  `packages/bybit_adapter/src/bybit_adapter/error_codes.py`; touched
+  `runner.py`, `orchestrator.py`, `executor.py`, `config.py`. Tests:
+  `test_truncate_breaker.py`, `test_runner_truncate_storm.py`,
+  `TestForcedReconcile` in `test_orchestrator.py`.
+
 ### SAME ORDER detection
 
 - `StrategyRunner._check_same_orders_side()` compares tracked orders by `TrackedOrder.placed_ts` when both fills map to tracked orders; use fill `exchange_ts` only as a fallback for untracked/legacy events. Duplicate same-price orders can rest concurrently and fill more than 5s apart in thin markets, so fill-time-only windows silently miss the critical duplicate-placement bug.
