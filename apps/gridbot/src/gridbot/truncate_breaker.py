@@ -56,6 +56,10 @@ class TruncateBreaker:
 
     @staticmethod
     def _key(side: str, price: Decimal) -> ScopeKey:
+        # NOT keyed by orderLinkId: it carries a per-placement -{millis} suffix
+        # (feature 0032), so it changes every retry and the breaker would never
+        # accumulate. (side, price) is stable across per-tick re-emission of the
+        # same grid-level close.
         return (side, price)
 
     def is_blocked(self, side: str, price: Decimal, now: float) -> bool:

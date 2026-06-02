@@ -1121,9 +1121,9 @@ class StrategyRunner:
         except Exception as e:
             self._dirty_rest_refresh_failure_count += 1
             logger.warning(
-                "%s: dirty REST refresh get_positions failed for %s: %s — "
+                "%s: dirty REST refresh get_positions failed for %s: %s: %s — "
                 "keeping in-memory mirror",
-                self.strat_id, direction, e,
+                self.strat_id, direction, type(e).__name__, e,
             )
             return
 
@@ -1141,12 +1141,12 @@ class StrategyRunner:
         else:
             try:
                 new_size = Decimal(str(entry.get("size", 0) or 0))
-            except (ArithmeticError, ValueError, TypeError):
+            except (ArithmeticError, ValueError, TypeError) as e:
                 self._dirty_rest_refresh_failure_count += 1
                 logger.warning(
-                    "%s: dirty REST refresh got unparseable size %r for %s — "
+                    "%s: dirty REST refresh got unparseable size %r (%s) for %s — "
                     "keeping in-memory mirror",
-                    self.strat_id, entry.get("size"), direction,
+                    self.strat_id, entry.get("size"), type(e).__name__, direction,
                 )
                 return
 

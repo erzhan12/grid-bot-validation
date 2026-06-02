@@ -34,6 +34,9 @@ Plan: docs/features/0064_PLAN.md  |  Branch: feature/0064-truncate-breaker-dirty
   - #1 `dirty_rest_refresh_failure_count` metric (REST refresh failures) + health-sweep surfacing
   - #2 `_dirty_ws_mismatch_streak` + threshold WARNING (WS feed stuck) — reset via `_clear_dirty`
   - +8 tests; full suite 2401 passed. (bot #3 already covered; #4/#5 not requested.)
+- [x] PR #157 bot review round 2 — APPROVED, no P0/P1; user requested #1-#4 (cosmetic):
+  - #1/#2 exception `type(e).__name__` in dirty-refresh WARNINGs; #3 Bybit error-code doc link in `error_codes.py`; #4 inline comment on breaker scope key. (#5 already covered.)
+  - No behavior change; full suite 2401 passed.
 
 ## What could break (revisit after impl)
 - Mock(spec=IntentExecutor) auto-creating truthy methods → classifier kept module-level

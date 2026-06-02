@@ -3,6 +3,9 @@
 Centralises numeric ErrCode literals so classifiers and divergence
 detectors reference one symbol instead of a magic number. Mirrors the
 ``AUTH_ERROR_CODES`` set kept in ``gridbot.executor``.
+
+Bybit error-code reference (look up new codes / wording here):
+https://bybit-exchange.github.io/docs/v5/error
 """
 
 # ErrCode 110017 "orderQty will be truncated to zero": Bybit dynamically
