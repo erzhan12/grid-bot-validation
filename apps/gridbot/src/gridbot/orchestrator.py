@@ -991,13 +991,16 @@ class Orchestrator:
         try:
             self._auth_cooldown.sweep_expired(datetime.now(UTC))
 
-            # Feature 0064 — surface 110017 breaker trip counts without
-            # per-occurrence ERROR spam. Monotonic per runner lifetime.
+            # Feature 0064 — surface 110017 breaker trip counts and dirty REST
+            # refresh failures without per-occurrence ERROR spam. Monotonic per
+            # runner lifetime.
             for runner in self._runners.values():
                 trips = runner.truncate_breaker_reconcile_count
-                if trips > 0:
+                rest_failures = runner.dirty_rest_refresh_failure_count
+                if trips > 0 or rest_failures > 0:
                     logger.debug(
-                        "%s: 110017 breaker trips=%d", runner.strat_id, trips
+                        "%s: 110017 breaker trips=%d, dirty REST refresh failures=%d",
+                        runner.strat_id, trips, rest_failures,
                     )
 
             for account_name in list(self._public_ws.keys()):

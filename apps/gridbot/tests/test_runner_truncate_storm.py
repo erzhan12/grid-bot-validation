@@ -603,3 +603,74 @@ def test_dirty_ws_gate_inactive_without_rest_baseline(runner):
 
     runner.on_position_update(_ws_pos("0.05"), None, 10000.0, 84.0)
     assert runner._long_position.size == Decimal("0.05")  # legit WS size written
+
+
+# --------------------------------------------------------------------------
+# Review v3 #1/#2 — observability metrics
+# --------------------------------------------------------------------------
+
+def test_rest_refresh_failure_count_increments_on_get_positions_error(runner, mock_rest_client):
+    """#1: a get_positions failure during dirty refresh increments the metric."""
+    runner._position_dirty[DirectionType.LONG] = True
+    mock_rest_client.get_positions.side_effect = Exception("REST down")
+    runner._refresh_position_size_from_rest(DirectionType.LONG)
+    assert runner.dirty_rest_refresh_failure_count == 1
+    runner._refresh_position_size_from_rest(DirectionType.LONG)
+    assert runner.dirty_rest_refresh_failure_count == 2
+
+
+def test_rest_refresh_failure_count_increments_on_unparseable_size(runner, mock_rest_client):
+    """#1: an unparseable size also counts as a refresh failure."""
+    mock_rest_client.get_positions.return_value = [{"positionIdx": 1, "size": "not-a-number"}]
+    runner._refresh_position_size_from_rest(DirectionType.LONG)
+    assert runner.dirty_rest_refresh_failure_count == 1
+
+
+def test_rest_refresh_failure_count_not_incremented_on_success(runner, mock_rest_client):
+    mock_rest_client.get_positions.return_value = _positions("0.05")
+    runner._refresh_position_size_from_rest(DirectionType.LONG)
+    assert runner.dirty_rest_refresh_failure_count == 0
+
+
+def test_no_rest_client_does_not_increment_failure_count(
+    strategy_config, mock_executor, instrument_info, clock
+):
+    """#1: rest_client=None is a static dry-run state, not a REST failure."""
+    r = StrategyRunner(
+        strategy_config=strategy_config, executor=mock_executor,
+        instrument_info=instrument_info, rest_client=None, clock=lambda: clock["now"],
+    )
+    r._refresh_position_size_from_rest(DirectionType.LONG)
+    assert r.dirty_rest_refresh_failure_count == 0
+
+
+def test_ws_mismatch_streak_increments_while_dirty(runner):
+    """#2: consecutive non-matching WS frames during dirty increment the streak."""
+    runner._position_dirty[DirectionType.LONG] = True
+    runner._last_rest_position_size[DirectionType.LONG] = Decimal("0.05")
+    for _ in range(3):
+        runner.on_position_update(_ws_pos("0.07"), None, 10000.0, 84.0)
+    assert runner._dirty_ws_mismatch_streak[DirectionType.LONG] == 3
+    assert runner._position_dirty[DirectionType.LONG] is True  # still dirty
+
+
+def test_ws_match_resets_mismatch_streak(runner):
+    """#2: a matching WS frame ends the episode and resets the streak."""
+    runner._position_dirty[DirectionType.LONG] = True
+    runner._last_rest_position_size[DirectionType.LONG] = Decimal("0.05")
+    runner.on_position_update(_ws_pos("0.07"), None, 10000.0, 84.0)  # mismatch → 1
+    assert runner._dirty_ws_mismatch_streak[DirectionType.LONG] == 1
+    runner.on_position_update(_ws_pos("0.05"), None, 10000.0, 84.0)  # match → clear + reset
+    assert runner._dirty_ws_mismatch_streak[DirectionType.LONG] == 0
+    assert runner._position_dirty[DirectionType.LONG] is False
+
+
+def test_ws_mismatch_warns_at_threshold(runner, monkeypatch, caplog):
+    """#2: a WARNING fires once the mismatch streak reaches the threshold."""
+    monkeypatch.setattr("gridbot.runner._DIRTY_WS_MISMATCH_ALERT_THRESHOLD", 3)
+    runner._position_dirty[DirectionType.LONG] = True
+    runner._last_rest_position_size[DirectionType.LONG] = Decimal("0.05")
+    with caplog.at_level("WARNING"):
+        for _ in range(3):
+            runner.on_position_update(_ws_pos("0.07"), None, 10000.0, 84.0)
+    assert any("consecutive WS" in rec.getMessage() for rec in caplog.records)

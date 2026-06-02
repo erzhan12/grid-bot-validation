@@ -780,6 +780,7 @@ class TestOrchestratorTick:
         mock_runner.strat_id = "btcusdt_test"
         mock_runner.symbol = "BTCUSDT"
         mock_runner.truncate_breaker_reconcile_count = 0  # 0064 health sweep reads this
+        mock_runner.dirty_rest_refresh_failure_count = 0  # 0064 health sweep reads this
         orchestrator._runners = {"btcusdt_test": mock_runner}
 
         ev1, ev2 = Mock(), Mock()
@@ -810,6 +811,7 @@ class TestOrchestratorTick:
         mock_runner.strat_id = "btcusdt_test"
         mock_runner.symbol = "BTCUSDT"
         mock_runner.truncate_breaker_reconcile_count = 0  # 0064 health sweep reads this
+        mock_runner.dirty_rest_refresh_failure_count = 0  # 0064 health sweep reads this
         orchestrator._runners = {"btcusdt_test": mock_runner}
 
         ev1 = Mock()
@@ -840,6 +842,7 @@ class TestOrchestratorTick:
         mock_runner.strat_id = "btcusdt_test"
         mock_runner.symbol = "BTCUSDT"
         mock_runner.truncate_breaker_reconcile_count = 0  # 0064 health sweep reads this
+        mock_runner.dirty_rest_refresh_failure_count = 0  # 0064 health sweep reads this
         orchestrator._runners = {"btcusdt_test": mock_runner}
         orchestrator._symbol_to_runners = {"BTCUSDT": [mock_runner]}
 
@@ -880,6 +883,7 @@ class TestOrchestratorTick:
         mock_runner.strat_id = "btcusdt_test"
         mock_runner.symbol = "BTCUSDT"
         mock_runner.truncate_breaker_reconcile_count = 0  # 0064 health sweep reads this
+        mock_runner.dirty_rest_refresh_failure_count = 0  # 0064 health sweep reads this
         mock_runner.on_execution.side_effect = ValueError("boom")
         orchestrator._runners = {"btcusdt_test": mock_runner}
         orchestrator._symbol_to_runners = {"BTCUSDT": [mock_runner]}
@@ -924,6 +928,7 @@ class TestOrchestratorWsPositionDrain:
         mock_runner.symbol = "BTCUSDT"
         mock_runner.engine.last_close = 42500.0
         mock_runner.truncate_breaker_reconcile_count = 0  # 0064 health sweep reads this
+        mock_runner.dirty_rest_refresh_failure_count = 0  # 0064 health sweep reads this
         orchestrator._runners = {"btcusdt_test": mock_runner}
         orchestrator._account_to_runners = {"test_account": [mock_runner]}
         orchestrator._symbol_to_runners = {"BTCUSDT": [mock_runner]}
@@ -1077,6 +1082,7 @@ class TestOrchestratorWsPositionDrain:
         mock_runner.symbol = "BTCUSDT"
         mock_runner.engine.last_close = 42500.0
         mock_runner.truncate_breaker_reconcile_count = 0  # 0064 health sweep reads this
+        mock_runner.dirty_rest_refresh_failure_count = 0  # 0064 health sweep reads this
         mock_runner.on_position_update.side_effect = ValueError("boom")
         orch._runners = {"btcusdt_test": mock_runner}
         orch._account_to_runners = {"test_account": [mock_runner]}
@@ -1236,6 +1242,7 @@ class TestOrchestratorTickPeriodicCheckIsolation:
         mock_runner.strat_id = "btcusdt_test"
         mock_runner.symbol = "BTCUSDT"
         mock_runner.truncate_breaker_reconcile_count = 0  # 0064 health sweep reads this
+        mock_runner.dirty_rest_refresh_failure_count = 0  # 0064 health sweep reads this
         orchestrator._runners = {"btcusdt_test": mock_runner}
         orchestrator._symbol_to_runners = {"BTCUSDT": [mock_runner]}
 
@@ -3726,12 +3733,29 @@ class TestForcedReconcile:
         runner = Mock()
         runner.strat_id = "btcusdt_test"
         runner.truncate_breaker_reconcile_count = 2
+        runner.dirty_rest_refresh_failure_count = 0
         orchestrator._runners["btcusdt_test"] = runner
 
         with caplog.at_level("DEBUG", logger="gridbot.orchestrator"):
             orchestrator._health_check_once()
 
         assert any(
-            "breaker" in r.message.lower() or "trip" in r.message.lower()
+            "breaker" in r.getMessage().lower() or "trip" in r.getMessage().lower()
             for r in caplog.records
+        )
+
+    def test_health_check_logs_rest_refresh_failures(self, gridbot_config, caplog):
+        """Review v3 #1: persistent dirty REST refresh failures are surfaced."""
+        orchestrator = Orchestrator(gridbot_config)
+        runner = Mock()
+        runner.strat_id = "btcusdt_test"
+        runner.truncate_breaker_reconcile_count = 0
+        runner.dirty_rest_refresh_failure_count = 4
+        orchestrator._runners["btcusdt_test"] = runner
+
+        with caplog.at_level("DEBUG", logger="gridbot.orchestrator"):
+            orchestrator._health_check_once()
+
+        assert any(
+            "refresh failures=4" in r.getMessage() for r in caplog.records
         )

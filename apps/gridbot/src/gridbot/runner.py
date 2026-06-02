@@ -88,6 +88,11 @@ _SAME_ORDER_REST_MAX_PAGES = 10
 # See docs/features/0046_PLAN.md and issue #94.
 _SAME_ORDER_WARN_THROTTLE_SEC = 60.0
 
+# Feature 0064 — emit a WARNING once a direction has had this many consecutive
+# WS position-size mismatches while dirty (REST baseline held each time). Signals
+# a WS feed stuck beyond the normal recovery window. Re-fires every multiple.
+_DIRTY_WS_MISMATCH_ALERT_THRESHOLD = 10
+
 
 @dataclass
 class _SameOrderDedupEntry:
@@ -270,6 +275,16 @@ class StrategyRunner:
         }
         # Monotonic count of breaker trips that fired a forced reconcile.
         self._truncate_breaker_reconcile_count: int = 0
+        # Observability (review v3): monotonic count of dirty REST refreshes that
+        # failed (get_positions raised / unparseable size) — surfaced by the
+        # health sweep so persistent REST issues blocking self-heal are visible.
+        self._dirty_rest_refresh_failure_count: int = 0
+        # Per-direction streak of consecutive WS size mismatches while dirty
+        # (reset on a match / episode clear). Drives a threshold WARNING.
+        self._dirty_ws_mismatch_streak: dict[str, int] = {
+            DirectionType.LONG: 0,
+            DirectionType.SHORT: 0,
+        }
 
         # Qty computation
         self._instrument_info = instrument_info
@@ -361,6 +376,17 @@ class StrategyRunner:
         signal without per-occurrence ERROR spam.
         """
         return self._truncate_breaker_reconcile_count
+
+    @property
+    def dirty_rest_refresh_failure_count(self) -> int:
+        """Number of dirty REST refreshes that failed (review v3 #1).
+
+        Incremented when ``get_positions`` raises or returns an unparseable
+        size during a dirty refresh. Monotonic for the runner lifetime; surfaced
+        by the health sweep so a persistent REST outage that blocks self-heal is
+        visible without per-occurrence ERROR spam.
+        """
+        return self._dirty_rest_refresh_failure_count
 
     @property
     def symbol(self) -> str:
@@ -1016,6 +1042,7 @@ class StrategyRunner:
         self._position_dirty[direction] = False
         self._last_dirty_rest_at[direction] = None
         self._last_rest_position_size[direction] = None
+        self._dirty_ws_mismatch_streak[direction] = 0
 
     def _apply_dirty_ws_size_gate(self, direction: str, ws_size: Decimal) -> Decimal:
         """Gate a WS position-size write while a direction is dirty (0064).
@@ -1040,11 +1067,24 @@ class StrategyRunner:
                 self.strat_id, ws_size, direction,
             )
             return ws_size
-        logger.debug(
-            "%s: ignoring non-matching WS size %s for dirty %s "
-            "(REST baseline %s stays authoritative)",
-            self.strat_id, ws_size, direction, baseline,
-        )
+        # Non-match while dirty: keep the REST-authoritative size and track the
+        # consecutive-mismatch streak (review v3 #2). A WARNING at each threshold
+        # multiple flags a WS feed stuck beyond the normal recovery window.
+        streak = self._dirty_ws_mismatch_streak[direction] + 1
+        self._dirty_ws_mismatch_streak[direction] = streak
+        if streak >= _DIRTY_WS_MISMATCH_ALERT_THRESHOLD and streak % _DIRTY_WS_MISMATCH_ALERT_THRESHOLD == 0:
+            logger.warning(
+                "%s: %d consecutive WS position-size mismatches for dirty %s "
+                "(REST baseline %s held) — WS feed may be stuck beyond the "
+                "normal recovery window",
+                self.strat_id, streak, direction, baseline,
+            )
+        else:
+            logger.debug(
+                "%s: ignoring non-matching WS size %s for dirty %s "
+                "(REST baseline %s stays authoritative, streak=%d)",
+                self.strat_id, ws_size, direction, baseline, streak,
+            )
         return baseline
 
     def _refresh_position_size_from_rest(
@@ -1079,6 +1119,7 @@ class StrategyRunner:
         try:
             positions = self._rest_client.get_positions(self._config.symbol)
         except Exception as e:
+            self._dirty_rest_refresh_failure_count += 1
             logger.warning(
                 "%s: dirty REST refresh get_positions failed for %s: %s — "
                 "keeping in-memory mirror",
@@ -1101,6 +1142,7 @@ class StrategyRunner:
             try:
                 new_size = Decimal(str(entry.get("size", 0) or 0))
             except (ArithmeticError, ValueError, TypeError):
+                self._dirty_rest_refresh_failure_count += 1
                 logger.warning(
                     "%s: dirty REST refresh got unparseable size %r for %s — "
                     "keeping in-memory mirror",

@@ -30,6 +30,10 @@ Plan: docs/features/0064_PLAN.md  |  Branch: feature/0064-truncate-breaker-dirty
 - [x] Update RULES.md — added "110017 retry-storm self-heal + circuit-breaker" section
 - [x] docs/features/0064_REVIEW.md findings — F1 (dirty-clear close-only), F2 (throttle on every attempt), F3 (`_clear_dirty` episode-scoped reset), F4 (dead test cond), F6 (negative tests) applied; F5 declined (plan-sanctioned, optional).
 - [x] Review v3 findings — P2 (split forced-reconcile try blocks so position resync survives an order-reconcile failure) applied + test; P3.1 (`rest_client=None` backstop test) + P3.2 (short-side refresh test) added; P3.3 non-issue. Full suite 2393 passed.
+- [x] PR #157 bot review (await-review) — APPROVED, no P0/P1; user requested fix of P2 #1 + #2:
+  - #1 `dirty_rest_refresh_failure_count` metric (REST refresh failures) + health-sweep surfacing
+  - #2 `_dirty_ws_mismatch_streak` + threshold WARNING (WS feed stuck) — reset via `_clear_dirty`
+  - +8 tests; full suite 2401 passed. (bot #3 already covered; #4/#5 not requested.)
 
 ## What could break (revisit after impl)
 - Mock(spec=IntentExecutor) auto-creating truthy methods → classifier kept module-level

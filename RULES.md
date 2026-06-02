@@ -325,6 +325,14 @@ Pitfalls / invariants (all enforced + tested):
   resync — the position resync is the #149-critical healing step (closes the
   stale-mirror gap). Designed to be reused by the broader divergence detector
   (issue #151).
+- **Observability (review v3)**: `dirty_rest_refresh_failure_count` (monotonic
+  property; incremented when a dirty REST refresh's `get_positions` raises or
+  returns an unparseable size) is surfaced by the health sweep alongside the
+  breaker trip count — a persistent REST outage that blocks self-heal is visible
+  without per-occurrence ERROR spam. `_dirty_ws_mismatch_streak[direction]`
+  counts consecutive WS size mismatches while dirty (reset on match / episode
+  clear) and emits a WARNING every `_DIRTY_WS_MISMATCH_ALERT_THRESHOLD` (10)
+  mismatches — a WS feed stuck beyond the normal recovery window.
 - Config (all on `StrategyConfig`, default-on): `dirty_refresh_enabled`,
   `dirty_rest_refresh_min_interval_seconds`, `truncate_breaker_{max_consecutive,
   window_seconds,cooldown_seconds,reconcile}`. Constant
