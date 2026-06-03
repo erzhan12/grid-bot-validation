@@ -102,6 +102,13 @@ class BacktestSession:
     UTA buffers, so a replay seeded from feature 0042 wallet snapshots
     will start with ``total_equity > current_balance`` and the gap
     persists across the run.
+
+    Feature 0065 adds a non-USDT collateral re-mark term to ``total_equity``
+    only (``Σ balance × mark − seed_contrib``). ``_collateral_remark_delta``
+    is an O(#collateral_coins) sum recomputed per ``update_equity`` /
+    ``refresh_balances`` call; the coin set is tiny in practice (1–5), so the
+    overhead is negligible, and the term is identically zero when no collateral
+    is modelled.
     """
 
     def __init__(

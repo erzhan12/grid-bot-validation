@@ -44,8 +44,11 @@ qty_tolerance: 0.001
 #   strat_id: "solusdt_test"
 #   wallet_coin: "USDT"
 #   # Feature 0065: re-mark non-USDT collateral so backtest totalEquity floats
-#   # like live. List every non-USDT coin held as collateral over the window;
-#   # each needs its *USDT ticker recorded (recorder.collateral_symbols).
+#   # like live. List every non-USDT coin held as collateral over the window.
+#   # PAIRED CONFIG (both required): every coin here must ALSO have its *USDT
+#   # symbol in the recorder's `collateral_symbols` (see recorder.yaml.example)
+#   # for the recording window — otherwise ticker_snapshots has no marks and
+#   # the coin runs on the seed mark all window (logged WARNING).
 #   collateral_coins: ["SOL"]
 #   collateral_symbol_map: {"SOL": "SOLUSDT"}   # optional; default {coin}USDT
 #   # optional — NOT applied to total_equity in 0065 (future margin parity only)

@@ -25,7 +25,6 @@ from grid_db import (
     Run,
     RunRepository,
     TickerSnapshot,
-    TickerSnapshotRepository,
     WalletSnapshot,
     redact_db_url,
 )
@@ -99,27 +98,33 @@ class CollateralMarkFeed:
         symbol_for: dict[str, str],
         start_ts: datetime,
         end_ts: datetime,
+        seed_at_ts: Optional[datetime] = None,
         batch_size: int = 1000,
     ):
         self._db = db
         self._symbol_for = dict(symbol_for)
         self._start_ts = start_ts
         self._end_ts = end_ts
+        # Lower floor for the carry-forward anchor: the seed moment. Defaults to
+        # start_ts (no pre-window carry) when not given.
+        self._seed_at_ts = seed_at_ts if seed_at_ts is not None else start_ts
         self._batch_size = batch_size
         # Per-coin streaming state.
         self._iters: dict[str, "object"] = {}
         self._pending: dict[str, Optional[tuple[datetime, Decimal]]] = {}
         self._current: dict[str, Optional[Decimal]] = {}
         self._last_ts: dict[str, datetime] = {}
-        # Anchor each coin's carry-forward to the latest mark AT-OR-BEFORE
-        # start_ts, so the first replay tick uses a correct carry-forward mark
-        # even when seed.at_ts < start_ts or the symbol has no row exactly at
-        # start_ts (a sparse stream's last pre-window mark must carry in). The
-        # forward stream below then only needs rows >= start_ts.
+        # Anchor each coin's carry-forward to the latest mark in the half-open
+        # seed window [seed_at_ts, start_ts], so the first replay tick uses a
+        # correct carry-forward mark when seed.at_ts < start_ts or the symbol
+        # has no row exactly at start_ts (sparse stream). Floored at seed_at_ts
+        # so a mark from BEFORE the seed anchor is NOT applied (that would be
+        # false backward drift relative to the at_ts seed mark). No mark in the
+        # window → None, and the session keeps the seed mark until a genuine
+        # in-window mark arrives. The forward stream below covers rows >= start_ts.
         with self._db.get_session() as session:
-            anchor_repo = TickerSnapshotRepository(session)
             anchors = {
-                coin: anchor_repo.get_mark_at_or_before(symbol, start_ts)
+                coin: self._anchor_mark(session, symbol)
                 for coin, symbol in self._symbol_for.items()
             }
         for coin, symbol in self._symbol_for.items():
@@ -127,6 +132,20 @@ class CollateralMarkFeed:
             self._iters[coin] = it
             self._pending[coin] = next(it, None)
             self._current[coin] = anchors[coin]
+
+    def _anchor_mark(self, session, symbol: str) -> Optional[Decimal]:
+        """Latest ``mark_price`` in ``[seed_at_ts, start_ts]`` (the seed window),
+        or ``None`` when the symbol has no row in that range. Floored at
+        ``seed_at_ts`` so a pre-seed mark is never used as the t0 carry-forward."""
+        row = (
+            session.query(TickerSnapshot.mark_price)
+            .filter(TickerSnapshot.symbol == symbol)
+            .filter(TickerSnapshot.exchange_ts >= self._seed_at_ts)
+            .filter(TickerSnapshot.exchange_ts <= self._start_ts)
+            .order_by(TickerSnapshot.exchange_ts.desc())
+            .first()
+        )
+        return row[0] if row else None
 
     def _iter_marks(self, symbol: str):
         """Yield ``(exchange_ts, mark_price)`` ascending across the window."""
@@ -418,6 +437,7 @@ class ReplayEngine:
                 symbol_for=symbol_for,
                 start_ts=start_ts,
                 end_ts=end_ts,
+                seed_at_ts=config.seed.at_ts,
             )
             logger.info(
                 "0065 collateral re-mark active: coins=%s symbols=%s",

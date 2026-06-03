@@ -86,9 +86,9 @@ class TestCollateralMarkFeed:
         with pytest.raises(ValueError, match="non-monotonic"):
             feed.mark_at("SOL", BASE + timedelta(seconds=10))
 
-    def test_anchors_carry_forward_pre_window_mark(self, db):
-        """F1: a mark at-or-before start_ts with NO row exactly at start_ts must
-        carry into the first tick (e.g. seed.at_ts < start_ts, sparse ticks)."""
+    def test_anchors_carry_forward_mark_within_seed_window(self, db):
+        """F1: a mark in [seed_at_ts, start_ts] (no row exactly at start_ts) must
+        carry into the first tick (seed.at_ts < start_ts, sparse ticks)."""
         with db.get_session() as session:
             TickerSnapshotRepository(session).bulk_insert([
                 _ticker("SOLUSDT", BASE - timedelta(seconds=30), Decimal("70")),
@@ -97,12 +97,32 @@ class TestCollateralMarkFeed:
             session.commit()
         feed = CollateralMarkFeed(
             db=db, symbol_for={"SOL": "SOLUSDT"},
+            seed_at_ts=BASE - timedelta(minutes=1),  # at_ts < start_ts
             start_ts=BASE, end_ts=BASE + timedelta(minutes=5),
         )
-        # First tick at start_ts: carry-forward the pre-window mark (70), not None.
+        # First tick at start_ts: carry-forward the in-window pre-start mark (70).
         assert feed.mark_at("SOL", BASE) == Decimal("70")
         # Then advances to the in-window mark.
         assert feed.mark_at("SOL", BASE + timedelta(seconds=60)) == Decimal("90")
+
+    def test_pre_seed_mark_not_anchored(self, db):
+        """P1 (PR #158): a ticker mark BEFORE seed_at_ts must NOT anchor the
+        carry-forward when start_ts > seed.at_ts (else false backward drift)."""
+        with db.get_session() as session:
+            TickerSnapshotRepository(session).bulk_insert([
+                _ticker("SOLUSDT", BASE - timedelta(seconds=30), Decimal("70")),  # pre-seed
+                _ticker("SOLUSDT", BASE + timedelta(minutes=2), Decimal("95")),   # in-window
+            ])
+            session.commit()
+        feed = CollateralMarkFeed(
+            db=db, symbol_for={"SOL": "SOLUSDT"},
+            seed_at_ts=BASE, start_ts=BASE + timedelta(minutes=1),
+            end_ts=BASE + timedelta(minutes=10),
+        )
+        # No mark in [seed_at_ts, start_ts] → anchor None → keep seed mark.
+        assert feed.mark_at("SOL", BASE + timedelta(minutes=1)) is None
+        # A genuine in-window mark is still picked up.
+        assert feed.mark_at("SOL", BASE + timedelta(minutes=3)) == Decimal("95")
 
     def test_multi_batch_pagination_holds_session(self, feed_db):
         """batch_size=1 forces the cursor to re-query across MULTIPLE batches on
