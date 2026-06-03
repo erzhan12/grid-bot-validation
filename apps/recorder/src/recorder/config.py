@@ -51,6 +51,26 @@ class RecorderConfig(BaseModel):
             raise ValueError("symbols must be non-empty, non-whitespace strings")
         return v
 
+    collateral_symbols: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Feature 0065: extra *USDT perp symbols to subscribe ticker for so "
+            "non-USDT collateral coins have marks in ticker_snapshots (e.g. "
+            "['SOLUSDT']). Merged with `symbols` (de-duplicated) for the public "
+            "collector; NOT subscribed for executions/positions/orders. "
+            "Configure every coin ever held as collateral over the window."
+        ),
+    )
+
+    @field_validator("collateral_symbols")
+    @classmethod
+    def non_empty_collateral_symbols(cls, v: list[str]) -> list[str]:
+        if any(not s.strip() for s in v):
+            raise ValueError(
+                "collateral_symbols must be non-empty, non-whitespace strings"
+            )
+        return v
+
     capture_public_trades: bool = Field(
         default=False,
         description="Capture public trades (high volume, ~85%% of storage). "

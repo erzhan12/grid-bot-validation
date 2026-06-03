@@ -17,6 +17,8 @@ from grid_db import (
     PositionSnapshotRepository,
     Run,
     Strategy,
+    TickerSnapshot,
+    TickerSnapshotRepository,
     User,
     WalletSnapshot,
     WalletSnapshotRepository,
@@ -33,6 +35,7 @@ from replay.snapshot_loader import (
     SeedSchemaError,
     WalletSeed,
     load_active_orders,
+    load_collateral_seed,
     load_grid_state,
     load_grid_state_from_snapshots,
     load_position_snapshots,
@@ -1368,3 +1371,200 @@ class TestLoadActiveOrders:
         assert seeds[0].direction == expected_direction
         assert seeds[0].side == side
         assert seeds[0].reduce_only is reduce_only
+
+
+# ---------------------------------------------------------------------------
+# load_collateral_seed (feature 0065)
+# ---------------------------------------------------------------------------
+
+
+class TestLoadCollateralSeed:
+    """Feature 0065 — multi-coin non-USDT collateral seed loader."""
+
+    AT_TS = datetime(2026, 6, 1, 17, 42, 30, tzinfo=timezone.utc)
+    STALENESS = timedelta(seconds=60)
+
+    def _wallet(
+        self, run_id, account_id, coin, exchange_ts, *, balance,
+        usd_value=None, collateral_switch=True, margin_collateral=True,
+    ):
+        raw = {"coin": coin, "walletBalance": str(balance)}
+        if usd_value is not None:
+            raw["usdValue"] = str(usd_value)
+        raw["collateralSwitch"] = collateral_switch
+        raw["marginCollateral"] = margin_collateral
+        return WalletSnapshot(
+            run_id=run_id, account_id=account_id,
+            exchange_ts=exchange_ts, local_ts=exchange_ts, coin=coin,
+            wallet_balance=Decimal(str(balance)),
+            available_balance=Decimal(str(balance)),
+            raw_json=raw,
+        )
+
+    def _call(self, session, run_id, account_id, **kw):
+        return load_collateral_seed(
+            session, run_id, account_id, self.AT_TS,
+            kw.pop("usdt_coin", "USDT"),
+            kw.pop("collateral_coins", ["SOL"]),
+            kw.pop("collateral_symbol_for", {}),
+            kw.pop("configured_value_ratios", {}),
+            kw.pop("wallet_max_staleness", self.STALENESS),
+        )
+
+    def test_only_configured_coins_processed_fresh_usdvalue(
+        self, session, sample_account, sample_run
+    ):
+        rid, aid = sample_run.run_id, str(sample_account.account_id)
+        fresh = self.AT_TS - timedelta(seconds=5)
+        repo = WalletSnapshotRepository(session)
+        repo.bulk_insert([
+            self._wallet(rid, aid, "USDT", fresh, balance="170.35", usd_value="156.75"),
+            self._wallet(rid, aid, "SOL", fresh, balance="0.2473524", usd_value="19.95071637"),
+            # BTC present in DB but NOT in collateral_coins → must be ignored.
+            self._wallet(rid, aid, "BTC", fresh, balance="1.0", usd_value="60000"),
+        ])
+
+        bal, marks, ratios, excluded, missing, switch_off = self._call(
+            session, rid, aid, collateral_coins=["SOL"]
+        )
+
+        assert set(bal) == {"SOL"}
+        assert bal["SOL"] == Decimal("0.2473524")
+        assert marks["SOL"] == Decimal("19.95071637") / Decimal("0.2473524")
+        assert ratios == {}
+        assert excluded == [] and missing == [] and switch_off == []
+
+    def test_stale_row_falls_back_to_ticker(
+        self, session, sample_account, sample_run
+    ):
+        rid, aid = sample_run.run_id, str(sample_account.account_id)
+        stale = self.AT_TS - timedelta(seconds=300)  # > 60s staleness
+        WalletSnapshotRepository(session).bulk_insert([
+            self._wallet(rid, aid, "SOL", stale, balance="0.2473524", usd_value="19.95071637"),
+        ])
+        TickerSnapshotRepository(session).bulk_insert([
+            TickerSnapshot(
+                symbol="SOLUSDT",
+                exchange_ts=self.AT_TS - timedelta(seconds=1),
+                local_ts=self.AT_TS - timedelta(seconds=1),
+                last_price=Decimal("80.99"), mark_price=Decimal("81.00"),
+                bid1_price=Decimal("80.98"), ask1_price=Decimal("81.01"),
+                funding_rate=Decimal("0.0001"),
+            ),
+        ])
+
+        bal, marks, _, excluded, missing, _ = self._call(
+            session, rid, aid, collateral_coins=["SOL"]
+        )
+        # ticker mark wins, NOT usdValue/balance (~80.66).
+        assert marks["SOL"] == Decimal("81.00")
+        assert bal["SOL"] == Decimal("0.2473524")
+        assert excluded == [] and missing == []
+
+    def test_missing_wallet_row_excluded(
+        self, session, sample_account, sample_run
+    ):
+        rid, aid = sample_run.run_id, str(sample_account.account_id)
+        # No DOGE row at all.
+        bal, marks, _, excluded, missing, _ = self._call(
+            session, rid, aid, collateral_coins=["DOGE"]
+        )
+        assert excluded == ["DOGE"]
+        assert bal == {} and marks == {} and missing == []
+
+    def test_zero_balance_excluded(self, session, sample_account, sample_run):
+        rid, aid = sample_run.run_id, str(sample_account.account_id)
+        WalletSnapshotRepository(session).bulk_insert([
+            self._wallet(rid, aid, "SOL", self.AT_TS - timedelta(seconds=5),
+                         balance="0", usd_value="0"),
+        ])
+        bal, _, _, excluded, _, _ = self._call(
+            session, rid, aid, collateral_coins=["SOL"]
+        )
+        assert excluded == ["SOL"]
+        assert bal == {}
+
+    def test_negative_balance_excluded(self, session, sample_account, sample_run):
+        """Inclusion rule is wallet_balance > 0 — a negative (borrowed) balance
+        must be excluded, not re-marked (would invert the drift sign)."""
+        rid, aid = sample_run.run_id, str(sample_account.account_id)
+        WalletSnapshotRepository(session).bulk_insert([
+            self._wallet(rid, aid, "SOL", self.AT_TS - timedelta(seconds=5),
+                         balance="-0.5", usd_value="-40"),
+        ])
+        bal, marks, _, excluded, _, _ = self._call(
+            session, rid, aid, collateral_coins=["SOL"]
+        )
+        assert excluded == ["SOL"]
+        assert bal == {} and marks == {}
+
+    def test_missing_seed_mark_goes_to_missing_mark(
+        self, session, sample_account, sample_run
+    ):
+        rid, aid = sample_run.run_id, str(sample_account.account_id)
+        stale = self.AT_TS - timedelta(seconds=300)
+        # Stale row, NO usdValue, and NO ticker → no usable seed mark.
+        WalletSnapshotRepository(session).bulk_insert([
+            self._wallet(rid, aid, "SOL", stale, balance="0.2473524", usd_value=None),
+        ])
+        bal, marks, ratios, excluded, missing, _ = self._call(
+            session, rid, aid, collateral_coins=["SOL"]
+        )
+        assert missing == ["SOL"]
+        # Coin dropped from ALL modelled dicts.
+        assert "SOL" not in bal and "SOL" not in marks and "SOL" not in ratios
+        assert excluded == []
+
+    def test_switch_off_recorded_but_coin_modelled(
+        self, session, sample_account, sample_run
+    ):
+        rid, aid = sample_run.run_id, str(sample_account.account_id)
+        WalletSnapshotRepository(session).bulk_insert([
+            self._wallet(rid, aid, "SOL", self.AT_TS - timedelta(seconds=5),
+                         balance="0.2473524", usd_value="19.95071637",
+                         collateral_switch=False),
+        ])
+        bal, marks, _, excluded, missing, switch_off = self._call(
+            session, rid, aid, collateral_coins=["SOL"]
+        )
+        assert switch_off == ["SOL"]
+        # Still modelled for totalEquity.
+        assert "SOL" in bal and "SOL" in marks
+        assert excluded == [] and missing == []
+
+    def test_value_ratio_stored_from_config(
+        self, session, sample_account, sample_run
+    ):
+        rid, aid = sample_run.run_id, str(sample_account.account_id)
+        WalletSnapshotRepository(session).bulk_insert([
+            self._wallet(rid, aid, "SOL", self.AT_TS - timedelta(seconds=5),
+                         balance="0.2473524", usd_value="19.95071637"),
+        ])
+        _, _, ratios, _, _, _ = self._call(
+            session, rid, aid, collateral_coins=["SOL"],
+            configured_value_ratios={"SOL": Decimal("0.85")},
+        )
+        assert ratios == {"SOL": Decimal("0.85")}
+
+    def test_empty_collateral_coins_returns_empty(
+        self, session, sample_account, sample_run
+    ):
+        rid, aid = sample_run.run_id, str(sample_account.account_id)
+        result = self._call(session, rid, aid, collateral_coins=[])
+        assert result == ({}, {}, {}, [], [], [])
+
+    def test_strip_tz_handles_naive_exchange_ts(
+        self, session, sample_account, sample_run
+    ):
+        """SQLite may hand back naive exchange_ts; loader must not raise on the
+        fresh-staleness subtraction against the tz-aware at_ts."""
+        rid, aid = sample_run.run_id, str(sample_account.account_id)
+        naive = (self.AT_TS - timedelta(seconds=5)).replace(tzinfo=None)
+        WalletSnapshotRepository(session).bulk_insert([
+            self._wallet(rid, aid, "SOL", naive, balance="0.2473524", usd_value="19.95071637"),
+        ])
+        bal, marks, _, _, _, _ = self._call(
+            session, rid, aid, collateral_coins=["SOL"]
+        )
+        assert bal["SOL"] == Decimal("0.2473524")
+        assert marks["SOL"] == Decimal("19.95071637") / Decimal("0.2473524")

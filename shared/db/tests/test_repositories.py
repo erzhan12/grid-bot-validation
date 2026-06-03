@@ -1264,6 +1264,126 @@ class TestWalletSnapshotRepository:
         )
         assert len(results) == 0
 
+    def test_get_all_coins_latest_before(self, session, sample_account, sample_run):
+        """Feature 0065: latest row per coin at-or-before at_ts, run-scoped."""
+        from grid_db import WalletSnapshotRepository, WalletSnapshot
+        from decimal import Decimal
+
+        repo = WalletSnapshotRepository(session)
+        base = datetime(2026, 6, 1, 17, 38, 0, tzinfo=UTC)
+        repo.bulk_insert([
+            # USDT: two rows — newer one (<= at_ts) wins.
+            WalletSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                exchange_ts=base, local_ts=base, coin="USDT",
+                wallet_balance=Decimal("100"), available_balance=Decimal("100"),
+            ),
+            WalletSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                exchange_ts=base + timedelta(seconds=60),
+                local_ts=base + timedelta(seconds=60), coin="USDT",
+                wallet_balance=Decimal("170"), available_balance=Decimal("110"),
+            ),
+            # SOL: single row.
+            WalletSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                exchange_ts=base + timedelta(seconds=30),
+                local_ts=base + timedelta(seconds=30), coin="SOL",
+                wallet_balance=Decimal("0.2473524"),
+                available_balance=Decimal("0.2473524"),
+            ),
+            # Future row beyond at_ts — must be excluded for both coins.
+            WalletSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                exchange_ts=base + timedelta(seconds=300),
+                local_ts=base + timedelta(seconds=300), coin="SOL",
+                wallet_balance=Decimal("99"), available_balance=Decimal("99"),
+            ),
+        ])
+
+        at_ts = base + timedelta(seconds=120)
+        rows = repo.get_all_coins_latest_before(
+            sample_run.run_id, str(sample_account.account_id), at_ts
+        )
+        by_coin = {r.coin: r for r in rows}
+        assert set(by_coin) == {"USDT", "SOL"}
+        assert by_coin["USDT"].wallet_balance == Decimal("170")  # newer USDT row
+        assert by_coin["SOL"].wallet_balance == Decimal("0.2473524")  # not the future 99
+
+    def test_get_all_coins_latest_before_excludes_other_runs(
+        self, session, sample_user, sample_account, sample_strategy, sample_run
+    ):
+        """Feature 0065: rows from a different run must not leak in."""
+        from grid_db import WalletSnapshotRepository, WalletSnapshot
+        from grid_db.models import Run
+        from decimal import Decimal
+
+        other_run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="live", status="completed",
+            start_ts=datetime(2026, 5, 31, tzinfo=UTC),
+        )
+        session.add(other_run)
+        session.flush()
+
+        repo = WalletSnapshotRepository(session)
+        base = datetime(2026, 6, 1, 17, 38, 0, tzinfo=UTC)
+        repo.bulk_insert([
+            WalletSnapshot(
+                run_id=other_run.run_id,
+                account_id=str(sample_account.account_id),
+                exchange_ts=base, local_ts=base, coin="SOL",
+                wallet_balance=Decimal("5"), available_balance=Decimal("5"),
+            ),
+        ])
+
+        rows = repo.get_all_coins_latest_before(
+            sample_run.run_id, str(sample_account.account_id),
+            base + timedelta(seconds=60),
+        )
+        assert rows == []
+
+    def test_get_all_coins_latest_before_tie_is_deterministic(
+        self, session, sample_account, sample_run
+    ):
+        """Feature 0065: two rows at the same exchange_ts → ordered (coin, id)
+        so a last-wins caller deterministically gets the highest-id row."""
+        from grid_db import WalletSnapshotRepository, WalletSnapshot
+        from decimal import Decimal
+
+        repo = WalletSnapshotRepository(session)
+        base = datetime(2026, 6, 1, 17, 38, 0, tzinfo=UTC)
+        repo.bulk_insert([
+            WalletSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                exchange_ts=base, local_ts=base, coin="SOL",
+                wallet_balance=Decimal("1"), available_balance=Decimal("1"),
+            ),
+            WalletSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                exchange_ts=base, local_ts=base, coin="SOL",  # same ts → tie
+                wallet_balance=Decimal("2"), available_balance=Decimal("2"),
+            ),
+        ])
+
+        rows = [
+            r for r in repo.get_all_coins_latest_before(
+                sample_run.run_id, str(sample_account.account_id),
+                base + timedelta(seconds=1),
+            )
+            if r.coin == "SOL"
+        ]
+        # Ordered ascending by id → last is the highest-id (latest insert).
+        assert rows[-1].wallet_balance == Decimal("2")
+
 
 class TestSeedAwareReplayRepositoryMethods:
     """Feature 0029: get_latest_before / get_active_at on the three
@@ -1626,6 +1746,62 @@ class TestTickerSnapshotRepository:
         assert latest is not None
         assert latest.last_price == Decimal("51000.00")
         assert latest.exchange_ts.replace(tzinfo=None) == ts2.replace(tzinfo=None)
+
+    def test_get_mark_at_or_before_returns_latest_le_ts(self, session):
+        """Feature 0065: latest mark_price with exchange_ts <= at_ts (carry-forward)."""
+        from grid_db import TickerSnapshotRepository, TickerSnapshot
+        from decimal import Decimal
+
+        repo = TickerSnapshotRepository(session)
+        base = datetime(2026, 5, 27, 16, 58, 0, tzinfo=UTC)
+        repo.bulk_insert([
+            TickerSnapshot(
+                symbol="SOLUSDT", exchange_ts=base, local_ts=base,
+                last_price=Decimal("84.10"), mark_price=Decimal("84.15"),
+                bid1_price=Decimal("84.09"), ask1_price=Decimal("84.11"),
+                funding_rate=Decimal("0.0001"),
+            ),
+            TickerSnapshot(
+                symbol="SOLUSDT",
+                exchange_ts=base + timedelta(seconds=30),
+                local_ts=base + timedelta(seconds=30),
+                last_price=Decimal("84.50"), mark_price=Decimal("84.55"),
+                bid1_price=Decimal("84.49"), ask1_price=Decimal("84.51"),
+                funding_rate=Decimal("0.0001"),
+            ),
+        ])
+
+        # at_ts strictly between the two rows → older mark carried forward.
+        between = base + timedelta(seconds=10)
+        assert repo.get_mark_at_or_before("SOLUSDT", between) == Decimal("84.15")
+        # at_ts at/after newer row → newer mark.
+        assert repo.get_mark_at_or_before(
+            "SOLUSDT", base + timedelta(seconds=60)
+        ) == Decimal("84.55")
+
+    def test_get_mark_at_or_before_none_when_no_row(self, session):
+        """Feature 0065: None when no row exists at-or-before at_ts."""
+        from grid_db import TickerSnapshotRepository, TickerSnapshot
+        from decimal import Decimal
+
+        repo = TickerSnapshotRepository(session)
+        base = datetime(2026, 5, 27, 16, 58, 0, tzinfo=UTC)
+        repo.bulk_insert([
+            TickerSnapshot(
+                symbol="SOLUSDT", exchange_ts=base, local_ts=base,
+                last_price=Decimal("84.10"), mark_price=Decimal("84.15"),
+                bid1_price=Decimal("84.09"), ask1_price=Decimal("84.11"),
+                funding_rate=Decimal("0.0001"),
+            ),
+        ])
+        # Before the only row → None.
+        assert repo.get_mark_at_or_before(
+            "SOLUSDT", base - timedelta(seconds=1)
+        ) is None
+        # Wrong symbol → None.
+        assert repo.get_mark_at_or_before(
+            "LTCUSDT", base + timedelta(seconds=1)
+        ) is None
 
 
 class TestPositionSnapshotSourceFiltering0034:

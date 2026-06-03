@@ -231,3 +231,84 @@ class TestSessionMarginTracking:
         equity = session.update_equity(sample_timestamp, Decimal("100"))
 
         assert equity == Decimal("10100")  # 10000 + 100 unrealized
+
+
+class TestSessionCollateralRemark:
+    """Feature 0065 — non-USDT collateral re-mark term on total_equity only."""
+
+    from datetime import datetime, timezone
+
+    TS = datetime(2026, 6, 1, 17, 42, 0, tzinfo=timezone.utc)
+
+    def _session(self):
+        from backtest.session import BacktestSession
+        return BacktestSession(
+            session_id="collat",
+            initial_balance=Decimal("10000"),
+            initial_equity=Decimal("10000"),
+            collateral_balances={"SOL": Decimal("0.25")},
+            collateral_seed_marks={"SOL": Decimal("80")},
+        )
+
+    def test_total_equity_at_seed_is_unchanged(self):
+        """seed_contrib cancels collateral_now at t0 → total_equity == initial_equity."""
+        s = self._session()
+        s.update_equity(self.TS, Decimal("0"))
+        assert s.total_equity == Decimal("10000")
+        # Available-based fields carry NO collateral term.
+        assert s.current_balance == Decimal("10000")
+        assert s.equity_curve[-1][1] == Decimal("10000")
+
+    def test_total_equity_floats_with_collateral_mark(self):
+        """mark 80 -> 90 on 0.25 SOL adds +2.5 to total_equity ONLY."""
+        s = self._session()
+        s.update_collateral_mark("SOL", Decimal("90"))
+        s.update_equity(self.TS, Decimal("0"))
+        assert s.total_equity == Decimal("10002.5")
+        # current_balance / equity_curve stay futures-only.
+        assert s.current_balance == Decimal("10000")
+        assert s.equity_curve[-1][1] == Decimal("10000")
+
+    def test_collateral_term_adds_on_top_of_pnl(self):
+        """total_equity = initial_equity + pnl_delta + (collateral_now - seed_contrib)."""
+        s = self._session()
+        s.total_realized_pnl = Decimal("100")
+        s.total_commission = Decimal("10")
+        s.update_collateral_mark("SOL", Decimal("100"))  # +0.25*(100-80)=+5
+        s.update_equity(self.TS, Decimal("50"))  # pnl_delta = 100+50-10 = 140
+        assert s.total_equity == Decimal("10145")  # 10000 + 140 + 5
+        assert s.current_balance == Decimal("10140")  # no collateral term
+
+    def test_refresh_balances_applies_collateral(self):
+        s = self._session()
+        s.update_collateral_mark("SOL", Decimal("90"))
+        s.refresh_balances(Decimal("0"))
+        assert s.total_equity == Decimal("10002.5")
+        assert s.current_balance == Decimal("10000")
+
+    def test_collateral_drift_total_and_by_coin(self):
+        s = self._session()
+        s.update_collateral_mark("SOL", Decimal("90"))
+        assert s.collateral_drift_total == Decimal("2.5")  # 0.25*(90-80)
+        assert s.collateral_drift_by_coin == {"SOL": Decimal("2.5")}
+
+    def test_finalize_final_balance_excludes_collateral(self):
+        s = self._session()
+        s.update_collateral_mark("SOL", Decimal("90"))  # would add 2.5 to equity
+        metrics = s.finalize(final_unrealized_pnl=Decimal("0"))
+        # final_balance is available-based (initial_balance + realized + unreal
+        # - commission + funding); collateral never enters it.
+        assert metrics.final_balance == Decimal("10000")
+
+    def test_empty_collateral_is_no_op(self, session, sample_timestamp):
+        """No collateral kwargs → total_equity == initial_equity + pnl_delta (#4)."""
+        session.total_realized_pnl = Decimal("100")
+        session.update_equity(sample_timestamp, Decimal("50"))
+        # initial_equity defaults to initial_balance (10000).
+        assert session.total_equity == Decimal("10150")
+        assert session.collateral_drift_total == Decimal("0")
+        assert session.collateral_drift_by_coin == {}
+        # update_collateral_mark on a non-collateral coin is a harmless no-op.
+        session.update_collateral_mark("SOL", Decimal("90"))
+        session.update_equity(sample_timestamp, Decimal("50"))
+        assert session.total_equity == Decimal("10150")

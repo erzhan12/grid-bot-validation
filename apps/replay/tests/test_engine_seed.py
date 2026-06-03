@@ -25,6 +25,8 @@ from grid_db import (
     PositionSnapshotRepository,
     Run,
     Strategy,
+    TickerSnapshot,
+    TickerSnapshotRepository,
     User,
     WalletSnapshot,
     WalletSnapshotRepository,
@@ -979,3 +981,119 @@ class TestReplayEngineSeedFailLoud:
             f"expected exactly one wallet warning, got {len(matched)}: "
             f"{[r.getMessage() for r in engine_warnings]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# E. Collateral merge into the wallet seed (feature 0065)
+# ---------------------------------------------------------------------------
+
+
+class TestReplayEngineSeedCollateral:
+    """``seed.collateral_coins`` merges per-coin balances/marks onto the
+    WalletSeed, and hard-requires a valid account-level wallet seed."""
+
+    def test_collateral_coins_with_missing_wallet_seed_raises(
+        self, db, seed_ts, snapshot_ts, grid_state_path, mock_instrument,
+    ):
+        """collateral_coins non-empty + load_wallet_seed_full() None →
+        SeedDataQualityError (NOT the soft-fallback to initial_balance)."""
+        with db.get_session() as session:
+            user = User(user_id="user-1", username="collat")
+            account = BybitAccount(
+                account_id="acc-1", user_id="user-1",
+                account_name="seed", environment="testnet",
+            )
+            strategy = Strategy(
+                strategy_id="strat-1", account_id="acc-1",
+                strategy_type="recorder", symbol=SYMBOL, config_json={},
+            )
+            run = Run(
+                run_id="collat-run", user_id="user-1", account_id="acc-1",
+                strategy_id="strat-1", run_type="recording", status="running",
+                start_ts=snapshot_ts - timedelta(minutes=1),
+                end_ts=seed_ts + timedelta(hours=1),
+            )
+            session.add_all([user, account, strategy, run])
+            session.commit()
+
+            PositionSnapshotRepository(session).bulk_insert([
+                PositionSnapshot(
+                    run_id="collat-run", account_id="acc-1", symbol=SYMBOL,
+                    exchange_ts=snapshot_ts, local_ts=snapshot_ts,
+                    side="Buy", size=Decimal("0"), entry_price=Decimal("0"),
+                    liq_price=None,
+                ),
+                PositionSnapshot(
+                    run_id="collat-run", account_id="acc-1", symbol=SYMBOL,
+                    exchange_ts=snapshot_ts, local_ts=snapshot_ts,
+                    side="Sell", size=Decimal("0"), entry_price=Decimal("0"),
+                    liq_price=None,
+                ),
+            ])
+            # Legacy wallet row: EXISTS (pre-check passes) but
+            # total_available_balance is NULL → load_wallet_seed_full -> None.
+            WalletSnapshotRepository(session).bulk_insert([
+                WalletSnapshot(
+                    run_id="collat-run", account_id="acc-1",
+                    exchange_ts=snapshot_ts, local_ts=snapshot_ts, coin="USDT",
+                    wallet_balance=Decimal("100"), available_balance=Decimal("100"),
+                    total_available_balance=None, total_equity=None,
+                ),
+            ])
+            session.commit()
+
+        config = ReplayConfig(
+            database_url="sqlite:///:memory:", run_id="collat-run", symbol=SYMBOL,
+            start_ts=seed_ts, end_ts=seed_ts + timedelta(hours=1),
+            strategy=ReplayStrategyConfig(
+                tick_size=Decimal("0.1"), grid_count=4, grid_step=0.2,
+            ),
+            initial_balance=Decimal("10000"), enable_funding=False,
+            seed=SeedConfig(
+                enabled=True, at_ts=seed_ts, account_id="acc-1",
+                strat_id=STRAT_ID, grid_state_path=grid_state_path,
+                collateral_coins=["SOL"],
+            ),
+        )
+        engine = ReplayEngine(config=config, db=db)
+        with pytest.raises(SeedDataQualityError, match="(?i)collateral"):
+            engine._load_seed(config, "collat-run")
+
+    def test_collateral_merge_populates_wallet_seed(
+        self, seeded_db, replay_config, mock_instrument,
+    ):
+        """A SOL wallet row + fresh usdValue merges onto the WalletSeed."""
+        sol_ts = replay_config.seed.at_ts - timedelta(seconds=30)
+        with seeded_db.get_session() as session:
+            WalletSnapshotRepository(session).bulk_insert([
+                WalletSnapshot(
+                    run_id="seed-run", account_id="acc-1",
+                    exchange_ts=sol_ts, local_ts=sol_ts, coin="SOL",
+                    wallet_balance=Decimal("0.2473524"),
+                    available_balance=Decimal("0.2473524"),
+                    raw_json={
+                        "coin": "SOL", "walletBalance": "0.2473524",
+                        "usdValue": "19.95071637",
+                        "collateralSwitch": True, "marginCollateral": True,
+                    },
+                ),
+            ])
+            session.commit()
+
+        new_seed = replay_config.seed.model_copy(update={"collateral_coins": ["SOL"]})
+        cfg = replay_config.model_copy(update={"seed": new_seed})
+
+        engine = ReplayEngine(config=cfg, db=seeded_db)
+        wallet_seed, *_ = engine._load_seed(cfg, "seed-run")
+
+        assert wallet_seed is not None
+        # Existing USDT account-level fields untouched.
+        assert wallet_seed.total_equity == Decimal("15000.50")
+        # Collateral merged.
+        assert wallet_seed.coin_balances == {"SOL": Decimal("0.2473524")}
+        assert wallet_seed.seed_marks["SOL"] == (
+            Decimal("19.95071637") / Decimal("0.2473524")
+        )
+        assert wallet_seed.collateral_excluded_coins == []
+        assert wallet_seed.collateral_missing_mark_coins == []
+        assert wallet_seed.collateral_switch_off_coins == []

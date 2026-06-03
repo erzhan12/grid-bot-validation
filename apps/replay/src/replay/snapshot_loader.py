@@ -39,9 +39,9 @@ side, reduce_only             direction
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from datetime import datetime
-from decimal import Decimal
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from sqlalchemy import inspect as sa_inspect
@@ -52,6 +52,7 @@ from grid_db import (
     GridStateSnapshotRepository,
     OrderRepository,
     PositionSnapshotRepository,
+    TickerSnapshotRepository,
     WalletSnapshotRepository,
 )
 
@@ -62,6 +63,16 @@ from gridcore.persistence import GridStateStore
 
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_tz(dt: datetime) -> datetime:
+    """Drop tzinfo for cross-source datetime arithmetic.
+
+    Mirrors ``engine._seed_pre_check`` (engine.py): SQLite hands back naive
+    ``exchange_ts`` while config ``at_ts`` is tz-aware, so subtracting them
+    directly raises ``TypeError``. Normalise both sides before comparing.
+    """
+    return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +138,29 @@ class WalletSeed:
     total_margin_balance: Decimal
     account_im_rate: Decimal
     account_mm_rate: Decimal
+
+    # --- Feature 0065: non-USDT collateral re-marking ---
+    # All default to empty so existing constructors / tests stay valid.
+    # Frozen dataclass: mutable defaults MUST use ``field(default_factory=...)``
+    # (a bare ``= {}`` raises at class-definition time), and the loader builds a
+    # NEW ``WalletSeed`` (or ``dataclasses.replace``) rather than mutating.
+    coin_balances: dict[str, Decimal] = field(default_factory=dict)
+    """Per-coin wallet balance for each MODELLED collateral coin (excludes the
+    USDT/``wallet_coin`` row, which is ``coin_balance``)."""
+    seed_marks: dict[str, Decimal] = field(default_factory=dict)
+    """Each modelled coin's mark at-or-before ``at_ts`` (t0 anchor for the
+    re-mark delta)."""
+    collateral_value_ratios: dict[str, Decimal] = field(default_factory=dict)
+    """Optional seed-locked collateral value ratios. NOT applied to
+    ``total_equity`` in 0065 — stored for a future margin-balance follow-up."""
+    collateral_excluded_coins: list[str] = field(default_factory=list)
+    """Configured coin with no wallet row (or zero balance) at seed time."""
+    collateral_missing_mark_coins: list[str] = field(default_factory=list)
+    """Configured coin with a balance row but no resolvable seed mark — dropped
+    from ``coin_balances`` / ``seed_marks`` / ``collateral_value_ratios``."""
+    collateral_switch_off_coins: list[str] = field(default_factory=list)
+    """Coin modelled for ``totalEquity`` but ``collateralSwitch`` /
+    ``marginCollateral`` was false/missing (metadata / WARN only)."""
 
 
 @dataclass(frozen=True)
@@ -575,6 +609,159 @@ def load_wallet_seed_full(
         account_mm_rate=(
             snap.account_mm_rate if snap.account_mm_rate is not None else Decimal("0")
         ),
+    )
+
+
+def load_collateral_seed(
+    db_session: Session,
+    run_id: str,
+    account_id: str,
+    at_ts: datetime,
+    usdt_coin: str,
+    collateral_coins: list[str],
+    collateral_symbol_for: dict[str, str],
+    configured_value_ratios: dict[str, Decimal],
+    wallet_max_staleness: timedelta,
+) -> tuple[
+    dict[str, Decimal],  # coin_balances
+    dict[str, Decimal],  # seed_marks
+    dict[str, Decimal],  # collateral_value_ratios
+    list[str],           # excluded_coins
+    list[str],           # missing_mark_coins
+    list[str],           # switch_off_coins
+]:
+    """Resolve per-coin balances + seed marks for non-USDT collateral re-marking.
+
+    Feature 0065. Bybit account ``totalEquity`` is the USD sum of per-asset
+    equity regardless of whether the asset is enabled as margin collateral, so
+    inclusion is gated purely on the operator list ``collateral_coins`` plus a
+    wallet row with ``wallet_balance > 0`` at-or-before ``at_ts`` — NOT on the
+    ``collateralSwitch`` / ``marginCollateral`` booleans (those are recorded as
+    metadata only).
+
+    Seed mark resolution per coin (valuation basis):
+
+    * **Preferred** ``usdValue / wallet_balance`` — only when the coin's wallet
+      row is FRESH vs ``at_ts`` (``_strip_tz(at_ts) - _strip_tz(row.exchange_ts)
+      <= wallet_max_staleness``) and ``usdValue`` is present. A quiet collateral
+      coin's per-coin row can be much older than the account-level USDT row that
+      ``initial_equity`` comes from; using its stale ``usdValue`` would inject a
+      false jump on the first ticker update.
+    * **Fallback** ``TickerSnapshotRepository.get_mark_at_or_before(symbol,
+      at_ts)`` — used when the row is stale or has no ``usdValue``.
+
+    A coin with a balance row but no usable seed mark is dropped from all three
+    model dicts and reported in ``missing_mark_coins`` (live ``totalEquity``
+    still includes it; the #3a gap surfaces it).
+
+    Returns:
+        ``(coin_balances, seed_marks, collateral_value_ratios, excluded_coins,
+        missing_mark_coins, switch_off_coins)``. The first three dicts contain
+        ONLY fully-modelled coins (every ``coin_balances`` key has a matching
+        ``seed_marks`` key).
+    """
+    coin_balances: dict[str, Decimal] = {}
+    seed_marks: dict[str, Decimal] = {}
+    value_ratios: dict[str, Decimal] = {}
+    excluded_coins: list[str] = []
+    missing_mark_coins: list[str] = []
+    switch_off_coins: list[str] = []
+
+    if not collateral_coins:
+        return (
+            coin_balances, seed_marks, value_ratios,
+            excluded_coins, missing_mark_coins, switch_off_coins,
+        )
+
+    wallet_repo = WalletSnapshotRepository(db_session)
+    ticker_repo = TickerSnapshotRepository(db_session)
+
+    rows = wallet_repo.get_all_coins_latest_before(run_id, account_id, at_ts)
+    # Dedup by coin (last wins) — the repo may return ties on exchange_ts.
+    rows_by_coin: dict[str, WalletSnapshot] = {}
+    for row in rows:
+        rows_by_coin[row.coin] = row
+
+    at_ts_naive = _strip_tz(at_ts)
+
+    for coin in collateral_coins:
+        if coin == usdt_coin:
+            # The USDT/base coin is seeded via initial_equity, not re-marked.
+            continue
+
+        row = rows_by_coin.get(coin)
+        # Inclusion rule is wallet_balance > 0 — exclude missing, None, zero,
+        # AND negative balances (a borrowed/short asset is not spot collateral
+        # and would invert the drift contribution if re-marked).
+        if row is None or row.wallet_balance is None or row.wallet_balance <= 0:
+            excluded_coins.append(coin)
+            logger.warning(
+                "collateral coin %s has no wallet row (or non-positive balance) "
+                "at at_ts=%s; excluding from totalEquity re-mark (cannot model).",
+                coin, at_ts,
+            )
+            continue
+
+        balance = row.wallet_balance
+        symbol = collateral_symbol_for.get(coin, f"{coin}USDT")
+        raw = row.raw_json or {}
+        row_age = at_ts_naive - _strip_tz(row.exchange_ts)
+        usd_value_raw = raw.get("usdValue")
+
+        # Resolve seed mark: fresh usdValue/balance, else carry-forward ticker.
+        # ``balance`` is already guaranteed non-zero by the exclusion gate
+        # above, so only a malformed usdValue string can fail here.
+        seed_mark: Optional[Decimal] = None
+        if usd_value_raw not in (None, "") and row_age <= wallet_max_staleness:
+            try:
+                seed_mark = Decimal(str(usd_value_raw)) / balance
+            except InvalidOperation:
+                logger.warning(
+                    "malformed usdValue=%r in %s wallet row; falling back to "
+                    "ticker mark for seed.",
+                    usd_value_raw, coin,
+                )
+                seed_mark = None
+        if seed_mark is None:
+            if usd_value_raw not in (None, "") and row_age > wallet_max_staleness:
+                logger.warning(
+                    "stale wallet row for %s seed mark (age %s > %s); using "
+                    "ticker mark at at_ts instead.",
+                    coin, row_age, wallet_max_staleness,
+                )
+            seed_mark = ticker_repo.get_mark_at_or_before(symbol, at_ts)
+
+        if seed_mark is None:
+            missing_mark_coins.append(coin)
+            logger.warning(
+                "collateral coin %s has a balance row but no usable seed mark "
+                "(no fresh usdValue and no %s ticker at-or-before at_ts=%s); "
+                "dropping from the modelled re-mark set.",
+                coin, symbol, at_ts,
+            )
+            continue
+
+        # Commit the fully-modelled coin.
+        seed_marks[coin] = seed_mark
+        coin_balances[coin] = balance
+        if coin in configured_value_ratios:
+            value_ratios[coin] = configured_value_ratios[coin]
+
+        # Boolean metadata only — never gates inclusion (Bybit totalEquity
+        # ignores the collateral switch). WARN when off/missing.
+        col_switch = raw.get("collateralSwitch")
+        margin_col = raw.get("marginCollateral")
+        if not col_switch or not margin_col:
+            switch_off_coins.append(coin)
+            logger.warning(
+                "collateral coin %s has collateralSwitch=%s marginCollateral=%s "
+                "(off/missing); still re-marked for totalEquity (metadata only).",
+                coin, col_switch, margin_col,
+            )
+
+    return (
+        coin_balances, seed_marks, value_ratios,
+        excluded_coins, missing_mark_coins, switch_off_coins,
     )
 
 

@@ -5,7 +5,7 @@ Loads replay configuration from YAML file with Pydantic validation.
 
 import os
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -137,6 +137,57 @@ class SeedConfig(BaseModel):
         default="USDT",
         description="Wallet coin to seed initial balance from.",
     )
+
+    # --- Feature 0065: non-USDT collateral re-marking ---
+    collateral_coins: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Non-USDT collateral coins to re-mark over the replay window so "
+            "backtest totalEquity floats like live (e.g. ['SOL']). Empty "
+            "preserves USDT-only behaviour. Configure every coin ever held as "
+            "collateral during the recording window."
+        ),
+    )
+    collateral_symbol_map: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Optional override for the *USDT perp symbol used to read each "
+            "coin's mark (default {coin}USDT, e.g. {'SOL': 'SOLUSDT'})."
+        ),
+    )
+    collateral_value_ratios: dict[str, Decimal] = Field(
+        default_factory=dict,
+        description=(
+            "Optional seed-time collateral value ratios per coin. NOT applied "
+            "to total_equity in 0065 (Bybit totalEquity excludes the ratio); "
+            "stored for a future margin-balance parity follow-up only."
+        ),
+    )
+    collateral_wallet_max_staleness: timedelta = Field(
+        default=timedelta(seconds=60),
+        description=(
+            "Max age of a per-coin wallet row for using its usdValue/balance as "
+            "the seed mark; staler rows fall back to the ticker mark at at_ts."
+        ),
+    )
+
+    @field_validator("collateral_coins")
+    @classmethod
+    def non_empty_collateral_coins(cls, v: list[str]) -> list[str]:
+        """Reject empty/whitespace coin names (matches recorder.collateral_symbols)."""
+        if any(not s.strip() for s in v):
+            raise ValueError(
+                "collateral_coins must be non-empty, non-whitespace strings"
+            )
+        return v
+
+    @field_validator("collateral_value_ratios", mode="before")
+    @classmethod
+    def parse_collateral_value_ratios(cls, v):
+        """Coerce per-coin ratio values to Decimal (string-exact, like YAML)."""
+        if isinstance(v, dict):
+            return {k: _parse_decimal(val) for k, val in v.items()}
+        return v
 
     @model_validator(mode="after")
     def require_seed_fields_when_enabled(self):

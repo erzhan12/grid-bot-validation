@@ -34,3 +34,21 @@ wind_down_mode: "leave_open"
 output_dir: "results/replay"
 price_tolerance: 0
 qty_tolerance: 0.001
+
+# Optional seed-from-recorder mode (feature 0029). When enabled, replay
+# reconstructs live state at `at_ts` (positions, wallet, grid, orders).
+# seed:
+#   enabled: true
+#   at_ts: "2026-06-01T17:42:10Z"
+#   account_id: "<uuid from grid_db.identity>"
+#   strat_id: "solusdt_test"
+#   wallet_coin: "USDT"
+#   # Feature 0065: re-mark non-USDT collateral so backtest totalEquity floats
+#   # like live. List every non-USDT coin held as collateral over the window;
+#   # each needs its *USDT ticker recorded (recorder.collateral_symbols).
+#   collateral_coins: ["SOL"]
+#   collateral_symbol_map: {"SOL": "SOLUSDT"}   # optional; default {coin}USDT
+#   # optional — NOT applied to total_equity in 0065 (future margin parity only)
+#   # collateral_value_ratios: {"SOL": "0.85"}
+#   # max wallet-row age for using usdValue as seed mark; else ticker at at_ts
+#   # collateral_wallet_max_staleness: 60

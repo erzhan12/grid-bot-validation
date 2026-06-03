@@ -10,7 +10,7 @@ Orchestrates:
 
 import logging
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Optional
 
@@ -24,6 +24,8 @@ from grid_db import (
     PositionSnapshotRepository,
     Run,
     RunRepository,
+    TickerSnapshot,
+    TickerSnapshotRepository,
     WalletSnapshot,
     redact_db_url,
 )
@@ -62,7 +64,9 @@ from replay.snapshot_loader import (
     PositionStateSeed,
     SeedDataQualityError,
     WalletSeed,
+    _strip_tz,
     load_active_orders,
+    load_collateral_seed,
     load_grid_state,
     load_grid_state_from_snapshots,
     load_position_snapshots,
@@ -71,6 +75,116 @@ from replay.snapshot_loader import (
 
 
 logger = logging.getLogger(__name__)
+
+
+class CollateralMarkFeed:
+    """Per-coin collateral mark stream over the replay window (feature 0065).
+
+    The traded-symbol ``HistoricalDataProvider`` only carries the traded
+    symbol's ticks, so non-USDT collateral coins need a separate mark source.
+    This feed streams each coin's ``(exchange_ts, mark_price)`` from
+    ``ticker_snapshots`` (same cursor-pagination pattern as
+    ``HistoricalDataProvider._iterate_tickers``) and exposes carry-forward,
+    at-or-before lookup via :meth:`mark_at`.
+
+    Memory: one batch per coin is held at a time — marks are NOT materialised
+    eagerly, so a multi-week window of a high-volume collateral symbol stays
+    bounded. :meth:`mark_at` assumes the requested ``ts`` is non-decreasing
+    across calls (the replay tick loop is ordered by ``exchange_ts``).
+    """
+
+    def __init__(
+        self,
+        db: DatabaseFactory,
+        symbol_for: dict[str, str],
+        start_ts: datetime,
+        end_ts: datetime,
+        batch_size: int = 1000,
+    ):
+        self._db = db
+        self._symbol_for = dict(symbol_for)
+        self._start_ts = start_ts
+        self._end_ts = end_ts
+        self._batch_size = batch_size
+        # Per-coin streaming state.
+        self._iters: dict[str, "object"] = {}
+        self._pending: dict[str, Optional[tuple[datetime, Decimal]]] = {}
+        self._current: dict[str, Optional[Decimal]] = {}
+        self._last_ts: dict[str, datetime] = {}
+        # Anchor each coin's carry-forward to the latest mark AT-OR-BEFORE
+        # start_ts, so the first replay tick uses a correct carry-forward mark
+        # even when seed.at_ts < start_ts or the symbol has no row exactly at
+        # start_ts (a sparse stream's last pre-window mark must carry in). The
+        # forward stream below then only needs rows >= start_ts.
+        with self._db.get_session() as session:
+            anchor_repo = TickerSnapshotRepository(session)
+            anchors = {
+                coin: anchor_repo.get_mark_at_or_before(symbol, start_ts)
+                for coin, symbol in self._symbol_for.items()
+            }
+        for coin, symbol in self._symbol_for.items():
+            it = self._iter_marks(symbol)
+            self._iters[coin] = it
+            self._pending[coin] = next(it, None)
+            self._current[coin] = anchors[coin]
+
+    def _iter_marks(self, symbol: str):
+        """Yield ``(exchange_ts, mark_price)`` ascending across the window."""
+        with self._db.get_session() as session:
+            cursor_ts = self._start_ts
+            use_gte = True
+            while True:
+                query = (
+                    session.query(TickerSnapshot.exchange_ts, TickerSnapshot.mark_price)
+                    .filter(TickerSnapshot.symbol == symbol)
+                    .filter(TickerSnapshot.exchange_ts <= self._end_ts)
+                )
+                if use_gte:
+                    query = query.filter(TickerSnapshot.exchange_ts >= cursor_ts)
+                else:
+                    query = query.filter(TickerSnapshot.exchange_ts > cursor_ts)
+
+                rows = (
+                    query.order_by(TickerSnapshot.exchange_ts)
+                    .limit(self._batch_size)
+                    .all()
+                )
+                if not rows:
+                    break
+                for ts, mark in rows:
+                    yield ts, mark
+                if len(rows) < self._batch_size:
+                    break
+                cursor_ts = rows[-1][0]
+                use_gte = False
+
+    def mark_at(self, coin: str, ts: datetime) -> Optional[Decimal]:
+        """Latest ``mark_price`` with ``exchange_ts <= ts`` (carry-forward).
+
+        Returns ``None`` until the first row at-or-before ``ts`` is seen (the
+        caller then keeps the seed mark). Advances the per-coin cursor in place;
+        ``ts`` MUST be non-decreasing across calls — the forward-only cursor
+        cannot rewind, so a regression is rejected with ``ValueError`` rather
+        than silently returning a too-new mark (guards against a future caller
+        or an out-of-order data provider feeding ticks in the wrong order).
+        """
+        if coin not in self._iters:
+            return None
+        ts_cmp = _strip_tz(ts)
+        last = self._last_ts.get(coin)
+        if last is not None and ts_cmp < last:
+            raise ValueError(
+                f"CollateralMarkFeed.mark_at: non-monotonic ts for {coin}: "
+                f"{ts} precedes previous {last}; the forward-only cursor cannot "
+                f"rewind (replay ticks must be ordered by exchange_ts)."
+            )
+        self._last_ts[coin] = ts_cmp
+        pend = self._pending.get(coin)
+        while pend is not None and _strip_tz(pend[0]) <= ts_cmp:
+            self._current[coin] = pend[1]
+            pend = next(self._iters[coin], None)
+            self._pending[coin] = pend
+        return self._current[coin]
 
 
 # Minimum gap between the latest required initial-snapshot row and seed.at_ts.
@@ -232,9 +346,19 @@ class ReplayEngine:
             if wallet_seed is not None
             else initial_balance
         )
+        # 0065: seed non-USDT collateral re-mark state onto the session
+        # (empty when no seed / no collateral → identical to pre-0065).
+        collateral_balances = (
+            wallet_seed.coin_balances if wallet_seed is not None else {}
+        )
+        collateral_seed_marks = (
+            wallet_seed.seed_marks if wallet_seed is not None else {}
+        )
         session = BacktestSession(
             initial_balance=initial_balance,
             initial_equity=initial_equity,
+            collateral_balances=collateral_balances,
+            collateral_seed_marks=collateral_seed_marks,
         )
         runner = self._init_runner(
             strategy_config,
@@ -280,6 +404,26 @@ class ReplayEngine:
             f"({range_info.total_records} records)"
         )
 
+        # 0065: collateral mark feed for non-USDT coins (the traded-symbol
+        # provider does not carry their ticks). Built only when collateral is
+        # modelled; reads ticker_snapshots for each coin's mapped *USDT symbol.
+        collateral_feed: Optional[CollateralMarkFeed] = None
+        if collateral_balances:
+            symbol_for = {
+                coin: config.seed.collateral_symbol_map.get(coin, f"{coin}USDT")
+                for coin in collateral_balances
+            }
+            collateral_feed = CollateralMarkFeed(
+                db=self._db,
+                symbol_for=symbol_for,
+                start_ts=start_ts,
+                end_ts=end_ts,
+            )
+            logger.info(
+                "0065 collateral re-mark active: coins=%s symbols=%s",
+                list(collateral_balances), symbol_for,
+            )
+
         # 4. Funding simulator
         funding_simulator = None
         if config.enable_funding:
@@ -289,10 +433,27 @@ class ReplayEngine:
         last_price = Decimal("0")
         last_timestamp = None
         tick_count = 0
+        # 0065: track which modelled collateral coins got at least one intra-run
+        # ticker mark, so we can WARN about coins that ran on the seed mark for
+        # the whole window (almost always a missing recorder.collateral_symbols).
+        collateral_marked_coins: set[str] = set()
 
         for tick in provider:
             last_price = tick.last_price
             last_timestamp = tick.exchange_ts
+
+            # 0065: refresh collateral marks at the TOP of the tick — BEFORE
+            # process_fills. On a fill tick, process_fills -> refresh_balances
+            # -> _estimate_pair_liq_prices reads session.total_equity for the
+            # emitted snapshot's liq_price; refreshing the mark here keeps that
+            # snapshot on the CURRENT tick's collateral value (else it lags one
+            # collateral step on exactly the rows the comparator measures).
+            if collateral_feed is not None:
+                for coin in collateral_balances:
+                    mark = collateral_feed.mark_at(coin, tick.exchange_ts)
+                    if mark is not None:
+                        session.update_collateral_mark(coin, mark)
+                        collateral_marked_coins.add(coin)
 
             # Funding
             if funding_simulator and funding_simulator.should_apply_funding(tick.exchange_ts):
@@ -320,7 +481,28 @@ class ReplayEngine:
 
         logger.info(f"Replay complete: {tick_count} ticks processed")
 
+        # 0065: surface collateral coins that never got an intra-run ticker mark
+        # (ran on the seed mark all window — usually a missing collateral symbol
+        # in the recorder window). Silent otherwise → an unexplained #3a gap.
+        if collateral_feed is not None:
+            never_marked = set(collateral_balances) - collateral_marked_coins
+            for coin in sorted(never_marked):
+                logger.warning(
+                    "0065: collateral coin %s had no ticker rows in the replay "
+                    "window; used the seed mark throughout (check "
+                    "recorder.collateral_symbols for its *USDT symbol).",
+                    coin,
+                )
+
         # 6. Wind down
+        # NOTE (0065 #3a): when wind_down_mode == CLOSE_ALL, _wind_down closes
+        # positions via tracker.process_fill + record_trade but does NOT call
+        # refresh_balances / update_equity, and finalize() does not rewrite
+        # session.total_equity. So after run(), session.total_equity reflects the
+        # LAST tick-loop update_equity (open-position unrealized), not the flat
+        # post-close state. #3a totalEquity-parity checks therefore require
+        # wind_down_mode == LEAVE_OPEN (the default); close_all is out of scope
+        # for #3a (see docs/features/0065_PLAN.md Phase 2B wind-down note).
         if config.wind_down_mode == WindDownMode.CLOSE_ALL and last_price > 0:
             self._wind_down(runner, session, last_price, last_timestamp)
 
@@ -368,6 +550,22 @@ class ReplayEngine:
             price_tolerance=config.price_tolerance,
             qty_tolerance=config.qty_tolerance,
         )
+
+        # 0065: collateral re-mark attribution (acceptance #3b + under-coverage
+        # surfacing). Replay-side assignment from the session's latest marks +
+        # the WalletSeed exclusion lists — NOT recomputed in fold_metrics_into.
+        metrics.non_usdt_collateral_drift_total = session.collateral_drift_total
+        metrics.collateral_drift_by_coin = session.collateral_drift_by_coin
+        if wallet_seed is not None:
+            metrics.collateral_excluded_coins = list(
+                wallet_seed.collateral_excluded_coins
+            )
+            metrics.collateral_missing_mark_coins = list(
+                wallet_seed.collateral_missing_mark_coins
+            )
+            metrics.collateral_switch_off_coins = list(
+                wallet_seed.collateral_switch_off_coins
+            )
 
         # 11. 0034: pair live/backtest position snapshots and fold telemetry
         # parity metrics into the same ValidationMetrics object. 0038:
@@ -711,6 +909,53 @@ class ReplayEngine:
                 seed.at_ts,
             )
 
+            # 0065: merge non-USDT collateral re-mark seed onto the wallet
+            # seed (same DB session — load_collateral_seed needs DB access).
+            # Non-empty collateral_coins HARD-REQUIRES a valid wallet seed:
+            # the soft-fallback to initial_balance is unsafe here because the
+            # collateral re-mark term is anchored to live total_equity at
+            # at_ts, and dataclasses.replace cannot operate on None.
+            if seed.collateral_coins:
+                if wallet_seed is None:
+                    raise SeedDataQualityError(
+                        f"seed.collateral_coins={seed.collateral_coins!r} requires a "
+                        f"valid account-level wallet seed (total_equity / "
+                        f"total_available_balance > 0) at at_ts="
+                        f"{seed.at_ts.isoformat()} for run_id={run_id!r} "
+                        f"account_id={seed.account_id!r} coin={seed.wallet_coin!r}; "
+                        f"collateral re-marking and end-of-window totalEquity "
+                        f"parity cannot be modelled without it."
+                    )
+                (
+                    coin_balances,
+                    seed_marks,
+                    value_ratios,
+                    excluded_coins,
+                    missing_mark_coins,
+                    switch_off_coins,
+                ) = load_collateral_seed(
+                    db_session,
+                    run_id,
+                    seed.account_id,
+                    seed.at_ts,
+                    seed.wallet_coin,
+                    seed.collateral_coins,
+                    seed.collateral_symbol_map,
+                    seed.collateral_value_ratios,
+                    seed.collateral_wallet_max_staleness,
+                )
+                wallet_seed = replace(
+                    wallet_seed,
+                    coin_balances=coin_balances,
+                    seed_marks=seed_marks,
+                    collateral_value_ratios=value_ratios,
+                    collateral_excluded_coins=excluded_coins,
+                    collateral_missing_mark_coins=missing_mark_coins,
+                    collateral_switch_off_coins=switch_off_coins,
+                )
+
+        # Reached only when collateral_coins is empty — the non-empty case
+        # raises above instead of soft-falling back.
         if wallet_seed is None:
             logger.warning(
                 "%s: wallet seed missing, defaulting to initial_balance",
@@ -762,10 +1007,8 @@ class ReplayEngine:
 
         # Compare ts values without tzinfo — SQLite may strip timezone on read,
         # so wallet_min / position_min may be naive while at_ts may be aware
-        # (or vice versa). Strip uniformly before comparing.
-        def _strip_tz(dt: datetime) -> datetime:
-            return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
-
+        # (or vice versa). Strip uniformly before comparing (module-level
+        # _strip_tz, shared with snapshot_loader.load_collateral_seed).
         latest_min = max(wallet_min, position_min)
         required_at_ts = _strip_tz(latest_min) + _SEED_PRE_CHECK_MARGIN
 

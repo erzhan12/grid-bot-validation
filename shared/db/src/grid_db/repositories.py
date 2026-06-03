@@ -1,8 +1,9 @@
 """Repository pattern for database operations with multi-tenant filtering."""
 
+from decimal import Decimal
 from typing import Generic, TypeVar, Optional, List
 
-from sqlalchemy import func, or_, tuple_
+from sqlalchemy import func, or_, tuple_, and_
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -597,6 +598,35 @@ class TickerSnapshotRepository(BaseRepository[TickerSnapshot]):
             .order_by(TickerSnapshot.exchange_ts.desc())
             .first()
         )
+
+    def get_mark_at_or_before(
+        self, symbol: str, at_ts: datetime
+    ) -> Optional[Decimal]:
+        """Get the latest ``mark_price`` for a symbol at-or-before ``at_ts``.
+
+        Feature 0065 (collateral re-marking). Carry-forward semantics: returns
+        the most recent ``mark_price`` where ``exchange_ts <= at_ts``, or
+        ``None`` when no such row exists. Unlike ``get_latest_by_symbol``
+        ("latest overall"), this is seed/tick-time bounded — used for both the
+        seed-mark fallback and intra-run collateral mark updates.
+
+        Args:
+            symbol: Perp symbol carrying the collateral coin's mark (e.g. 'SOLUSDT').
+            at_ts: Inclusive upper bound on ``exchange_ts``.
+
+        Returns:
+            Latest ``mark_price`` Decimal, or None if no row at-or-before ``at_ts``.
+        """
+        result = (
+            self.session.query(TickerSnapshot.mark_price)
+            .filter(
+                TickerSnapshot.symbol == symbol,
+                TickerSnapshot.exchange_ts <= at_ts,
+            )
+            .order_by(TickerSnapshot.exchange_ts.desc())
+            .first()
+        )
+        return result[0] if result else None
 
     def bulk_insert(self, snapshots: List[TickerSnapshot]) -> int:
         """Bulk insert ticker snapshots with duplicate skipping.
@@ -1217,6 +1247,65 @@ class WalletSnapshotRepository(BaseRepository[WalletSnapshot]):
             )
             .order_by(WalletSnapshot.exchange_ts.desc())
             .first()
+        )
+
+    def get_all_coins_latest_before(
+        self,
+        run_id: str,
+        account_id: str,
+        at_ts: datetime,
+    ) -> List[WalletSnapshot]:
+        """Get the latest wallet snapshot per coin at-or-before ``at_ts``.
+
+        Feature 0065 (multi-coin collateral seed). Groups by ``coin`` and
+        returns the row with the max ``exchange_ts`` (<= ``at_ts``) for each
+        coin. Run-scoped — pre-0029 rows with NULL ``run_id`` are excluded
+        (same contract as ``get_latest_before``). Bybit's UTA wallet WS pushes
+        only changed coins, so a quiet collateral coin may carry a stale row;
+        callers (``load_collateral_seed``) handle staleness separately.
+
+        Args:
+            run_id: Recorder run identifier.
+            account_id: Account ID.
+            at_ts: Inclusive upper bound on ``exchange_ts``.
+
+        Returns:
+            One ``WalletSnapshot`` per coin (latest at-or-before ``at_ts``);
+            empty list when no rows match. On an ``exchange_ts`` tie for a coin
+            (two pushes at the same instant — there is no unique constraint on
+            ``(run_id, account_id, coin, exchange_ts)``) the join yields both
+            rows; results are ordered ``(coin, id)`` so a caller that keeps the
+            LAST row per coin gets the highest ``id`` (latest insert) — a stable
+            tie-break matching ``GridStateSnapshotRepository.get_at_or_before``.
+        """
+        subq = (
+            self.session.query(
+                WalletSnapshot.coin.label("coin"),
+                func.max(WalletSnapshot.exchange_ts).label("max_ts"),
+            )
+            .filter(
+                WalletSnapshot.run_id == run_id,
+                WalletSnapshot.account_id == account_id,
+                WalletSnapshot.exchange_ts <= at_ts,
+            )
+            .group_by(WalletSnapshot.coin)
+            .subquery()
+        )
+        return (
+            self.session.query(WalletSnapshot)
+            .join(
+                subq,
+                and_(
+                    WalletSnapshot.coin == subq.c.coin,
+                    WalletSnapshot.exchange_ts == subq.c.max_ts,
+                ),
+            )
+            .filter(
+                WalletSnapshot.run_id == run_id,
+                WalletSnapshot.account_id == account_id,
+            )
+            .order_by(WalletSnapshot.coin, WalletSnapshot.id)
+            .all()
         )
 
 

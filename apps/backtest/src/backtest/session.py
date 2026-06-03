@@ -109,6 +109,8 @@ class BacktestSession:
         session_id: Optional[str] = None,
         initial_balance: Decimal = Decimal("10000"),
         initial_equity: Optional[Decimal] = None,
+        collateral_balances: Optional[dict[str, Decimal]] = None,
+        collateral_seed_marks: Optional[dict[str, Decimal]] = None,
     ):
         """Initialize backtest session.
 
@@ -122,6 +124,12 @@ class BacktestSession:
                 formula. When ``None``, falls back to ``initial_balance``
                 so non-replay backtests and pre-0043 callers behave
                 identically.
+            collateral_balances: Feature 0065 — per-coin non-USDT collateral
+                balance held at seed (modelled coins only). Empty/None keeps
+                USDT-only behaviour (the re-mark term is identically zero).
+            collateral_seed_marks: Feature 0065 — each modelled coin's mark at
+                seed (``at_ts``); the t0 anchor that makes the re-mark term a
+                pure delta. Keys MUST match ``collateral_balances``.
         """
         self.session_id = session_id or uuid.uuid4().hex
         self.initial_balance = initial_balance
@@ -129,7 +137,40 @@ class BacktestSession:
         self.initial_equity = (
             initial_equity if initial_equity is not None else initial_balance
         )
-        self.total_equity = self.initial_equity
+
+        # --- Feature 0065: non-USDT collateral re-mark state ---
+        # ``total_equity`` floats with these coins' marks like Bybit account
+        # ``totalEquity`` (full asset USD value, NO collateral value ratio).
+        # The futures-fill path (``current_balance`` / ``equity_curve`` /
+        # ``final_balance``) is untouched, preserving PnL/fee/qty parity.
+        self.collateral_balances: dict[str, Decimal] = dict(collateral_balances or {})
+        self.collateral_seed_marks: dict[str, Decimal] = dict(
+            collateral_seed_marks or {}
+        )
+        # Contract: every balance coin needs a seed mark (load_collateral_seed
+        # commits both atomically). Fail with a clear message rather than an
+        # opaque KeyError in the seed_contrib sum / drift_by_coin below.
+        _missing_marks = set(self.collateral_balances) - set(self.collateral_seed_marks)
+        if _missing_marks:
+            raise ValueError(
+                f"collateral_balances has coins without seed marks: "
+                f"{sorted(_missing_marks)} (collateral_balances and "
+                f"collateral_seed_marks keys must match)"
+            )
+        # Latest mark seen per coin, anchored at the seed marks.
+        self.collateral_marks: dict[str, Decimal] = dict(self.collateral_seed_marks)
+        # Σ balance × seed_mark — subtracted so the term is a pure delta from t0
+        # (no collateral value ratio; ratio applies to margin balance, not
+        # totalEquity).
+        self._collateral_seed_contrib: Decimal = sum(
+            (
+                bal * self.collateral_seed_marks[coin]
+                for coin, bal in self.collateral_balances.items()
+            ),
+            Decimal("0"),
+        )
+
+        self.total_equity = self.initial_equity + self._collateral_remark_delta()
 
         # Trade tracking
         self.trades: list[BacktestTrade] = []
@@ -185,6 +226,49 @@ class BacktestSession:
         """
         self.total_funding += amount
 
+    # ------------------------------------------------------------------
+    # Feature 0065 — non-USDT collateral re-marking
+    # ------------------------------------------------------------------
+
+    def update_collateral_mark(self, coin: str, mark: Decimal) -> None:
+        """Record the latest mark for a modelled collateral coin.
+
+        No-op for coins not in the seeded collateral set (so the engine can
+        call it unconditionally per tick). Cheap; the next ``update_equity`` /
+        ``refresh_balances`` folds the new mark into ``total_equity``.
+        """
+        if coin in self.collateral_balances:
+            self.collateral_marks[coin] = mark
+
+    def _collateral_remark_delta(self) -> Decimal:
+        """Re-mark delta added to ``total_equity`` only: ``collateral_now -
+        seed_contrib`` where ``collateral_now = Σ balance × latest_mark`` (full
+        asset USD value, no collateral value ratio). Zero when no collateral is
+        modelled or marks still sit at seed."""
+        collateral_now = sum(
+            (
+                bal * self.collateral_marks[coin]
+                for coin, bal in self.collateral_balances.items()
+            ),
+            Decimal("0"),
+        )
+        return collateral_now - self._collateral_seed_contrib
+
+    @property
+    def collateral_drift_total(self) -> Decimal:
+        """Modelled non-USDT collateral re-mark delta at the latest marks
+        (acceptance #3b). Equals ``_collateral_remark_delta()``."""
+        return self._collateral_remark_delta()
+
+    @property
+    def collateral_drift_by_coin(self) -> dict[str, Decimal]:
+        """Per-coin re-mark contribution ``balance × (latest_mark -
+        seed_mark)`` (no ratio); sums to ``collateral_drift_total``."""
+        return {
+            coin: bal * (self.collateral_marks[coin] - self.collateral_seed_marks[coin])
+            for coin, bal in self.collateral_balances.items()
+        }
+
     def refresh_balances(self, unrealized_pnl: Decimal) -> None:
         """Refresh ``current_balance`` and ``total_equity`` from current state.
 
@@ -222,7 +306,12 @@ class BacktestSession:
             + self.total_funding
         )
         self.current_balance = self.initial_balance + pnl_delta
-        self.total_equity = self.initial_equity + pnl_delta
+        # 0065: total_equity ALSO floats with non-USDT collateral marks (delta
+        # from seed). MUST be applied here too — process_fills calls this right
+        # before reading total_equity for the emitted pair-liq snapshot.
+        self.total_equity = (
+            self.initial_equity + pnl_delta + self._collateral_remark_delta()
+        )
 
     def update_equity(
         self,
@@ -252,9 +341,13 @@ class BacktestSession:
         )
         equity = self.initial_balance + pnl_delta
 
+        # equity_curve / current_balance stay available-based (futures-only);
+        # collateral revaluation moves total_equity ONLY (see refresh_balances).
         self.equity_curve.append((timestamp, equity))
         self.current_balance = equity
-        self.total_equity = self.initial_equity + pnl_delta
+        self.total_equity = (
+            self.initial_equity + pnl_delta + self._collateral_remark_delta()
+        )
 
         # Update peak and drawdown
         if equity >= self._peak_equity:

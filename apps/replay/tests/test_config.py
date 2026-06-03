@@ -160,3 +160,47 @@ class TestLoadConfig:
         )
         config = load_config()
         assert config.symbol == "BTCUSDT"
+
+
+class TestSeedConfigCollateral:
+    """Feature 0065 — non-USDT collateral re-mark seed fields."""
+
+    def test_collateral_defaults_empty(self):
+        from datetime import timedelta
+        from replay.config import SeedConfig
+
+        cfg = SeedConfig()
+        assert cfg.collateral_coins == []
+        assert cfg.collateral_symbol_map == {}
+        assert cfg.collateral_value_ratios == {}
+        assert cfg.collateral_wallet_max_staleness == timedelta(seconds=60)
+
+    def test_collateral_fields_populate(self):
+        from replay.config import SeedConfig
+
+        cfg = SeedConfig(
+            enabled=True,
+            at_ts="2026-06-01T17:42:00Z",
+            account_id="9bdb9748-f9e0-5c13-b144-0ad6a8dbcaba",
+            strat_id="solusdt_test",
+            collateral_coins=["SOL"],
+            collateral_symbol_map={"SOL": "SOLUSDT"},
+            collateral_value_ratios={"SOL": "0.85"},
+        )
+        assert cfg.collateral_coins == ["SOL"]
+        assert cfg.collateral_symbol_map == {"SOL": "SOLUSDT"}
+        # value ratios coerced to Decimal.
+        assert cfg.collateral_value_ratios == {"SOL": Decimal("0.85")}
+
+    def test_collateral_wallet_max_staleness_seconds(self):
+        from datetime import timedelta
+        from replay.config import SeedConfig
+
+        cfg = SeedConfig(collateral_wallet_max_staleness=120)
+        assert cfg.collateral_wallet_max_staleness == timedelta(seconds=120)
+
+    def test_collateral_coins_rejects_empty_string(self):
+        from replay.config import SeedConfig
+
+        with pytest.raises(ValidationError, match="collateral_coins"):
+            SeedConfig(collateral_coins=["SOL", "  "])

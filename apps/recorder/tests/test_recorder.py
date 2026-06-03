@@ -155,6 +155,38 @@ class TestRecorderStartStop:
 
         await recorder.stop()
 
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_collateral_symbols_merged_into_public_subscription(
+        self, mock_rest_cls, mock_pub_cls, db
+    ):
+        """Feature 0065: collateral_symbols are added to the PublicCollector
+        subscription set, de-duplicated and order-preserving (traded symbols
+        first)."""
+        config = RecorderConfig(
+            symbols=["LTCUSDT"],
+            collateral_symbols=["SOLUSDT", "LTCUSDT"],  # LTCUSDT dup collapses
+            database_url="sqlite:///:memory:",
+            testnet=True,
+            batch_size=10,
+            flush_interval=1.0,
+            health_log_interval=60.0,
+        )
+
+        mock_pub = MagicMock()
+        mock_pub.start = AsyncMock()
+        mock_pub.stop = AsyncMock()
+        mock_pub.get_connection_state.return_value = None
+        mock_pub_cls.return_value = mock_pub
+
+        recorder = Recorder(config=config, db=db)
+        await recorder.start()
+
+        call_kwargs = mock_pub_cls.call_args[1]
+        assert call_kwargs["symbols"] == ["LTCUSDT", "SOLUSDT"]
+
+        await recorder.stop()
+
     @patch("recorder.recorder.PrivateCollector")
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")

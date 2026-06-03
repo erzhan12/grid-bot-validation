@@ -132,6 +132,22 @@ class ValidationMetrics:
     # docs/features/0044_PLAN.md.
     position_pairs_state_diverged: int = 0
 
+    # 0065: non-USDT collateral re-mark attribution. Computed replay-side from
+    # BacktestSession + WalletSeed (NOT in PositionComparator.fold_metrics_into).
+    # non_usdt_collateral_drift_total is the modelled re-mark delta
+    # (collateral_now - seed_contrib) at the last processed tick — one additive
+    # component already folded into backtest total_equity (Phase 2A), NOT the
+    # acceptance-#3a gap. collateral_drift_by_coin breaks it down per coin. The
+    # three list fields surface under-coverage (coins live includes but the
+    # backtest could not model / re-marked metadata).
+    non_usdt_collateral_drift_total: Decimal = field(
+        default_factory=lambda: Decimal("0")
+    )
+    collateral_drift_by_coin: dict[str, Decimal] = field(default_factory=dict)
+    collateral_excluded_coins: list[str] = field(default_factory=list)
+    collateral_missing_mark_coins: list[str] = field(default_factory=list)
+    collateral_switch_off_coins: list[str] = field(default_factory=list)
+
 
 def _compute_trade_delta(pair: MatchedTrade) -> TradeDelta:
     """Compute delta between a matched pair."""

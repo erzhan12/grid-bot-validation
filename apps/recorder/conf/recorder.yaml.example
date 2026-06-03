@@ -4,6 +4,14 @@
 symbols:
   - "BTCUSDT"
 
+# Feature 0065: extra *USDT perp symbols to subscribe ticker for, so non-USDT
+# collateral coins (e.g. SOL held as UTA margin collateral) have marks in
+# ticker_snapshots for replay totalEquity re-marking. De-duplicated with
+# `symbols`; NOT subscribed for executions/positions/orders. List every coin
+# ever held as collateral over the recording window.
+# collateral_symbols:
+#   - "SOLUSDT"
+
 # Database (SQLite file path)
 database_url: "sqlite:///recorder.db"
 

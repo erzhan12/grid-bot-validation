@@ -228,7 +228,28 @@ class ComparatorReporter:
             ("position_pairs_unmatched_bt", str(m.position_pairs_unmatched_bt)),
             ("position_pairs_state_diverged", str(m.position_pairs_state_diverged)),
             ("position_pairs_missing_telemetry", str(m.position_pairs_missing_telemetry)),
+            # 0065: non-USDT collateral re-mark attribution. Total always
+            # present (0 → back-compat); per-coin + exclusion lists only when
+            # non-empty so USDT-only runs stay byte-identical.
+            ("non_usdt_collateral_drift_total", str(m.non_usdt_collateral_drift_total)),
         ]
+        for coin, value in m.collateral_drift_by_coin.items():
+            rows.append((f"collateral_drift.{coin}", str(value)))
+        if m.collateral_excluded_coins:
+            rows.append(
+                ("collateral_excluded_coins", ",".join(m.collateral_excluded_coins))
+            )
+        if m.collateral_missing_mark_coins:
+            rows.append(
+                (
+                    "collateral_missing_mark_coins",
+                    ",".join(m.collateral_missing_mark_coins),
+                )
+            )
+        if m.collateral_switch_off_coins:
+            rows.append(
+                ("collateral_switch_off_coins", ",".join(m.collateral_switch_off_coins))
+            )
 
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
@@ -455,6 +476,7 @@ class ComparatorReporter:
             f"    Max divergence: {m.equity_max_divergence}",
             f"    Mean divergence:{m.equity_mean_divergence}",
             f"    Correlation:    {m.equity_correlation:.4f}",
+            f"    Non-USDT collateral drift: {m.non_usdt_collateral_drift_total}",
             "",
             "  POSITION TELEMETRY",
             f"    Pairs compared:        {m.position_pairs_compared}",

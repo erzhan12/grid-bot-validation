@@ -207,8 +207,16 @@ class Recorder:
 
     async def _init_collectors(self) -> None:
         """Create and start public/private WebSocket collectors."""
+        # 0065: subscribe ticker for the traded symbols PLUS any collateral
+        # symbols (so non-USDT collateral coins get marks in ticker_snapshots),
+        # de-duplicated and order-preserving (traded symbols first). The
+        # private collector and initial REST snapshots stay scoped to the
+        # traded `symbols` only — collateral coins are not traded.
+        public_symbols = list(
+            dict.fromkeys(self._config.symbols + self._config.collateral_symbols)
+        )
         self._public_collector = PublicCollector(
-            symbols=self._config.symbols,
+            symbols=public_symbols,
             on_ticker=self._handle_ticker,
             on_trades=self._handle_trades if self._config.capture_public_trades else None,
             on_gap_detected=self._handle_public_gap,

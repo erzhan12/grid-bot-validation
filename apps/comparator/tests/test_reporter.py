@@ -145,6 +145,54 @@ class TestComparatorReporter:
         assert "Cur realised final" in out
         assert "Cum realised final" in out
 
+    def test_export_metrics_includes_collateral_rows(
+        self, sample_match_result, tmp_path,
+    ):
+        """0065: collateral drift total + per-coin + exclusion-list rows."""
+        metrics = calculate_metrics(sample_match_result)
+        metrics.non_usdt_collateral_drift_total = Decimal("2.5")
+        metrics.collateral_drift_by_coin = {"SOL": Decimal("2.5")}
+        metrics.collateral_excluded_coins = ["DOGE"]
+        metrics.collateral_missing_mark_coins = ["XRP"]
+        metrics.collateral_switch_off_coins = ["BTC"]
+        reporter = ComparatorReporter(sample_match_result, metrics)
+        path = tmp_path / "metrics.csv"
+        reporter.export_metrics(path)
+        with open(path) as f:
+            d = {r["metric"]: r["value"] for r in csv.DictReader(f)}
+        assert d["non_usdt_collateral_drift_total"] == "2.5"
+        assert d["collateral_drift.SOL"] == "2.5"
+        assert d["collateral_excluded_coins"] == "DOGE"
+        assert d["collateral_missing_mark_coins"] == "XRP"
+        assert d["collateral_switch_off_coins"] == "BTC"
+
+    def test_export_metrics_collateral_absent_when_empty(
+        self, sample_match_result, tmp_path,
+    ):
+        """0065: drift total row always present (0), no per-coin/list rows."""
+        metrics = calculate_metrics(sample_match_result)
+        reporter = ComparatorReporter(sample_match_result, metrics)
+        path = tmp_path / "metrics.csv"
+        reporter.export_metrics(path)
+        with open(path) as f:
+            d = {r["metric"]: r["value"] for r in csv.DictReader(f)}
+        assert d["non_usdt_collateral_drift_total"] == "0"
+        assert "collateral_excluded_coins" not in d
+        assert "collateral_missing_mark_coins" not in d
+        assert "collateral_switch_off_coins" not in d
+        assert not any(k.startswith("collateral_drift.") for k in d)
+
+    def test_print_summary_includes_collateral_line(
+        self, sample_match_result, capsys,
+    ):
+        """0065: print_summary surfaces the collateral drift line."""
+        metrics = calculate_metrics(sample_match_result)
+        metrics.non_usdt_collateral_drift_total = Decimal("2.5")
+        reporter = ComparatorReporter(sample_match_result, metrics)
+        reporter.print_summary()
+        out = capsys.readouterr().out
+        assert "Non-USDT collateral drift" in out
+
     def test_export_metrics_includes_metadata(self, sample_match_result, tmp_path):
         """Metrics CSV includes optional metadata with meta. prefix."""
         metrics = calculate_metrics(sample_match_result)

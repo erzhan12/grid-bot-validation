@@ -12,6 +12,7 @@ class TestRecorderConfig:
     def test_defaults(self):
         config = RecorderConfig()
         assert config.symbols == []
+        assert config.collateral_symbols == []
         assert config.database_url == "sqlite:///recorder.db"
         assert config.testnet is False
         assert config.batch_size == 100
@@ -19,6 +20,18 @@ class TestRecorderConfig:
         assert config.gap_threshold_seconds == 5.0
         assert config.health_log_interval == 300.0
         assert config.account is None
+
+    def test_collateral_symbols_custom(self):
+        """Feature 0065: extra ticker subs for collateral coin marks."""
+        config = RecorderConfig(
+            symbols=["LTCUSDT"], collateral_symbols=["SOLUSDT"],
+        )
+        assert config.collateral_symbols == ["SOLUSDT"]
+
+    def test_collateral_symbols_rejects_empty_string(self):
+        """Same non-empty/non-whitespace rule as symbols."""
+        with pytest.raises(ValueError, match="collateral_symbols"):
+            RecorderConfig(symbols=["LTCUSDT"], collateral_symbols=["  "])
 
     def test_custom_values(self):
         config = RecorderConfig(
