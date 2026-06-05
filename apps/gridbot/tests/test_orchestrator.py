@@ -12,6 +12,7 @@ from gridcore import EventType, TickerEvent
 from gridbot.config import GridbotConfig, AccountConfig, StrategyConfig
 from gridbot.notifier import Notifier
 from gridbot.orchestrator import Orchestrator
+from gridbot.position_fetcher import WalletSnapshot
 from gridbot.reconciler import ReconciliationResult
 from grid_db.identity import account_id_for
 
@@ -157,6 +158,113 @@ class TestOrchestratorInit:
 
         assert "btcusdt_test" in orchestrator._runners
         assert "btcusdt_test" in orchestrator._retry_queues
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_init_account_wires_on_wallet(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        gridbot_config,
+        account_config,
+    ):
+        """Phase 4: on_wallet routes to position_fetcher.on_wallet_message."""
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._position_fetcher.on_wallet_message = MagicMock()
+        orchestrator._init_account(account_config)
+
+        priv_kwargs = mock_private_ws.call_args.kwargs
+        assert priv_kwargs.get("on_wallet") is not None
+        msg = {"topic": "wallet", "data": [{"coin": []}]}
+        priv_kwargs["on_wallet"](msg)
+        orchestrator._position_fetcher.on_wallet_message.assert_called_once_with(
+            "test_account", msg
+        )
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_init_account_skips_on_wallet_when_disabled(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        account_config,
+        strategy_config,
+    ):
+        """wallet_ws_enabled=False → no on_wallet (full Phase-4 kill-switch)."""
+        cfg = GridbotConfig(
+            accounts=[account_config], strategies=[strategy_config],
+            database_url="sqlite:///:memory:", wallet_ws_enabled=False,
+        )
+        orchestrator = Orchestrator(cfg)
+        orchestrator._init_account(account_config)
+        priv_kwargs = mock_private_ws.call_args.kwargs
+        assert priv_kwargs.get("on_wallet") is None
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_init_strategy_injects_wallet_provider(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        gridbot_config,
+        account_config,
+        strategy_config,
+    ):
+        """Phase 4: runner gets a non-blocking peek_wallet_snapshot provider."""
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._position_fetcher.peek_wallet_snapshot = MagicMock(
+            return_value=(WalletSnapshot(available_balance=42.0), 1.0)
+        )
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+
+        runner = orchestrator._runners["btcusdt_test"]
+        assert runner._wallet_provider is not None
+        result = runner._wallet_provider()
+        orchestrator._position_fetcher.peek_wallet_snapshot.assert_called_once_with(
+            "test_account"
+        )
+        assert result[0].available_balance == 42.0
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_init_strategy_no_provider_when_disabled(
+        self,
+        mock_private_ws,
+        mock_public_ws,
+        mock_rest_client,
+        account_config,
+        strategy_config,
+    ):
+        """wallet_ws_enabled=False → runner has no provider (legacy path)."""
+        cfg = GridbotConfig(
+            accounts=[account_config], strategies=[strategy_config],
+            database_url="sqlite:///:memory:", wallet_ws_enabled=False,
+        )
+        orchestrator = Orchestrator(cfg)
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+        assert orchestrator._runners["btcusdt_test"]._wallet_provider is None
+
+
+class TestPhase4Config:
+    """Phase 4 (review P8) — GridbotConfig wallet-WS fields."""
+
+    def test_defaults(self):
+        cfg = GridbotConfig()
+        assert cfg.wallet_ws_enabled is True
+        assert cfg.wallet_ws_max_age_seconds == 45.0
+
+    def test_max_age_must_be_positive(self):
+        with pytest.raises(Exception):
+            GridbotConfig(wallet_ws_max_age_seconds=0.0)
 
 
 class TestOrchestratorRouting:
@@ -384,8 +492,8 @@ class TestOrchestratorLifecycle:
         orchestrator._init_strategy(strategy_config)
         orchestrator._build_routing_maps()
 
-        # Mock wallet balance to raise (startup warns and continues)
-        orchestrator._position_fetcher.get_wallet_balance = Mock(
+        # Mock wallet snapshot to raise (startup warns and continues)
+        orchestrator._position_fetcher.get_wallet_snapshot = Mock(
             side_effect=TimeoutError("REST hung")
         )
 
@@ -935,7 +1043,9 @@ class TestOrchestratorWsPositionDrain:
 
         # Stub wallet fetch — real impl raises from non-main thread guards
         # in some paths and we want a deterministic value here.
-        orchestrator._position_fetcher.get_wallet_balance = Mock(return_value=1000.0)
+        orchestrator._position_fetcher.get_wallet_snapshot = Mock(
+            return_value=WalletSnapshot(wallet_balance=1000.0)
+        )
         return orchestrator, mock_runner
 
     @staticmethod
@@ -1087,7 +1197,9 @@ class TestOrchestratorWsPositionDrain:
         orch._runners = {"btcusdt_test": mock_runner}
         orch._account_to_runners = {"test_account": [mock_runner]}
         orch._symbol_to_runners = {"BTCUSDT": [mock_runner]}
-        orch._position_fetcher.get_wallet_balance = Mock(return_value=1000.0)
+        orch._position_fetcher.get_wallet_snapshot = Mock(
+            return_value=WalletSnapshot(wallet_balance=1000.0)
+        )
 
         self._push_ws(orch, "BTCUSDT", long_size="0.3", short_size="0.2")
         orch._tick()  # must not raise
@@ -1359,6 +1471,9 @@ class TestOrchestratorPositionCheck:
             short_position=short_pos,
             wallet_balance=10000.0,
             last_close=42000.0,
+            available_balance=0.0,
+            total_available_balance=0.0,
+            total_maintenance_margin=0.0,
         )
         rest_client.get_positions.assert_not_called()
 
@@ -1401,6 +1516,9 @@ class TestOrchestratorPositionCheck:
             short_position=short_pos_rest,
             wallet_balance=5000.0,
             last_close=42000.0,
+            available_balance=0.0,
+            total_available_balance=0.0,
+            total_maintenance_margin=0.0,
         )
 
     @patch("gridbot.orchestrator.BybitRestClient")
@@ -3060,8 +3178,8 @@ class TestOrchestratorWalletCache:
         rest_client.get_wallet_balance.assert_called_once()
 
         assert "test_account" in orchestrator._position_fetcher._wallet_cache
-        cached_balance, _ = orchestrator._position_fetcher._wallet_cache["test_account"]
-        assert cached_balance == 5000.0
+        cached_snap, _ = orchestrator._position_fetcher._wallet_cache["test_account"]
+        assert cached_snap.wallet_balance == 5000.0
 
     @patch("gridbot.orchestrator.BybitRestClient")
     @patch("gridbot.orchestrator.PublicWebSocketClient")
@@ -3076,7 +3194,7 @@ class TestOrchestratorWalletCache:
         orchestrator = Orchestrator(gridbot_config)
         orchestrator._init_account(account_config)
 
-        orchestrator._position_fetcher._wallet_cache["test_account"] = (10000.0, datetime.now(UTC))
+        orchestrator._position_fetcher._wallet_cache["test_account"] = (WalletSnapshot(wallet_balance=10000.0), datetime.now(UTC))
 
         rest_client = orchestrator._rest_clients["test_account"]
         rest_client.get_wallet_balance.return_value = {
@@ -3101,7 +3219,7 @@ class TestOrchestratorWalletCache:
         orchestrator._init_account(account_config)
 
         old_timestamp = datetime.now(UTC) - timedelta(seconds=400)
-        orchestrator._position_fetcher._wallet_cache["test_account"] = (5000.0, old_timestamp)
+        orchestrator._position_fetcher._wallet_cache["test_account"] = (WalletSnapshot(wallet_balance=5000.0), old_timestamp)
 
         rest_client = orchestrator._rest_clients["test_account"]
         rest_client.get_wallet_balance.return_value = {
@@ -3112,8 +3230,8 @@ class TestOrchestratorWalletCache:
         assert balance == 7500.0
         rest_client.get_wallet_balance.assert_called_once()
 
-        cached_balance, _ = orchestrator._position_fetcher._wallet_cache["test_account"]
-        assert cached_balance == 7500.0
+        cached_snap, _ = orchestrator._position_fetcher._wallet_cache["test_account"]
+        assert cached_snap.wallet_balance == 7500.0
 
     @patch("gridbot.orchestrator.BybitRestClient")
     @patch("gridbot.orchestrator.PublicWebSocketClient")
@@ -3133,7 +3251,7 @@ class TestOrchestratorWalletCache:
         orchestrator = Orchestrator(config)
         orchestrator._init_account(account_config)
 
-        orchestrator._position_fetcher._wallet_cache["test_account"] = (5000.0, datetime.now(UTC))
+        orchestrator._position_fetcher._wallet_cache["test_account"] = (WalletSnapshot(wallet_balance=5000.0), datetime.now(UTC))
 
         rest_client = orchestrator._rest_clients["test_account"]
         rest_client.get_wallet_balance.return_value = {

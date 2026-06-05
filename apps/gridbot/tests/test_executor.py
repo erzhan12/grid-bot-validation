@@ -13,8 +13,9 @@ from gridbot.executor import (
     CancelResult,
     AUTH_ERROR_CODES,
     is_truncate_error,
+    is_insufficient_balance,
 )
-from bybit_adapter.error_codes import ORDER_QTY_TRUNCATED_TO_ZERO
+from bybit_adapter.error_codes import ORDER_QTY_TRUNCATED_TO_ZERO, INSUFFICIENT_BALANCE
 
 
 class TestIsTruncateError:
@@ -40,6 +41,38 @@ class TestIsTruncateError:
     def test_none_and_empty_are_not_truncate(self):
         assert is_truncate_error(None) is False
         assert is_truncate_error("") is False
+
+
+class TestIsInsufficientBalance:
+    """Feature 0066 — classify ErrCode 110007 ('available balance not enough').
+
+    The load-bearing classifier for the retry-queue no-enqueue storm guard
+    (runner._execute_place_intent). Mirrors TestIsTruncateError; the live storm
+    came from REAL Bybit responses, so BOTH wire formats must be covered.
+    """
+
+    def test_constant_is_110007(self):
+        assert INSUFFICIENT_BALANCE == 110007
+
+    def test_detects_check_response_format(self):
+        # _check_response format: "[110007] ..."
+        err = "Bybit API error in place_order: [110007] ab not enough for new order"
+        assert is_insufficient_balance(err) is True
+
+    def test_detects_pybit_native_format(self):
+        # pybit native: "(ErrCode: 110007) ..." — the form a real live error takes.
+        err = "place_order failed (ErrCode: 110007) ab not enough for new order"
+        assert is_insufficient_balance(err) is True
+
+    def test_other_error_code_is_not_insufficient_balance(self):
+        # 110017 (the sibling truncate code) must NOT classify as 110007.
+        assert is_insufficient_balance("Bybit API error: [110017] truncated") is False
+        assert is_insufficient_balance("Bybit API error: [110001] params error") is False
+        assert is_insufficient_balance("Connection timeout") is False
+
+    def test_none_and_empty_are_not_insufficient_balance(self):
+        assert is_insufficient_balance(None) is False
+        assert is_insufficient_balance("") is False
 
 
 @pytest.fixture
@@ -148,6 +181,7 @@ class TestExecutorPlaceOrder:
             "price": "50000.0",
             "reduce_only": False,
             "position_idx": 1,  # long direction
+            "time_in_force": "GTC",  # default (non-post-only) — feature 0066
         }
         assert order_link_id.startswith(f"{place_intent.client_order_id}-")
         assert order_link_id.partition("-")[2].isdigit()
@@ -181,10 +215,28 @@ class TestExecutorPlaceOrder:
             "price": "50000.0",
             "reduce_only": False,
             "position_idx": 2,  # short direction
+            "time_in_force": "GTC",  # default (non-post-only) — feature 0066
         }
         assert order_link_id.startswith(f"{intent.client_order_id}-")
         assert order_link_id.partition("-")[2].isdigit()
         assert result.order_link_id == order_link_id
+
+    def test_post_only_intent_passes_postonly_tif(self, executor, mock_rest_client):
+        """Feature 0066: post_only=True → place_order time_in_force='PostOnly'."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Sell", price=Decimal("50000.0"),
+            qty=Decimal("0.001"), grid_level=10, direction="short",
+            reduce_only=True, post_only=True,
+        )
+        executor.execute_place(intent)
+        _, kwargs = mock_rest_client.place_order.call_args
+        assert kwargs["time_in_force"] == "PostOnly"
+
+    def test_default_intent_passes_gtc_tif(self, executor, mock_rest_client, place_intent):
+        """Default (post_only=False) → time_in_force='GTC' (today's behavior)."""
+        executor.execute_place(place_intent)
+        _, kwargs = mock_rest_client.place_order.call_args
+        assert kwargs["time_in_force"] == "GTC"
 
     def test_execute_place_passes_orderLinkId_from_client_order_id(
         self, executor, mock_rest_client

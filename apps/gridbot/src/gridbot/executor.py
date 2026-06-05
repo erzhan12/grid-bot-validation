@@ -11,7 +11,10 @@ from datetime import datetime, UTC
 from typing import Callable, Optional
 
 from bybit_adapter.rest_client import BybitRestClient
-from bybit_adapter.error_codes import ORDER_QTY_TRUNCATED_TO_ZERO
+from bybit_adapter.error_codes import (
+    INSUFFICIENT_BALANCE,
+    ORDER_QTY_TRUNCATED_TO_ZERO,
+)
 from gridcore.intents import PlaceLimitIntent, CancelIntent
 from gridcore.position import DirectionType
 from gridbot.order_link_id import make_order_link_id
@@ -41,6 +44,24 @@ def is_truncate_error(error: Optional[str]) -> bool:
     if match:
         code = int(match.group(1) or match.group(2))
         return code == ORDER_QTY_TRUNCATED_TO_ZERO
+    return False
+
+
+def is_insufficient_balance(error: Optional[str]) -> bool:
+    """Return True if an error string carries Bybit ErrCode 110007.
+
+    110007 ("available balance not enough for new order") means the account's
+    free margin cannot cover an OPEN order. Module-level (mirrors
+    ``is_truncate_error``) so the runner branches on it without routing through
+    a mock executor instance — feature 0066 / issue #159. Reuses the shared
+    ``_ERR_CODE_RE`` for both wire formats.
+    """
+    if not error:
+        return False
+    match = _ERR_CODE_RE.search(error)
+    if match:
+        code = int(match.group(1) or match.group(2))
+        return code == INSUFFICIENT_BALANCE
     return False
 
 
@@ -208,6 +229,9 @@ class IntentExecutor:
                 reduce_only=intent.reduce_only,
                 position_idx=position_idx,
                 order_link_id=unique_link_id,
+                # Feature 0066 (issue #159): maker-only for chase-close orders.
+                # Default GTC == today's implicit behavior for every other order.
+                time_in_force="PostOnly" if intent.post_only else "GTC",
             )
 
             order_id = result.get("orderId")

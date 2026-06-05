@@ -469,6 +469,7 @@ class BybitRestClient:
         reduce_only: bool = False,
         position_idx: int = 0,
         order_link_id: Optional[str] = None,
+        time_in_force: str = "GTC",
     ) -> dict:
         """Place a new order.
 
@@ -481,6 +482,8 @@ class BybitRestClient:
             reduce_only: Whether this is a reduce-only order
             position_idx: Position index for hedge mode (0=one-way, 1=buy-side, 2=sell-side)
             order_link_id: Custom order ID for tracking (client_order_id)
+            time_in_force: Bybit timeInForce ("GTC" default == today's implicit
+                behavior; "PostOnly" for maker-only chase orders, feature 0066).
 
         Returns:
             Order response dict with keys: orderId, orderLinkId, etc.
@@ -505,6 +508,7 @@ class BybitRestClient:
             "qty": qty,
             "reduceOnly": reduce_only,
             "positionIdx": position_idx,
+            "timeInForce": time_in_force,
         }
         if price is not None:
             params["price"] = price

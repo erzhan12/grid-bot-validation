@@ -62,6 +62,11 @@ class PlaceLimitIntent:
     grid_level: int       # Grid level index for comparison reports
     direction: str        # 'long' or 'short'
     order_link_id: str | None = field(default=None, compare=False)
+    # Feature 0066 (issue #159): post-only (maker) flag for chase-close orders.
+    # Excluded from identity (compare=False, not in _IDENTITY_PARAMS) so the
+    # deterministic client_order_id and dedup are unaffected; defaults False so
+    # every existing emit-site is byte-for-byte unchanged.
+    post_only: bool = field(default=False, compare=False)
 
     # Parameters that determine order identity for deduplication
     # Excludes: qty (execution layer determines), reduce_only (order flag), grid_level (tracking only)
@@ -78,6 +83,7 @@ class PlaceLimitIntent:
         grid_level: int,
         direction: str,
         reduce_only: bool = False,
+        post_only: bool = False,
     ) -> "PlaceLimitIntent":
         """
         Factory method to create a PlaceLimitIntent with deterministic client_order_id.
@@ -103,6 +109,8 @@ class PlaceLimitIntent:
             grid_level: Grid level index (for tracking/reporting, NOT part of identity hash)
             direction: 'long' or 'short'
             reduce_only: Whether this is a reduce-only order (NOT part of identity hash)
+            post_only: Whether this is a post-only (maker-only) order for
+                chase-close (NOT part of identity hash; feature 0066)
 
         Returns:
             PlaceLimitIntent with deterministic client_order_id
@@ -123,6 +131,7 @@ class PlaceLimitIntent:
             client_order_id=deterministic_id,
             grid_level=grid_level,
             direction=direction,
+            post_only=post_only,
         )
 
 

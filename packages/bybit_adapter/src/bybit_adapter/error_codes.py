@@ -14,3 +14,9 @@ https://bybit-exchange.github.io/docs/v5/error
 # order is rejected. Surfaces during local-mirror divergence (feature 0064,
 # issue #149).
 ORDER_QTY_TRUNCATED_TO_ZERO = 110017
+
+# ErrCode 110007 "available balance not enough for new order": the account's
+# free margin cannot cover an OPEN (non-reduce-only) order. Reduce-only orders
+# are exempt (they free margin). Drives the low-balance preflight + retry-queue
+# no-enqueue guard (feature 0066, issue #159).
+INSUFFICIENT_BALANCE = 110007

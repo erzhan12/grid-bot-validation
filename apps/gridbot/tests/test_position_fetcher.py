@@ -17,6 +17,7 @@ from gridbot.notifier import Notifier
 from gridbot.position_fetcher import (
     PositionFetcher,
     StartupTimeoutError,
+    WalletSnapshot,
     _POSITION_FETCH_SLOW_THRESHOLD,
     _POSITION_STARTUP_HARD_CAP,
 )
@@ -30,6 +31,7 @@ def _make_fetcher(
     wallet_cache_interval=300.0,
     position_check_interval=60.0,
     on_position_changed=None,
+    wallet_ws_max_age_seconds=45.0,
 ):
     return PositionFetcher(
         rest_clients=rest_clients if rest_clients is not None else {},
@@ -38,6 +40,7 @@ def _make_fetcher(
         wallet_cache_interval=wallet_cache_interval,
         position_check_interval=position_check_interval,
         on_position_changed=on_position_changed,
+        wallet_ws_max_age_seconds=wallet_ws_max_age_seconds,
     )
 
 
@@ -209,7 +212,7 @@ class TestGetWalletBalance:
         fetcher = _make_fetcher(
             rest_clients={"a": rest}, wallet_cache_interval=300.0,
         )
-        fetcher._wallet_cache["a"] = (10000.0, datetime.now(UTC))
+        fetcher._wallet_cache["a"] = (WalletSnapshot(wallet_balance=10000.0), datetime.now(UTC))
 
         assert fetcher.get_wallet_balance("a") == 10000.0
         rest.get_wallet_balance.assert_not_called()
@@ -222,12 +225,12 @@ class TestGetWalletBalance:
         fetcher = _make_fetcher(
             rest_clients={"a": rest}, wallet_cache_interval=300.0,
         )
-        fetcher._wallet_cache["a"] = (5000.0, datetime.now(UTC) - timedelta(seconds=400))
+        fetcher._wallet_cache["a"] = (WalletSnapshot(wallet_balance=5000.0), datetime.now(UTC) - timedelta(seconds=400))
 
         assert fetcher.get_wallet_balance("a") == 7500.0
         rest.get_wallet_balance.assert_called_once()
-        cached_balance, _ = fetcher._wallet_cache["a"]
-        assert cached_balance == 7500.0
+        cached_snap, _ = fetcher._wallet_cache["a"]
+        assert cached_snap.wallet_balance == 7500.0
 
     def test_disabled_when_interval_zero_always_fetches(self):
         rest = Mock()
@@ -238,7 +241,7 @@ class TestGetWalletBalance:
             rest_clients={"a": rest}, wallet_cache_interval=0.0,
         )
         # Pre-seed cache; should be ignored.
-        fetcher._wallet_cache["a"] = (5000.0, datetime.now(UTC))
+        fetcher._wallet_cache["a"] = (WalletSnapshot(wallet_balance=5000.0), datetime.now(UTC))
 
         assert fetcher.get_wallet_balance("a") == 8000.0
         rest.get_wallet_balance.assert_called_once()
@@ -410,6 +413,9 @@ class TestFetchAndUpdate:
             short_position=short_pos,
             wallet_balance=10000.0,
             last_close=42000.0,
+            available_balance=0.0,
+            total_available_balance=0.0,
+            total_maintenance_margin=0.0,
         )
         rest.get_positions.assert_called_once()
 
@@ -427,6 +433,9 @@ class TestFetchAndUpdate:
             short_position=short_pos,
             wallet_balance=10000.0,
             last_close=42000.0,
+            available_balance=0.0,
+            total_available_balance=0.0,
+            total_maintenance_margin=0.0,
         )
         rest.get_positions.assert_not_called()
 
@@ -446,4 +455,356 @@ class TestFetchAndUpdate:
             short_position=short_pos,
             wallet_balance=10000.0,
             last_close=None,
+            available_balance=0.0,
+            total_available_balance=0.0,
+            total_maintenance_margin=0.0,
         )
+
+
+class TestWalletSnapshot:
+    """Feature 0066 (issue #159) — wallet snapshot extraction."""
+
+    def test_extracts_account_and_coin_fields(self):
+        rest = Mock()
+        rest.get_wallet_balance.return_value = {
+            "list": [{
+                "totalAvailableBalance": "1234.5",
+                "totalMaintenanceMargin": "30.25",
+                "coin": [
+                    {"coin": "USDT", "walletBalance": "5000",
+                     "availableToWithdraw": "900"},
+                ],
+            }]
+        }
+        fetcher = _make_fetcher(rest_clients={"a": rest}, wallet_cache_interval=0.0)
+        snap = fetcher.get_wallet_snapshot("a")
+        assert snap.wallet_balance == 5000.0
+        assert snap.available_balance == 900.0
+        assert snap.total_available_balance == 1234.5
+        assert snap.total_maintenance_margin == 30.25
+        # Back-compat float accessor still works.
+        assert fetcher._fetch_wallet_snapshot("a").wallet_balance == 5000.0
+
+    def test_empty_string_fields_coerced_to_zero(self):
+        """Bybit mainnet UTA sends '' for unused numeric fields (RULES.md)."""
+        rest = Mock()
+        rest.get_wallet_balance.return_value = {
+            "list": [{
+                "totalAvailableBalance": "",
+                "totalMaintenanceMargin": "",
+                "coin": [
+                    {"coin": "USDT", "walletBalance": "5000",
+                     "availableToWithdraw": ""},
+                ],
+            }]
+        }
+        fetcher = _make_fetcher(rest_clients={"a": rest}, wallet_cache_interval=0.0)
+        snap = fetcher.get_wallet_snapshot("a")
+        assert snap.wallet_balance == 5000.0
+        assert snap.available_balance == 0.0
+        assert snap.total_available_balance == 0.0
+        assert snap.total_maintenance_margin == 0.0
+
+    def test_available_falls_back_to_account_total_when_coin_empty(self):
+        """UTA cross-margin: empty per-coin field → account-level free margin."""
+        rest = Mock()
+        rest.get_wallet_balance.return_value = {
+            "list": [{
+                "totalAvailableBalance": "777.0",
+                "coin": [
+                    {"coin": "USDT", "walletBalance": "5000",
+                     "availableToWithdraw": ""},
+                ],
+            }]
+        }
+        fetcher = _make_fetcher(rest_clients={"a": rest}, wallet_cache_interval=0.0)
+        snap = fetcher.get_wallet_snapshot("a")
+        assert snap.available_balance == 777.0
+
+    def test_no_usdt_returns_zero_snapshot(self):
+        rest = Mock()
+        rest.get_wallet_balance.return_value = {"list": [{"coin": []}]}
+        fetcher = _make_fetcher(rest_clients={"a": rest}, wallet_cache_interval=0.0)
+        assert fetcher.get_wallet_snapshot("a") == WalletSnapshot()
+
+
+class TestSnapshotFromWalletAccountRow:
+    """Phase 4 (review P3) — shared parser for REST list[0] / WS data[0]."""
+
+    def test_maps_account_and_coin_fields(self):
+        fetcher = _make_fetcher()
+        row = {
+            "totalAvailableBalance": "1234.5",
+            "totalMaintenanceMargin": "30.25",
+            "coin": [
+                {"coin": "USDT", "walletBalance": "5000",
+                 "availableToWithdraw": "900"},
+            ],
+        }
+        snap = fetcher._snapshot_from_wallet_account_row(row)
+        assert snap == WalletSnapshot(
+            wallet_balance=5000.0,
+            available_balance=900.0,
+            total_available_balance=1234.5,
+            total_maintenance_margin=30.25,
+        )
+
+    def test_account_total_fallback_when_coin_empty(self):
+        fetcher = _make_fetcher()
+        row = {
+            "totalAvailableBalance": "777.0",
+            "coin": [
+                {"coin": "USDT", "walletBalance": "5000",
+                 "availableToWithdraw": ""},
+            ],
+        }
+        snap = fetcher._snapshot_from_wallet_account_row(row)
+        assert snap.available_balance == 777.0
+
+    def test_no_usdt_coin_returns_none(self):
+        fetcher = _make_fetcher()
+        assert fetcher._snapshot_from_wallet_account_row({"coin": []}) is None
+
+    def test_zero_coin_available_collapses_to_account_total(self):
+        """Documented UTA semantics: a per-coin availableToWithdraw of "0" is
+        indistinguishable from "" and collapses to the account-level free margin.
+        Locks the fallback so it can't silently drift (review test-gap)."""
+        fetcher = _make_fetcher()
+        row = {
+            "totalAvailableBalance": "500",
+            "coin": [{"coin": "USDT", "walletBalance": "100",
+                      "availableToWithdraw": "0"}],
+        }
+        snap = fetcher._snapshot_from_wallet_account_row(row)
+        assert snap.available_balance == 500.0  # account total, not the per-coin 0
+
+    def test_legacy_available_balance_used_when_v5_field_absent(self):
+        """review round-4 F1: legacy UTA 1.0 / cross-margin coins surface free
+        margin only as `availableBalance`; parser must fall back to it (mirrors
+        recorder.py) so the preflight doesn't misread free margin as 0."""
+        fetcher = _make_fetcher()
+        row = {
+            "coin": [{"coin": "USDT", "walletBalance": "5000",
+                      "availableBalance": "321.0"}],  # no availableToWithdraw key
+        }
+        snap = fetcher._snapshot_from_wallet_account_row(row)
+        assert snap.available_balance == 321.0
+
+    def test_legacy_available_balance_used_when_v5_field_empty(self):
+        fetcher = _make_fetcher()
+        row = {
+            "coin": [{"coin": "USDT", "walletBalance": "5000",
+                      "availableToWithdraw": "", "availableBalance": "150.5"}],
+        }
+        snap = fetcher._snapshot_from_wallet_account_row(row)
+        assert snap.available_balance == 150.5
+
+    def test_v5_availableToWithdraw_preferred_over_legacy_field(self):
+        """When the v5 field is present and non-empty it wins over the legacy one."""
+        fetcher = _make_fetcher()
+        row = {
+            "coin": [{"coin": "USDT", "walletBalance": "5000",
+                      "availableToWithdraw": "900", "availableBalance": "111"}],
+        }
+        snap = fetcher._snapshot_from_wallet_account_row(row)
+        assert snap.available_balance == 900.0
+
+    def test_same_dict_yields_same_result_rest_or_ws(self):
+        """A single account-row dict parses identically regardless of source."""
+        fetcher = _make_fetcher()
+        row = {
+            "totalAvailableBalance": "100.0",
+            "coin": [{"coin": "USDT", "walletBalance": "200",
+                      "availableToWithdraw": "50"}],
+        }
+        # REST path uses list[0]; WS path uses data[0] — same dict.
+        assert (fetcher._snapshot_from_wallet_account_row(row)
+                == fetcher._snapshot_from_wallet_account_row(row))
+
+
+class TestOnWalletMessage:
+    """Phase 4 — WS `wallet` topic handler (runs on the WS thread)."""
+
+    def _frame(self, *, wallet_balance="5000", available="120",
+               total_available="777.0"):
+        return {
+            "topic": "wallet",
+            "creationTime": 1704067200000,
+            "data": [{
+                "totalAvailableBalance": total_available,
+                "coin": [{"coin": "USDT", "walletBalance": wallet_balance,
+                          "availableToWithdraw": available}],
+            }],
+        }
+
+    def test_populates_ws_snapshot(self):
+        fetcher = _make_fetcher()
+        fetcher.on_wallet_message("a", self._frame())
+        snap, ts = fetcher._wallet_ws_data["a"]
+        assert snap.wallet_balance == 5000.0
+        assert snap.available_balance == 120.0
+        assert isinstance(ts, datetime)
+
+    def test_skips_missing_data_keeps_last_good(self):
+        fetcher = _make_fetcher()
+        prior = (WalletSnapshot(available_balance=99.0), datetime.now(UTC))
+        fetcher._wallet_ws_data["a"] = prior
+        fetcher.on_wallet_message("a", {"topic": "wallet"})  # no data key
+        assert fetcher._wallet_ws_data["a"] is prior
+
+    def test_skips_no_usdt_coin_keeps_last_good(self):
+        fetcher = _make_fetcher()
+        prior = (WalletSnapshot(available_balance=99.0), datetime.now(UTC))
+        fetcher._wallet_ws_data["a"] = prior
+        fetcher.on_wallet_message("a", {"data": [{"coin": []}]})
+        assert fetcher._wallet_ws_data["a"] is prior
+
+    def test_writes_valid_row_with_zero_available_not_masked(self):
+        """A funded account with 0 free margin (wallet>0) is a REAL signal —
+        written, not skipped by an all-zero heuristic (review P2-malformed)."""
+        fetcher = _make_fetcher()
+        fetcher.on_wallet_message("a", {
+            "data": [{"coin": [{"coin": "USDT", "walletBalance": "100",
+                                "availableToWithdraw": "0"}]}],
+        })
+        snap, _ = fetcher._wallet_ws_data["a"]
+        assert snap.wallet_balance == 100.0
+        assert snap.available_balance == 0.0
+
+    def test_writes_legacy_available_balance_field(self):
+        """review round-4 F1: WS frame whose USDT coin carries only the legacy
+        `availableBalance` is parsed via the shared parser → free margin captured."""
+        fetcher = _make_fetcher()
+        fetcher.on_wallet_message("a", {
+            "data": [{"coin": [{"coin": "USDT", "walletBalance": "5000",
+                                "availableBalance": "75.0"}]}],
+        })
+        snap, _ = fetcher._wallet_ws_data["a"]
+        assert snap.available_balance == 75.0
+
+    def test_never_raises_on_parse_error(self):
+        """Malformed frame must not raise on the WS thread (no write), and the
+        swallowed error IS surfaced to the operator (mirrors on_position_message)."""
+        notifier = Mock(spec=Notifier)
+        fetcher = _make_fetcher(notifier=notifier)
+        fetcher.on_wallet_message("a", {"data": "not-a-list"})  # data[0] → str
+        assert "a" not in fetcher._wallet_ws_data
+        notifier.alert_exception.assert_called_once()
+        assert notifier.alert_exception.call_args[0][0] == "_on_wallet"
+        assert notifier.alert_exception.call_args.kwargs.get("error_key") == "ws_on_wallet"
+
+
+class TestPeekWalletSnapshot:
+    """Phase 4 — non-blocking hot-path reader (newest of WS / REST by ts)."""
+
+    def test_returns_none_when_no_data(self):
+        fetcher = _make_fetcher()
+        assert fetcher.peek_wallet_snapshot("a") is None
+
+    def test_non_blocking_never_fetches(self):
+        rest = Mock()
+        fetcher = _make_fetcher(rest_clients={"a": rest})
+        fetcher._wallet_ws_data["a"] = (
+            WalletSnapshot(available_balance=100.0), datetime.now(UTC))
+        snap, age = fetcher.peek_wallet_snapshot("a")
+        assert snap.available_balance == 100.0
+        assert age >= 0.0
+        rest.get_wallet_balance.assert_not_called()
+
+    def test_prefers_newer_rest_over_stale_ws(self):
+        """review P2: a stale WS slot must NOT shadow a fresher REST entry."""
+        fetcher = _make_fetcher()
+        now = datetime.now(UTC)
+        fetcher._wallet_ws_data["a"] = (
+            WalletSnapshot(available_balance=999.0), now - timedelta(seconds=120))
+        fetcher._wallet_cache["a"] = (
+            WalletSnapshot(available_balance=5.0), now - timedelta(seconds=1))
+        snap, age = fetcher.peek_wallet_snapshot("a")
+        assert snap.available_balance == 5.0  # the fresher REST one
+        assert age < 60.0
+
+    def test_prefers_newer_ws_over_older_rest(self):
+        fetcher = _make_fetcher()
+        now = datetime.now(UTC)
+        fetcher._wallet_ws_data["a"] = (
+            WalletSnapshot(available_balance=5.0), now - timedelta(seconds=1))
+        fetcher._wallet_cache["a"] = (
+            WalletSnapshot(available_balance=999.0), now - timedelta(seconds=120))
+        snap, age = fetcher.peek_wallet_snapshot("a")
+        assert snap.available_balance == 5.0  # the fresher WS one
+        assert age < 60.0
+
+    def test_returns_only_present_source(self):
+        fetcher = _make_fetcher()
+        now = datetime.now(UTC)
+        fetcher._wallet_cache["a"] = (WalletSnapshot(available_balance=7.0), now)
+        snap, _ = fetcher.peek_wallet_snapshot("a")
+        assert snap.available_balance == 7.0
+
+
+class TestGetWalletSnapshotWsPrimary:
+    """Phase 4 — background reader: WS within window, else REST (may fetch)."""
+
+    def test_ws_primary_when_fresh(self):
+        rest = Mock()
+        fetcher = _make_fetcher(rest_clients={"a": rest},
+                                wallet_ws_max_age_seconds=45.0)
+        fetcher._wallet_ws_data["a"] = (
+            WalletSnapshot(available_balance=42.0), datetime.now(UTC))
+        snap = fetcher.get_wallet_snapshot("a")
+        assert snap.available_balance == 42.0
+        rest.get_wallet_balance.assert_not_called()
+
+    def test_rest_when_ws_stale(self):
+        rest = Mock()
+        rest.get_wallet_balance.return_value = {
+            "list": [{"coin": [{"coin": "USDT", "walletBalance": "5000",
+                                "availableToWithdraw": "100"}]}]
+        }
+        fetcher = _make_fetcher(rest_clients={"a": rest},
+                                wallet_ws_max_age_seconds=45.0,
+                                wallet_cache_interval=300.0)
+        fetcher._wallet_ws_data["a"] = (
+            WalletSnapshot(available_balance=42.0),
+            datetime.now(UTC) - timedelta(seconds=100))  # stale WS
+        snap = fetcher.get_wallet_snapshot("a")
+        assert snap.wallet_balance == 5000.0  # fell through to REST
+        rest.get_wallet_balance.assert_called_once()
+
+    def test_rest_when_no_ws(self):
+        rest = Mock()
+        rest.get_wallet_balance.return_value = {
+            "list": [{"coin": [{"coin": "USDT", "walletBalance": "8000",
+                                "availableToWithdraw": "200"}]}]
+        }
+        fetcher = _make_fetcher(rest_clients={"a": rest},
+                                wallet_cache_interval=0.0)
+        snap = fetcher.get_wallet_snapshot("a")
+        assert snap.wallet_balance == 8000.0
+        rest.get_wallet_balance.assert_called_once()
+
+    def test_logs_ws_source_with_age_when_fresh(self, caplog):
+        """review F3: DEBUG ops log identifies the WS source + slot age — the
+        signal to validate WS freshness in rollout (the INFO heartbeat lags)."""
+        rest = Mock()
+        fetcher = _make_fetcher(rest_clients={"a": rest},
+                                wallet_ws_max_age_seconds=45.0)
+        fetcher._wallet_ws_data["a"] = (
+            WalletSnapshot(available_balance=42.0), datetime.now(UTC))
+        with caplog.at_level(logging.DEBUG, logger="gridbot.position_fetcher"):
+            fetcher.get_wallet_snapshot("a")
+        assert any("WS" in r.getMessage() and "age=" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_logs_rest_source_when_ws_stale_or_absent(self, caplog):
+        """review F3: DEBUG ops log identifies the REST fallback source."""
+        rest = Mock()
+        rest.get_wallet_balance.return_value = {
+            "list": [{"coin": [{"coin": "USDT", "walletBalance": "8000",
+                                "availableToWithdraw": "200"}]}]
+        }
+        fetcher = _make_fetcher(rest_clients={"a": rest},
+                                wallet_cache_interval=0.0)
+        with caplog.at_level(logging.DEBUG, logger="gridbot.position_fetcher"):
+            fetcher.get_wallet_snapshot("a")
+        assert any("REST" in r.getMessage() for r in caplog.records)

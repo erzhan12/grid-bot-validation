@@ -100,6 +100,97 @@ class StrategyConfig(BaseModel):
         description="Trigger one forced position+order reconcile when the breaker trips.",
     )
 
+    # Feature 0066 — 110007 low-balance preflight + retry-queue guard (issue #159).
+    # All default-on so existing conf/*.yaml keep working unchanged.
+    preflight_balance_check_enabled: bool = Field(
+        default=True,
+        description=(
+            "Master kill-switch for the low-balance preflight. When True, an "
+            "OPEN (non-reduce-only) order is rejected locally in "
+            "_is_good_to_place when est_cost = qty*price/leverage exceeds "
+            "available_balance*(1+buffer) — preventing the 110007 retry storm. "
+            "Reduce-only orders always bypass the check (they free margin)."
+        ),
+    )
+    preflight_balance_buffer: float = Field(
+        default=0.05,
+        ge=0,
+        description=(
+            "Fractional safety margin on the preflight est_cost so fee/funding/"
+            "rounding slack near the affordability boundary does not still 110007."
+        ),
+    )
+    assumed_leverage: float = Field(
+        default=1.0,
+        gt=0,
+        description=(
+            "Fallback leverage for the preflight est_cost when no live exchange "
+            "leverage has been observed for the direction. Bias LOW: an "
+            "under-estimate only over-rejects affordable opens, never lets an "
+            "unaffordable one through."
+        ),
+    )
+    # Low-balance predicate (shared by the moderate_liq_risk fix + chase-close).
+    low_balance_fraction: float = Field(
+        default=0.10,
+        gt=0,
+        description=(
+            "Low-balance is True when available_balance is positive but below "
+            "total_position_value * this fraction. Drives the moderate_liq_risk "
+            "fix (3a) and chase-close (3b) — feature 0066 / issue #159."
+        ),
+    )
+    moderate_liq_low_balance_fix_enabled: bool = Field(
+        default=True,
+        description=(
+            "Kill-switch for the moderate_liq_risk low-balance fix. When True and "
+            "low-balance, the moderate_liq_risk arm SKIPS the 0.5 close-throttle "
+            "so margin-freeing closes are not slowed (the issue #159 deadlock). "
+            "When False the arm is byte-for-byte the pre-0066 behavior."
+        ),
+    )
+    # Chase-close active defense (feature 0066 / issue #159). Default OFF — it
+    # actively places orders; promote to on only after the regression suite plus
+    # one live low-balance stress event confirms the dominant side decreases.
+    chase_close_enabled: bool = Field(
+        default=False,
+        description=(
+            "Kill-switch for chase-close. When True AND low-balance AND the "
+            "position_ratio is extreme, the bot cancels resting grow-side opens "
+            "for the dominant side and places a reduce-only post-only close near "
+            "the touch to trim it without market-order slippage."
+        ),
+    )
+    chase_position_ratio_threshold: float = Field(
+        default=5.0,
+        gt=0,
+        description=(
+            "Chase enters when low-balance and position_ratio > this (long "
+            "dominant) or < 1/this (short dominant)."
+        ),
+    )
+    chase_offset_pct: float = Field(
+        default=0.0007,
+        gt=0,
+        description=(
+            "Chase order offset from the touch (maker-safe: Sell above / Buy "
+            "below). Issue #159 suggested the 0.0005–0.0010 band."
+        ),
+    )
+    chase_replace_drift_pct: float = Field(
+        default=0.0010,
+        gt=0,
+        description="Cancel-replace the chase order when price drifts more than this from it.",
+    )
+    chase_close_hysteresis: float = Field(
+        default=0.1,
+        ge=0,
+        description=(
+            "Ratio re-entry margin so the chase exits only after the imbalance "
+            "recovers past the threshold by this fraction (anti-flap)."
+        ),
+    )
+
     # Mode
     shadow_mode: bool = Field(default=False, description="Log intents without executing")
 
@@ -176,6 +267,29 @@ class GridbotConfig(BaseModel):
     wallet_cache_interval: float = Field(
         default=300.0,
         description="Seconds to cache wallet balance (0 to disable caching)",
+    )
+    # Feature 0066 (issue #159) — real-time wallet via the WS `wallet` topic.
+    wallet_ws_enabled: bool = Field(
+        default=True,
+        description=(
+            "Phase-4 master kill-switch for the real-time wallet WS feed. When "
+            "True, the private WS subscribes the `wallet` topic and the runner's "
+            "preflight reads a non-blocking, age-bounded peek of free margin. "
+            "When False, BOTH the WS subscription AND the runner wallet_provider "
+            "are skipped — the preflight reverts to the pre-Phase-4 "
+            "position-cadence `_available_balance` path (no age-bounding)."
+        ),
+    )
+    wallet_ws_max_age_seconds: float = Field(
+        default=45.0,
+        gt=0,
+        description=(
+            "Max age of a WS/REST wallet snapshot the preflight will trust "
+            "before failing open. Bounds how long a silently-dead WS may pin a "
+            "stale slot; well under wallet_cache_interval (300s). A quiet-but-"
+            "healthy WS falling back to REST is harmless (an unchanging balance "
+            "is still accurate)."
+        ),
     )
     rest_fetch_timeout: float = Field(
         default=10.0,

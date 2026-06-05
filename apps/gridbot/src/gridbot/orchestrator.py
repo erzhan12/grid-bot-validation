@@ -199,6 +199,7 @@ class Orchestrator:
             wallet_cache_interval=self._config.wallet_cache_interval,
             position_check_interval=self._config.position_check_interval,
             on_position_changed=self._on_position,
+            wallet_ws_max_age_seconds=self._config.wallet_ws_max_age_seconds,
         )
 
         # Auth-cooldown subsystem. Constructed eagerly for the same reason
@@ -445,7 +446,8 @@ class Orchestrator:
             account_slot = self._latest_position.get(account_name)
             if not account_slot:
                 continue
-            wallet_balance = self._position_fetcher.get_wallet_balance(account_name)
+            wallet = self._position_fetcher.get_wallet_snapshot(account_name)
+            wallet_balance = wallet.wallet_balance
             for runner in runners:
                 snapshot = account_slot.get(runner.symbol)
                 if snapshot is None:
@@ -463,6 +465,9 @@ class Orchestrator:
                         last_close=_runner_market_price(
                             runner, self._latest_ticker.get(runner.symbol)
                         ),
+                        available_balance=wallet.available_balance,
+                        total_available_balance=wallet.total_available_balance,
+                        total_maintenance_margin=wallet.total_maintenance_margin,
                     )
                 except Exception as e:
                     logger.error(
@@ -688,6 +693,14 @@ class Orchestrator:
             ),
             on_disconnect=lambda ts, a=name: self._on_ws_disconnect(a, "public", ts),
         )
+        # Feature 0066 Phase 4: subscribe the real-time `wallet` topic only when
+        # the kill-switch is on. PrivateWebSocketClient subscribes wallet_stream
+        # solely when on_wallet is set, so None here = no subscription (the full
+        # Phase-4 kill-switch — the wallet_provider is also skipped below).
+        on_wallet = (
+            (lambda msg, a=name: self._position_fetcher.on_wallet_message(a, msg))
+            if self._config.wallet_ws_enabled else None
+        )
         self._private_ws[name] = PrivateWebSocketClient(
             api_key=account_config.api_key,
             api_secret=account_config.api_secret,
@@ -695,6 +708,7 @@ class Orchestrator:
             on_position=lambda msg, a=name: self._position_fetcher.on_position_message(a, msg),
             on_order=lambda msg, a=name: self._on_order(a, msg),
             on_execution=lambda msg, a=name: self._on_execution(a, msg),
+            on_wallet=on_wallet,
             on_disconnect=lambda ts, a=name: self._on_ws_disconnect(a, "private", ts),
             message_gap_watchdog_enabled=False,
         )
@@ -733,6 +747,15 @@ class Orchestrator:
             strategy_config.symbol, account_name
         )
 
+        # Feature 0066 Phase 4: inject the NON-BLOCKING peek_wallet_snapshot
+        # reader as the preflight's real-time free-margin source. Skipped (None)
+        # when wallet_ws_enabled is off → the runner takes the legacy
+        # position-cadence _available_balance path (full Phase-4 kill-switch).
+        wallet_provider = (
+            (lambda acct=account_name: self._position_fetcher.peek_wallet_snapshot(acct))
+            if self._config.wallet_ws_enabled else None
+        )
+
         # Create runner
         runner = StrategyRunner(
             strategy_config=strategy_config,
@@ -748,6 +771,9 @@ class Orchestrator:
             # Feature 0064 — dirty-mirror REST refresh + breaker forced reconcile.
             rest_client=self._rest_clients[account_name],
             on_truncate_breaker_tripped=self._force_reconcile_strat,
+            # Feature 0066 Phase 4 — real-time wallet preflight source.
+            wallet_provider=wallet_provider,
+            wallet_ws_max_age_seconds=self._config.wallet_ws_max_age_seconds,
         )
         self._runners[strat_id] = runner
         self._strategy_executors[strat_id] = executor

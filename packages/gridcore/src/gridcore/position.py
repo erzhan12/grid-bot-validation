@@ -45,6 +45,12 @@ class PositionState:
     liquidation_price: Decimal = Decimal('0')
     leverage: int = 1
     position_value: Decimal = Decimal('0')
+    # Bybit positionIM / positionMM: per-position Initial / Maintenance Margin
+    # in USDT (dollar amounts) — feature 0066 / issue #159. NOT the same as
+    # `margin` above (a positionValue/walletBalance ratio); kept separate so the
+    # ratio-based risk thresholds are never confused with dollar margin.
+    initial_margin: Decimal = Decimal('0')
+    maintenance_margin: Decimal = Decimal('0')
     # Bybit cumRealisedPnl: lifetime cumulative realised PnL; does NOT reset
     # per cycle (~80x the Web UI "Realized" value).
     cum_realized_pnl: Decimal = Decimal('0')
@@ -170,7 +176,8 @@ class Position:
         self,
         position: PositionState,
         opposite_position: PositionState,
-        last_close: float
+        last_close: float,
+        low_balance: bool = False
     ) -> dict[str, float]:
         """
         Calculate order size multipliers based on position state.
@@ -196,6 +203,11 @@ class Position:
             position: Current position state
             opposite_position: Opposite direction position state
             last_close: Current market price
+            low_balance: When True (account free margin exhausted), the
+                moderate_liq_risk arm skips its 0.5 close-throttle so
+                margin-freeing closes are not slowed (feature 0066 / issue #159).
+                Defaults False — backtest and pre-0066 callers keep the original
+                hedge-throttle behavior (and backtest parity).
 
         Returns:
             Dictionary with 'Buy' and 'Sell' multipliers for this position
@@ -263,20 +275,23 @@ class Position:
                 liq_ratio,
                 is_position_equal,
                 total_margin,
-                unrealized_pnl_pct
+                unrealized_pnl_pct,
+                low_balance
             )
         else:  # short
             self._apply_short_position_rules(
                 liq_ratio,
                 is_position_equal,
                 total_margin,
-                unrealized_pnl_pct
+                unrealized_pnl_pct,
+                low_balance
             )
 
         # Log position state (matches reference position.py:24-31)
         logger.debug(
             '%s margin=%.2f liq_ratio=%.2f unrealized_pnl=%.2f%% '
             'upnl_usdt=%.4f realized_usdt=%.4f cum_realized_usdt=%.4f pos_value_usdt=%.2f '
+            'im_usdt=%.4f mm_usdt=%.4f low_balance=%s '
             'multiplier=%s position_ratio=%.2f total_margin=%.2f',
             self.direction,
             float(position.margin),
@@ -286,6 +301,9 @@ class Position:
             float(position.cur_realized_pnl),
             float(position.cum_realized_pnl),
             float(position.position_value),
+            float(position.initial_margin),
+            float(position.maintenance_margin),
+            low_balance,
             self.amount_multiplier,
             self.position_ratio,
             total_margin
@@ -298,7 +316,8 @@ class Position:
         liq_ratio: float,
         is_position_equal: bool,
         total_margin: float,
-        unrealized_pnl_pct: float
+        unrealized_pnl_pct: float,
+        low_balance: bool = False
     ) -> None:
         """
         Apply risk management rules for long positions.
@@ -311,6 +330,9 @@ class Position:
         3. Specific position sizing conditions - strategic adjustments
 
         Capital preservation > strategy optimization.
+
+        ``low_balance`` (feature 0066): when True, the moderate_liq_risk arm
+        skips its 0.5 close-throttle on the opposite side (defaults False).
         """
         # High liquidation risk → decrease long position (HIGHEST PRIORITY)
         if liq_ratio > 1.05 * self.risk_config.min_liq_ratio:
@@ -321,8 +343,17 @@ class Position:
         elif liq_ratio > self.risk_config.min_liq_ratio:
             logger.info('Position adjustment: %s moderate_liq_risk (ratio=%.2f)', self.direction, liq_ratio)
             if self._opposite:
-                # Reduce short's buy orders → allows short to grow as hedge
-                self._opposite.set_amount_multiplier(self.SIDE_BUY, 0.5)
+                if low_balance:
+                    # Feature 0066 (issue #159): under exhausted balance, do NOT
+                    # throttle the opposite short's close (Buy) orders. The 0.5
+                    # hedge-throttle slows the very closes that free margin,
+                    # which deadlocked the bot during the 110007 storm.
+                    logger.info(
+                        'Position adjustment: %s moderate_liq_risk low_balance '
+                        '— skipping close-throttle to free margin', self.direction)
+                else:
+                    # Reduce short's buy orders → allows short to grow as hedge
+                    self._opposite.set_amount_multiplier(self.SIDE_BUY, 0.5)
 
         # Positions equal but low total margin → adjust
         elif is_position_equal and total_margin < self.risk_config.min_total_margin:
@@ -344,7 +375,8 @@ class Position:
         liq_ratio: float,
         is_position_equal: bool,
         total_margin: float,
-        unrealized_pnl_pct: float
+        unrealized_pnl_pct: float,
+        low_balance: bool = False
     ) -> None:
         """
         Apply risk management rules for short positions.
@@ -355,12 +387,15 @@ class Position:
         1. EMERGENCY high liquidation risk → decrease short
         2. Moderate liquidation risk → hedge via opposite (long)
         3. Equal positions with low total margin → adjust
-        4. Small short losing (shared ratio > 2 AND upnl < 0) → martingale short
-        5. Very small short (shared ratio > 5) → martingale short
+        4. Small short losing (shared ratio > 2 AND upnl < 0) → risk-mgmt grow short
+        5. Very small short (shared ratio > 5) → risk-mgmt grow short
 
         Capital preservation > strategy optimization. The if/elif chain means
         only one arm fires per call. position_ratio is the shared
         long.margin / short.margin metric; see calculate_amount_multiplier.
+
+        ``low_balance`` (feature 0066): when True, the moderate_liq_risk arm
+        skips its 0.5 close-throttle on the opposite side (defaults False).
         """
         # 1. High liquidation risk (short) → decrease short position (EMERGENCY)
         # For shorts: liq_ratio = liq_price / last_close, so ratio > 1 always
@@ -375,21 +410,29 @@ class Position:
 
         # 2. Moderate liquidation risk → grow opposite (long) as hedge
         # Reference: bbu_reference/bbu2-master/position.py:81-86. Must be
-        # checked BEFORE the martingale arms (Feature 0027): if the moderate
+        # checked BEFORE the risk-mgmt grow arms (Feature 0027): if the moderate
         # band overlaps with `position_ratio > 2.0 AND upnl < 0`, the safer
-        # action (hedge) wins over the martingale (grow the at-risk side).
+        # action (hedge) wins over the risk-mgmt grow rule (grow the at-risk side).
         elif 0.0 < liq_ratio < self.risk_config.max_liq_ratio:
             logger.info('Position adjustment: %s moderate_liq_risk (ratio=%.2f)', self.direction, liq_ratio)
             if self._opposite:
-                # Reduce long's sell orders → allows long to grow as hedge
-                self._opposite.set_amount_multiplier(self.SIDE_SELL, 0.5)
+                if low_balance:
+                    # Feature 0066 (issue #159): under exhausted balance, do NOT
+                    # throttle the opposite long's close (Sell) orders — the 0.5
+                    # hedge-throttle slows margin-freeing closes (the deadlock).
+                    logger.info(
+                        'Position adjustment: %s moderate_liq_risk low_balance '
+                        '— skipping close-throttle to free margin', self.direction)
+                else:
+                    # Reduce long's sell orders → allows long to grow as hedge
+                    self._opposite.set_amount_multiplier(self.SIDE_SELL, 0.5)
 
         # 3. Positions equal but low total margin → adjust
         elif is_position_equal and total_margin < self.risk_config.min_total_margin:
             logger.info('Position adjustment: %s low_margin (total=%.2f)', self.direction, total_margin)
             self._adjust_position_for_low_margin()
 
-        # 4. Short is the smaller side AND losing → martingale grow short
+        # 4. Short is the smaller side AND losing → risk-mgmt grow short
         # Shared ratio > 2.0 means long.margin > 2 × short.margin, i.e., short
         # is the smaller side. Combined with upnl < 0 the rule averages into
         # the smaller losing side. Matches bbu_reference/bbu2-master/position.py:89-90.
@@ -397,7 +440,7 @@ class Position:
             logger.info('Position adjustment: %s ratio=%.2f increasing sells', self.direction, self.position_ratio)
             self.set_amount_multiplier(self.SIDE_SELL, 2.0)
 
-        # 5. Short extremely small (shared ratio > 5) → martingale grow short
+        # 5. Short extremely small (shared ratio > 5) → risk-mgmt grow short
         # No upnl gate. Matches bbu_reference/bbu2-master/position.py:91-92.
         elif self.position_ratio > 5.0:
             logger.info('Position adjustment: %s ratio=%.2f increasing sells', self.direction, self.position_ratio)

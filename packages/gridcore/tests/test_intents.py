@@ -69,3 +69,21 @@ def test_place_intent_order_link_id_not_in_identity_params():
 
     assert "order_link_id" not in PlaceLimitIntent._IDENTITY_PARAMS
     assert assigned.client_order_id == intent.client_order_id
+
+
+def test_post_only_default_false_preserves_identity():
+    """Feature 0066: post_only is excluded from identity (id + ==/hash)."""
+    plain = PlaceLimitIntent.create(
+        symbol="BTCUSDT", side="Buy", price=Decimal("100"), qty=Decimal("0.1"),
+        grid_level=3, direction="long",
+    )
+    maker = PlaceLimitIntent.create(
+        symbol="BTCUSDT", side="Buy", price=Decimal("100"), qty=Decimal("0.1"),
+        grid_level=3, direction="long", post_only=True,
+    )
+    assert plain.post_only is False
+    assert maker.post_only is True
+    assert maker.client_order_id == plain.client_order_id  # id unaffected
+    assert maker == plain                                   # compare=False
+    assert hash(maker) == hash(plain)
+    assert "post_only" not in PlaceLimitIntent._IDENTITY_PARAMS

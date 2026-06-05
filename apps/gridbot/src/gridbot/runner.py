@@ -20,6 +20,13 @@ from typing import Optional, Callable, TYPE_CHECKING
 if TYPE_CHECKING:
     from gridbot.writers.grid_state_writer import GridStateWriter
     from bybit_adapter.rest_client import BybitRestClient
+    # Annotation-only: importing position_fetcher at runtime would be circular
+    # (position_fetcher imports StrategyRunner).
+    from gridbot.position_fetcher import WalletSnapshot
+
+# Provider returns (snapshot, age_seconds) or None — the non-blocking
+# peek_wallet_snapshot reader injected for the Phase-4 preflight (feature 0066).
+WalletProvider = Callable[[], "Optional[tuple[WalletSnapshot, float]]"]
 
 from gridcore import (
     GridEngine,
@@ -43,7 +50,11 @@ from gridcore import (
 )
 
 from gridbot.config import StrategyConfig
-from gridbot.executor import IntentExecutor, is_truncate_error
+from gridbot.executor import (
+    IntentExecutor,
+    is_insufficient_balance,
+    is_truncate_error,
+)
 from gridbot.notifier import Notifier
 from gridbot.order_link_id import make_order_link_id
 from gridbot.truncate_breaker import TruncateBreaker
@@ -183,6 +194,8 @@ class StrategyRunner:
         truncate_breaker: Optional[TruncateBreaker] = None,
         on_truncate_breaker_tripped: Optional[Callable[[str, str], None]] = None,
         clock: Optional[Callable[[], float]] = None,
+        wallet_provider: Optional["WalletProvider"] = None,
+        wallet_ws_max_age_seconds: float = 45.0,
     ):
         """Initialize strategy runner.
 
@@ -216,6 +229,15 @@ class StrategyRunner:
                 forced position+order reconcile.
             clock: Monotonic clock for breaker windows / dirty-refresh throttle.
                 Defaults to ``time.monotonic``; injectable for tests.
+            wallet_provider: Optional non-blocking reader returning
+                ``(WalletSnapshot, age_seconds)`` or ``None`` — the orchestrator
+                wires ``position_fetcher.peek_wallet_snapshot`` here (feature 0066
+                Phase 4). When set, the preflight reads a FRESH, age-bounded free
+                margin from it (authoritative even at 0; stale/None/raise →
+                fail-open). When ``None`` (unit tests / ``wallet_ws_enabled=False``)
+                the preflight uses the position-cadence ``_available_balance``.
+            wallet_ws_max_age_seconds: Max age (s) of a provider peek the preflight
+                will trust before failing open (feature 0066 Phase 4).
         """
         # 0047: if a DB writer is wired, account_id MUST be explicitly set —
         # the dummy default would FK-mismatch with replay's account scope
@@ -292,6 +314,43 @@ class StrategyRunner:
             strategy_config.amount, instrument_info
         )
         self._wallet_balance: Decimal = Decimal("0")
+
+        # Feature 0066 (issue #159) — account-level balance/margin signal for
+        # the low-balance preflight + chase-close. Populated by
+        # on_position_update from the wallet snapshot; 0 = no data yet (the
+        # preflight fails open). `_available_balance` is the free-margin figure
+        # the preflight checks; the other two are observability.
+        self._available_balance: Decimal = Decimal("0")
+        self._total_available_balance: Decimal = Decimal("0")
+        self._total_maintenance_margin: Decimal = Decimal("0")
+        # Raw low-balance predicate (single source of truth, recomputed each
+        # on_position_update), shared by the moderate_liq_risk fix (3a) and
+        # chase-close (3b). Each consumer applies its own kill-switch.
+        self._low_balance: bool = False
+        # Chase-close state machine (feature 0066 / issue #159, default OFF).
+        # The decision runs in on_position_update (which holds no `limits`
+        # snapshot and never dispatches) and only appends intents to
+        # `_pending_chase_intents`; they are drained on the next dispatch tick.
+        self._chase_state: str = "IDLE"  # "IDLE" | "CHASING"
+        self._chase_direction: Optional[str] = None
+        self._chase_order: Optional[dict] = None  # {client_order_id, price, side}
+        self._pending_chase_intents: list[PlaceLimitIntent | CancelIntent] = []
+        # Per-direction live exchange leverage, captured in
+        # _build_position_state and used by the preflight's
+        # est_cost = qty*price/leverage. Kept SEPARATE from
+        # PositionState.leverage (which feeds the risk-multiplier upnl calc and
+        # must stay at its default to preserve backtest parity).
+        self._leverage: dict[str, float] = {}
+
+        # Feature 0066 Phase 4 — real-time wallet provider for the preflight.
+        # `_wallet_provider` is the non-blocking peek_wallet_snapshot reader (or
+        # None on the legacy / kill-switched path); `_wallet_ws_max_age_seconds`
+        # bounds how fresh a peek must be to be trusted (else fail-open).
+        self._wallet_provider = wallet_provider
+        self._wallet_ws_max_age_seconds = wallet_ws_max_age_seconds
+        # Monotonic timestamp of the last provider-error WARNING (throttle so a
+        # persistently-raising provider can't flood the log on the hot path).
+        self._last_wallet_provider_error_log: float = 0.0
 
         # Restore full grid if available and config matches
         restored_grid = self._load_grid_state()
@@ -570,6 +629,10 @@ class StrategyRunner:
             Exception: Re-raised after logging so orchestrator can handle notification.
         """
         try:
+            # Feature 0066 — drain any buffered chase-close intents first (they
+            # were decided in on_position_update, which holds no limits snapshot).
+            self._drain_pending_chase_intents()
+
             # Always pass ticker to engine (keeps last_close fresh for risk calcs)
             limit_orders = self.get_limit_orders()
             intents = self._engine.on_event(event, limit_orders)
@@ -619,6 +682,9 @@ class StrategyRunner:
             Exception: Re-raised after logging so orchestrator can handle notification.
         """
         try:
+            # Feature 0066 — drain buffered chase-close intents first.
+            self._drain_pending_chase_intents()
+
             # Reset the per-event phantom drop flag. _check_same_orders may
             # set it to True via _diagnostic_rest_check_executions when this
             # event is the WS_GLITCH-confirmed phantom side of a SAME ORDER
@@ -697,6 +763,9 @@ class StrategyRunner:
             Exception: Re-raised after logging so orchestrator can handle notification.
         """
         try:
+            # Feature 0066 — drain buffered chase-close intents first.
+            self._drain_pending_chase_intents()
+
             # Update tracked order status
             tracked = self._find_tracked_order(event.order_link_id, event.order_id)
             if tracked:
@@ -738,6 +807,9 @@ class StrategyRunner:
         short_position: Optional[dict],
         wallet_balance: float,
         last_close: Optional[float],
+        available_balance: Optional[float] = None,
+        total_available_balance: Optional[float] = None,
+        total_maintenance_margin: Optional[float] = None,
     ) -> None:
         """Update position state and recalculate multipliers.
 
@@ -746,6 +818,12 @@ class StrategyRunner:
             short_position: Short position data from exchange.
             wallet_balance: Current wallet balance.
             last_close: Current price, or None when no ticker has been seen yet.
+            available_balance: USDT free balance for new orders (feature 0066);
+                None (default) leaves the stored value unchanged so existing
+                callers/tests keep working and the preflight fails open.
+            total_available_balance: Account-level free margin (observability).
+            total_maintenance_margin: Account-level maintenance margin
+                (observability).
 
         Raises:
             Exception: Re-raised after logging so orchestrator can handle notification.
@@ -753,6 +831,15 @@ class StrategyRunner:
         try:
             # Store wallet balance for qty computation
             self._wallet_balance = Decimal(str(wallet_balance))
+
+            # Feature 0066 — store the account-level balance signal when the
+            # caller provides it (None defaults preserve old callers/tests).
+            if available_balance is not None:
+                self._available_balance = Decimal(str(available_balance))
+            if total_available_balance is not None:
+                self._total_available_balance = Decimal(str(total_available_balance))
+            if total_maintenance_margin is not None:
+                self._total_maintenance_margin = Decimal(str(total_maintenance_margin))
 
             # Build PositionState objects
             long_state = self._build_position_state(long_position, wallet_balance, DirectionType.LONG)
@@ -811,6 +898,22 @@ class StrategyRunner:
                 return
             price = float(last_close) if last_close is not None else 0.0
 
+            # Feature 0066 (issue #159) — low-balance predicate (single source of
+            # truth, shared by the moderate_liq_risk fix and chase-close). The 3a
+            # fix is gated by its own kill-switch here so that when disabled the
+            # multiplier calc is byte-for-byte the pre-0066 behavior (and backtest
+            # parity holds, since the backtest path never feeds available_balance).
+            total_position_value = Decimal("0")
+            if long_state:
+                total_position_value += long_state.position_value
+            if short_state:
+                total_position_value += short_state.position_value
+            self._low_balance = self._is_low_balance(total_position_value)
+            moderate_low_balance = (
+                self._low_balance
+                and self._config.moderate_liq_low_balance_fix_enabled
+            )
+
             # Reset both positions once before calculating (bbu2 pattern)
             self._long_position.reset_amount_multiplier()
             self._short_position.reset_amount_multiplier()
@@ -821,13 +924,13 @@ class StrategyRunner:
             if long_state:
                 opposite = short_state or PositionState(direction=DirectionType.SHORT)
                 self._long_position.calculate_amount_multiplier(
-                    long_state, opposite, price
+                    long_state, opposite, price, low_balance=moderate_low_balance
                 )
 
             if short_state:
                 opposite = long_state or PositionState(direction=DirectionType.LONG)
                 self._short_position.calculate_amount_multiplier(
-                    short_state, opposite, price
+                    short_state, opposite, price, low_balance=moderate_low_balance
                 )
 
             self._last_position_check = datetime.now(UTC)
@@ -837,8 +940,16 @@ class StrategyRunner:
             logger.info(
                 f"{self.strat_id}: Position update - ratio={position_ratio:.2f}, "
                 f"long_mult=Buy:{long_mult['Buy']:.2f}/Sell:{long_mult['Sell']:.2f}, "
-                f"short_mult=Buy:{short_mult['Buy']:.2f}/Sell:{short_mult['Sell']:.2f}"
+                f"short_mult=Buy:{short_mult['Buy']:.2f}/Sell:{short_mult['Sell']:.2f}, "
+                f"avail={self._available_balance:.2f} "
+                f"total_avail={self._total_available_balance:.2f} "
+                f"total_mm={self._total_maintenance_margin:.2f}"
             )
+
+            # Feature 0066 (issue #159) — chase-close decision (default OFF).
+            # Buffers intents only; the next dispatch tick drains them. Runs
+            # last so it sees the freshest ratio/balance/sizes.
+            self._evaluate_chase(price, position_ratio)
         except Exception as e:
             logger.error(f"{self.strat_id}: Error in on_position_update: {e}", exc_info=True)
             raise
@@ -940,6 +1051,20 @@ class StrategyRunner:
         # = the Bybit Web UI "Realized" column.
         cum_realized_pnl = float(position_data.get("cumRealisedPnl", 0) or 0)
         cur_realized_pnl = float(position_data.get("curRealisedPnl", 0) or 0)
+        # Bybit positionIM / positionMM: per-position Initial / Maintenance
+        # Margin in USDT (dollar amounts) — feature 0066 / issue #159.
+        initial_margin = Decimal(str(position_data.get("positionIM", 0) or 0))
+        maintenance_margin = Decimal(str(position_data.get("positionMM", 0) or 0))
+
+        # Capture live exchange leverage for the preflight est_cost (feature
+        # 0066). Stored OUT of PositionState.leverage so the risk-multiplier
+        # upnl calc (position.py) is unaffected and backtest parity holds.
+        lev_raw = position_data.get("leverage")
+        if lev_raw not in (None, ""):
+            try:
+                self._leverage[direction] = float(lev_raw)
+            except (TypeError, ValueError):
+                pass
 
         # Calculate margin
         size_d = Decimal(str(size))
@@ -955,6 +1080,8 @@ class StrategyRunner:
             margin=margin,
             liquidation_price=Decimal(str(liq_price)),
             position_value=position_value,
+            initial_margin=initial_margin,
+            maintenance_margin=maintenance_margin,
             cum_realized_pnl=Decimal(str(cum_realized_pnl)),
             cur_realized_pnl=Decimal(str(cur_realized_pnl)),
         )
@@ -1170,6 +1297,345 @@ class StrategyRunner:
             # Establish the REST baseline the WS gate consults for THIS episode.
             self._last_rest_position_size[direction] = new_size
 
+    def _predicate_available_balance(self) -> tuple[Decimal, bool]:
+        """Free margin for the low-balance PREDICATE (3a moderate_liq + 3b chase).
+
+        review F1 / Phase 4: align the predicate's freshness with the preflight by
+        reading the same non-blocking ``wallet_provider`` when wired, so chase and
+        preflight share one freshness (plan rollout §3 prerequisite). Returns
+        ``(available, authoritative)``:
+
+        - ``authoritative=True`` — a FRESH provider peek (``age <
+          wallet_ws_max_age_seconds``); its value is real even at 0 (no free
+          margin), so the caller treats 0 as the most extreme low-balance state.
+        - ``authoritative=False`` — the position-cadence ``_available_balance``
+          latch (provider absent / stale / raised); a 0 here means "no data yet"
+          and the caller must NOT trigger defenses on it.
+
+        Additive: no provider (unit tests / backtest / ``wallet_ws_enabled=False``)
+        returns the latch with ``authoritative=False`` — exact pre-Phase-4 behavior.
+        Never raises (a predicate read must not abort ``on_position_update``).
+        Note this is INTENTIONALLY different from the preflight's stale handling:
+        the preflight fails OPEN on a stale/None peek, whereas the predicate falls
+        back to the latch (its best-available position-cadence value).
+        """
+        if self._wallet_provider is not None:
+            try:
+                peek = self._wallet_provider()
+            except Exception:
+                peek = None  # provider error → fall back to the latch
+            if peek is not None:
+                snapshot, age = peek
+                if age < self._wallet_ws_max_age_seconds:
+                    return Decimal(str(snapshot.available_balance)), True
+        return self._available_balance, False
+
+    def _is_low_balance(self, total_position_value: Decimal) -> bool:
+        """Low-balance predicate (feature 0066 / issue #159).
+
+        Single source of truth shared by the moderate_liq_risk fix (3a) and
+        chase-close (3b). True when free margin is small relative to total
+        position value (``available < total_position_value *
+        low_balance_fraction``). The balance source shares the preflight's
+        freshness via ``_predicate_available_balance`` (review F1).
+
+        A FRESH provider 0 (genuinely no free margin) is the most extreme
+        low-balance state → True. A latch 0 (provider absent/stale) means "no
+        data yet" → False, so neither defense acts on stale/absent data. No
+        position to measure against → False.
+        """
+        avail, authoritative = self._predicate_available_balance()
+        if total_position_value <= 0:
+            return False
+        if avail <= 0:
+            return authoritative  # fresh 0 = real (low); latch 0 = no data (not)
+        frac = Decimal(str(self._config.low_balance_fraction))
+        return avail < total_position_value * frac
+
+    def _effective_leverage(self, direction: str) -> Decimal:
+        """Leverage for the preflight est_cost (feature 0066 / issue #159).
+
+        Prefer the live exchange leverage captured per-direction in
+        ``_build_position_state``; fall back to the conservative
+        ``assumed_leverage`` config when none has been observed. Bias LOW:
+        under-estimating leverage only over-rejects affordable opens, it never
+        lets an unaffordable one through.
+        """
+        lev = self._leverage.get(direction)
+        if lev is None or lev <= 0:
+            lev = self._config.assumed_leverage
+        return Decimal(str(lev))
+
+    def _preflight_available_balance(self, intent: PlaceLimitIntent) -> Optional[Decimal]:
+        """Resolve the free-margin figure the open-order preflight checks.
+
+        Returns the Decimal available balance to test against, or ``None`` to
+        FAIL OPEN (skip the check). Two paths (feature 0066 Phase 2 base + P4):
+
+        - **Provider wired (Phase 4):** read the non-blocking peek. A FRESH peek
+          (``age < wallet_ws_max_age_seconds``) is AUTHORITATIVE even at 0 (a
+          real "no free margin" signal that must block every open); a stale /
+          ``None`` / raising peek → fail-open. Never falls back to
+          ``_available_balance`` — the latch reads the same WS/REST caches and is
+          never fresher, so a stale peek means the latch is stale too. A raising
+          provider is caught (throttled WARNING) and must never abort dispatch.
+        - **No provider (legacy / ``wallet_ws_enabled=False``):** use the
+          position-cadence ``_available_balance``; ``> 0`` means data (check it),
+          ``<= 0`` means no data yet → fail-open.
+        """
+        if self._wallet_provider is not None:
+            try:
+                peek = self._wallet_provider()
+            except Exception as e:
+                now = self._clock()
+                if now - self._last_wallet_provider_error_log >= 60.0:
+                    self._last_wallet_provider_error_log = now
+                    logger.warning(
+                        "%s: wallet_provider raised (%s); preflight fails open",
+                        self.strat_id, e,
+                    )
+                return None  # a balance read must never abort order dispatch
+            if peek is None:
+                return None  # no cached snapshot → fail-open
+            snapshot, age = peek
+            if age >= self._wallet_ws_max_age_seconds:
+                # Stale → fail-open. Do NOT trust the stale peek and do NOT fall
+                # back to the (equally-stale) _available_balance latch.
+                return None
+            # Fresh: authoritative, even when 0 (no free margin → blocks opens).
+            return Decimal(str(snapshot.available_balance))
+
+        # No provider: legacy position-cadence latch; 0 = no data yet → fail-open.
+        avail = self._available_balance
+        if avail <= 0:
+            return None
+        return avail
+
+    def _preflight_blocks_open(self, intent: PlaceLimitIntent) -> bool:
+        """True if this OPEN order is unaffordable and must be blocked locally.
+
+        Caller gates on ``not intent.reduce_only`` and
+        ``preflight_balance_check_enabled``. Resolves the balance source via
+        ``_preflight_available_balance`` (fail-open → ``None`` → not blocked),
+        then applies the leverage-adjusted ``est_cost`` + buffer affordability
+        test (``est_cost = qty*price/leverage``; over-conservative leverage only
+        ever over-rejects, never lets an unaffordable open through).
+        """
+        avail = self._preflight_available_balance(intent)
+        if avail is None:
+            logger.debug(
+                "%s: preflight skipped (no fresh balance data) for %s %s",
+                self.strat_id, intent.direction, intent.side,
+            )
+            return False
+        leverage = max(self._effective_leverage(intent.direction), Decimal("1"))
+        est_cost = (intent.qty * intent.price) / leverage
+        buffer = Decimal(str(self._config.preflight_balance_buffer))
+        if avail < est_cost * (Decimal("1") + buffer):
+            # DEBUG, not INFO: this fires once per blocked open intent on the hot
+            # dispatch path, and by design fires for every unaffordable grid level
+            # on every ticker tick for the whole duration of the low-balance state
+            # (a blocked open never rests, so it is re-emitted next tick). INFO
+            # here would be sustained log spam precisely during the storm. Matches
+            # every sibling per-intent drop (qty<=0 / 110017 breaker / the generic
+            # `_is_good_to_place` rejection), all DEBUG. The low-balance state stays
+            # observable at INFO via the per-tick `Position update` heartbeat
+            # (avail= / total_avail=).
+            logger.debug(
+                "%s: LowBalanceSkip %s %s qty=%s price=%s "
+                "est_cost=%.4f avail=%.4f buffer=%s",
+                self.strat_id, intent.direction, intent.side,
+                intent.qty, intent.price, float(est_cost),
+                float(avail), buffer,
+            )
+            return True
+        return False
+
+    # ---- Feature 0066 (issue #159) — chase-close active defense (default OFF) ----
+
+    def _drain_pending_chase_intents(self) -> None:
+        """Dispatch chase intents buffered by on_position_update.
+
+        Called at the top of on_ticker / on_execution / on_order_update — the
+        only sites that hold a `limits` snapshot and call _execute_intents. The
+        buffer is reused through the existing dispatch path (cancel-before-place,
+        per-place limits refresh, reduce-only guard) with zero new dispatch code.
+        """
+        if not self._pending_chase_intents:
+            return
+        buffered = self._pending_chase_intents
+        self._pending_chase_intents = []
+        self._execute_intents(buffered, self.get_limit_orders())
+
+    def _dominant_size(self, direction: str) -> Decimal:
+        return (self._long_position.size if direction == DirectionType.LONG
+                else self._short_position.size)
+
+    def _evaluate_chase(self, price: float, position_ratio: float) -> None:
+        """Chase-close decision. Mutates chase state + appends intents to the
+        buffer ONLY (never dispatches — on_position_update has no limits)."""
+        if not self._config.chase_close_enabled or price <= 0:
+            return
+        thr = self._config.chase_position_ratio_threshold
+        if thr <= 0:
+            return
+        hyst = self._config.chase_close_hysteresis
+
+        dominant: Optional[str] = None
+        if self._low_balance:
+            if position_ratio > thr:
+                dominant = DirectionType.LONG
+            elif position_ratio < (1.0 / thr):
+                dominant = DirectionType.SHORT
+
+        if self._chase_state == "IDLE":
+            if dominant is not None:
+                self._enter_chase(dominant, price)
+            return
+
+        # CHASING — exit if conditions cleared, else re-peg on drift.
+        if self._should_exit_chase(position_ratio, thr, hyst):
+            self._exit_chase()
+            return
+        self._repeg_chase_if_drifted(price)
+
+    def _build_chase_order(
+        self, direction: str, close_side: str, price: float, size: Decimal
+    ) -> Optional[PlaceLimitIntent]:
+        """Build a reduce-only, post-only close near the touch for the dominant
+        side. Maker-safe pricing (Sell above / Buy below) so post-only never
+        crosses/rejects. Qty is half the dominant size (rounded to qty_step),
+        which stays strictly below position_size so the reduce-only guard passes."""
+        offset = Decimal(str(self._config.chase_offset_pct))
+        p = Decimal(str(price))
+        chase_price = (p * (Decimal("1") + offset) if close_side == "Sell"
+                       else p * (Decimal("1") - offset))
+        qty = size / Decimal("2")
+        if self._instrument_info:
+            chase_price = self._instrument_info.round_price(chase_price)
+            qty = self._instrument_info.round_qty(qty)
+            if qty < self._instrument_info.min_qty:
+                return None
+        if qty <= 0 or qty >= size:
+            return None
+        return PlaceLimitIntent.create(
+            symbol=self._config.symbol, side=close_side, price=chase_price,
+            qty=qty, grid_level=-1, direction=direction,
+            reduce_only=True, post_only=True,
+        )
+
+    def _enter_chase(self, direction: str, price: float) -> None:
+        size = self._dominant_size(direction)
+        if size <= 0:
+            return  # nothing to trim
+        chase = self._build_chase_order(
+            direction, "Sell" if direction == DirectionType.LONG else "Buy", price, size
+        )
+        if chase is None:
+            return  # position too small to trim safely
+        # Cancel resting grow-side opens for the dominant direction (stop adding
+        # to the side we are trying to shrink). This is a deliberate,
+        # balance-driven cancel — distinct from the forward-only multiplier rule.
+        grow_side = "Buy" if direction == DirectionType.LONG else "Sell"
+        for tracked in list(self._tracked_orders.values()):
+            ti = tracked.intent
+            if (tracked.status == "placed" and tracked.order_id and ti is not None
+                    and not ti.reduce_only and ti.direction == direction
+                    and ti.side == grow_side):
+                self._pending_chase_intents.append(CancelIntent(
+                    symbol=self._config.symbol, order_id=tracked.order_id,
+                    reason="chase_close", price=ti.price, side=ti.side,
+                ))
+        self._pending_chase_intents.append(chase)
+        self._chase_state = "CHASING"
+        self._chase_direction = direction
+        self._chase_order = {
+            "client_order_id": chase.client_order_id,
+            "price": chase.price,
+            "side": chase.side,
+        }
+        logger.info(
+            "%s: chase-close ENTER %s close=%s price=%s qty=%s",
+            self.strat_id, direction, chase.side, chase.price, chase.qty,
+        )
+
+    def _should_exit_chase(self, position_ratio: float, thr: float, hyst: float) -> bool:
+        if not self._low_balance:
+            return True
+        d = self._chase_direction
+        if d is None or self._dominant_size(d) <= 0:
+            return True  # dominant position flat
+        if d == DirectionType.LONG:
+            return position_ratio < thr * (1.0 - hyst)
+        return position_ratio > (1.0 / thr) * (1.0 + hyst)
+
+    def _retire_live_chase_order(self, reason: str) -> None:
+        """Retire the current chase order on exit / re-peg.
+
+        Two cases (a chase decision can fire on several `on_position_update`s
+        before the next dispatch tick drains the buffer):
+        - the chase place is still BUFFERED (never dispatched) → just drop it
+          from the buffer; there is nothing resting on the exchange. Without
+          this it would dispatch and rest as an orphan after the state machine
+          has already moved on.
+        - the chase order was already DISPATCHED and is resting → cancel it by
+          exchange order_id.
+        """
+        if not self._chase_order:
+            return
+        coid = self._chase_order["client_order_id"]
+        before = len(self._pending_chase_intents)
+        self._pending_chase_intents = [
+            i for i in self._pending_chase_intents
+            if not (isinstance(i, PlaceLimitIntent) and i.client_order_id == coid)
+        ]
+        if len(self._pending_chase_intents) != before:
+            return  # was still buffered → dropped, nothing to cancel on-exchange
+        tracked = self._tracked_orders.get(coid)
+        if tracked and tracked.order_id and tracked.status == "placed":
+            self._pending_chase_intents.append(CancelIntent(
+                symbol=self._config.symbol, order_id=tracked.order_id,
+                reason=reason, price=self._chase_order["price"],
+                side=self._chase_order["side"],
+            ))
+
+    def _repeg_chase_if_drifted(self, price: float) -> None:
+        if not self._chase_order:
+            return
+        ref = self._chase_order["price"]
+        if ref <= 0:
+            return
+        rel = abs(Decimal(str(price)) - ref) / ref
+        if rel <= Decimal(str(self._config.chase_replace_drift_pct)):
+            return
+        # Cancel-replace the chase order ONLY (explicitly exempt from the
+        # forward-only invariant — it acts on its own order, not grid orders).
+        self._retire_live_chase_order("chase_replace")
+        size = self._dominant_size(self._chase_direction)
+        new_chase = self._build_chase_order(
+            self._chase_direction, self._chase_order["side"], price, size
+        )
+        if new_chase is None:
+            self._exit_chase()
+            return
+        self._pending_chase_intents.append(new_chase)
+        self._chase_order = {
+            "client_order_id": new_chase.client_order_id,
+            "price": new_chase.price,
+            "side": new_chase.side,
+        }
+        logger.info(
+            "%s: chase-close REPEG %s price=%s",
+            self.strat_id, self._chase_direction, new_chase.price,
+        )
+
+    def _exit_chase(self) -> None:
+        self._retire_live_chase_order("chase_exit")
+        logger.info("%s: chase-close EXIT %s", self.strat_id, self._chase_direction)
+        self._chase_state = "IDLE"
+        self._chase_direction = None
+        self._chase_order = None
+
     def _is_good_to_place(self, intent: PlaceLimitIntent, limits: dict[str, list[dict]]) -> bool:
         """Check if order can be placed (exact-duplicate + reduce-only checks).
 
@@ -1204,6 +1670,16 @@ class StrategyRunner:
             # Sum reduce_only qty for position-size check
             if order['reduceOnly'] and order['side'] == close_side:
                 reduce_only_qty += Decimal(str(order['qty']))
+
+        # Feature 0066 (issue #159) — low-balance preflight for OPEN orders.
+        # Reject locally an open order the account can't afford so Bybit never
+        # returns 110007 and the retry queue is never fed (the storm). Reduce-only
+        # orders are exempt (they free margin) and fall through to the existing
+        # reduce-only guard below.
+        if (not intent.reduce_only
+                and self._config.preflight_balance_check_enabled
+                and self._preflight_blocks_open(intent)):
+            return False
 
         if not intent.reduce_only:
             return True
@@ -1339,6 +1815,25 @@ class StrategyRunner:
             return
 
         tracked.mark_failed()
+
+        # Feature 0066 (issue #159) — 110007 "available balance not enough" on an
+        # OPEN order: do NOT enqueue to the retry queue. A boundary race (balance
+        # moved between the preflight read and submit) can still surface 110007;
+        # retrying the same/grown qty against the same exhausted balance just
+        # re-storms. Drop it (log once) — the preflight re-gates on the next tick
+        # once balance recovers. Mirrors the 0064 "do NOT enqueue 110017"
+        # decision. Scoped to OPEN orders (not reduce_only) to match the spec —
+        # reduce-only closes do not 110007 (Bybit accepts them under exhausted
+        # balance), so a reduce-only failure here is some other condition and
+        # keeps the normal retry path rather than being silently dropped.
+        # Stateless: no breaker.
+        if not intent.reduce_only and is_insufficient_balance(result.error):
+            logger.warning(
+                "%s: 110007 available-balance-not-enough on %s %s @ %s — "
+                "dropping (not enqueued); preflight re-gates next tick",
+                self.strat_id, intent.direction, intent.side, intent.price,
+            )
+            return
 
         if not is_truncate_error(result.error):
             # Non-110017 failure → existing retry-queue behaviour (feature 0032

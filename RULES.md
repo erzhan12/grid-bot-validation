@@ -343,6 +343,151 @@ Pitfalls / invariants (all enforced + tested):
   `test_truncate_breaker.py`, `test_runner_truncate_storm.py`,
   `TestForcedReconcile` in `test_orchestrator.py`.
 
+### 110007 low-balance preflight + chase-close (feature 0066, issue #159)
+
+Defends against the **110007 "available balance not enough"** retry storm that
+hit under a low-balance + long-heavy state (the risk-mgmt rule grew the losing
+short with mult=2.0; the grown open exceeded free margin → 110007 every attempt
+→ retry-queue amplification). Three layers + a bug-fix, all additive:
+
+- **Margin observability (default-on, no behavior change).**
+  `position_fetcher.WalletSnapshot` carries `available_balance` /
+  `total_available_balance` / `total_maintenance_margin` (extracted from the
+  same `get_wallet_balance()` REST response — **no extra API call**; the
+  `_wallet_cache` now holds the snapshot, `get_wallet_balance` reads
+  `.wallet_balance`). `PositionState` gains `initial_margin`/`maintenance_margin`
+  (Bybit `positionIM`/`positionMM`, **dollar amounts** — kept SEPARATE from the
+  `margin` ratio, see "Margin Ratio vs Bybit positionIM — Critical Distinction").
+  The per-tick `Position
+  update` INFO heartbeat is **extended** (not changed) with `avail=` /
+  `total_avail=` / `total_mm=`; the gridbot-health analyzer parses those and
+  tracks a `min_available_balance` all-time peak.
+  - **UTA empty-string trap**: Bybit mainnet sends `""` for unused numeric
+    fields (`availableToWithdraw` on cross-margin). Parse with
+    `position_fetcher._float_or_zero` (None/`""` → 0.0); `.get(k, 0)` only
+    handles *missing* keys.
+  - **`available_balance` fallback chain** (`_snapshot_from_wallet_account_row`):
+    prefer the UTA-v5 per-coin `availableToWithdraw`; when it is absent/empty,
+    fall back to the **legacy `availableBalance`** coin field (UTA 1.0 / some
+    cross-margin coins surface free margin only there — **must mirror
+    `recorder.py:404-408`** so the two parsers can't drift); then fall back to the
+    account-level `total_available_balance`. Missing this legacy field would let a
+    funded account parse free margin as 0 → on the provider path a fresh 0 blocks
+    ALL opens (halts trading), on the no-provider path it fail-opens.
+- **Preflight balance check (default-on, the storm-stopper).** In
+  `_is_good_to_place`, BEFORE the `if not intent.reduce_only: return True`
+  early-return: for OPEN orders only, reject locally when
+  `available_balance < (qty*price/leverage) * (1 + buffer)`. **Reduce-only
+  always bypasses** (frees margin, can't 110007). **Fail-open** when
+  `available_balance <= 0` (no data yet) — never block all opens on a transient
+  gap. Leverage via `_effective_leverage(direction)`: live per-direction
+  leverage (captured in `_build_position_state` into `self._leverage`, kept OUT
+  of `PositionState.leverage` so the risk-multiplier upnl calc + backtest parity
+  are untouched) else `assumed_leverage`. Bias leverage LOW — under-estimating
+  only over-rejects affordable opens, never lets an unaffordable one through.
+- **Retry-queue 110007 guard (default-on).** In `_execute_place_intent`, a
+  110007 on an open order is **dropped, not enqueued** (mirrors the 0064 "do NOT
+  enqueue 110017" decision). It is **stateless — no breaker, no cooldown**; the
+  preflight re-gates on the next tick once balance recovers. `INSUFFICIENT_BALANCE
+  = 110007` + `executor.is_insufficient_balance()` (sibling of
+  `is_truncate_error`).
+- **moderate_liq_risk bug-fix (3a, default-on).** Under low-balance the
+  `moderate_liq_risk` arm SKIPS the 0.5 close-throttle (`position.py`, both long
+  and short branches) — that throttle slowed the margin-freeing closes and
+  deadlocked the bot. `low_balance` is threaded into `calculate_amount_multiplier`
+  + the rule helpers (default False = byte-for-byte pre-0066). The kill-switch
+  (`moderate_liq_low_balance_fix_enabled`) is applied in the RUNNER (it passes
+  `low_balance=False` when off) because `position.py` is gridcore and cannot read
+  gridbot config. This deviates from the bbu2-derived rule ONLY under the new
+  low-balance condition.
+- **Chase-close (3b, default-OFF).** When low-balance AND `position_ratio`
+  extreme, cancel resting grow-side opens for the dominant side and place a
+  reduce-only **post-only** close near the touch to trim it without slippage.
+  Post-only support is new and additive: `PlaceLimitIntent.post_only`
+  (`compare=False`, NOT in `_IDENTITY_PARAMS` → id/dedup unchanged), threaded
+  via `executor.execute_place` → `rest_client.place_order(time_in_force=...)`
+  (default `"GTC"` == today's implicit behavior).
+  - **Dispatch — stash-and-drain**: `on_position_update` holds no `limits`
+    snapshot and never dispatches, so the chase decision only mutates state +
+    appends to `self._pending_chase_intents`; `_drain_pending_chase_intents()`
+    at the top of `on_ticker`/`on_execution`/`on_order_update` feeds the buffer
+    through the existing `_execute_intents(..., get_limit_orders())`.
+  - State machine `IDLE→CHASING→IDLE`. Maker-safe pricing: **Sell above / Buy
+    below** the touch (post-only never crosses — note this is the OPPOSITE of an
+    aggressive taker peg). Chase qty is half the dominant size (rounded), kept
+    strictly below position size so the reduce-only guard passes. Cancel-replace
+    on drift acts on the chase order ONLY — explicitly exempt from the
+    forward-only `amount_multiplier` invariant (it is not a grid order). Exit
+    has hysteresis (`chase_close_hysteresis`) to avoid flapping.
+- **Single source of truth**: `_is_low_balance(total_position_value)` (avail > 0
+  AND avail < total_position_value * `low_balance_fraction`), recomputed each
+  `on_position_update` into `self._low_balance`; 3a and 3b each apply their own
+  kill-switch on top.
+- **Real-time wallet feed (Phase 4, default-on).** The preflight's free-margin
+  signal would otherwise lag up to `wallet_cache_interval` (300s, REST-cached),
+  so the bot subscribes the private WS **`wallet`** topic (account-level free
+  margin — `totalAvailableBalance` / per-coin `availableToWithdraw` — is NOT in
+  the `position` topic, which carries only per-position `positionIM`/`positionMM`).
+  `ws_client` already supports `on_wallet`; orchestrator just wires it.
+  - `position_fetcher._wallet_ws_data[acct] = (snapshot, ts)` is written ONLY by
+    `on_wallet_message` on the **WS thread** (single GIL-atomic assignment, no
+    lock, mirrors `_position_ws_data`); it NEVER touches `_wallet_cache` (the
+    main-thread-guarded REST cache). `on_wallet_message` **never raises on the WS
+    thread** and validates **structurally** (needs `data[0]` + a USDT coin row) —
+    a valid row is written **even when `available_balance==0`** (a funded account
+    with no free margin is a REAL signal; do NOT use an all-zero skip heuristic).
+  - **Shared parser** `_snapshot_from_wallet_account_row(row)` (returns `None` on
+    no-USDT) is called by BOTH `_fetch_wallet_snapshot` (REST `list[0]`) and
+    `on_wallet_message` (WS `data[0]`) — same V5 shape, one parser, no field drift.
+  - **Hot path uses `peek_wallet_snapshot(acct) -> (snapshot, age) | None`**:
+    non-blocking, NEVER fetches, returns the **newest of {WS slot, REST cache} by
+    timestamp** (a stale WS slot must NOT shadow a fresher REST entry). The
+    background `get_wallet_snapshot` keeps its WS-if-fresh-else-REST(-fetch) form;
+    only `peek` feeds the preflight (injected as the runner `wallet_provider`).
+  - **Preflight balance source = freshness, not positivity.** Provider wired: a
+    FRESH peek (`age < wallet_ws_max_age_seconds`) is **authoritative even at 0**
+    (fresh-zero blocks every open); a stale / `None` / **raising** peek →
+    **fail-open** (never falls back to the equally-stale `_available_balance`
+    latch; a raising provider is caught + throttled-WARNING and never aborts
+    dispatch). No provider (kill-switch off / unit tests) → legacy
+    `_available_balance` path with the `>0`-means-data rule. Logic lives in
+    `runner._preflight_available_balance` / `_preflight_blocks_open`.
+  - **`wallet_ws_enabled=False` is a FULL kill-switch**: skips BOTH the `on_wallet`
+    wiring AND the `wallet_provider` injection → genuine pre-Phase-4 behavior
+    (position-cadence balance, REST TTL, no age-bounding, no fail-open-on-stale).
+    Not "WS off but REST still age-bounded".
+  - Caveat: staleness is **bounded to `wallet_ws_max_age_seconds`, then
+    fail-open** — NOT "eliminated". The INFO `avail=` heartbeat is written on the
+    position-drain cadence and is NOT a reliable WS-freshness signal; validate via
+    the **DEBUG WS-vs-REST source/age log** emitted at every `get_wallet_snapshot`
+    return path (`served from WS (age=…)` / `served from REST …`).
+  - **Predicate freshness (review F1):** the low-balance PREDICATE
+    (`_is_low_balance`, used by 3a moderate_liq + 3b chase) reads the SAME
+    `wallet_provider` peek as the preflight via `_predicate_available_balance`
+    (fresh peek authoritative — a fresh 0 = real no-free-margin = low-balance;
+    stale/None/raising → falls back to the position-cadence `_available_balance`
+    latch, where a 0 still means "no data"). So chase and preflight now share one
+    freshness — this resolves the plan rollout §3 chase-enable prerequisite.
+    Additive: no provider (backtest / `wallet_ws_enabled=False`) keeps the exact
+    pre-Phase-4 latch behavior.
+- Config — **`GridbotConfig`** (Phase 4, not `StrategyConfig`):
+  `wallet_ws_enabled` (True), `wallet_ws_max_age_seconds` (45.0, `gt=0`).
+- Config (`StrategyConfig`, all default preserve behavior):
+  `preflight_balance_check_enabled` (True), `preflight_balance_buffer` (0.05),
+  `assumed_leverage` (1.0), `low_balance_fraction` (0.10),
+  `moderate_liq_low_balance_fix_enabled` (True), `chase_close_enabled` (**False**),
+  `chase_position_ratio_threshold` (5.0), `chase_offset_pct` (0.0007),
+  `chase_replace_drift_pct` (0.0010), `chase_close_hysteresis` (0.1).
+- Files touched: `position.py`, `intents.py`, `error_codes.py`,
+  `rest_client.py`, `runner.py`, `position_fetcher.py`, `orchestrator.py`,
+  `executor.py`, `config.py`, gridbot-health `analyze.py`. Tests:
+  `test_runner_lowbalance_storm.py`, `test_position_low_balance.py`, plus 3b.0
+  surface in `test_intents.py` / `test_executor.py` / `test_rest_client.py`; Phase-4
+  WS-wallet/peek/provider surface in `test_position_fetcher.py` /
+  `test_runner_lowbalance_storm.py` / `test_orchestrator.py`.
+  Promote `chase_close_enabled` to on only after one live low-balance stress
+  event confirms the dominant side decreases without market-order slippage.
+
 ### SAME ORDER detection
 
 - `StrategyRunner._check_same_orders_side()` compares tracked orders by `TrackedOrder.placed_ts` when both fills map to tracked orders; use fill `exchange_ts` only as a fallback for untracked/legacy events. Duplicate same-price orders can rest concurrently and fill more than 5s apart in thin markets, so fill-time-only windows silently miss the critical duplicate-placement bug.

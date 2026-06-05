@@ -391,6 +391,23 @@ class TestPlaceOrder:
         call_kwargs = mock_session.place_order.call_args[1]
         assert call_kwargs["reduceOnly"] is True
 
+    def test_time_in_force_defaults_to_gtc(self, client, mock_session):
+        """Feature 0066: omitted time_in_force → GTC (today's implicit behavior)."""
+        mock_session.place_order.return_value = _ok_response({"orderId": "o1"})
+        client.place_order(
+            symbol="BTCUSDT", side="Buy", order_type="Limit", qty="0.1", price="100000",
+        )
+        assert mock_session.place_order.call_args[1]["timeInForce"] == "GTC"
+
+    def test_time_in_force_postonly_threads_through(self, client, mock_session):
+        """Feature 0066: time_in_force='PostOnly' reaches params['timeInForce']."""
+        mock_session.place_order.return_value = _ok_response({"orderId": "o1"})
+        client.place_order(
+            symbol="BTCUSDT", side="Sell", order_type="Limit", qty="0.1",
+            price="100000", time_in_force="PostOnly",
+        )
+        assert mock_session.place_order.call_args[1]["timeInForce"] == "PostOnly"
+
     def test_api_error_raises(self, client, mock_session):
         mock_session.place_order.return_value = _error_response(110001, "Insufficient balance")
 
