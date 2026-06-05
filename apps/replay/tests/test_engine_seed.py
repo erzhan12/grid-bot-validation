@@ -464,6 +464,66 @@ class TestReplayEngineSeedingPipeline:
             "grid seed source=db" in rec.message for rec in caplog.records
         )
 
+    def test_load_seed_uses_active_gridbot_run_when_account_scope_misses(
+        self, seeded_db, replay_config, seed_ts, snapshot_ts, mock_instrument,
+    ):
+        """Legacy/shared Phase 4: grid snapshots may use a different account_id.
+
+        When ``seed.account_id`` matches recorder rows but not the gridbot
+        writer's ``account_id``, the account-scoped lookup misses and must not
+        fall through to ``grid_state_path`` while a live/shadow row exists.
+        """
+        live_grid = [
+            {"side": "Buy", "price": 91000.0},
+            {"side": "Buy", "price": 91200.0},
+            {"side": "Sell", "price": 91600.0},
+            {"side": "Sell", "price": 91800.0},
+        ]
+        with seeded_db.get_session() as session:
+            live_user = User(user_id="live-user", username="live-gridbot")
+            live_account = BybitAccount(
+                account_id="live-acc",
+                user_id="live-user",
+                account_name="gridbot_account",
+                environment="testnet",
+            )
+            live_strategy = Strategy(
+                strategy_id="live-strat",
+                account_id="live-acc",
+                strategy_type="GridStrategy",
+                symbol=SYMBOL,
+                config_json={"strat_id": STRAT_ID},
+            )
+            live_run = Run(
+                run_id="live-grid-run",
+                user_id="live-user",
+                account_id="live-acc",
+                strategy_id="live-strat",
+                run_type="live",
+                status="running",
+                start_ts=seed_ts - timedelta(minutes=10),
+                end_ts=seed_ts + timedelta(hours=1),
+            )
+            session.add_all([live_user, live_account, live_strategy, live_run])
+            session.flush()
+            GridStateSnapshotRepository(session).insert(
+                GridStateSnapshot(
+                    run_id="live-grid-run", account_id="live-acc", strat_id=STRAT_ID,
+                    symbol=SYMBOL,
+                    exchange_ts=snapshot_ts, local_ts=snapshot_ts,
+                    grid_json=live_grid, grid_step=Decimal("0.2"), grid_count=4,
+                    raw_fingerprint=grid_fingerprint_hash(live_grid, 0.2, 4),
+                )
+            )
+            session.commit()
+
+        engine = ReplayEngine(config=replay_config, db=seeded_db)
+        run_id, *_ = engine._resolve_run(replay_config)
+        _, _, _, grid_seed, _ = engine._load_seed(replay_config, run_id)
+        assert grid_seed is not None
+        assert grid_seed.grid == live_grid
+        assert grid_seed.grid[0]["price"] == 91000.0
+
     def test_load_seed_falls_back_to_file_when_no_db_snapshot(
         self, seeded_db, replay_config, mock_instrument,
     ):

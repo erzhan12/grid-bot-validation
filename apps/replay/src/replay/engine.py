@@ -67,6 +67,7 @@ from replay.snapshot_loader import (
     load_active_orders,
     load_collateral_seed,
     load_grid_state,
+    load_grid_state_from_active_snapshots,
     load_grid_state_from_snapshots,
     load_position_snapshots,
     load_wallet_seed_full,
@@ -885,6 +886,17 @@ class ReplayEngine:
                 expected_count=config.strategy.grid_count,
             )
             grid_source: Optional[str] = "db" if grid_seed is not None else None
+            if grid_seed is None:
+                grid_seed = load_grid_state_from_active_snapshots(
+                    db_session,
+                    seed.strat_id,
+                    config.symbol,
+                    seed.at_ts,
+                    expected_step=config.strategy.grid_step,
+                    expected_count=config.strategy.grid_count,
+                )
+                if grid_seed is not None:
+                    grid_source = "db"
             if grid_seed is None and seed.grid_state_path is not None:
                 grid_seed = load_grid_state(
                     GridStateStore(file_path=seed.grid_state_path),
