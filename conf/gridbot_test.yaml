@@ -10,7 +10,7 @@ strategies:
     symbol: LTCUSDT
     tick_size: "0.1"
     grid_count: 20
-    grid_step: 0.2
+    grid_step: 0.4
     amount: "x0.0005"
     max_margin: 5.0
     # Continuous own-side x2 boost while equal positions AND total_margin < 3.
