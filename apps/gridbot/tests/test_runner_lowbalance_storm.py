@@ -1125,6 +1125,27 @@ def test_low_balance_skip_summary_emits_via_drain_hook(lb_runner, lb_clock, capl
     assert "total=1" in summ[0].getMessage()
 
 
+def test_low_balance_skip_summary_baseline_is_construction_clock(
+    strategy_config, mock_executor, instrument_info, caplog
+):
+    """Regression (review P2): _skip_summary_last_emit baselines to the clock AT
+    CONSTRUCTION, not 0.0. Production self._clock is time.monotonic (a large
+    value); a 0.0 baseline is only saved from an immediate first-skip flush by the
+    first drain's empty-window advance — fragile. This locks the explicit baseline:
+    construct at a high clock, record a skip, then emit DIRECTLY (no intervening
+    empty-window drain) → no flush until a full interval has actually elapsed."""
+    clk = _FakeClock(1000.0)
+    r = _make_runner(strategy_config, mock_executor, instrument_info, clk)
+    assert r._skip_summary_last_emit == 1000.0  # baselined to construction, not 0.0
+    with caplog.at_level("INFO"):
+        r._preflight_blocks_open(_open_short("100.0", "1.0"))  # window has 1 skip
+        r._emit_skip_summary()                                  # 1000-1000=0 < 60 → no flush
+        assert _info_lines(caplog, "window:") == []
+        clk.t = 1061.0
+        r._emit_skip_summary()                                  # full interval → flush
+    assert len(_info_lines(caplog, "window:")) == 1
+
+
 # ---- Acceptance criterion — both kill-switches off restore current behavior ----
 
 def test_low_balance_skip_killswitches_off_preserve_debug(

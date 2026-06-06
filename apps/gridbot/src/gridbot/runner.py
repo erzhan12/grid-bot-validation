@@ -371,7 +371,11 @@ class StrategyRunner:
         self._skip_window: dict[tuple[str, str], int] = {}
         self._skip_window_avail_min: Optional[float] = None
         self._skip_window_avail_max: Optional[float] = None
-        self._skip_summary_last_emit: float = 0.0
+        # Baseline the first summary window to construction time, NOT 0.0:
+        # production self._clock is time.monotonic (a large value), so a 0.0
+        # baseline would make `now - last_emit >= interval` true on the very
+        # first skip and flush a mislabeled "<interval>s window" after one tick.
+        self._skip_summary_last_emit: float = self._clock()
 
         # Restore full grid if available and config matches
         restored_grid = self._load_grid_state()
