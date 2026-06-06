@@ -100,3 +100,8 @@ apps/pnl_checker/src/pnl_checker/output/
 conf/instruments_cache.json
 conf/risk_limits_cache.json
 /keys.yaml
+
+# Incident captures: ignore the heavy raw .jsonl log slices (0.9–36 MB each,
+# regenerable from the recorder). The small .summary.md post-mortems and the
+# compressed .jsonl.gz archives stay tracked as the durable record.
+docs/incidents/*.jsonl
