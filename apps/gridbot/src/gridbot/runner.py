@@ -352,6 +352,27 @@ class StrategyRunner:
         # persistently-raising provider can't flood the log on the hot path).
         self._last_wallet_provider_error_log: float = 0.0
 
+        # Feature 0067 (issue #164) — suppress LowBalanceSkip log spam. Under a
+        # sustained low-balance regime the stateless preflight re-rejects the
+        # same N grid levels every tick (~10/s), so the per-intent DEBUG line
+        # floods the log (~2.1M/day). Instead we log only the ENTER/EXIT edges
+        # of the regime (per (direction, side)) at INFO and a periodic summary.
+        # Plain dict ops on the single-threaded dispatch path: no Bybit calls,
+        # no asyncio task (the summary + edge reconcile flush on the existing
+        # dispatch cadence via _drain_pending_chase_intents using self._clock()).
+        # `_skip_state`: per-key sustained-regime record (survives across ticks).
+        # `_skip_tick_seen`: per-sample scratch (keys evaluated with FRESH
+        #   balance this dispatch; written only when transition logging is on,
+        #   cleared unconditionally each reconcile).
+        # `_skip_window` (+ avail band): per-summary-window skip counts,
+        #   incremented unconditionally on every genuine skip.
+        self._skip_state: dict[tuple[str, str], dict] = {}
+        self._skip_tick_seen: dict[tuple[str, str], dict] = {}
+        self._skip_window: dict[tuple[str, str], int] = {}
+        self._skip_window_avail_min: Optional[float] = None
+        self._skip_window_avail_max: Optional[float] = None
+        self._skip_summary_last_emit: float = 0.0
+
         # Restore full grid if available and config matches
         restored_grid = self._load_grid_state()
 
@@ -1421,8 +1442,21 @@ class StrategyRunner:
         test (``est_cost = qty*price/leverage``; over-conservative leverage only
         ever over-rejects, never lets an unaffordable open through).
         """
+        # Feature 0067 — the affordability DECISION below is unchanged; this
+        # method now also records per-(direction, side) skip evidence so the
+        # sustained-skip regime can be logged at its edges (ENTER/EXIT) instead
+        # of one DEBUG line per blocked grid level per tick. THREE return points,
+        # all preserved:
         avail = self._preflight_available_balance(intent)
         if avail is None:
+            # (0) Fail-open: no fresh balance data (no provider + non-positive
+            # latch, provider raised, or a stale WS peek). The order is allowed
+            # through, so this is NOT a skip: state-neutral AND evidence-neutral
+            # — no _skip_state mutation, no _skip_window increment, and no
+            # _skip_tick_seen write (a fail-open carries no affordability verdict,
+            # so it must neither create nor satisfy an EXIT for the key). Leaving
+            # the key absent from the scratch is what preserves a sibling key's
+            # genuine fresh skip recorded in the same sample (Medium-3).
             logger.debug(
                 "%s: preflight skipped (no fresh balance data) for %s %s",
                 self.strat_id, intent.direction, intent.side,
@@ -1431,25 +1465,177 @@ class StrategyRunner:
         leverage = max(self._effective_leverage(intent.direction), Decimal("1"))
         est_cost = (intent.qty * intent.price) / leverage
         buffer = Decimal(str(self._config.preflight_balance_buffer))
+        key = (intent.direction, intent.side)
         if avail < est_cost * (Decimal("1") + buffer):
-            # DEBUG, not INFO: this fires once per blocked open intent on the hot
-            # dispatch path, and by design fires for every unaffordable grid level
-            # on every ticker tick for the whole duration of the low-balance state
-            # (a blocked open never rests, so it is re-emitted next tick). INFO
-            # here would be sustained log spam precisely during the storm. Matches
-            # every sibling per-intent drop (qty<=0 / 110017 breaker / the generic
-            # `_is_good_to_place` rejection), all DEBUG. The low-balance state stays
-            # observable at INFO via the per-tick `Position update` heartbeat
-            # (avail= / total_avail=).
-            logger.debug(
-                "%s: LowBalanceSkip %s %s qty=%s price=%s "
-                "est_cost=%.4f avail=%.4f buffer=%s",
-                self.strat_id, intent.direction, intent.side,
-                intent.qty, intent.price, float(est_cost),
-                float(avail), buffer,
-            )
+            # (1) Unaffordable → a genuine fresh skip; block (return True).
+            avail_f = float(avail)
+            # Phase-2 window counter: incremented unconditionally on every
+            # genuine skip, INDEPENDENT of the transition flag, so the periodic
+            # summary works even when transition logging is off (M1). Reset only
+            # by the summary flush itself.
+            self._skip_window[key] = self._skip_window.get(key, 0) + 1
+            self._skip_window_avail_min = (
+                avail_f if self._skip_window_avail_min is None
+                else min(self._skip_window_avail_min, avail_f))
+            self._skip_window_avail_max = (
+                avail_f if self._skip_window_avail_max is None
+                else max(self._skip_window_avail_max, avail_f))
+            if self._config.low_balance_skip_transition_logs_enabled:
+                # Per-sample scratch upsert (written ONLY while transition logging
+                # is on → no count accrual / False→True poisoning when off). The
+                # ENTER/EXIT edges + the 60s summary carry the signal, so the
+                # per-intent DEBUG line is suppressed here.
+                s = self._skip_tick_seen.get(key)
+                if s is None:
+                    s = {"blocked": False, "count": 0, "avail_min": avail_f,
+                         "avail_max": avail_f, "first_blocked_price": 0.0}
+                    self._skip_tick_seen[key] = s
+                if not s["blocked"]:
+                    # first BLOCKED level for this key this sample (sticky-True).
+                    s["blocked"] = True
+                    s["first_blocked_price"] = float(intent.price)
+                s["count"] += 1
+                s["avail_min"] = min(s["avail_min"], avail_f)
+                s["avail_max"] = max(s["avail_max"], avail_f)
+            else:
+                # Transition logging OFF → emit the per-intent DEBUG line exactly
+                # as before (byte-for-byte current behavior). DEBUG, not INFO:
+                # one line per blocked open on the hot path; the low-balance
+                # state also stays observable at INFO via the per-tick
+                # `Position update` heartbeat (avail= / total_avail=).
+                logger.debug(
+                    "%s: LowBalanceSkip %s %s qty=%s price=%s "
+                    "est_cost=%.4f avail=%.4f buffer=%s",
+                    self.strat_id, intent.direction, intent.side,
+                    intent.qty, intent.price, float(est_cost),
+                    avail_f, buffer,
+                )
             return True
+        # (2) Genuinely affordable → allow (return False). Mark the key
+        # evaluated-fresh-affordable for this sample so Part B can drive an EXIT;
+        # a sibling level already recorded as blocked stays blocked (sticky).
+        if self._config.low_balance_skip_transition_logs_enabled:
+            if key not in self._skip_tick_seen:
+                self._skip_tick_seen[key] = {
+                    "blocked": False, "count": 0, "avail_min": float(avail),
+                    "avail_max": float(avail), "first_blocked_price": 0.0}
         return False
+
+    # ---- Feature 0067 (issue #164) — LowBalanceSkip edge logging + summary ----
+
+    def _reconcile_skip_edges(self) -> None:
+        """Resolve LowBalanceSkip ENTER/EXIT edges at the SAMPLE boundary (once
+        per dispatch, via _drain_pending_chase_intents). Edges are decided on the
+        WHOLE sample's view of a key — never inline per intent — so a cheap
+        affordable level and a pricier blocked level of the same key in one tick
+        resolve to a single "blocked" verdict instead of EXIT/ENTER flutter.
+
+        Reconciles ONLY keys present in `_skip_tick_seen` (the keys actually
+        evaluated with FRESH balance in the just-finished sample). A key absent
+        from the scratch (no open intents for it, or only fail-open reads) carries
+        no evidence and is left untouched by steps 1-2 — this is what prevents an
+        interleaved `on_order_update` (which evaluates zero open preflights) from
+        manufacturing a spurious EXIT then re-ENTER on the next `on_ticker`.
+
+        Edge LOGGING (steps 1-2) is gated on the transition kill-switch; the
+        scratch CLEAR (step 3) is UNCONDITIONAL so a True→False→True runtime flag
+        flip cannot strand scratch written in the last enabled dispatch and replay
+        it as stale evidence on re-enable.
+        """
+        cfg = self._config
+        if cfg.low_balance_skip_transition_logs_enabled:
+            now = self._clock()
+            # Step 1 — per-key edges for keys evaluated fresh this sample.
+            for key, s in self._skip_tick_seen.items():
+                direction, side = key
+                st = self._skip_state.get(key)
+                if s["blocked"]:
+                    if st is None or not st["active"]:
+                        # ENTER — start (or restart) the sustained-skip regime.
+                        self._skip_state[key] = {
+                            "active": True, "count": s["count"],
+                            "avail_min": s["avail_min"], "avail_max": s["avail_max"],
+                            "first_blocked_price": s["first_blocked_price"],
+                            "last_blocked_clock": now,
+                        }
+                        logger.info(
+                            "%s: LowBalanceSkip ENTER direction=%s side=%s "
+                            "first_blocked_price=%.4f avail_min=%.4f avail_max=%.4f",
+                            self.strat_id, direction, side,
+                            s["first_blocked_price"], s["avail_min"], s["avail_max"],
+                        )
+                    else:
+                        # Sustained — accumulate, widen band, refresh idle clock.
+                        st["count"] += s["count"]
+                        st["avail_min"] = min(st["avail_min"], s["avail_min"])
+                        st["avail_max"] = max(st["avail_max"], s["avail_max"])
+                        st["last_blocked_clock"] = now
+                else:
+                    # Evaluated fresh and zero blocked levels for this key.
+                    if st is not None and st["active"]:
+                        # EXIT — the recovery edge.
+                        logger.info(
+                            "%s: LowBalanceSkip EXIT direction=%s side=%s after "
+                            "%d skips, avail_min=%.4f avail_max=%.4f",
+                            self.strat_id, direction, side, st["count"],
+                            st["avail_min"], st["avail_max"],
+                        )
+                        st["active"] = False
+                        st["count"] = 0
+                    # else: affordable and already idle → no-op.
+            # Step 2 — idle-timeout sweep over ALL active keys (not just scratch
+            # keys) to EXIT a key removed from the grid mid-storm with no recovery
+            # EXIT. During a live storm the key is re-blocked every tick (~10/s)
+            # so last_blocked_clock refreshes and the timeout never fires — it
+            # only fires after a SUSTAINED absence of blocks (a genuinely ended
+            # episode), so it does not reintroduce a single-event false EXIT.
+            idle = cfg.low_balance_skip_exit_idle_seconds
+            if idle > 0:
+                for key, st in self._skip_state.items():
+                    if st["active"] and now - st["last_blocked_clock"] >= idle:
+                        direction, side = key
+                        logger.info(
+                            "%s: LowBalanceSkip EXIT direction=%s side=%s after %d "
+                            "skips (idle %ss, no affordable confirmation)",
+                            self.strat_id, direction, side, st["count"], idle,
+                        )
+                        st["active"] = False
+                        st["count"] = 0
+        # Step 3 — UNCONDITIONAL scratch clear for the next sample.
+        self._skip_tick_seen = {}
+
+    def _emit_skip_summary(self) -> None:
+        """Periodic INFO summary of LowBalanceSkip activity, flushed on the
+        dispatch cadence (no asyncio task) using the injectable self._clock().
+        Per-runner (per-strat); the window counter accumulates independently of
+        the transition flag, so the summary works even with edge logging off."""
+        cfg = self._config
+        if not cfg.low_balance_skip_summary_enabled:
+            return
+        now = self._clock()
+        if now - self._skip_summary_last_emit < cfg.low_balance_skip_summary_interval_sec:
+            return
+        total = sum(self._skip_window.values())
+        if total == 0:
+            # No activity this window — advance the clock, emit nothing (no
+            # empty-window spam).
+            self._skip_summary_last_emit = now
+            return
+        parts = " ".join(
+            f"{direction}.{side}={n}"
+            for (direction, side), n in self._skip_window.items()
+        )
+        logger.info(
+            "%s: LowBalanceSkip %ss window: %s(%s) total=%d avail_min=%.4f avail_max=%.4f",
+            self.strat_id, cfg.low_balance_skip_summary_interval_sec,
+            self.strat_id, parts, total,
+            self._skip_window_avail_min if self._skip_window_avail_min is not None else 0.0,
+            self._skip_window_avail_max if self._skip_window_avail_max is not None else 0.0,
+        )
+        self._skip_window = {}
+        self._skip_window_avail_min = None
+        self._skip_window_avail_max = None
+        self._skip_summary_last_emit = now
 
     # ---- Feature 0066 (issue #159) — chase-close active defense (default OFF) ----
 
@@ -1461,6 +1647,16 @@ class StrategyRunner:
         buffer is reused through the existing dispatch path (cancel-before-place,
         per-place limits refresh, reduce-only guard) with zero new dispatch code.
         """
+        # Feature 0067 — flush the LowBalanceSkip edge reconcile + periodic
+        # summary on the existing dispatch cadence. These MUST run BEFORE the
+        # early-return guard below: the guard returns on the common path
+        # (chase_close_enabled=False default → empty chase buffer almost always),
+        # so a call placed after it would never fire during a low-balance storm.
+        # The reconcile observes the scratch written by the PREVIOUS dispatch's
+        # _execute_intents (one evaluated-sample latency, harmless for logging).
+        self._reconcile_skip_edges()
+        self._emit_skip_summary()
+
         if not self._pending_chase_intents:
             return
         buffered = self._pending_chase_intents

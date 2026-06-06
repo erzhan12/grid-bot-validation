@@ -488,6 +488,54 @@ short with mult=2.0; the grown open exceeded free margin → 110007 every attemp
   Promote `chase_close_enabled` to on only after one live low-balance stress
   event confirms the dominant side decreases without market-order slippage.
 
+#### LowBalanceSkip log-spam suppression (feature 0067, issue #164)
+
+- The per-intent `LowBalanceSkip` DEBUG (one line per blocked open per tick →
+  ~2.1M/day under a sustained storm) is **suppressed by default** and replaced
+  by ENTER/EXIT INFO edges per `(direction, side)` + a 60s INFO summary. Both
+  default-on and kill-switchable; with **both flags False** the preflight emits
+  the per-intent DEBUG line exactly as before (byte-for-byte). The accept/reject
+  DECISION is never changed — only what is logged.
+- **Edges resolve at the SAMPLE boundary, never inline per intent.**
+  `_preflight_blocks_open` (Part A) only records per-sample scratch
+  (`_skip_tick_seen`, keyed by `(direction, side)`); `_reconcile_skip_edges`
+  (Part B) emits ENTER/EXIT. Part B runs as the **first statement of
+  `_drain_pending_chase_intents`, BEFORE its `if not self._pending_chase_intents:
+  return` guard** (the guard returns on the common chase-disabled path, so a call
+  after it would never fire during a storm). So the reconcile of dispatch N's
+  scratch happens at the top of dispatch N+1 (one evaluated-sample latency).
+  Pitfall: a test that calls `_preflight_blocks_open` alone sees NO edge — drive
+  `preflight → _reconcile_skip_edges()` per sample, and ≥1 test must drive the
+  real `on_ticker`/`on_order_update` handlers (cross-dispatch timing).
+- **Scratch semantics (load-bearing):** absence of a key from `_skip_tick_seen`
+  means "no fresh evidence this sample", NOT "affordable". A fail-open
+  (`_preflight_available_balance` → None) is evidence-neutral: no scratch write,
+  no window increment, no state mutation — so a stale-WS blip mid-storm produces
+  no churn and doesn't discard a sibling key's genuine skip. EXIT requires the key
+  to be present with `blocked=False` (evaluated-fresh-and-affordable). `blocked`
+  is sticky-True within a sample → no intra-tick EXIT/ENTER flutter.
+- **Scratch write is gated on `transition_logs_enabled`; the scratch clear (Part
+  B step 3) is UNCONDITIONAL** — a `True→False→True` runtime flag flip must not
+  strand stale evidence and replay it on re-enable. The `_skip_window` summary
+  counter is incremented unconditionally on every genuine skip (independent of
+  the transition flag) so the summary works even with edge logging off.
+- **Idle-timeout sweep** (`low_balance_skip_exit_idle_seconds`, default 60s, 0
+  disables): EXITs an `active` key that was removed from the grid mid-storm with
+  no recovery EXIT. Sweeps ALL active keys, not just scratch keys; safe because a
+  live storm re-blocks every ~100ms so `last_blocked_clock` refreshes and it never
+  fires mid-storm — only after a sustained block-absence. A re-block then re-ENTERs
+  fresh (count reset).
+- Config (`StrategyConfig`, all default-on / preserve behavior):
+  `low_balance_skip_transition_logs_enabled` (True),
+  `low_balance_skip_exit_idle_seconds` (60, `ge=0`),
+  `low_balance_skip_summary_enabled` (True),
+  `low_balance_skip_summary_interval_sec` (60, `gt=0`).
+- Files touched: `runner.py` (state in `__init__`, Part A in
+  `_preflight_blocks_open`, `_reconcile_skip_edges` + `_emit_skip_summary`, drain
+  hook), `config.py`. Tests: `test_runner_lowbalance_storm.py` (17 new, keyed
+  `test_low_balance_skip_*`). Record floats (`avail_min/max`,
+  `first_blocked_price`) are `float`; affordability comparison stays `Decimal`.
+
 ### SAME ORDER detection
 
 - `StrategyRunner._check_same_orders_side()` compares tracked orders by `TrackedOrder.placed_ts` when both fills map to tracked orders; use fill `exchange_ts` only as a fallback for untracked/legacy events. Duplicate same-price orders can rest concurrently and fill more than 5s apart in thin markets, so fill-time-only windows silently miss the critical duplicate-placement bug.

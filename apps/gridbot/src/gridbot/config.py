@@ -191,6 +191,47 @@ class StrategyConfig(BaseModel):
         ),
     )
 
+    # Feature 0067 — suppress LowBalanceSkip log spam (issue #164). Both
+    # default-on and kill-switchable; with BOTH False the preflight emits the
+    # per-intent DEBUG line exactly as today (byte-for-byte current behavior).
+    low_balance_skip_transition_logs_enabled: bool = Field(
+        default=True,
+        description=(
+            "Master kill-switch for LowBalanceSkip state-transition logging. "
+            "When True, the per-intent DEBUG line is suppressed and the "
+            "sustained-skip regime is logged only at its edges (ENTER/EXIT INFO) "
+            "per (direction, side). When False, the per-intent DEBUG fires on "
+            "every rejection (current behavior). The accept/reject decision is "
+            "never changed — only what is logged."
+        ),
+    )
+    low_balance_skip_exit_idle_seconds: int = Field(
+        default=60,
+        ge=0,
+        description=(
+            "Idle-timeout for the reconcile sweep that EXITs an active "
+            "LowBalanceSkip key after this many seconds with no fresh blocks "
+            "(resolves a key removed from the grid mid-storm without a recovery "
+            "EXIT). 0 disables the sweep (pure event-driven EXIT). Far longer "
+            "than the ~100ms inter-block gap during a live storm, so it never "
+            "false-fires mid-storm."
+        ),
+    )
+    low_balance_skip_summary_enabled: bool = Field(
+        default=True,
+        description=(
+            "Kill-switch for the periodic INFO summary of LowBalanceSkip "
+            "activity. Flushes on the dispatch cadence (no asyncio task); "
+            "increments independently of the transition flag so the summary "
+            "works even when transition logging is off."
+        ),
+    )
+    low_balance_skip_summary_interval_sec: int = Field(
+        default=60,
+        gt=0,
+        description="Window length (seconds) for the periodic LowBalanceSkip summary.",
+    )
+
     # Mode
     shadow_mode: bool = Field(default=False, description="Log intents without executing")
 

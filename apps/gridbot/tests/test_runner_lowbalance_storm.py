@@ -731,3 +731,415 @@ def test_low_balance_predicate_stale_provider_falls_back_to_latch(
     r2 = _runner_with_provider(strategy_config, mock_executor, instrument_info, _raise)
     r2._available_balance = Decimal("5")  # latch low → low (5 < 10), no raise escapes
     assert r2._is_low_balance(Decimal("100")) is True
+
+
+# --------------------------------------------------------------------------
+# Feature 0067 — suppress LowBalanceSkip log spam (issue #164)
+#
+# Two complementary, default-on, kill-switchable changes: (1) state-transition
+# (ENTER/EXIT) INFO logging that suppresses the per-intent DEBUG spam while the
+# sustained-skip regime is active for a (direction, side) key; (2) a periodic
+# 60s INFO summary. Edges resolve at the SAMPLE boundary (Part B
+# `_reconcile_skip_edges`), not inline per intent — so the unit shape is
+# "preflight per intent, then reconcile", and ≥1 integration test drives the
+# real dispatch handlers (reconcile runs at the top of the NEXT dispatch).
+# --------------------------------------------------------------------------
+
+class _FakeClock:
+    """Mutable monotonic float-seconds clock for the 60s-window / idle-timeout
+    tests (injected as ``clock=`` like the existing timing tests)."""
+
+    def __init__(self, t: float = 0.0):
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def _open_long(price="100.0", qty="1.0"):
+    """A grow-side open-long Buy (reduce_only=False) → key ('long', 'Buy')."""
+    return PlaceLimitIntent.create(
+        symbol="SOLUSDT", side="Buy", price=Decimal(price), qty=Decimal(qty),
+        grid_level=3, direction="long", reduce_only=False,
+    )
+
+
+def _skip_debug_lines(caplog):
+    """The per-intent ``LowBalanceSkip`` DEBUG lines only (NOT the 'preflight
+    skipped (no fresh balance data)' fail-open DEBUG, NOT INFO edges/summary)."""
+    return [r for r in caplog.records
+            if r.levelname == "DEBUG" and "LowBalanceSkip" in r.getMessage()]
+
+
+def _info_lines(caplog, token):
+    return [r for r in caplog.records
+            if r.levelname == "INFO" and token in r.getMessage()]
+
+
+@pytest.fixture
+def lb_clock():
+    return _FakeClock()
+
+
+@pytest.fixture
+def lb_runner(strategy_config, mock_executor, instrument_info, lb_clock):
+    """Runner on a mutable clock, low (blocking) available balance, no provider
+    → open preflights reach the LowBalanceSkip site. Feature 0067 transition +
+    summary default-on. (Sets ``_available_balance`` — NOT ``_wallet_balance``,
+    which is unrelated to the preflight; runner.py:1409.)"""
+    r = StrategyRunner(
+        strategy_config=strategy_config, executor=mock_executor,
+        instrument_info=instrument_info, rest_client=None, clock=lb_clock,
+    )
+    r._available_balance = Decimal("5")  # est_cost 100 ≫ 5 → blocked (no provider)
+    return r
+
+
+def _make_runner(strategy_config, mock_executor, instrument_info, clock, **cfg_update):
+    cfg = strategy_config.model_copy(update=cfg_update) if cfg_update else strategy_config
+    r = StrategyRunner(
+        strategy_config=cfg, executor=mock_executor,
+        instrument_info=instrument_info, rest_client=None, clock=clock,
+    )
+    r._available_balance = Decimal("5")
+    return r
+
+
+# ---- Phase 1 — state-transition (ENTER/EXIT) logging ----
+
+def test_low_balance_skip_logs_only_on_transition(lb_runner, caplog):
+    """Same unaffordable key over two samples → exactly 1 ENTER, 0 EXIT, and
+    ZERO per-intent DEBUG (the edge carries the signal). Block decision still True."""
+    with caplog.at_level("DEBUG"):
+        assert lb_runner._preflight_blocks_open(_open_short("100.0", "1.0")) is True
+        lb_runner._reconcile_skip_edges()
+        assert lb_runner._preflight_blocks_open(_open_short("100.0", "1.0")) is True
+        lb_runner._reconcile_skip_edges()
+    enter = _info_lines(caplog, "LowBalanceSkip ENTER")
+    assert len(enter) == 1
+    # Guard the ENTER operator payload shape (a dropped/mis-formatted token would
+    # otherwise pass every other test, which only checks the "ENTER" substring).
+    enter_msg = enter[0].getMessage()
+    assert "direction=short side=Sell" in enter_msg
+    assert "first_blocked_price=" in enter_msg
+    assert "avail_min=" in enter_msg and "avail_max=" in enter_msg
+    assert len(_info_lines(caplog, "LowBalanceSkip EXIT")) == 0
+    assert _skip_debug_lines(caplog) == []
+
+
+def test_low_balance_skip_exit_after_balance_restored(lb_runner, caplog):
+    """Sample 1 blocked (ENTER); sample 2 same key affordable (EXIT carrying count)."""
+    with caplog.at_level("DEBUG"):
+        lb_runner._available_balance = Decimal("5")
+        lb_runner._preflight_blocks_open(_open_short("100.0", "1.0"))
+        lb_runner._reconcile_skip_edges()  # ENTER
+        lb_runner._available_balance = Decimal("200")  # affordable now
+        assert lb_runner._preflight_blocks_open(_open_short("100.0", "1.0")) is False
+        lb_runner._reconcile_skip_edges()  # EXIT
+    assert len(_info_lines(caplog, "LowBalanceSkip ENTER")) == 1
+    exits = _info_lines(caplog, "LowBalanceSkip EXIT")
+    assert len(exits) == 1
+    assert "after 1 skips" in exits[0].getMessage()
+    assert lb_runner._skip_state[("short", "Sell")]["active"] is False
+
+
+@pytest.mark.parametrize("affordable_first", [True, False])
+def test_low_balance_skip_no_intratick_flutter(lb_runner, caplog, affordable_first):
+    """One sample, same key: a cheap AFFORDABLE level + a pricier BLOCKED level
+    (either order) → exactly 1 ENTER, 0 EXIT (no intra-tick EXIT/ENTER flutter)."""
+    lb_runner._available_balance = Decimal("50")  # cheap (est 10) ok, pricey (est 100) blocked
+    with caplog.at_level("DEBUG"):
+        if affordable_first:
+            assert lb_runner._preflight_blocks_open(_open_short("10.0", "1.0")) is False
+            assert lb_runner._preflight_blocks_open(_open_short("100.0", "1.0")) is True
+        else:
+            assert lb_runner._preflight_blocks_open(_open_short("100.0", "1.0")) is True
+            assert lb_runner._preflight_blocks_open(_open_short("10.0", "1.0")) is False
+        lb_runner._reconcile_skip_edges()
+    assert len(_info_lines(caplog, "LowBalanceSkip ENTER")) == 1
+    assert len(_info_lines(caplog, "LowBalanceSkip EXIT")) == 0
+
+
+def test_low_balance_skip_failopen_does_not_exit(lb_runner, caplog):
+    """A stale-WS-style fail-open sample is evidence-neutral: key stays active,
+    no EXIT, no ENTER, window counter unchanged (M4)."""
+    with caplog.at_level("DEBUG"):
+        lb_runner._available_balance = Decimal("5")
+        lb_runner._preflight_blocks_open(_open_short("100.0", "1.0"))
+        lb_runner._reconcile_skip_edges()  # ENTER, active
+        lb_runner._available_balance = Decimal("0")  # no data → fail-open (None)
+        window_before = dict(lb_runner._skip_window)
+        assert lb_runner._preflight_blocks_open(_open_short("100.0", "1.0")) is False
+        lb_runner._reconcile_skip_edges()
+    assert len(_info_lines(caplog, "LowBalanceSkip ENTER")) == 1
+    assert len(_info_lines(caplog, "LowBalanceSkip EXIT")) == 0
+    assert lb_runner._skip_state[("short", "Sell")]["active"] is True
+    assert lb_runner._skip_window == window_before  # fail-open did not count
+
+
+def test_low_balance_skip_no_false_exit_on_interleaved_event(lb_runner, caplog):
+    """Integration shape (M2/High): on_ticker(blocked) → on_order_update(no opens)
+    → on_ticker(blocked). Reconcile runs at the top of the NEXT dispatch, so the
+    interleaved order-update must NOT manufacture a spurious EXIT: exactly 1
+    ENTER, 0 EXIT across the whole sequence."""
+    from unittest.mock import Mock as _Mock
+    lb_runner._engine = _Mock()
+    lb_runner._resolve_qty = lambda intent: intent  # bypass qty calc; keep qty=1
+    lb_runner._on_unknown_order = None
+    ou = _Mock()
+    ou.status = "New"
+    ou.order_id = "oid"
+    ou.order_link_id = "olid"
+    with caplog.at_level("DEBUG"):
+        lb_runner._engine.on_event = _Mock(return_value=[_open_short("100.0", "1.0")])
+        lb_runner.on_ticker(_Mock())          # blocked grid → scratch written
+        lb_runner._engine.on_event = _Mock(return_value=[])
+        lb_runner.on_order_update(ou)         # reconcile prior sample → ENTER; no opens
+        lb_runner._engine.on_event = _Mock(return_value=[_open_short("100.0", "1.0")])
+        lb_runner.on_ticker(_Mock())          # reconcile empty → no EXIT; blocked again
+    assert len(_info_lines(caplog, "LowBalanceSkip ENTER")) == 1
+    assert len(_info_lines(caplog, "LowBalanceSkip EXIT")) == 0
+
+
+def test_low_balance_skip_partial_failopen_preserves_sibling_skip(
+    strategy_config, mock_executor, instrument_info, caplog
+):
+    """One sample: long.Buy evaluates fresh-unaffordable (genuine skip) while
+    short.Sell fails open (stale peek) → long.Buy ENTERs (its skip is NOT
+    discarded), short.Sell untouched/absent from state (Medium-3). Uses a
+    stateful provider so the two intents get different freshness."""
+    calls = {"n": 0}
+
+    def provider():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return (WalletSnapshot(available_balance=5.0), 1.0)    # fresh → blocked
+        return (WalletSnapshot(available_balance=5.0), 100.0)      # stale → fail-open
+
+    r = StrategyRunner(
+        strategy_config=strategy_config, executor=mock_executor,
+        instrument_info=instrument_info, rest_client=None, clock=lambda: 0.0,
+        wallet_provider=provider, wallet_ws_max_age_seconds=45.0,
+    )
+    with caplog.at_level("DEBUG"):
+        assert r._preflight_blocks_open(_open_long("100.0", "1.0")) is True    # fresh, blocked
+        assert r._preflight_blocks_open(_open_short("100.0", "1.0")) is False  # stale, fail-open
+        r._reconcile_skip_edges()
+    enter = _info_lines(caplog, "LowBalanceSkip ENTER")
+    assert len(enter) == 1
+    assert "direction=long side=Buy" in enter[0].getMessage()
+    assert r._skip_state[("long", "Buy")]["active"] is True
+    assert ("short", "Sell") not in r._skip_state  # sibling untouched (absent from scratch)
+
+
+def test_low_balance_skip_per_key_independent(lb_runner, caplog):
+    """long.Buy + short.Sell both blocked (2 ENTER); next sample short.Sell
+    recovers while long.Buy stays blocked → independent EXIT for short.Sell only."""
+    with caplog.at_level("DEBUG"):
+        lb_runner._available_balance = Decimal("5")
+        lb_runner._preflight_blocks_open(_open_long("100.0", "1.0"))
+        lb_runner._preflight_blocks_open(_open_short("100.0", "1.0"))
+        lb_runner._reconcile_skip_edges()  # 2 ENTER
+        lb_runner._preflight_blocks_open(_open_long("100.0", "1.0"))   # still blocked
+        lb_runner._preflight_blocks_open(_open_short("1.0", "1.0"))    # est 1 → affordable
+        lb_runner._reconcile_skip_edges()
+    assert len(_info_lines(caplog, "LowBalanceSkip ENTER")) == 2
+    exits = _info_lines(caplog, "LowBalanceSkip EXIT")
+    assert len(exits) == 1
+    assert "direction=short side=Sell" in exits[0].getMessage()
+    assert lb_runner._skip_state[("long", "Buy")]["active"] is True
+    assert lb_runner._skip_state[("short", "Sell")]["active"] is False
+
+
+# ---- Phase 1 — idle-timeout sweep (stuck-active removed keys) ----
+
+def test_low_balance_skip_idle_timeout_exits_removed_key(lb_runner, lb_clock, caplog):
+    """A key removed from the intent set mid-storm (no recovery EXIT) is swept to
+    EXIT after `low_balance_skip_exit_idle_seconds`; a later re-block re-ENTERs
+    fresh (count reset), NOT a silent Sustained."""
+    with caplog.at_level("DEBUG"):
+        lb_runner._preflight_blocks_open(_open_short("100.0", "1.0"))
+        lb_runner._reconcile_skip_edges()  # ENTER, last_blocked_clock=0
+        lb_runner._reconcile_skip_edges()  # t=0, empty scratch, no timeout
+        lb_clock.t = 30.0
+        lb_runner._reconcile_skip_edges()  # 30 < 60, no timeout
+        lb_clock.t = 61.0
+        lb_runner._reconcile_skip_edges()  # 61 >= 60 → idle EXIT
+    assert len(_info_lines(caplog, "LowBalanceSkip ENTER")) == 1
+    exits = _info_lines(caplog, "LowBalanceSkip EXIT")
+    assert len(exits) == 1
+    assert "idle 60s" in exits[0].getMessage()
+    assert lb_runner._skip_state[("short", "Sell")]["active"] is False
+    caplog.clear()
+    with caplog.at_level("DEBUG"):
+        lb_runner._preflight_blocks_open(_open_short("100.0", "1.0"))
+        lb_runner._reconcile_skip_edges()
+    assert len(_info_lines(caplog, "LowBalanceSkip ENTER")) == 1  # fresh episode
+
+
+def test_low_balance_skip_idle_timeout_disabled_keeps_active(
+    strategy_config, mock_executor, instrument_info, lb_clock, caplog
+):
+    """`low_balance_skip_exit_idle_seconds=0` disables the sweep → a removed key
+    stays active forever (documents the opt-out)."""
+    r = _make_runner(strategy_config, mock_executor, instrument_info, lb_clock,
+                     low_balance_skip_exit_idle_seconds=0)
+    with caplog.at_level("DEBUG"):
+        r._preflight_blocks_open(_open_short("100.0", "1.0"))
+        r._reconcile_skip_edges()  # ENTER
+        lb_clock.t = 100000.0
+        r._reconcile_skip_edges()  # no sweep (disabled)
+    assert len(_info_lines(caplog, "LowBalanceSkip EXIT")) == 0
+    assert r._skip_state[("short", "Sell")]["active"] is True
+
+
+def test_low_balance_skip_flag_flip_true_false_true_no_stale_replay(lb_runner, caplog):
+    """True (scratch written) → flip False (reconcile clears scratch unconditionally,
+    no edge) → flip True (reconcile, no new intents) → 0 ENTER, 0 EXIT (no stale
+    evidence replayed from the pre-disable sample)."""
+    with caplog.at_level("DEBUG"):
+        lb_runner._preflight_blocks_open(_open_short("100.0", "1.0"))
+        assert ("short", "Sell") in lb_runner._skip_tick_seen  # scratch written while on
+        lb_runner._config = lb_runner._config.model_copy(
+            update={"low_balance_skip_transition_logs_enabled": False})
+        lb_runner._reconcile_skip_edges()  # unconditional clear; flag off → no edge
+        assert lb_runner._skip_tick_seen == {}
+        lb_runner._config = lb_runner._config.model_copy(
+            update={"low_balance_skip_transition_logs_enabled": True})
+        lb_runner._reconcile_skip_edges()  # no new intents → nothing replays
+    assert _info_lines(caplog, "LowBalanceSkip ENTER") == []
+    assert _info_lines(caplog, "LowBalanceSkip EXIT") == []
+    assert ("short", "Sell") not in lb_runner._skip_state
+
+
+def test_low_balance_skip_no_scratch_leak_when_transition_off(
+    strategy_config, mock_executor, instrument_info, caplog
+):
+    """transition off → scratch never written (no unbounded count accrual), but
+    the window counter still accumulates. Flip on → first ENTER count == this
+    sample's skips only (no inflation carried from the off period) (F2)."""
+    r = _make_runner(strategy_config, mock_executor, instrument_info, lambda: 0.0,
+                     low_balance_skip_transition_logs_enabled=False)
+    with caplog.at_level("DEBUG"):
+        for _ in range(3):
+            r._preflight_blocks_open(_open_short("100.0", "1.0"))
+            assert r._skip_tick_seen == {}  # never written while off
+    assert r._skip_window[("short", "Sell")] == 3  # window still accumulates
+    r._config = r._config.model_copy(
+        update={"low_balance_skip_transition_logs_enabled": True})
+    caplog.clear()
+    with caplog.at_level("DEBUG"):
+        r._preflight_blocks_open(_open_short("100.0", "1.0"))
+        r._reconcile_skip_edges()
+    assert len(_info_lines(caplog, "LowBalanceSkip ENTER")) == 1
+    assert r._skip_state[("short", "Sell")]["count"] == 1  # not inflated by off period
+
+
+# ---- Phase 2 — periodic 60s summary ----
+
+def test_low_balance_skip_emit_summary_at_60s(lb_runner, lb_clock, caplog):
+    """Accumulate skips, advance the clock past the interval, flush → exactly 1
+    INFO summary carrying total / per-(direction,side) counts / avail band;
+    window reset; a second flush within the window emits nothing."""
+    with caplog.at_level("INFO"):
+        for _ in range(3):
+            lb_runner._preflight_blocks_open(_open_short("100.0", "1.0"))
+            lb_runner._reconcile_skip_edges()
+        lb_clock.t = 61.0
+        lb_runner._emit_skip_summary()
+    summ = _info_lines(caplog, "window:")
+    assert len(summ) == 1
+    msg = summ[0].getMessage()
+    assert "total=3" in msg
+    assert "short.Sell=3" in msg
+    assert "avail_min=" in msg and "avail_max=" in msg
+    assert lb_runner._skip_window == {}
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        lb_runner._emit_skip_summary()  # within window → nothing
+    assert _info_lines(caplog, "window:") == []
+
+
+def test_low_balance_skip_summary_fires_with_transition_logs_off(
+    strategy_config, mock_executor, instrument_info, lb_clock, caplog
+):
+    """M1 row 3: transition off + summary on → per-intent DEBUG still fires AND
+    the 60s summary still emits (window counter is increment-independent of the
+    transition flag); no ENTER/EXIT."""
+    r = _make_runner(strategy_config, mock_executor, instrument_info, lb_clock,
+                     low_balance_skip_transition_logs_enabled=False,
+                     low_balance_skip_summary_enabled=True)
+    with caplog.at_level("DEBUG"):
+        r._preflight_blocks_open(_open_short("100.0", "1.0"))
+        r._reconcile_skip_edges()
+        lb_clock.t = 61.0
+        r._emit_skip_summary()
+    assert len(_skip_debug_lines(caplog)) == 1
+    assert len(_info_lines(caplog, "window:")) == 1
+    assert _info_lines(caplog, "LowBalanceSkip ENTER") == []
+
+
+def test_low_balance_skip_transition_on_summary_off(
+    strategy_config, mock_executor, instrument_info, lb_clock, caplog
+):
+    """M1 row 2: transition ON + summary OFF → ENTER edges fire and the per-intent
+    DEBUG is suppressed, but NO 60s summary line even when the clock is past the
+    interval (the summary kill-switch is honored independently of the transition
+    flag, and short-circuits before advancing _skip_summary_last_emit)."""
+    r = _make_runner(strategy_config, mock_executor, instrument_info, lb_clock,
+                     low_balance_skip_transition_logs_enabled=True,
+                     low_balance_skip_summary_enabled=False)
+    with caplog.at_level("DEBUG"):
+        r._preflight_blocks_open(_open_short("100.0", "1.0"))
+        r._reconcile_skip_edges()       # ENTER (transition on)
+        lb_clock.t = 61.0
+        r._emit_skip_summary()          # summary off → nothing, even past interval
+    assert len(_info_lines(caplog, "LowBalanceSkip ENTER")) == 1
+    assert _skip_debug_lines(caplog) == []        # per-intent DEBUG suppressed
+    assert _info_lines(caplog, "window:") == []   # summary suppressed
+    assert r._skip_summary_last_emit == 0.0       # guard returns before clock update
+
+
+def test_low_balance_skip_summary_empty_window_no_emit(lb_runner, lb_clock, caplog):
+    """Clock past interval but zero skips → no summary line (and last-emit advances)."""
+    lb_clock.t = 61.0
+    with caplog.at_level("INFO"):
+        lb_runner._emit_skip_summary()
+    assert _info_lines(caplog, "window:") == []
+    assert lb_runner._skip_summary_last_emit == 61.0
+
+
+def test_low_balance_skip_summary_emits_via_drain_hook(lb_runner, lb_clock, caplog):
+    """Summary flushes through _drain_pending_chase_intents (production hook), and a
+    high monotonic baseline does not cause an immediate summary on the first skip."""
+    lb_clock.t = 1000.0
+    with caplog.at_level("INFO"):
+        lb_runner._drain_pending_chase_intents()  # empty window → advance baseline
+        lb_runner._preflight_blocks_open(_open_short("100.0", "1.0"))
+        lb_runner._drain_pending_chase_intents()  # skips present but within interval
+        assert _info_lines(caplog, "window:") == []
+        lb_clock.t = 1061.0
+        lb_runner._drain_pending_chase_intents()  # past interval → summary via drain
+    summ = _info_lines(caplog, "window:")
+    assert len(summ) == 1
+    assert "total=1" in summ[0].getMessage()
+
+
+# ---- Acceptance criterion — both kill-switches off restore current behavior ----
+
+def test_low_balance_skip_killswitches_off_preserve_debug(
+    strategy_config, mock_executor, instrument_info, caplog
+):
+    """Both flags False → byte-for-byte current behavior: per-intent DEBUG on
+    every rejection, NO INFO ENTER/EXIT/summary lines."""
+    r = _make_runner(strategy_config, mock_executor, instrument_info, lambda: 0.0,
+                     low_balance_skip_transition_logs_enabled=False,
+                     low_balance_skip_summary_enabled=False)
+    with caplog.at_level("DEBUG"):
+        assert r._preflight_blocks_open(_open_short("100.0", "1.0")) is True
+        r._reconcile_skip_edges()
+        r._emit_skip_summary()
+    debug = _skip_debug_lines(caplog)
+    assert len(debug) == 1
+    assert "qty=" in debug[0].getMessage() and "est_cost=" in debug[0].getMessage()
+    assert _info_lines(caplog, "LowBalanceSkip") == []
