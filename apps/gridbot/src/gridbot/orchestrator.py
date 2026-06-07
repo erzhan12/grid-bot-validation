@@ -1410,7 +1410,7 @@ class Orchestrator:
             except Exception as e:
                 self._notifier.alert_exception(
                     f"forced reconcile position {strat_id}", e,
-                    error_key=f"force_reconcile_pos_{strat_id}",
+                    error_key=f"force_reconcile_pos_{strat_id}_{d}",
                 )
         return True
 
