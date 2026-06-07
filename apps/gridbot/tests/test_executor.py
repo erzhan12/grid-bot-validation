@@ -14,8 +14,14 @@ from gridbot.executor import (
     AUTH_ERROR_CODES,
     is_truncate_error,
     is_insufficient_balance,
+    is_network_error,
+    is_duplicate_link_error,
 )
-from bybit_adapter.error_codes import ORDER_QTY_TRUNCATED_TO_ZERO, INSUFFICIENT_BALANCE
+from bybit_adapter.error_codes import (
+    ORDER_QTY_TRUNCATED_TO_ZERO,
+    INSUFFICIENT_BALANCE,
+    ORDER_LINK_ID_DUPLICATE,
+)
 
 
 class TestIsTruncateError:
@@ -73,6 +79,62 @@ class TestIsInsufficientBalance:
     def test_none_and_empty_are_not_insufficient_balance(self):
         assert is_insufficient_balance(None) is False
         assert is_insufficient_balance("") is False
+
+
+class TestIsNetworkError:
+    """Feature 0069 — narrow transient-network classifier for the divergence
+    placement-failure UNION (issue #151)."""
+
+    def test_matches_timeout(self):
+        assert is_network_error("Connection timeout") is True
+        assert is_network_error("Read timed out... ReadTimeout") is True
+
+    def test_matches_connection_and_readtimeout(self):
+        assert is_network_error("requests.exceptions.ConnectionError: boom") is True
+        assert is_network_error("pybit raised ReadTimeout after 10s") is True
+
+    def test_matches_temporarily_unavailable(self):
+        assert is_network_error("503 Service Temporarily Unavailable") is True
+
+    def test_does_not_match_generic_error_or_digits(self):
+        # NARROW: a bare "error" or a stray digit must NOT classify as network.
+        assert is_network_error("some weird error") is False
+        assert is_network_error("12345") is False
+
+    def test_does_not_match_errcodes(self):
+        assert is_network_error("Bybit API error: [110017] truncated") is False
+        assert is_network_error("Bybit API error: [110007] balance") is False
+
+    def test_none_and_empty_are_not_network(self):
+        assert is_network_error(None) is False
+        assert is_network_error("") is False
+
+
+class TestIsDuplicateLinkError:
+    """Feature 0069 — classify ErrCode 110072 ('OrderLinkedID is duplicate')."""
+
+    def test_constant_is_110072(self):
+        assert ORDER_LINK_ID_DUPLICATE == 110072
+
+    def test_detects_check_response_format(self):
+        err = "Bybit API error in place_order: [110072] OrderLinkedID is duplicate"
+        assert is_duplicate_link_error(err) is True
+
+    def test_detects_pybit_native_format(self):
+        err = "place_order failed (ErrCode: 110072) duplicate"
+        assert is_duplicate_link_error(err) is True
+
+    def test_detects_wording_case_insensitive(self):
+        assert is_duplicate_link_error("orderlinkedid is DUPLICATE") is True
+
+    def test_other_error_code_is_not_duplicate(self):
+        assert is_duplicate_link_error("Bybit API error: [110017] truncated") is False
+        assert is_duplicate_link_error("Bybit API error: [110007] balance") is False
+        assert is_duplicate_link_error("Connection timeout") is False
+
+    def test_none_and_empty_are_not_duplicate(self):
+        assert is_duplicate_link_error(None) is False
+        assert is_duplicate_link_error("") is False
 
 
 @pytest.fixture

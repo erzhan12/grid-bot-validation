@@ -112,6 +112,40 @@ class TestStrategyConfig:
         with pytest.raises(ValidationError):
             StrategyConfig(**base, dirty_rest_refresh_min_interval_seconds=0)  # gt=0
 
+    def test_divergence_detector_defaults(self):
+        """Feature 0069 — defaults ship on and load cleanly (issue #151)."""
+        strategy = StrategyConfig(
+            strat_id="btc_main", account="main", symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+        )
+        assert strategy.divergence_detector_enabled is True
+        assert strategy.divergence_failure_mix_threshold == 10
+        assert strategy.divergence_failure_mix_window_seconds == 60.0
+        assert strategy.divergence_retry_budget == 5
+        assert strategy.divergence_size_check_interval_seconds == 300.0
+        assert strategy.divergence_size_delta_qty_step_multiplier == 5.0
+        assert strategy.divergence_reconcile_min_interval_seconds == 300.0
+
+    def test_divergence_detector_invalid_values_rejected(self):
+        """Feature 0069 — counts/budgets use ge=1; intervals/windows/multiplier
+        use gt=0; degenerate YAML is rejected at load."""
+        base = dict(
+            strat_id="btc_main", account="main", symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+        )
+        with pytest.raises(ValidationError):
+            StrategyConfig(**base, divergence_failure_mix_threshold=0)  # ge=1
+        with pytest.raises(ValidationError):
+            StrategyConfig(**base, divergence_retry_budget=0)  # ge=1
+        with pytest.raises(ValidationError):
+            StrategyConfig(**base, divergence_failure_mix_window_seconds=0)  # gt=0
+        with pytest.raises(ValidationError):
+            StrategyConfig(**base, divergence_size_check_interval_seconds=0)  # gt=0
+        with pytest.raises(ValidationError):
+            StrategyConfig(**base, divergence_reconcile_min_interval_seconds=0)  # gt=0
+        with pytest.raises(ValidationError):
+            StrategyConfig(**base, divergence_size_delta_qty_step_multiplier=0)  # gt=0
+
     def test_increase_same_position_on_low_margin_defaults_false(self):
         """Test low-margin equal-position boost flag defaults off."""
         strategy = StrategyConfig(

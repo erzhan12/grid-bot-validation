@@ -13,6 +13,7 @@ from typing import Callable, Optional
 from bybit_adapter.rest_client import BybitRestClient
 from bybit_adapter.error_codes import (
     INSUFFICIENT_BALANCE,
+    ORDER_LINK_ID_DUPLICATE,
     ORDER_QTY_TRUNCATED_TO_ZERO,
 )
 from gridcore.intents import PlaceLimitIntent, CancelIntent
@@ -62,6 +63,55 @@ def is_insufficient_balance(error: Optional[str]) -> bool:
     if match:
         code = int(match.group(1) or match.group(2))
         return code == INSUFFICIENT_BALANCE
+    return False
+
+
+# Feature 0069 (issue #151) — narrow lowercased-token test for transient
+# network/transport failures surfaced as the str(exception) from execute_place.
+# NARROW on purpose: must NOT match a bare "error" or a digit, so it never
+# swallows a real ErrCode classification. "connection" covers ConnectionError;
+# "readtimeout"/"timeout" cover pybit's ReadTimeout.
+_NETWORK_ERROR_TOKENS = (
+    "timeout",
+    "connection",
+    "temporarily unavailable",
+    "readtimeout",
+)
+
+
+def is_network_error(error: Optional[str]) -> bool:
+    """Return True if an error string looks like a transient network failure.
+
+    Counts toward the state-divergence detector's sustained placement-failure
+    UNION (feature 0069 / issue #151) alongside ``is_truncate_error`` (110017)
+    and ``is_duplicate_link_error`` (110072). Module-level for isolated
+    testability — no inline substring checks at the call site. Deliberately
+    narrow: a bare ``"error"`` or a stray digit must NOT match.
+    """
+    if not error:
+        return False
+    lowered = error.lower()
+    return any(token in lowered for token in _NETWORK_ERROR_TOKENS)
+
+
+def is_duplicate_link_error(error: Optional[str]) -> bool:
+    """Return True if an error string carries Bybit ErrCode 110072.
+
+    110072 ("OrderLinkedID is duplicate") means a re-sent order reused a still-
+    cached orderLinkId, or a REST retry landed an order whose first ack never
+    arrived via WS. Matches the numeric code (via the shared ``_ERR_CODE_RE``
+    for both wire formats) OR the literal wording. Module-level (mirrors
+    ``is_truncate_error``) so the runner branches without a mock executor —
+    feature 0069 / issue #151. Replaces the inline 110072 substring checks.
+    """
+    if not error:
+        return False
+    if "orderlinkedid is duplicate" in error.lower():
+        return True
+    match = _ERR_CODE_RE.search(error)
+    if match:
+        code = int(match.group(1) or match.group(2))
+        return code == ORDER_LINK_ID_DUPLICATE
     return False
 
 

@@ -52,7 +52,9 @@ from gridcore import (
 from gridbot.config import StrategyConfig
 from gridbot.executor import (
     IntentExecutor,
+    is_duplicate_link_error,
     is_insufficient_balance,
+    is_network_error,
     is_truncate_error,
 )
 from gridbot.notifier import Notifier
@@ -193,6 +195,7 @@ class StrategyRunner:
         rest_client: Optional["BybitRestClient"] = None,
         truncate_breaker: Optional[TruncateBreaker] = None,
         on_truncate_breaker_tripped: Optional[Callable[[str, str], None]] = None,
+        on_divergence_failure_mix: Optional[Callable[[str, str, int], None]] = None,
         clock: Optional[Callable[[], float]] = None,
         wallet_provider: Optional["WalletProvider"] = None,
         wallet_ws_max_age_seconds: float = 45.0,
@@ -269,6 +272,9 @@ class StrategyRunner:
         self._rest_client = rest_client
         self._clock = clock or time.monotonic
         self._on_truncate_breaker_tripped = on_truncate_breaker_tripped
+        # Feature 0069 (issue #151) signal 1 — callback invoked when the rolling
+        # placement-failure UNION window crosses its threshold.
+        self._on_divergence_failure_mix = on_divergence_failure_mix
         self._truncate_breaker = truncate_breaker or TruncateBreaker(
             max_consecutive=strategy_config.truncate_breaker_max_consecutive,
             window_seconds=strategy_config.truncate_breaker_window_seconds,
@@ -307,6 +313,12 @@ class StrategyRunner:
             DirectionType.LONG: 0,
             DirectionType.SHORT: 0,
         }
+        # Feature 0069 (issue #151) signal 1 — rolling window of monotonic
+        # timestamps of placement failures in the UNION {110017, 110072,
+        # network}. Stamped/evicted via self._clock() (injectable) so tests
+        # drive the window deterministically; cleared the instant the threshold
+        # fires (see _record_placement_failure).
+        self._placement_failure_window: deque[float] = deque()
 
         # Qty computation
         self._instrument_info = instrument_info
@@ -1322,6 +1334,106 @@ class StrategyRunner:
             # Establish the REST baseline the WS gate consults for THIS episode.
             self._last_rest_position_size[direction] = new_size
 
+    def rest_position_size(self, direction: str) -> Optional[Decimal]:
+        """PURE REST read of one direction's position size (feature 0069 sig 3).
+
+        Factors ONLY the ``positionIdx``/``get_positions`` read out of
+        ``_refresh_position_size_from_rest`` WITHOUT any side effects: it does
+        NOT write ``_last_dirty_rest_at``, does NOT bump
+        ``_dirty_rest_refresh_failure_count``, and does NOT mutate the
+        ``_long_position``/``_short_position`` mirrors. Used by the divergence
+        size-delta sweep, which must not perturb the dirty-refresh throttle or
+        the failure-counter observability that signal 2 reads.
+
+        Returns the parsed exchange size as ``Decimal`` (``Decimal("0")`` when no
+        entry for the direction), or ``None`` on ``rest_client is None`` or any
+        ``get_positions``/parse error — the caller SKIPS the comparison for that
+        direction (no fire) rather than counting a phantom delta. A ``None``
+        return is logged at DEBUG so REST flakiness stays observable.
+        """
+        if self._rest_client is None:
+            logger.debug(
+                "%s: rest_position_size for %s skipped — no rest_client",
+                self.strat_id, direction,
+            )
+            return None
+        position_idx = 1 if direction == DirectionType.LONG else 2
+        try:
+            positions = self._rest_client.get_positions(self._config.symbol)
+        except Exception as e:
+            logger.debug(
+                "%s: rest_position_size get_positions failed for %s: %s: %s",
+                self.strat_id, direction, type(e).__name__, e,
+            )
+            return None
+
+        def _matches(p: dict) -> bool:
+            try:
+                return int(p.get("positionIdx", -1)) == position_idx
+            except (TypeError, ValueError):
+                return False
+
+        entry = next((p for p in positions if _matches(p)), None)
+        if entry is None:
+            return Decimal("0")
+        try:
+            return Decimal(str(entry.get("size", 0) or 0))
+        except (ArithmeticError, ValueError, TypeError):
+            logger.debug(
+                "%s: rest_position_size unparseable size %r for %s",
+                self.strat_id, entry.get("size"), direction,
+            )
+            return None
+
+    def clear_dedup_cache(self) -> None:
+        """Clear the verdict-aware SAME ORDER dedup cache (feature 0069).
+
+        Called by the orchestrator's divergence wrapper AFTER a real forced
+        reconcile so stale orderLinkId adjudication state cannot suppress fresh
+        retriggers against the now-resynced grid. Runs synchronously on the main
+        tick thread (signals 1/2/3 fire there; signal 4 drains there), so there
+        is no concurrent reader of a half-cleared cache. The cache re-populates
+        naturally as new SAME ORDER pairs are adjudicated on later ticks.
+        """
+        self._same_order_dedup_cache.clear()
+
+    def _record_placement_failure(self, error: Optional[str]) -> None:
+        """Feed one placement failure into the divergence UNION window (sig 1).
+
+        Invoked from BOTH ``_execute_place_intent`` failure exits (110017 branch
+        and the non-110017 early-return that carries 110072/network). Applies the
+        UNION-membership test itself ({110017, 110072, network}; 110007 is
+        excluded) so both call sites pass the raw ``result.error``. Stamps/evicts
+        with ``self._clock()`` (injectable) so the window is deterministic under
+        a fake clock. When the count reaches the threshold the window is CLEARED
+        immediately and the ``on_divergence_failure_mix`` callback is invoked —
+        "a fire" means threshold-reached, regardless of whether the downstream
+        wrapper then reconciles or suppresses (so a cooldown-suppressed fire does
+        not leave the window full and re-trigger on every subsequent failure).
+        Inert when the detector is disabled.
+        """
+        if not self._config.divergence_detector_enabled:
+            return
+        if not (
+            is_truncate_error(error)
+            or is_duplicate_link_error(error)
+            or is_network_error(error)
+        ):
+            return
+        now = self._clock()
+        window = self._placement_failure_window
+        window.append(now)
+        cutoff = now - self._config.divergence_failure_mix_window_seconds
+        while window and window[0] < cutoff:
+            window.popleft()
+        if len(window) >= self._config.divergence_failure_mix_threshold:
+            count = len(window)
+            window.clear()
+            if self._on_divergence_failure_mix is not None:
+                self._on_divergence_failure_mix(
+                    self.strat_id, "rest_failure_mix", count
+                )
+
     def _predicate_available_balance(self) -> tuple[Decimal, bool]:
         """Free margin for the low-balance PREDICATE (3a moderate_liq + 3b chase).
 
@@ -2038,11 +2150,17 @@ class StrategyRunner:
         if not is_truncate_error(result.error):
             # Non-110017 failure → existing retry-queue behaviour (feature 0032
             # wire-id reuse preserved via the failed-tracked-order path above).
+            # Feature 0069 — 110072/network leave via THIS branch, so record
+            # here too (the helper applies the UNION test and ignores the rest).
+            self._record_placement_failure(result.error)
             if self._on_intent_failed:
                 self._on_intent_failed(assigned, result.error)
             return
 
         # --- 110017 (orderQty truncated to zero) handling ---
+        # Feature 0069 signal 1 — 110017 feeds the placement-failure UNION too
+        # (the helper short-circuits when the detector is disabled).
+        self._record_placement_failure(result.error)
         # Mark the direction dirty so the NEXT placement REST-refreshes the
         # mirror before the guard (self-heal), even before the breaker trips.
         self._position_dirty[intent.direction] = True

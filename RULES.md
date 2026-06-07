@@ -343,6 +343,95 @@ Pitfalls / invariants (all enforced + tested):
   `test_truncate_breaker.py`, `test_runner_truncate_storm.py`,
   `TestForcedReconcile` in `test_orchestrator.py`.
 
+### Auto state-divergence detector (feature 0069, issue #151)
+
+Closes the gap the 2026-05-30 incident exposed: after ~5h of WS instability the
+local mirror diverged far enough that the bot could not self-recover until a
+manual restart re-ran the cold-start reconciler. WS reconnects fired but did NOT
+force a full position+order re-sync. This detector watches FOUR observable signals
+and, on any fire, triggers a **forced full reconcile WITHOUT restarting** — the
+same `Orchestrator._force_reconcile_strat` the 0064 breaker uses.
+
+- **Reuses `_force_reconcile_strat`**, now `(strat_id, direction: str|None,
+  emit_breaker_warning=True) -> bool`. `direction=None` (every detector signal)
+  does ONE rate-limit check, ONE `reconcile_reconnect`, then refreshes BOTH LONG
+  and SHORT mirrors — handled INTERNALLY so the per-strat rate-limit timestamp is
+  set once (two back-to-back calls would rate-limit the second side and leave a
+  hedge-mode mirror half stale). Returns True only when a reconcile actually ran
+  (False = rate-limited / no runner). The breaker-trip caller still passes a
+  specific direction + the default `emit_breaker_warning=True` → byte-for-byte
+  unchanged.
+- **Two SEPARATE throttles.** The detector throttle
+  (`_divergence_last_fire_at`, `divergence_reconcile_min_interval_seconds`,
+  default **300s**) is distinct from the breaker cooldown
+  (`_force_reconcile_last_at`, `truncate_breaker_cooldown_seconds`, default 60s).
+  The wrapper `_trigger_divergence_reconcile` checks its own throttle, then calls
+  `_force_reconcile_strat(direction=None, emit_breaker_warning=False)` and branches
+  on the bool: only on True does it emit the single
+  `state-divergence detected (signal=…, evidence=…), forcing full reconcile`
+  WARNING, clear the runner dedup cache (`clear_dedup_cache()`), and bump the
+  detector throttle. On False (suppressed by the breaker cooldown) it emits a
+  DEBUG line and does NONE of those — so the analyzer's `force_reconcile_fired`
+  never overstates real reconciles and the dedup cache is never evicted without a
+  resync. Passing `emit_breaker_warning=False` suppresses the breaker line (and
+  its `'None'` direction text) on the detector path, so each reconcile matches
+  EXACTLY ONE analyzer pattern (no double-count).
+- **Master kill-switch `divergence_detector_enabled`** (default True) is enforced
+  BOTH at the wrapper entry (catch-all) AND at each signal's upstream work, so the
+  detector is fully inert (no signal, no extra REST) when off.
+- **Signal 1 — placement-failure UNION.** `runner._record_placement_failure(error)`
+  (called from BOTH `_execute_place_intent` failure exits) appends to a rolling
+  `_placement_failure_window` (deque, stamped/evicted via the injectable
+  `self._clock()`) when the error is in the UNION {110017, 110072, network};
+  **110007 is EXCLUDED** (intentional low-balance drop). At
+  `divergence_failure_mix_threshold` (10) within
+  `divergence_failure_mix_window_seconds` (60) it CLEARS the window and fires the
+  `on_divergence_failure_mix` callback — "a fire" = threshold-reached, regardless
+  of whether the downstream reconcile is then suppressed (so a cooldown-suppressed
+  fire does not leave the window full and re-trigger on every later failure). Two
+  new classifiers in `executor.py`: `is_network_error` (narrow lowercased tokens:
+  `timeout`/`connection`/`temporarily unavailable`/`readtimeout`) and
+  `is_duplicate_link_error` (110072 / "OrderLinkedID is duplicate").
+- **Signal 2 — retry-budget edge.** In `_health_check_once`, fire once per NEW
+  edge when `truncate_breaker_reconcile_count >= divergence_retry_budget` (5) AND
+  the count differs from `_divergence_budget_last_fired[strat]`. Backstop for when
+  the breaker counts but does not auto-reconcile.
+- **Signal 3 — REST-vs-local size delta.** `_divergence_size_check_once` (gated by
+  `_next_divergence_size_check`, primed half an interval ahead of `_next_order_sync`
+  so the two REST sweeps don't co-fire) compares `runner.rest_position_size(dir)`
+  (a NEW **pure** REST read — no mirror mutation, no throttle write, no failure-
+  counter bump, unlike `_refresh_position_size_from_rest`) to the local mirror.
+  Evaluates BOTH directions, fires ONCE with `direction=None` if EITHER exceeds
+  `qty_step * divergence_size_delta_qty_step_multiplier` (5). A `None` REST read
+  skips that direction (no fire). `divergence_size_check_interval_seconds` carries
+  `gt=0` (cannot be disabled) so position size ALWAYS has a periodic backstop.
+- **Signal 4 — post-WS-recovery.** A PRIVATE-channel gap/reset (heartbeat
+  `_on_ws_disconnect kind=="private"`, or the private reconnect branches of
+  `_health_check_once` / `_ws_health_check_once`) fans out account→strats via
+  `_account_to_runners` into `_pending_post_recovery_reconcile` (a `set[str]`
+  guarded by `_pending_post_recovery_lock` — `_on_ws_disconnect` runs on the WS
+  heartbeat thread). Public-only gaps do NOT enqueue. The set is drained
+  swap-and-clear ONCE per `_tick` at a PINNED point: after the per-tick WS event
+  drains (so no concurrent reader of a half-cleared dedup cache) and IMMEDIATELY
+  before the order-sync gate (sharing the tick's `now`). A throttle/cooldown-
+  suppressed strat is DROPPED, not retried (no 10Hz busy-loop); when it would be
+  throttle-suppressed AND `order_sync_interval > 0`, the drain peeks the throttle
+  and sets `_next_order_sync = 0.0` so the order-sync gate runs THIS tick
+  (fast-track), shrinking the order-level backstop from up to `order_sync_interval`
+  to the same tick.
+- Config (all on `StrategyConfig`, default-on): `divergence_detector_enabled`,
+  `divergence_failure_mix_threshold` (ge=1), `divergence_failure_mix_window_seconds`
+  (gt=0), `divergence_retry_budget` (ge=1), `divergence_size_check_interval_seconds`
+  (gt=0), `divergence_size_delta_qty_step_multiplier` (gt=0),
+  `divergence_reconcile_min_interval_seconds` (gt=0). Constant
+  `bybit_adapter.error_codes.ORDER_LINK_ID_DUPLICATE = 110072`.
+- **Analyzer**: `force_reconcile_fired` is a SINGLE merged `event_coverage` key
+  covering BOTH origins (detector WARNING + 0064 breaker line) — do NOT split.
+- Files touched: `runner.py`, `orchestrator.py`, `executor.py`, `config.py`,
+  `error_codes.py`, `.claude/skills/gridbot-health/analyze.py`. Tests:
+  `test_runner_divergence.py`, `test_orchestrator_divergence.py`,
+  classifier tests in `test_executor.py`, config tests in `test_config.py`.
+
 ### 110007 low-balance preflight + chase-close (feature 0066, issue #159)
 
 Defends against the **110007 "available balance not enough"** retry storm that

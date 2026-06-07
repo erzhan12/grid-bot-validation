@@ -1,45 +1,25 @@
-# 0065 — Backtest wallet seed: re-mark non-USDT collateral (totalEquity / liq_price parity)
+# 0069 — Auto state-divergence detector + on-demand forced reconcile (issue #151)
 
-Plan: docs/features/0065_PLAN.md  |  Branch: feature/0065-collateral-remark. TDD throughout (RED → GREEN per phase).
+Plan: docs/features/0069_PLAN.md  |  Branch: feature/0069-divergence-detector
 
-## Grounding (resolved from real DB `recorder_ltcusdt_phase4.db`)
-- [x] SOL per-coin `raw_json`: `walletBalance`, `usdValue`, `collateralSwitch`(bool), `marginCollateral`(bool) confirmed
-- [x] SOL only 3 rows (quiet-coin staleness real → ticker fallback needed)
-- [x] Fixture: run_id `1aff13af-…`, account `9bdb9748-…`, SOLUSDT ticker present, traded sym LTCUSDT
+## Status: implementation + tests + docs COMPLETE (adversarial review running)
 
-## Phase 1 — Data layer
-- [x] 1B repos: `WalletSnapshotRepository.get_all_coins_latest_before` (+2 tests)
-- [x] 1B repos: `TickerSnapshotRepository.get_mark_at_or_before` (+2 tests)
-- [x] 1B `WalletSeed`: +6 fields (`field(default_factory=...)`, frozen-safe)
-- [x] 1B `load_collateral_seed(...)` loader (fresh `usdValue/bal` vs ticker fallback, `_strip_tz`) (+9 tests)
-- [x] 1B `engine._load_seed` merge via `dataclasses.replace`; raise `SeedDataQualityError` (+2 tests)
-- [x] 1C `SeedConfig`: 4 collateral fields (+3 tests)
-- [x] 1A recorder: `RecorderConfig.collateral_symbols` + merged public sub set (+3 tests)
+- [x] error_codes.py — `ORDER_LINK_ID_DUPLICATE = 110072`
+- [x] executor.py — `is_network_error`, `is_duplicate_link_error` classifiers
+- [x] config.py — 7 new `divergence_*` StrategyConfig fields (ge=1 / gt=0 constraints)
+- [x] runner.py — `_record_placement_failure` (signal 1), `clear_dedup_cache`,
+      `rest_position_size` (pure read), `on_divergence_failure_mix` ctor param,
+      `_placement_failure_window`, two `_execute_place_intent` call sites
+- [x] orchestrator.py — `_force_reconcile_strat` refactor (`direction:str|None`,
+      `emit_breaker_warning`, `-> bool`, both-directions internal), wrapper
+      `_trigger_divergence_reconcile`, `_enqueue_post_recovery_reconcile`,
+      `_divergence_size_check_once`/`_interval`, signal-1 wiring, signal-2 edge in
+      `_health_check_once`, signal-3 gate+priming, signal-4 enqueues (3 private
+      sources) + pinned `_tick` drain + order-sync fast-track, new __init__ state
+- [x] analyze.py — merged `force_reconcile_fired` event_coverage key + label + scan
+- [x] Tests: test_runner_divergence.py, test_orchestrator_divergence.py,
+      test_executor.py classifiers, test_config.py, test_analyze.py
+- [x] Docs: RULES.md 0069 section, SKILL.md Table 13 note
+- [x] Full suite green: 1258 passed, 1 skipped (apps/gridbot + packages)
 
-## Phase 2 — Backtest equity re-marking
-- [x] 2A `BacktestSession`: collateral kwargs, `seed_contrib`, `collateral_marks`, `update_collateral_mark`, `collateral_drift_total`, `collateral_drift_by_coin` (+7 tests)
-- [x] 2A re-mark DELTA in BOTH `update_equity` AND `refresh_balances`; `current_balance`/`equity_curve`/`final_balance` unchanged
-- [x] 2B `CollateralMarkFeed` (per-coin ticker stream, `mark_at(coin, ts)`) (+4 tests)
-- [x] 2B engine: build session w/ collateral kwargs; `update_collateral_mark` at TOP of tick loop (before `process_fills`)
-- [x] 2B wind-down: `leave_open` default for #3a (documented; close_all out of scope)
-
-## Phase 3 — Comparator attribution
-- [x] 3 `ValidationMetrics`: `non_usdt_collateral_drift_total`, `collateral_drift_by_coin`, 3 list fields
-- [x] 3 engine: plumb session drift + seed lists into metrics after finalize
-- [x] 3 `reporter.export_metrics` rows + `print_summary` line (+3 tests)
-
-## Verification
-- [x] All new unit tests pass (loader, repos, session, recorder config, reporter, engine_seed)
-- [x] Engine integration: SOL fixture, #3a (<$1), #3b, #4 USDT-only no-op (+3 tests)
-- [x] Full repo suite green — 2439 passed, 3 skipped (+38 new)
-- [x] `scripts/verify_0065_collateral.py` runs on real DB (SOL drift attribution)
-- [x] Operator YAML examples (replay + recorder) documented
-- [x] RULES.md entry 25 added
-- [x] Adversarial review pass — 4-lens + verify (P0s = positive confirmations; applied 8 P1–P3 fixes: feed monotonicity guard, deterministic tie-break, _strip_tz DRY, close_all/#3a doc, collateral_coins validator, never-marked WARN, InvalidOperation log, session contract assert)
-- [ ] User sign-off + commit (awaiting explicit instruction)
-
-## What could break (revisit)
-- Frozen dataclass mutable default → `field(default_factory=...)` ✓
-- Static seed balances vs live balance drift (SOL doubled mid-window) — #3a WARN documented
-- `_strip_tz` tz mismatch (naive SQLite ts vs aware config at_ts) — handled + tested
-- Perp mark vs Bybit `usdValue` basis divergence on tight #3a — documented limitation
+## Not committed — awaiting user review/approval before any commit.

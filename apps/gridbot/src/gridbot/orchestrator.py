@@ -13,6 +13,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, UTC
+from decimal import Decimal
 from typing import Optional
 from uuid import UUID
 
@@ -23,6 +24,7 @@ from grid_db import DatabaseFactory
 from grid_db import Run, RunRepository, Strategy, BybitAccount, User
 from grid_db.identity import account_id_for, strategy_id_for, user_id_for
 from gridcore import (
+    DirectionType,
     GridStateStore,
     InstrumentInfo,
     TickerEvent,
@@ -129,6 +131,24 @@ class Orchestrator:
         # tripped breaker cannot itself spam REST during an outage. strat_id ->
         # monotonic ts of the last forced reconcile.
         self._force_reconcile_last_at: dict[str, float] = {}
+
+        # Feature 0069 (issue #151) — state-divergence detector. Logic lives on
+        # the orchestrator (no separate class). All four signals converge on
+        # _trigger_divergence_reconcile -> _force_reconcile_strat(direction=None).
+        # Detector throttle (≥5 min default), SEPARATE from the breaker cooldown:
+        # strat_id -> monotonic ts of the last divergence-driven forced reconcile.
+        self._divergence_last_fire_at: dict[str, float] = {}
+        # Signal 2 edge-tracking: strat_id -> the breaker reconcile-count value
+        # we last fired on (fire once per new exhaustion edge, not every tick).
+        self._divergence_budget_last_fired: dict[str, int] = {}
+        # Signal 4 — strats pending a post-WS-recovery forced reconcile. Mutated
+        # from the WS heartbeat thread (_on_ws_disconnect) AND the main loop, so
+        # guarded by a dedicated lock; drained (swap-and-clear) once per _tick.
+        self._pending_post_recovery_reconcile: set[str] = set()
+        self._pending_post_recovery_lock = threading.Lock()
+        # Signal 3 — next REST-vs-local size-delta sweep (primed with a phase
+        # offset vs _next_order_sync in start() so the two sweeps do not co-fire).
+        self._next_divergence_size_check: float = 0.0
 
         # Run tracking
         self._run_ids: dict[str, UUID] = {}  # strat_id -> run_id
@@ -347,6 +367,12 @@ class Orchestrator:
         self._next_ws_health_check = now + _WS_HEALTH_CHECK_INTERVAL
         self._next_order_sync = now  # order sync runs immediately on first tick
         self._next_retry_tick = now + _RETRY_TICK_INTERVAL
+        # Feature 0069 signal 3 — phase-offset half an interval ahead of
+        # _next_order_sync (which fires this tick) so the two periodic REST sweeps
+        # do not co-fire and produce a synchronized burst.
+        self._next_divergence_size_check = (
+            now + self._divergence_size_check_interval() / 2.0
+        )
 
         self._running = True
         self._started = True
@@ -548,6 +574,35 @@ class Orchestrator:
                     "_ws_health_check_once", e,
                     error_key="periodic_ws_health_check",
                 )
+        # Feature 0069 signal 4 — drain post-WS-recovery forced reconciles.
+        # PINNED here: after the per-tick WS event drains (steps 1/2/2.5) so no
+        # order-update event is adjudicated against a half-cleared dedup cache,
+        # and IMMEDIATELY BEFORE the order-sync gate (sharing this tick's `now`)
+        # so a fast-tracked _next_order_sync is consumed THIS tick. Swap-and-clear
+        # under the lock, then iterate the captured set OUTSIDE the lock. The
+        # drain NEVER re-adds: a strat whose reconcile is suppressed (detector
+        # throttle or breaker cooldown) is DROPPED, not retried (position size is
+        # backstopped by signal 3, order-level by the periodic order-sync).
+        with self._pending_post_recovery_lock:
+            pending_recovery = self._pending_post_recovery_reconcile
+            self._pending_post_recovery_reconcile = set()
+        for strat_id in pending_recovery:
+            cfg = next(
+                (c for c in self._config.strategies if c.strat_id == strat_id),
+                None,
+            )
+            # Fast-track the order-sync (same tick) when the reconcile WOULD be
+            # throttle-suppressed AND order-sync is enabled — shrinking the
+            # order-level backstop from up to order_sync_interval to this tick.
+            # Read-only peek (does NOT bump the throttle); a NON-suppressed strat
+            # reconciles directly below and needs no fast-track.
+            if cfg is not None and self._config.order_sync_interval > 0:
+                last = self._divergence_last_fire_at.get(strat_id, 0.0)
+                if (now - last) < cfg.divergence_reconcile_min_interval_seconds:
+                    self._next_order_sync = 0.0
+            self._trigger_divergence_reconcile(
+                strat_id, "post_ws_recovery", "private_ws_recovery", direction=None,
+            )
         if (
             self._config.order_sync_interval > 0
             and now >= self._next_order_sync
@@ -563,6 +618,22 @@ class Orchestrator:
                 self._notifier.alert_exception(
                     "_order_sync_once", e,
                     error_key="periodic_order_sync",
+                )
+        # Feature 0069 signal 3 — periodic REST-vs-local position-size delta sweep.
+        if now >= self._next_divergence_size_check:
+            self._next_divergence_size_check = (
+                now + self._divergence_size_check_interval()
+            )
+            try:
+                self._divergence_size_check_once()
+            except Exception as e:
+                logger.error(
+                    "Periodic check failed (_divergence_size_check_once): %s",
+                    e, exc_info=True,
+                )
+                self._notifier.alert_exception(
+                    "_divergence_size_check_once", e,
+                    error_key="periodic_divergence_size_check",
                 )
         if now >= self._next_retry_tick:
             for rq in self._retry_queues.values():
@@ -771,6 +842,8 @@ class Orchestrator:
             # Feature 0064 — dirty-mirror REST refresh + breaker forced reconcile.
             rest_client=self._rest_clients[account_name],
             on_truncate_breaker_tripped=self._force_reconcile_strat,
+            # Feature 0069 (issue #151) — signal 1 placement-failure UNION fire.
+            on_divergence_failure_mix=self._trigger_divergence_reconcile,
             # Feature 0066 Phase 4 — real-time wallet preflight source.
             wallet_provider=wallet_provider,
             wallet_ws_max_age_seconds=self._config.wallet_ws_max_age_seconds,
@@ -1029,6 +1102,26 @@ class Orchestrator:
                         runner.strat_id, trips, rest_failures,
                     )
 
+                # Feature 0069 signal 2 — reconciler retry-budget exhaustion.
+                # Fire once per NEW edge (count crosses to a value we have not
+                # yet fired on), not every tick while parked at the same value.
+                cfg = next(
+                    (c for c in self._config.strategies
+                     if c.strat_id == runner.strat_id),
+                    None,
+                )
+                if cfg is not None and cfg.divergence_detector_enabled:
+                    if (
+                        trips >= cfg.divergence_retry_budget
+                        and trips != self._divergence_budget_last_fired.get(
+                            runner.strat_id, -1
+                        )
+                    ):
+                        self._divergence_budget_last_fired[runner.strat_id] = trips
+                        self._trigger_divergence_reconcile(
+                            runner.strat_id, "retry_budget", trips,
+                        )
+
             for account_name in list(self._public_ws.keys()):
                 # Check public WS
                 pub_ws = self._public_ws.get(account_name)
@@ -1081,6 +1174,10 @@ class Orchestrator:
                                 "(threshold=%.1fs) — blocking main polling loop",
                                 account_name, elapsed, _WS_RECONNECT_SLOW_THRESHOLD,
                             )
+                    # Feature 0069 signal 4 — a private socket was found dead and
+                    # reconnected; schedule a forced reconcile (drained next _tick).
+                    # Private-only — the public branch above does NOT enqueue.
+                    self._enqueue_post_recovery_reconcile(account_name)
         except Exception as e:
             self._notifier.alert_exception(
                 "_health_check_once", e, error_key="health_check_loop",
@@ -1124,6 +1221,13 @@ class Orchestrator:
                     "WS socket dead for %s/private; resetting",
                     account_name,
                 )
+                # Feature 0069 signal 4 — a dead PRIVATE socket IS the divergence
+                # event; enqueue on DETECTION (before reset) so a forced reconcile
+                # is scheduled even if reset() raises — the reconcile runs over
+                # REST, independent of the WS socket. Mirrors _health_check_once,
+                # which enqueues after its reconnect try/except regardless of
+                # success. Private-only (public loop above does NOT enqueue).
+                self._enqueue_post_recovery_reconcile(account_name)
                 priv_ws.reset()
             except Exception as e:
                 logger.error(
@@ -1166,6 +1270,14 @@ class Orchestrator:
             account_name, kind,
         )
 
+        # Feature 0069 signal 4 — a PRIVATE-channel gap means order/position acks
+        # may have been missed; schedule a forced reconcile drained next _tick.
+        # Public-only gaps imply stale price ticks, not order/position divergence,
+        # so they do NOT enqueue. Runs on the WS heartbeat thread — the helper
+        # takes _pending_post_recovery_lock.
+        if kind == "private":
+            self._enqueue_post_recovery_reconcile(account_name)
+
         def _do_reset() -> None:
             try:
                 client.reset()
@@ -1206,22 +1318,52 @@ class Orchestrator:
             "%s: Untracked order seen — fast-tracking order sync", strat_id,
         )
 
-    def _force_reconcile_strat(self, strat_id: str, direction: str) -> None:
-        """Breaker-triggered forced position + order reconcile (feature 0064).
+    def _force_reconcile_strat(
+        self,
+        strat_id: str,
+        direction: "str | None",
+        emit_breaker_warning: bool = True,
+    ) -> bool:
+        """Forced position + order reconcile (feature 0064; extended 0069).
 
-        Wired as the runner's ``on_truncate_breaker_tripped`` callback. Resyncs
-        the order book via ``reconcile_reconnect`` (handles untracked-on-exchange
-        / missing-in-memory) AND the position size via
-        ``_refresh_position_size_from_rest(force=True)`` — the piece
-        ``reconcile_reconnect`` does NOT do today — closing the stale-mirror gap
-        that defeated ``_is_good_to_place``. Rate-limited to at most once per
+        Wired as the runner's ``on_truncate_breaker_tripped`` callback AND reused
+        by the state-divergence detector (issue #151). Resyncs the order book via
+        ``reconcile_reconnect`` (handles untracked-on-exchange / missing-in-memory)
+        AND the position size via ``_refresh_position_size_from_rest(force=True)``
+        — the piece ``reconcile_reconnect`` does NOT do — closing the stale-mirror
+        gap that defeated ``_is_good_to_place``. Rate-limited to at most once per
         ``truncate_breaker_cooldown_seconds`` per strat so a tripped breaker
-        cannot itself spam REST during an outage. Designed to be reusable by the
-        broader divergence detector (issue #151).
+        cannot itself spam REST during an outage.
+
+        ``direction``:
+          - a specific side (``DirectionType.LONG``/``SHORT``) — the breaker-trip
+            caller's path: ONE ``reconcile_reconnect`` + ONE position refresh for
+            that side (unchanged behaviour).
+          - ``None`` — every detector signal's path: ONE rate-limit check, ONE
+            ``reconcile_reconnect`` (whole-runner / direction-agnostic), then a
+            position refresh for BOTH LONG and SHORT (each in its own try/except).
+            Handled INTERNALLY so the rate-limit timestamp is set exactly once and
+            the second direction is never silently dropped behind the rate-limit
+            (which two back-to-back calls would do — leaving a hedge-mode mirror
+            half stale behind a WARNING claiming a full reconcile).
+
+        ``emit_breaker_warning``: when True (default — breaker-trip caller) the
+        ``"110017 breaker tripped — forcing ..."`` WARNING is emitted (byte-for-
+        byte unchanged). The detector wrapper passes False so that line — and its
+        ``'None'`` direction text — is suppressed; only the wrapper's single
+        ``state-divergence detected`` WARNING is emitted on a detector fire,
+        keeping the analyzer's merged ``force_reconcile_fired`` count at one per
+        reconcile (each reconcile matches exactly one of the two scanned patterns).
+
+        Returns True when a reconcile was ATTEMPTED (not rate-limited / no runner),
+        False on every no-op exit. True does NOT guarantee full success — the two
+        REST steps run in independent try/excepts and a partial failure is alerted
+        via ``_notifier.alert_exception`` but still returns True (the WARNING is
+        about the action taken, not a success guarantee).
         """
         runner = self._runners.get(strat_id)
         if runner is None:
-            return
+            return False
         account_name = self._get_account_for_strategy(strat_id)
         reconciler = self._reconcilers.get(account_name) if account_name else None
 
@@ -1237,13 +1379,14 @@ class Orchestrator:
                 "%s: forced reconcile rate-limited (%.1fs since last < %.1fs)",
                 strat_id, now - last, cooldown,
             )
-            return
+            return False
         self._force_reconcile_last_at[strat_id] = now
 
-        logger.warning(
-            "%s: 110017 breaker tripped — forcing %s position + order reconcile",
-            strat_id, direction,
-        )
+        if emit_breaker_warning:
+            logger.warning(
+                "%s: 110017 breaker tripped — forcing %s position + order reconcile",
+                strat_id, direction,
+            )
         if reconciler is not None:
             try:
                 reconciler.reconcile_reconnect(runner)
@@ -1253,15 +1396,185 @@ class Orchestrator:
                     error_key=f"force_reconcile_orders_{strat_id}",
                 )
         # Position-size resync is the #149-critical healing step — it closes the
-        # stale-mirror gap that defeats _is_good_to_place. Run it in its OWN
-        # try/except so an order-reconcile failure above never skips it (P2).
-        try:
-            runner._refresh_position_size_from_rest(direction, force=True)
-        except Exception as e:
-            self._notifier.alert_exception(
-                f"forced reconcile position {strat_id}", e,
-                error_key=f"force_reconcile_pos_{strat_id}",
+        # stale-mirror gap that defeats _is_good_to_place. Run each direction in
+        # its OWN try/except so an order-reconcile failure above never skips it
+        # (P2) and one direction's failure never skips the other (B-1).
+        directions = (
+            (DirectionType.LONG, DirectionType.SHORT)
+            if direction is None
+            else (direction,)
+        )
+        for d in directions:
+            try:
+                runner._refresh_position_size_from_rest(d, force=True)
+            except Exception as e:
+                self._notifier.alert_exception(
+                    f"forced reconcile position {strat_id}", e,
+                    error_key=f"force_reconcile_pos_{strat_id}",
+                )
+        return True
+
+    def _trigger_divergence_reconcile(
+        self,
+        strat_id: str,
+        signal: str,
+        evidence: object,
+        direction: "str | None" = None,
+    ) -> None:
+        """Thin divergence wrapper around ``_force_reconcile_strat`` (issue #151).
+
+        All four detector signals funnel here. Fire-and-forget (returns None — no
+        caller, including signal 4's drain, inspects a return value). Order:
+
+        1. Master kill-switch (BEFORE the throttle): if the per-strat
+           ``divergence_detector_enabled`` is False, RETURN immediately (no
+           reconcile, no WARNING, no throttle bump). This is the catch-all the
+           kill-switch test asserts.
+        2. Detector throttle (SEPARATE from the breaker cooldown): if within
+           ``divergence_reconcile_min_interval_seconds`` of the last divergence
+           fire, emit DEBUG and RETURN — without calling ``_force_reconcile_strat``
+           and without bumping the throttle.
+        3. Call ``_force_reconcile_strat`` exactly ONCE — ALWAYS ``direction=None``
+           (the internal both-directions handling does the work) and ALWAYS
+           ``emit_breaker_warning=False`` (suppress the breaker line on this path).
+           Branch on the returned bool so side-effects ONLY land on a real
+           reconcile:
+             - False (rate-limited by the breaker cooldown / no runner): single
+               DEBUG "suppressed" line; NO WARNING, NO dedup-clear, NO throttle
+               bump. A suppressed fire never evicts adjudication state without a
+               resync, and the analyzer counter never overstates real reconciles.
+             - True: the single ``state-divergence detected`` WARNING, clear the
+               runner's dedup cache, and bump the detector throttle.
+        """
+        cfg = next(
+            (c for c in self._config.strategies if c.strat_id == strat_id), None
+        )
+        if cfg is None or not cfg.divergence_detector_enabled:
+            return
+
+        now = time.monotonic()
+        last = self._divergence_last_fire_at.get(strat_id, 0.0)
+        min_interval = cfg.divergence_reconcile_min_interval_seconds
+        if (now - last) < min_interval:
+            logger.debug(
+                "%s: divergence signal=%s within throttle (%.1fs since last < %.1fs) "
+                "— skipping",
+                strat_id, signal, now - last, min_interval,
             )
+            return
+
+        ran = self._force_reconcile_strat(strat_id, None, emit_breaker_warning=False)
+        if not ran:
+            logger.debug(
+                "%s: divergence signal=%s suppressed — forced reconcile within "
+                "breaker cooldown",
+                strat_id, signal,
+            )
+            return
+
+        logger.warning(
+            "%s: state-divergence detected (signal=%s, evidence=%s), "
+            "forcing full reconcile",
+            strat_id, signal, evidence,
+        )
+        runner = self._runners.get(strat_id)
+        if runner is not None:
+            try:
+                runner.clear_dedup_cache()
+            except Exception as e:
+                self._notifier.alert_exception(
+                    f"divergence dedup clear {strat_id}", e,
+                    error_key=f"divergence_dedup_clear_{strat_id}",
+                )
+        self._divergence_last_fire_at[strat_id] = now
+
+    def _enqueue_post_recovery_reconcile(self, account_name: str) -> None:
+        """Signal 4 — fan out an account-level WS recovery to its strats.
+
+        The three trigger sources (``_on_ws_disconnect`` heartbeat gap,
+        ``_health_check_once`` private reconnect, ``_ws_health_check_once`` private
+        reset) identify the socket by ``account_name``; the pending set is keyed by
+        ``strat_id``, so fan out via ``_account_to_runners`` here. Skips per-strat
+        when the detector is disabled. Takes ``_pending_post_recovery_lock`` because
+        ``_on_ws_disconnect`` runs on the WS heartbeat thread. The set dedups the
+        public+private double-fire for the same account naturally.
+        """
+        runners = self._account_to_runners.get(account_name, [])
+        with self._pending_post_recovery_lock:
+            for runner in runners:
+                cfg = next(
+                    (c for c in self._config.strategies
+                     if c.strat_id == runner.strat_id),
+                    None,
+                )
+                if cfg is None or not cfg.divergence_detector_enabled:
+                    continue
+                self._pending_post_recovery_reconcile.add(runner.strat_id)
+
+    def _divergence_size_check_interval(self) -> float:
+        """Cadence for the signal-3 size-delta sweep (orchestrator-level gate).
+
+        The per-strat ``divergence_size_check_interval_seconds`` is honoured by
+        taking the MIN across enabled strats so the most-frequent strat's cadence
+        is respected; the sweep itself is per-runner and cheap, so over-checking a
+        slower strat is harmless. Falls back to 300s when no strat is enabled.
+        """
+        intervals = [
+            c.divergence_size_check_interval_seconds
+            for c in self._config.strategies
+            if c.divergence_detector_enabled
+        ]
+        return min(intervals) if intervals else 300.0
+
+    def _divergence_size_check_once(self) -> None:
+        """Signal 3 — read-only REST-vs-local position-size delta sweep.
+
+        For each runner: skip when the detector is disabled, when
+        ``_instrument_info`` is None (no-rounding mode), or when ``qty_step`` is not
+        a positive ``Decimal``. Evaluate BOTH directions via the pure
+        ``rest_position_size`` read (no mirror mutation); a ``None`` REST read skips
+        that direction (no fire). If EITHER direction's ``abs(rest - local)`` exceeds
+        ``qty_step * multiplier``, fire ONCE with ``direction=None`` (full reconcile
+        refreshes both mirrors — never targets one side, avoiding the same-sweep
+        throttle trap).
+        """
+        for runner in self._runners.values():
+            cfg = next(
+                (c for c in self._config.strategies
+                 if c.strat_id == runner.strat_id),
+                None,
+            )
+            if cfg is None or not cfg.divergence_detector_enabled:
+                continue
+            info = getattr(runner, "_instrument_info", None)
+            if info is None:
+                continue
+            qty_step = getattr(info, "qty_step", None)
+            if not isinstance(qty_step, Decimal) or qty_step <= 0:
+                continue
+            threshold = qty_step * Decimal(
+                str(cfg.divergence_size_delta_qty_step_multiplier)
+            )
+            deltas: list[tuple[str, Decimal]] = []
+            for direction, local_size in (
+                (DirectionType.LONG, runner._long_position.size),
+                (DirectionType.SHORT, runner._short_position.size),
+            ):
+                rest_size = runner.rest_position_size(direction)
+                if rest_size is None:
+                    logger.debug(
+                        "%s: divergence size-check REST read failed for %s — "
+                        "skipping that direction",
+                        runner.strat_id, direction,
+                    )
+                    continue
+                deltas.append((direction, abs(rest_size - local_size)))
+            diverged = [(d, delta) for d, delta in deltas if delta > threshold]
+            if diverged:
+                evidence = "+".join(f"{d} Δ{delta}" for d, delta in deltas)
+                self._trigger_divergence_reconcile(
+                    runner.strat_id, "rest_size_delta", evidence, direction=None,
+                )
 
     def _order_sync_once(self) -> None:
         """Single-shot order reconciliation sweep.

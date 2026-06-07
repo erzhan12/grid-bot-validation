@@ -232,6 +232,75 @@ class StrategyConfig(BaseModel):
         description="Window length (seconds) for the periodic LowBalanceSkip summary.",
     )
 
+    # Feature 0069 — auto state-divergence detector + on-demand forced reconcile
+    # (issue #151). Four signals (placement-failure union / retry-budget /
+    # REST-vs-local size delta / post-WS-recovery) converge on one forced
+    # reconcile, throttled SEPARATELY from the 0064 breaker cooldown. All
+    # default-on so existing conf/*.yaml keep working unchanged.
+    divergence_detector_enabled: bool = Field(
+        default=True,
+        description=(
+            "Master kill-switch for the state-divergence detector. When False "
+            "the detector is fully inert: no signal records, no extra REST, no "
+            "forced reconcile, no WARNING. The 0064 breaker is unaffected."
+        ),
+    )
+    divergence_failure_mix_threshold: int = Field(
+        default=10,
+        ge=1,
+        description=(
+            "Signal 1: fire when this many placement failures whose error is in "
+            "the UNION of {110017, 110072, network} occur within "
+            "divergence_failure_mix_window_seconds on one strat (110007 is "
+            "EXCLUDED — it is an intentional low-balance drop, not divergence)."
+        ),
+    )
+    divergence_failure_mix_window_seconds: float = Field(
+        default=60.0,
+        gt=0,
+        description="Signal 1: rolling window (seconds) for the placement-failure UNION count.",
+    )
+    divergence_retry_budget: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            "Signal 2: fire once per new edge when truncate_breaker_reconcile_count "
+            "reaches this many breaker-driven reconciles (backstop for the cases "
+            "the breaker counts but does not auto-reconcile)."
+        ),
+    )
+    divergence_size_check_interval_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        description=(
+            "Signal 3: cadence (seconds) of the read-only REST-vs-local "
+            "position-size delta sweep. gt=0 (cannot be disabled): position size "
+            "always has a periodic backstop, which is why a throttle-suppressed "
+            "signal-4 reconcile can be safely dropped. NOTE: a single "
+            "orchestrator-level gate drives the sweep for ALL strats at the "
+            "MINIMUM interval across enabled strats — a strat configured with a "
+            "longer interval is swept more often (harmless: the per-runner read "
+            "is cheap and idempotent)."
+        ),
+    )
+    divergence_size_delta_qty_step_multiplier: float = Field(
+        default=5.0,
+        gt=0,
+        description=(
+            "Signal 3: fire when abs(rest_size - local_size) exceeds "
+            "qty_step * this multiplier for either direction."
+        ),
+    )
+    divergence_reconcile_min_interval_seconds: float = Field(
+        default=300.0,
+        gt=0,
+        description=(
+            "Detector throttle: minimum seconds between forced reconciles per "
+            "strat triggered by ANY divergence signal. SEPARATE from the 0064 "
+            "breaker cooldown (truncate_breaker_cooldown_seconds)."
+        ),
+    )
+
     # Mode
     shadow_mode: bool = Field(default=False, description="Log intents without executing")
 

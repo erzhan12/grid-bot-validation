@@ -20,3 +20,11 @@ ORDER_QTY_TRUNCATED_TO_ZERO = 110017
 # are exempt (they free margin). Drives the low-balance preflight + retry-queue
 # no-enqueue guard (feature 0066, issue #159).
 INSUFFICIENT_BALANCE = 110007
+
+# ErrCode 110072 "OrderLinkedID is duplicate": a re-submitted order reuses an
+# orderLinkId Bybit still caches (it survives ~1-2h past the order lifetime), or
+# a REST retry lands an order whose first ack never arrived via WS. Individually
+# benign (the retry queue handles it), but a SUSTAINED run is evidence the WS ack
+# path is degraded and the local mirror may be drifting — counted by the
+# state-divergence detector (feature 0069, issue #151).
+ORDER_LINK_ID_DUPLICATE = 110072
