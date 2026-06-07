@@ -1321,7 +1321,7 @@ class Orchestrator:
     def _force_reconcile_strat(
         self,
         strat_id: str,
-        direction: "str | None",
+        direction: Optional[str],
         emit_breaker_warning: bool = True,
     ) -> bool:
         """Forced position + order reconcile (feature 0064; extended 0069).
@@ -1419,7 +1419,7 @@ class Orchestrator:
         strat_id: str,
         signal: str,
         evidence: object,
-        direction: "str | None" = None,
+        direction: Optional[str] = None,
     ) -> None:
         """Thin divergence wrapper around ``_force_reconcile_strat`` (issue #151).
 
