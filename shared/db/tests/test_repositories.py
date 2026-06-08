@@ -2344,3 +2344,93 @@ class TestGridStateSnapshotRepository:
         )
         assert picked is not None
         assert picked.run_id == newer_run.run_id
+
+    # ----- account-agnostic active lookup (replay fallback, #151-adjacent) -----
+
+    def test_get_active_run_at_or_before_matches_other_account(
+        self, session, sample_user, sample_account, sample_strategy,
+    ):
+        """The account-agnostic fallback finds a live grid snapshot written
+        under a DIFFERENT ``account_id`` than the caller's account — the exact
+        pre-0053 divergence (recorder placeholder vs gridbot ``account_id_for``).
+        The account-scoped ``get_at_or_before`` misses the same row, proving the
+        fallback is necessary.
+        """
+        at_ts = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+        other_user = User(user_id="gridbot-user", username="gridbot")
+        other_account = BybitAccount(
+            account_id="gridbot-acc", user_id="gridbot-user",
+            account_name="gridbot_account", environment="testnet",
+        )
+        other_strategy = Strategy(
+            strategy_id="gridbot-strat", account_id="gridbot-acc",
+            strategy_type="GridStrategy", symbol="BTCUSDT", config_json={},
+        )
+        other_run = Run(
+            user_id="gridbot-user", account_id="gridbot-acc",
+            strategy_id="gridbot-strat", run_type="live", status="running",
+            start_ts=datetime(2026, 1, 1, tzinfo=UTC), end_ts=None,
+        )
+        session.add_all([other_user, other_account, other_strategy, other_run])
+        session.flush()
+        grid = [
+            {"side": "Buy", "price": 100.0},
+            {"side": "Wait", "price": 101.0},
+            {"side": "Sell", "price": 102.0},
+        ]
+        exchange_ts = datetime(2026, 1, 2, 8, 0, tzinfo=UTC)
+        repo = GridStateSnapshotRepository(session)
+        repo.insert(GridStateSnapshot(
+            run_id=other_run.run_id, account_id="gridbot-acc",
+            strat_id="strat_a", symbol="BTCUSDT",
+            exchange_ts=exchange_ts, local_ts=exchange_ts,
+            grid_json=grid, grid_step=Decimal("0.5"), grid_count=3,
+            raw_fingerprint=grid_fingerprint_hash(grid, 0.5, 3),
+        ))
+        session.flush()
+
+        # Account-scoped sibling (caller's own account) MISSES.
+        assert repo.get_at_or_before(
+            sample_account.account_id, "strat_a", "BTCUSDT", at_ts,
+        ) is None
+        # Account-agnostic fallback FINDS the other account's live grid.
+        picked = repo.get_active_run_at_or_before("strat_a", "BTCUSDT", at_ts)
+        assert picked is not None
+        assert picked.run_id == other_run.run_id
+        assert picked.account_id == "gridbot-acc"
+
+    def test_get_active_run_at_or_before_excludes_ended_run(
+        self, session, sample_user, sample_account, sample_strategy,
+    ):
+        """Run-active guard still applies without the account predicate: a live
+        run ended before ``at_ts`` is excluded (no stale-grid reintroduction).
+        """
+        at_ts = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+        self._seed_grid_run(
+            session, sample_user, sample_account, sample_strategy,
+            run_type="live",
+            start_ts=datetime(2026, 1, 1, tzinfo=UTC),
+            end_ts=datetime(2026, 1, 2, 9, 0, tzinfo=UTC),  # ended before at_ts
+            exchange_ts=datetime(2026, 1, 2, 8, 0, tzinfo=UTC),
+        )
+        assert GridStateSnapshotRepository(session).get_active_run_at_or_before(
+            "strat_a", "BTCUSDT", at_ts,
+        ) is None
+
+    def test_get_active_run_at_or_before_excludes_recording_run(
+        self, session, sample_user, sample_account, sample_strategy,
+    ):
+        """A ``recording`` run is excluded by the ``run_type`` guard even
+        without the account predicate (the recorder never writes grid state).
+        """
+        at_ts = datetime(2026, 1, 2, 12, 0, tzinfo=UTC)
+        self._seed_grid_run(
+            session, sample_user, sample_account, sample_strategy,
+            run_type="recording",
+            start_ts=datetime(2026, 1, 1, tzinfo=UTC),
+            end_ts=None,
+            exchange_ts=datetime(2026, 1, 2, 8, 0, tzinfo=UTC),
+        )
+        assert GridStateSnapshotRepository(session).get_active_run_at_or_before(
+            "strat_a", "BTCUSDT", at_ts,
+        ) is None

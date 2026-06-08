@@ -1468,3 +1468,40 @@ class GridStateSnapshotRepository(BaseRepository[GridStateSnapshot]):
             )
             .first()
         )
+
+    def get_active_run_at_or_before(
+        self,
+        strat_id: str,
+        symbol: str,
+        at_ts: datetime,
+    ) -> Optional[GridStateSnapshot]:
+        """Latest live/shadow grid snapshot for ``strat_id`` at-or-before ``at_ts``.
+
+        Same run-active guard as :meth:`get_at_or_before`, but without an
+        ``account_id`` predicate. Used when ``seed.account_id`` does not match
+        the account stamped on gridbot snapshot rows (legacy Phase 4 DBs).
+
+        Assumes ``(strat_id, symbol)`` is account-unique among grid-writing
+        runs — true for the Phase 4 1:1 recorder↔gridbot↔strategy topology.
+        If two distinct accounts ever ran the same ``strat_id``+``symbol`` with
+        overlapping live/shadow runs in one shared DB, ``ORDER BY exchange_ts
+        DESC`` would pick the globally-latest, which may be the wrong account.
+        Only reached as a fallback after the account-scoped lookup misses.
+        """
+        return (
+            self.session.query(GridStateSnapshot)
+            .join(Run, Run.run_id == GridStateSnapshot.run_id)
+            .filter(
+                GridStateSnapshot.strat_id == strat_id,
+                GridStateSnapshot.symbol == symbol,
+                GridStateSnapshot.exchange_ts <= at_ts,
+                Run.run_type.in_(("live", "shadow")),
+                Run.start_ts <= at_ts,
+                or_(Run.end_ts.is_(None), Run.end_ts >= at_ts),
+            )
+            .order_by(
+                GridStateSnapshot.exchange_ts.desc(),
+                GridStateSnapshot.id.desc(),
+            )
+            .first()
+        )

@@ -65,6 +65,33 @@ from gridcore.persistence import GridStateStore
 logger = logging.getLogger(__name__)
 
 
+def _grid_seed_from_row(
+    row: GridStateSnapshot,
+    strat_id: str,
+    expected_step: float,
+    expected_count: int,
+) -> Optional[GridStateSeed]:
+    """Validate a DB grid snapshot row and adapt it to replay's seed shape."""
+    if int(row.grid_count) != int(expected_count):
+        logger.info(
+            "%s: saved grid_count=%d differs from replay config %d; falling back",
+            strat_id, row.grid_count, expected_count,
+        )
+        return None
+    if Decimal(str(row.grid_step)) != Decimal(str(expected_step)):
+        logger.info(
+            "%s: saved grid_step=%s differs from replay config %s; falling back",
+            strat_id, row.grid_step, expected_step,
+        )
+        return None
+    return GridStateSeed(
+        strat_id=strat_id,
+        grid=row.grid_json,
+        grid_step=float(row.grid_step),
+        grid_count=int(row.grid_count),
+    )
+
+
 def _strip_tz(dt: datetime) -> datetime:
     """Drop tzinfo for cross-source datetime arithmetic.
 
@@ -390,28 +417,60 @@ def load_grid_state_from_snapshots(
             "%s: no grid snapshot at-or-before %s", strat_id, at_ts,
         )
         return None
-    if int(row.grid_count) != int(expected_count):
+    seed = _grid_seed_from_row(row, strat_id, expected_step, expected_count)
+    if seed is not None:
+        # 0052 N3: the success-path log fires ONLY when the row passed
+        # step/count validation, never on the mismatch/fall-back branch.
         logger.info(
-            "%s: saved grid_count=%d differs from replay config %d; falling back",
-            strat_id, row.grid_count, expected_count,
+            "%s: grid snapshot loaded from run_id=%s exchange_ts=%s",
+            strat_id, row.run_id, row.exchange_ts,
+        )
+    return seed
+
+
+def load_grid_state_from_active_snapshots(
+    db_session: Session,
+    strat_id: str,
+    symbol: str,
+    at_ts: datetime,
+    expected_step: float,
+    expected_count: int,
+) -> Optional[GridStateSeed]:
+    """Load grid state from the active live/shadow gridbot run at ``at_ts``.
+
+    Fallback when :func:`load_grid_state_from_snapshots` misses because
+    ``seed.account_id`` does not match the ``account_id`` stamped on gridbot
+    rows (legacy recorder placeholder vs unified ``account_id_for`` after
+    feature 0053). Wallet/position/order seeds still use the recorder
+    ``run_id``; only the grid dimension is gridbot-owned under live/shadow
+    runs.
+    """
+    if not sa_inspect(db_session.connection()).has_table(
+        GridStateSnapshot.__tablename__,
+    ):
+        logger.info(
+            "%s: grid_state_snapshots table not present (pre-0047 DB); "
+            "falling back to file path / fresh build",
+            strat_id,
         )
         return None
-    if Decimal(str(row.grid_step)) != Decimal(str(expected_step)):
+    row = GridStateSnapshotRepository(db_session).get_active_run_at_or_before(
+        strat_id, symbol, at_ts,
+    )
+    if row is None:
         logger.info(
-            "%s: saved grid_step=%s differs from replay config %s; falling back",
-            strat_id, row.grid_step, expected_step,
+            "%s: no active live/shadow grid snapshot for %s at-or-before %s",
+            strat_id, symbol, at_ts,
         )
         return None
-    logger.info(
-        "%s: grid snapshot loaded from run_id=%s exchange_ts=%s",
-        strat_id, row.run_id, row.exchange_ts,
-    )
-    return GridStateSeed(
-        strat_id=strat_id,
-        grid=row.grid_json,
-        grid_step=float(row.grid_step),
-        grid_count=int(row.grid_count),
-    )
+    seed = _grid_seed_from_row(row, strat_id, expected_step, expected_count)
+    if seed is not None:
+        # 0052 N3: success-path log only fires when validation passed.
+        logger.info(
+            "%s: loaded grid snapshot from active %s run_id=%s at %s",
+            strat_id, symbol, row.run_id, row.exchange_ts,
+        )
+    return seed
 
 
 def load_position_snapshots(
