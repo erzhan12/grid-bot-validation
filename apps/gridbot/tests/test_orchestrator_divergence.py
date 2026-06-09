@@ -241,6 +241,33 @@ def test_signal2_disabled_does_not_fire():
     orch._trigger_divergence_reconcile.assert_not_called()
 
 
+def test_signal2_retries_after_breaker_cooldown_suppresses_reconcile(fixed_clock):
+    """Budget edge must not be consumed when reconcile is rate-limited.
+
+    Otherwise a parked truncate_breaker_reconcile_count (no new 110017s while
+    placements are blocked) never gets the both-direction backstop reconcile.
+    """
+    orch, runner, reconciler = _wire(
+        _gridbot_config(_strategy_config(
+            divergence_retry_budget=5,
+            truncate_breaker_cooldown_seconds=60.0,
+        ))
+    )
+    runner.dirty_rest_refresh_failure_count = 0
+    runner.truncate_breaker_reconcile_count = 5
+    orch._force_reconcile_last_at["btcusdt_test"] = 1000.0
+    fixed_clock["now"] = 1030.0  # 30s later — still inside 60s cooldown
+
+    orch._health_check_once()
+    assert "btcusdt_test" not in orch._divergence_budget_last_fired
+    reconciler.reconcile_reconnect.assert_not_called()
+
+    fixed_clock["now"] = 1070.0  # cooldown expired — same edge should retry
+    orch._health_check_once()
+    assert orch._divergence_budget_last_fired["btcusdt_test"] == 5
+    reconciler.reconcile_reconnect.assert_called_once_with(runner)
+
+
 # ==========================================================================
 # Signal 3 — REST-vs-local position-size delta sweep
 # ==========================================================================
