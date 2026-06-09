@@ -395,7 +395,11 @@ same `Orchestrator._force_reconcile_strat` the 0064 breaker uses.
 - **Signal 2 — retry-budget edge.** In `_health_check_once`, fire once per NEW
   edge when `truncate_breaker_reconcile_count >= divergence_retry_budget` (5) AND
   the count differs from `_divergence_budget_last_fired[strat]`. Backstop for when
-  the breaker counts but does not auto-reconcile.
+  the breaker counts but does not auto-reconcile. **Pitfall:** only bump
+  `_divergence_budget_last_fired` when `_trigger_divergence_reconcile` returns
+  `True` (reconcile actually ran). Consuming the edge before a suppressed reconcile
+  (breaker cooldown / detector throttle) leaves the bot stuck with a parked count
+  and no further signal-2 retries until trips advances again.
 - **Signal 3 — REST-vs-local size delta.** `_divergence_size_check_once` (gated by
   `_next_divergence_size_check`, primed half an interval ahead of `_next_order_sync`
   so the two REST sweeps don't co-fire) compares `runner.rest_position_size(dir)`
