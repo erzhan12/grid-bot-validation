@@ -145,6 +145,92 @@ class TestComparatorReporter:
         assert "Cur realised final" in out
         assert "Cum realised final" in out
 
+    def test_export_metrics_includes_0070_robust_rows(
+        self, sample_match_result, tmp_path,
+    ):
+        """0070: robust rows grouped per family, in the documented order."""
+        metrics = calculate_metrics(sample_match_result)
+        metrics.cur_realised_usdt_median_abs_delta = Decimal("0.10")
+        metrics.cur_realised_usdt_p95_abs_delta = Decimal("0.50")
+        metrics.cur_realised_usdt_spike_intensity = Decimal("0.40")
+        metrics.cur_realised_usdt_spike_count_30c = 3
+        metrics.pnl_median_abs_delta = Decimal("0.07")
+        metrics.pnl_spike_count_30c = 2
+        reporter = ComparatorReporter(sample_match_result, metrics)
+        path = tmp_path / "metrics.csv"
+        reporter.export_metrics(path)
+        with open(path) as f:
+            rows = list(csv.DictReader(f))
+        d = {r["metric"]: r["value"] for r in rows}
+        keys = [r["metric"] for r in rows]
+
+        # Values present.
+        assert d["cur_realised_usdt_median_abs_delta"] == "0.10"
+        assert d["cur_realised_usdt_p95_abs_delta"] == "0.50"
+        assert d["cur_realised_usdt_spike_intensity"] == "0.40"
+        assert d["cur_realised_usdt_spike_count_30c"] == "3"
+        for key in (
+            "pnl_median_abs_delta", "pnl_p95_abs_delta", "pnl_std_abs_delta",
+            "pnl_spike_intensity", "pnl_spike_count_30c",
+            "pnl_spike_count_relative_3",
+        ):
+            assert key in d
+        assert d["pnl_median_abs_delta"] == "0.07"
+        assert d["pnl_spike_count_30c"] == "2"
+
+        # The six cur_realised_usdt robust rows are contiguous, AFTER the
+        # existing mean/max pair (grouped per family).
+        i_max = keys.index("cur_realised_usdt_max_abs_delta")
+        assert keys[i_max - 1] == "cur_realised_usdt_mean_abs_delta"
+        assert keys[i_max + 1:i_max + 7] == [
+            "cur_realised_usdt_median_abs_delta",
+            "cur_realised_usdt_p95_abs_delta",
+            "cur_realised_usdt_std_abs_delta",
+            "cur_realised_usdt_spike_intensity",
+            "cur_realised_usdt_spike_count_30c",
+            "cur_realised_usdt_spike_count_relative_3",
+        ]
+
+        # The six pnl_* robust rows are contiguous, AFTER cumulative_pnl_delta
+        # and BEFORE pnl_correlation (no pnl mean/max anchor).
+        i_cum = keys.index("cumulative_pnl_delta")
+        assert keys[i_cum + 1:i_cum + 7] == [
+            "pnl_median_abs_delta",
+            "pnl_p95_abs_delta",
+            "pnl_std_abs_delta",
+            "pnl_spike_intensity",
+            "pnl_spike_count_30c",
+            "pnl_spike_count_relative_3",
+        ]
+        assert keys[i_cum + 7] == "pnl_correlation"
+
+    def test_print_summary_includes_0070_robust_lines(
+        self, sample_match_result, capsys,
+    ):
+        """0070: grouped POSITION ROBUST STATS + PnL robust console lines."""
+        metrics = calculate_metrics(sample_match_result)
+        metrics.cur_realised_usdt_median_abs_delta = Decimal("0.10")
+        metrics.cur_realised_usdt_p95_abs_delta = Decimal("0.50")
+        metrics.cur_realised_usdt_max_abs_delta = Decimal("0.50")
+        metrics.cur_realised_usdt_spike_intensity = Decimal("0.40")
+        metrics.pnl_median_abs_delta = Decimal("0.07")
+        reporter = ComparatorReporter(sample_match_result, metrics)
+        reporter.print_summary()
+        out = capsys.readouterr().out
+        assert "POSITION ROBUST STATS" in out
+        # cur_realised_usdt grouped line shows median / p95 / max side-by-side.
+        cur_line = next(
+            ln for ln in out.splitlines() if ln.strip().startswith("cur_realised_usdt:")
+        )
+        assert "median=" in cur_line
+        assert "p95=" in cur_line
+        assert "max=" in cur_line
+        assert "spike_int=" in cur_line
+        # PnL COMPARISON surfaces the trade-level robust line.
+        assert "PnL robust:" in out
+        # Existing 0059 lines remain untouched.
+        assert "Cur realised mean |delta|" in out
+
     def test_export_metrics_includes_collateral_rows(
         self, sample_match_result, tmp_path,
     ):

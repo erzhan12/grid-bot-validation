@@ -28,7 +28,7 @@ from gridcore.pnl import calc_unrealised_pnl
 
 from grid_db.models import PositionSnapshot
 
-from comparator.metrics import ValidationMetrics
+from comparator.metrics import ValidationMetrics, _spike_stats
 
 
 logger = logging.getLogger(__name__)
@@ -266,15 +266,21 @@ class PositionComparator:
         metrics: ValidationMetrics,
         pairs: list[PositionComparisonPair],
     ) -> None:
-        """Mutate ``metrics`` with the 21 telemetry aggregate fields (idempotent).
+        """Mutate ``metrics`` with the telemetry aggregate fields (idempotent).
 
-        21 total = 12 pre-existing + 9 from 0059.
-        0059 adds nine per-snapshot aggregates (upnl/cur/cum/pos-value
-        mean+max |delta| and pos_value_final_delta) alongside the original
-        12. The new per-snapshot mean/max families sum |delta| across ALL
-        matched pairs, whereas the ``*_final_delta`` fields keep only the
-        last per-side value; both are retained because intermediate drift
-        that cancels out is invisible to a final-only comparison.
+        21 base = 12 pre-existing + 9 from 0059. 0059 adds nine per-snapshot
+        aggregates (upnl/cur/cum/pos-value mean+max |delta| and
+        pos_value_final_delta) alongside the original 12. The per-snapshot
+        mean/max families sum |delta| across ALL matched pairs, whereas the
+        ``*_final_delta`` fields keep only the last per-side value; both are
+        retained because intermediate drift that cancels out is invisible to a
+        final-only comparison.
+
+        0070 additionally folds six robust spike-vs-drift stats
+        (median / p95 / std / spike_intensity / spike_count_30c /
+        spike_count_relative_3) for each of the eight ``_fold_family`` families
+        via the shared ``_spike_stats`` helper — 48 more fields, computed over
+        the same matched-pair lists as the mean/max aggregates.
         """
         all_matched = [
             p for p in pairs if p.backtest is not None and p.live is not None
@@ -293,50 +299,58 @@ class PositionComparator:
             1 for p in matched if p.has_missing_telemetry
         )
 
-        def _agg(field_name: str) -> tuple[Decimal, Decimal]:
-            """Mean abs / max abs over matched pairs, skipping None per-field.
+        def _fold_family(prefix: str, field_name: str) -> None:
+            """Fold mean/max + the six 0070 robust stats for one delta family.
 
-            Pure Decimal arithmetic — no float roundtrip — so cumulative
-            rounding from many small deltas stays exact. Important because
-            `position_im` / `position_mm` deltas can be 1e-8 USDT per pair
-            and the acceptance gate is set at 0.05 USDT total.
+            Builds the per-pair abs-delta list exactly as the legacy mean/max
+            aggregate did — skipping None per-field over ``matched`` (so the
+            0044 state-diverged filter is inherited) — then assigns BOTH the
+            pre-existing ``<prefix>_mean_abs_delta`` / ``<prefix>_max_abs_delta``
+            and the six 0070 fields (``<prefix>_{median,p95,std}_abs_delta``,
+            ``_spike_intensity``, ``_spike_count_30c``, ``_spike_count_relative_3``)
+            via the shared ``_spike_stats`` helper over the same list.
+
+            Pure-Decimal mean/max (no float roundtrip) so cumulative rounding
+            from many small deltas stays exact — ``position_im`` /
+            ``position_mm`` deltas can be 1e-8 USDT per pair and the acceptance
+            gate is 0.05 USDT total.
             """
             vals = [
                 abs(getattr(p, field_name))
                 for p in matched
                 if getattr(p, field_name) is not None
             ]
-            if not vals:
-                return Decimal("0"), Decimal("0")
-            mean = sum(vals, Decimal("0")) / Decimal(len(vals))
-            return mean, max(vals)
+            if vals:
+                mean = sum(vals, Decimal("0")) / Decimal(len(vals))
+                maximum = max(vals)
+            else:
+                mean = maximum = Decimal("0")
+            setattr(metrics, f"{prefix}_mean_abs_delta", mean)
+            setattr(metrics, f"{prefix}_max_abs_delta", maximum)
+            stats = _spike_stats(vals)
+            setattr(metrics, f"{prefix}_median_abs_delta", stats.median)
+            setattr(metrics, f"{prefix}_p95_abs_delta", stats.p95)
+            setattr(metrics, f"{prefix}_std_abs_delta", stats.std)
+            setattr(metrics, f"{prefix}_spike_intensity", stats.spike_intensity)
+            setattr(metrics, f"{prefix}_spike_count_30c", stats.spike_count_abs)
+            setattr(
+                metrics,
+                f"{prefix}_spike_count_relative_3",
+                stats.spike_count_rel,
+            )
 
-        metrics.position_im_mean_abs_delta, metrics.position_im_max_abs_delta = _agg(
-            "position_im_delta"
-        )
-        metrics.position_mm_mean_abs_delta, metrics.position_mm_max_abs_delta = _agg(
-            "position_mm_delta"
-        )
-        metrics.liq_price_mean_abs_delta, metrics.liq_price_max_abs_delta = _agg(
-            "liq_price_delta"
-        )
-        metrics.unrealised_pnl_mean_abs_delta, metrics.unrealised_pnl_max_abs_delta = _agg(
-            "unrealised_pnl_delta"
-        )
-        # 0059: per-snapshot mean/max |delta| families. cur/cum reuse the
-        # existing per-pair delta fields; upnl/pos_value use the new ones.
-        metrics.upnl_usdt_mean_abs_delta, metrics.upnl_usdt_max_abs_delta = _agg(
-            "upnl_usdt_delta"
-        )
-        metrics.cur_realised_usdt_mean_abs_delta, metrics.cur_realised_usdt_max_abs_delta = _agg(
-            "cur_realised_pnl_delta"
-        )
-        metrics.cum_realised_usdt_mean_abs_delta, metrics.cum_realised_usdt_max_abs_delta = _agg(
-            "cum_realised_pnl_delta"
-        )
-        metrics.pos_value_usdt_mean_abs_delta, metrics.pos_value_usdt_max_abs_delta = _agg(
-            "pos_value_delta"
-        )
+        # (metrics prefix, per-pair delta field). position_im / position_mm are
+        # OPTIONAL (issue #155 noise) but folded for symmetric coverage. 0059
+        # families: cur/cum reuse the existing per-pair delta fields; upnl /
+        # pos_value use the 0059 delta fields.
+        _fold_family("position_im", "position_im_delta")
+        _fold_family("position_mm", "position_mm_delta")
+        _fold_family("liq_price", "liq_price_delta")
+        _fold_family("unrealised_pnl", "unrealised_pnl_delta")
+        _fold_family("upnl_usdt", "upnl_usdt_delta")
+        _fold_family("cur_realised_usdt", "cur_realised_pnl_delta")
+        _fold_family("cum_realised_usdt", "cum_realised_pnl_delta")
+        _fold_family("pos_value_usdt", "pos_value_delta")
 
         # cum_realised_pnl: compare the FINAL value delta only (per Step 4
         # design — per-pair rounding noise accumulates over long sessions).

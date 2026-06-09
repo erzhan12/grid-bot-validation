@@ -7,10 +7,13 @@ import pytest
 
 from comparator.matcher import MatchedTrade, MatchResult
 from comparator.metrics import (
+    ABS_THRESHOLD,
+    REL_K,
     calculate_metrics,
     _compute_trade_delta,
     _pearson_correlation,
     _decimal_median,
+    _spike_stats,
 )
 
 
@@ -280,3 +283,130 @@ class TestCalculateMetrics:
         m = calculate_metrics(result, price_tolerance=Decimal("0"), qty_tolerance=Decimal("1"))
         assert m.breaches_count == 1
         assert ("x", 0) in m.breaches
+
+
+class TestSpikeStats:
+    """0070: shared robust-statistics helper (issue #156)."""
+
+    def test_spike_stats_empty(self):
+        """Empty list → all six zero (no-data / all-flat case)."""
+        s = _spike_stats([])
+        assert s.median == Decimal("0")
+        assert s.p95 == Decimal("0")
+        assert s.std == Decimal("0")
+        assert s.spike_intensity == Decimal("0")
+        assert s.spike_count_abs == 0
+        assert s.spike_count_rel == 0
+
+    def test_spike_stats_all_zero(self):
+        """All-zero deltas → median=p95=std=spike_intensity=0, counts 0."""
+        s = _spike_stats([Decimal("0")] * 4)
+        assert s.median == Decimal("0")
+        assert s.p95 == Decimal("0")
+        assert s.std == Decimal("0")
+        assert s.spike_intensity == Decimal("0")
+        assert s.spike_count_abs == 0
+        assert s.spike_count_rel == 0
+
+    def test_spike_stats_median_index(self):
+        """median = deltas[len//2] (upper-mid, NOT averaged); p95 = deltas[int(len*0.95)]."""
+        # Odd length: 5 values → index 2.
+        odd = _spike_stats(
+            [Decimal("1"), Decimal("2"), Decimal("3"), Decimal("4"), Decimal("5")]
+        )
+        assert odd.median == Decimal("3")
+        assert odd.p95 == Decimal("5")  # int(5*0.95)=4 → deltas[4]
+        # Even length: [1,2,3,4] → index 2 picks 3 (upper-mid), NOT (2+3)/2.
+        even = _spike_stats(
+            [Decimal("1"), Decimal("2"), Decimal("3"), Decimal("4")]
+        )
+        assert even.median == Decimal("3")
+        # Contrast with the averaging _decimal_median helper.
+        assert _decimal_median(
+            [Decimal("1"), Decimal("2"), Decimal("3"), Decimal("4")]
+        ) == Decimal("2.5")
+        assert even.p95 == Decimal("4")  # int(4*0.95)=3 → deltas[3]
+
+    def test_spike_stats_p95_small_list_no_indexerror(self):
+        """Lists of length 1, 2, 19 do not raise; p95 clamps to the last element."""
+        assert _spike_stats([Decimal("0.7")]).p95 == Decimal("0.7")
+        assert _spike_stats([Decimal("0.1"), Decimal("0.9")]).p95 == Decimal("0.9")
+        long19 = [Decimal("0.1")] * 18 + [Decimal("0.9")]
+        assert _spike_stats(long19).p95 == Decimal("0.9")
+
+    def test_spike_stats_spike_intensity(self):
+        """spike_intensity = max - median, exact."""
+        s = _spike_stats([Decimal("0.1"), Decimal("0.2"), Decimal("0.9")])
+        assert s.median == Decimal("0.2")
+        assert s.spike_intensity == Decimal("0.7")  # 0.9 - 0.2
+
+    def test_spike_stats_spike_count_abs_threshold(self):
+        """Counts only deltas > 0.30 (boundary 0.30 excluded; 0.31 included)."""
+        s = _spike_stats([Decimal("0.29"), Decimal("0.30"), Decimal("0.31")])
+        assert s.spike_count_abs == 1
+        assert ABS_THRESHOLD == Decimal("0.30")
+
+    def test_spike_stats_spike_count_rel_median_zero_guard(self):
+        """median == 0 with a positive tail → spike_count_rel == 0 (no false count)."""
+        s = _spike_stats([Decimal("0"), Decimal("0"), Decimal("0.5")])
+        assert s.median == Decimal("0")
+        assert s.spike_count_rel == 0
+        # spike_count_abs still fires on the > 0.30 tail.
+        assert s.spike_count_abs == 1
+
+    def test_spike_stats_spike_count_rel_positive(self):
+        """median > 0 → counts deltas > 3 x median."""
+        s = _spike_stats(
+            [Decimal("0.1"), Decimal("0.1"), Decimal("0.1"), Decimal("0.4")]
+        )
+        assert s.median == Decimal("0.1")  # deltas[2]
+        assert REL_K == Decimal("3")
+        # 3 x 0.1 = 0.3; only 0.4 exceeds it.
+        assert s.spike_count_rel == 1
+
+    def test_spike_stats_std_single_element(self):
+        """pstdev([x]) == 0, no raise; result is Decimal."""
+        s = _spike_stats([Decimal("5")])
+        assert s.std == Decimal("0")
+        assert isinstance(s.std, Decimal)
+
+
+class TestPnlRobustStats:
+    """0070: trade-level pnl_* robust stats wired through calculate_metrics."""
+
+    def test_pnl_robust_stats_populated(self, make_trade, ts):
+        """Single injected PnL outlier populates pnl_spike_* symmetrically."""
+        # live pnl = 0 throughout; bt pnl = baseline 0.05 x4 + one 0.60 spike.
+        bt_pnls = [Decimal("0.05")] * 4 + [Decimal("0.60")]
+        matched = []
+        for i, p in enumerate(bt_pnls):
+            live = make_trade(
+                client_order_id=f"o{i}", realized_pnl=Decimal("0"),
+                timestamp=ts + timedelta(hours=i), source="live",
+            )
+            bt = make_trade(
+                client_order_id=f"o{i}", realized_pnl=p,
+                timestamp=ts + timedelta(hours=i), source="backtest",
+            )
+            matched.append(MatchedTrade(live=live, backtest=bt))
+        result = MatchResult(matched=matched, live_only=[], backtest_only=[])
+        m = calculate_metrics(result)
+
+        assert m.pnl_median_abs_delta == Decimal("0.05")
+        assert m.pnl_p95_abs_delta == Decimal("0.60")  # n=5, int(4.75)=4
+        assert m.pnl_spike_intensity == Decimal("0.55")  # 0.60 - 0.05
+        assert m.pnl_spike_count_30c == 1
+        assert m.pnl_spike_count_relative_3 == 1  # 0.60 > 3 x 0.05
+
+    def test_pnl_robust_stats_empty_match_result(self, make_trade):
+        """No matched pairs → pnl_* robust fields keep their defaults."""
+        result = MatchResult(
+            matched=[], live_only=[make_trade(source="live")], backtest_only=[],
+        )
+        m = calculate_metrics(result)
+        assert m.pnl_median_abs_delta == Decimal("0")
+        assert m.pnl_p95_abs_delta == Decimal("0")
+        assert m.pnl_std_abs_delta == Decimal("0")
+        assert m.pnl_spike_intensity == Decimal("0")
+        assert m.pnl_spike_count_30c == 0
+        assert m.pnl_spike_count_relative_3 == 0

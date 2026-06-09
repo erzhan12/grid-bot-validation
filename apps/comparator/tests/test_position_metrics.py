@@ -410,6 +410,173 @@ def test_fold_metrics_idempotent(base_ts):
     assert snapshot1 == snapshot2
 
 
+# ---------------------------------------------------------------------------
+# 0070: robust spike-vs-drift stats per per-snapshot family
+# ---------------------------------------------------------------------------
+
+
+def _matched_pairs_over(base_ts, snap_field, deltas, side="Buy"):
+    """Build matched pairs whose ``<snap_field>`` delta equals each given value.
+
+    Live side = 0, backtest side = the delta, one pair per second so the
+    monotonic two-pointer consumes 1:1. ``snap_field`` is the PositionSnapshot
+    kwarg (e.g. ``cur_realised_pnl`` → folds into ``cur_realised_usdt_*``).
+    Size/entry stay at the defaults so no pair is state-diverged.
+    """
+    live, bt = [], []
+    for i, d in enumerate(deltas):
+        ts = base_ts + timedelta(seconds=i)
+        live.append(_snap(side, ts, source="live", **{snap_field: Decimal("0")}))
+        bt.append(_snap(side, ts, source="backtest", **{snap_field: d}))
+    return PositionComparator().pair_and_compare(live, bt)
+
+
+def _fold(pairs):
+    metrics = ValidationMetrics()
+    PositionComparator().fold_metrics_into(metrics, pairs)
+    return metrics
+
+
+class TestRobustStatsPerSnapshot:
+    """fold_metrics_into populates the six 0070 stats per family."""
+
+    def test_cur_realised_robust_stats_populated(self, base_ts):
+        """Baseline cluster + one spike over cur_realised_pnl_delta."""
+        deltas = [Decimal("0.10")] * 19 + [Decimal("0.50")]
+        m = _fold(_matched_pairs_over(base_ts, "cur_realised_pnl", deltas))
+        assert m.position_pairs_compared == 20
+        assert m.cur_realised_usdt_median_abs_delta == Decimal("0.10")
+        assert m.cur_realised_usdt_p95_abs_delta == Decimal("0.50")
+        assert m.cur_realised_usdt_max_abs_delta == Decimal("0.50")
+        assert m.cur_realised_usdt_spike_intensity == Decimal("0.40")
+        assert m.cur_realised_usdt_spike_count_30c == 1
+        assert m.cur_realised_usdt_spike_count_relative_3 == 1  # 0.50 > 3 x 0.10
+        assert m.cur_realised_usdt_std_abs_delta > 0
+
+    def test_pos_value_robust_stats_populated(self, base_ts):
+        """Same shape over pos_value_delta → pos_value_usdt_* family."""
+        deltas = [Decimal("0.10")] * 19 + [Decimal("0.50")]
+        m = _fold(_matched_pairs_over(base_ts, "position_value", deltas))
+        assert m.pos_value_usdt_median_abs_delta == Decimal("0.10")
+        assert m.pos_value_usdt_p95_abs_delta == Decimal("0.50")
+        assert m.pos_value_usdt_max_abs_delta == Decimal("0.50")
+        assert m.pos_value_usdt_spike_intensity == Decimal("0.40")
+        assert m.pos_value_usdt_spike_count_30c == 1
+        assert m.pos_value_usdt_spike_count_relative_3 == 1
+
+    def test_drift_vs_spike_classification(self, base_ts):
+        """Acceptance #2: sustained drift classified as drift, not spike.
+
+        20 matched pairs (meets the Layer-4 volume floor) each with
+        cur_realised_pnl_delta = 0.31 (strictly > the 0.30 ABS_THRESHOLD).
+        """
+        m = _fold(_matched_pairs_over(base_ts, "cur_realised_pnl", [Decimal("0.31")] * 20))
+        assert m.position_pairs_compared == 20
+        assert m.cur_realised_usdt_median_abs_delta == Decimal("0.31")
+        assert m.cur_realised_usdt_max_abs_delta == Decimal("0.31")
+        assert m.cur_realised_usdt_spike_intensity == Decimal("0")  # max - median
+        assert m.cur_realised_usdt_spike_count_30c == 20
+        # Old C108-style gate fires...
+        assert m.cur_realised_usdt_max_abs_delta > Decimal("0.30")
+        # ...but Layer-1 (spike) is FALSE — correctly classified as drift.
+        layer1_spike = (
+            m.cur_realised_usdt_spike_intensity > Decimal("0.20")
+            and m.cur_realised_usdt_spike_count_30c <= 3
+        )
+        assert layer1_spike is False
+        # Layer-2 (sustained drift) is TRUE.
+        layer2_drift = (
+            m.cur_realised_usdt_median_abs_delta > Decimal("0.10")
+            and m.cur_realised_usdt_spike_count_30c > 10
+        )
+        assert layer2_drift is True
+
+    def test_volume_floor_advisory_only(self, base_ts):
+        """11 baseline + 1 spike = 12 matched pairs (below the matched<20 floor).
+
+        Raw emission only — Layers 1-3 must NOT be evaluated for classification
+        at this sample size (operator-side rule, not enforced here). Verifies the
+        fold helper emits without crashing and that p95 selects the tail element
+        via deltas[int(len*0.95)] (distinct from the median); the no-IndexError
+        clamp itself is covered by test_spike_stats_p95_small_list_no_indexerror.
+        """
+        deltas = [Decimal("0.05")] * 11 + [Decimal("0.50")]
+        m = _fold(_matched_pairs_over(base_ts, "cur_realised_pnl", deltas))
+        assert m.position_pairs_compared == 12  # below the Layer-4 floor
+        assert m.cur_realised_usdt_median_abs_delta == Decimal("0.05")
+        # p95 index = int(12*0.95) = 11 → the tail element, NOT the median.
+        assert m.cur_realised_usdt_p95_abs_delta == Decimal("0.50")
+        assert m.cur_realised_usdt_spike_count_30c == 1
+
+    def test_injected_spike_classification(self, base_ts):
+        """Acceptance #3: tight baseline + one injected spike → spike, not drift."""
+        deltas = [Decimal("0.05")] * 20 + [Decimal("0.60")]
+        m = _fold(_matched_pairs_over(base_ts, "cur_realised_pnl", deltas))
+        assert m.position_pairs_compared >= 20
+        assert m.cur_realised_usdt_spike_intensity > Decimal("0.20")
+        layer1_spike = (
+            m.cur_realised_usdt_spike_intensity > Decimal("0.20")
+            and m.cur_realised_usdt_spike_count_30c <= 3
+        )
+        assert layer1_spike is True
+
+    def test_robust_stats_zero_when_all_deltas_zero(self, base_ts):
+        """Equal live/bt snapshots → zero delta list → all robust fields zero."""
+        m = _fold(_matched_pairs_over(base_ts, "cur_realised_pnl", [Decimal("0")] * 3))
+        assert m.cur_realised_usdt_median_abs_delta == Decimal("0")
+        assert m.cur_realised_usdt_p95_abs_delta == Decimal("0")
+        assert m.cur_realised_usdt_std_abs_delta == Decimal("0")
+        assert m.cur_realised_usdt_spike_intensity == Decimal("0")
+        assert m.cur_realised_usdt_spike_count_30c == 0
+        assert m.cur_realised_usdt_spike_count_relative_3 == 0
+
+    def test_robust_stats_skip_state_diverged_pairs(self, base_ts):
+        """State-diverged pairs are excluded from the robust fold (0044 filter)."""
+        # Two consistent pairs (delta 0.5) + one diverged pair (size mismatch).
+        live = [
+            _snap("Buy", base_ts, size=Decimal("1"), cur_realised_pnl=Decimal("0"), source="live"),
+            _snap("Buy", base_ts + timedelta(seconds=1), size=Decimal("1"), cur_realised_pnl=Decimal("0"), source="live"),
+            _snap("Buy", base_ts + timedelta(seconds=2), size=Decimal("5"), cur_realised_pnl=Decimal("0"), source="live"),
+        ]
+        bt = [
+            _snap("Buy", base_ts, size=Decimal("1"), cur_realised_pnl=Decimal("0.5"), source="backtest"),
+            _snap("Buy", base_ts + timedelta(seconds=1), size=Decimal("1"), cur_realised_pnl=Decimal("0.5"), source="backtest"),
+            _snap("Buy", base_ts + timedelta(seconds=2), size=Decimal("1"), cur_realised_pnl=Decimal("100"), source="backtest"),
+        ]
+        m = _fold(PositionComparator().pair_and_compare(live, bt))
+        assert m.position_pairs_state_diverged == 1
+        assert m.position_pairs_compared == 2
+        # The 100 USDT diverged-pair delta does NOT leak into the robust stats.
+        assert m.cur_realised_usdt_max_abs_delta == Decimal("0.5")
+        assert m.cur_realised_usdt_median_abs_delta == Decimal("0.5")
+        assert m.cur_realised_usdt_spike_count_30c == 2
+
+    def test_fold_metrics_idempotent_with_robust_stats(self, base_ts):
+        """Robust fields are stable across a second fold_metrics_into call."""
+        deltas = [Decimal("0.05")] * 5 + [Decimal("0.60")]
+        pairs = _matched_pairs_over(base_ts, "cur_realised_pnl", deltas)
+        metrics = ValidationMetrics()
+        PositionComparator().fold_metrics_into(metrics, pairs)
+        first = (
+            metrics.cur_realised_usdt_median_abs_delta,
+            metrics.cur_realised_usdt_spike_intensity,
+            metrics.cur_realised_usdt_spike_count_30c,
+        )
+        PositionComparator().fold_metrics_into(metrics, pairs)
+        second = (
+            metrics.cur_realised_usdt_median_abs_delta,
+            metrics.cur_realised_usdt_spike_intensity,
+            metrics.cur_realised_usdt_spike_count_30c,
+        )
+        assert first == second
+
+    def test_position_im_robust_stats_smoke_optional(self, base_ts):
+        """Optional: IM family is instrumented for symmetric coverage."""
+        m = _fold(_matched_pairs_over(base_ts, "position_im", [Decimal("0.5"), Decimal("0.7")]))
+        assert m.position_im_median_abs_delta == Decimal("0.7")  # deltas[1] upper-mid
+        assert m.position_im_max_abs_delta == Decimal("0.7")
+
+
 def test_un_migrated_db_raises():
     """Load_position_snapshots raises on missing source column.
 

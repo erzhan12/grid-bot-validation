@@ -20,6 +20,29 @@ logger = logging.getLogger(__name__)
 ResampledRow = tuple[datetime, Optional[Decimal], Optional[Decimal]]
 
 
+def _robust_stat_rows(m: ValidationMetrics, prefix: str) -> list[tuple[str, str]]:
+    """0070: the six robust-stat ``(key, value)`` CSV rows for one family.
+
+    Emitted contiguous per family so the flat key-value file stays
+    human-diffable. Counts (``_spike_count_*``) are ints rendered via
+    ``str(int)``; the other four are Decimals via ``str(Decimal)`` — consistent
+    with every other metrics row. The exported keys ``_spike_count_30c`` /
+    ``_spike_count_relative_3`` are the export names for the helper's internal
+    ``spike_count_abs`` / ``spike_count_rel`` (see RULES.md mapping table).
+    """
+    return [
+        (f"{prefix}_median_abs_delta", str(getattr(m, f"{prefix}_median_abs_delta"))),
+        (f"{prefix}_p95_abs_delta", str(getattr(m, f"{prefix}_p95_abs_delta"))),
+        (f"{prefix}_std_abs_delta", str(getattr(m, f"{prefix}_std_abs_delta"))),
+        (f"{prefix}_spike_intensity", str(getattr(m, f"{prefix}_spike_intensity"))),
+        (f"{prefix}_spike_count_30c", str(getattr(m, f"{prefix}_spike_count_30c"))),
+        (
+            f"{prefix}_spike_count_relative_3",
+            str(getattr(m, f"{prefix}_spike_count_relative_3")),
+        ),
+    ]
+
+
 class ComparatorReporter:
     """Export comparison results to CSV and console."""
 
@@ -189,6 +212,11 @@ class ComparatorReporter:
             ("total_live_pnl", str(m.total_live_pnl)),
             ("total_backtest_pnl", str(m.total_backtest_pnl)),
             ("cumulative_pnl_delta", str(m.cumulative_pnl_delta)),
+            # 0070: trade-level PnL robust stats. Inserted here (after
+            # cumulative_pnl_delta, before pnl_correlation) — there is no
+            # pnl_mean/max anchor, so this family does NOT follow the
+            # position-family "after the mean/max pair" rule.
+            *_robust_stat_rows(m, "pnl"),
             ("pnl_correlation", f"{m.pnl_correlation:.6f}"),
             ("total_live_volume", str(m.total_live_volume)),
             ("total_backtest_volume", str(m.total_backtest_volume)),
@@ -201,15 +229,20 @@ class ComparatorReporter:
             ("equity_max_divergence", str(m.equity_max_divergence)),
             ("equity_mean_divergence", str(m.equity_mean_divergence)),
             ("equity_correlation", f"{m.equity_correlation:.6f}"),
-            # 0034: position telemetry parity metrics.
+            # 0034: position telemetry parity metrics. 0070 appends the six
+            # robust rows contiguous after each family's mean/max pair.
             ("position_im_mean_abs_delta", str(m.position_im_mean_abs_delta)),
             ("position_im_max_abs_delta", str(m.position_im_max_abs_delta)),
+            *_robust_stat_rows(m, "position_im"),
             ("position_mm_mean_abs_delta", str(m.position_mm_mean_abs_delta)),
             ("position_mm_max_abs_delta", str(m.position_mm_max_abs_delta)),
+            *_robust_stat_rows(m, "position_mm"),
             ("liq_price_mean_abs_delta", str(m.liq_price_mean_abs_delta)),
             ("liq_price_max_abs_delta", str(m.liq_price_max_abs_delta)),
+            *_robust_stat_rows(m, "liq_price"),
             ("unrealised_pnl_mean_abs_delta", str(m.unrealised_pnl_mean_abs_delta)),
             ("unrealised_pnl_max_abs_delta", str(m.unrealised_pnl_max_abs_delta)),
+            *_robust_stat_rows(m, "unrealised_pnl"),
             ("cum_realised_pnl_final_delta", str(m.cum_realised_pnl_final_delta)),
             ("cur_realised_pnl_final_delta", str(m.cur_realised_pnl_final_delta)),
             # 0059: per-snapshot parity aggregates (distinct from the
@@ -217,12 +250,16 @@ class ComparatorReporter:
             # separates the per-snapshot family from the final-only scalars).
             ("upnl_usdt_mean_abs_delta", str(m.upnl_usdt_mean_abs_delta)),
             ("upnl_usdt_max_abs_delta", str(m.upnl_usdt_max_abs_delta)),
+            *_robust_stat_rows(m, "upnl_usdt"),
             ("cur_realised_usdt_mean_abs_delta", str(m.cur_realised_usdt_mean_abs_delta)),
             ("cur_realised_usdt_max_abs_delta", str(m.cur_realised_usdt_max_abs_delta)),
+            *_robust_stat_rows(m, "cur_realised_usdt"),
             ("cum_realised_usdt_mean_abs_delta", str(m.cum_realised_usdt_mean_abs_delta)),
             ("cum_realised_usdt_max_abs_delta", str(m.cum_realised_usdt_max_abs_delta)),
+            *_robust_stat_rows(m, "cum_realised_usdt"),
             ("pos_value_usdt_mean_abs_delta", str(m.pos_value_usdt_mean_abs_delta)),
             ("pos_value_usdt_max_abs_delta", str(m.pos_value_usdt_max_abs_delta)),
+            *_robust_stat_rows(m, "pos_value_usdt"),
             ("pos_value_final_delta", str(m.pos_value_final_delta)),
             ("position_pairs_compared", str(m.position_pairs_compared)),
             ("position_pairs_unmatched_bt", str(m.position_pairs_unmatched_bt)),
@@ -449,6 +486,9 @@ class ComparatorReporter:
             f"    Live total:     {m.total_live_pnl}",
             f"    Backtest total: {m.total_backtest_pnl}",
             f"    Delta:          {m.cumulative_pnl_delta}",
+            # 0070: trade-level PnL robust spike-vs-drift stats (no max field
+            # for this family — spike_intensity = max - median encodes the peak).
+            f"    PnL robust:     median={m.pnl_median_abs_delta} p95={m.pnl_p95_abs_delta} std={m.pnl_std_abs_delta} spike_int={m.pnl_spike_intensity} n>0.30={m.pnl_spike_count_30c} n>3xmed={m.pnl_spike_count_relative_3}",
             f"    Correlation:    {m.pnl_correlation:.4f}",
             "",
             "  FEES",
@@ -504,6 +544,22 @@ class ComparatorReporter:
             f"    Pos value mean |delta|:   {m.pos_value_usdt_mean_abs_delta}",
             f"    Pos value max |delta|:    {m.pos_value_usdt_max_abs_delta}",
             f"    Pos value final:          {m.pos_value_final_delta}",
+            "",
+            # 0070: per-family robust spike-vs-drift stats, grouped one line per
+            # family with median / p95 / max side-by-side plus std, the peak
+            # silhouette (spike_int = max - median) and the two spike counts
+            # (n>0.30 = |delta| > $0.30; n>3xmed = |delta| > 3 x median). Apply
+            # the Layer 1-4 operator rules (RULES.md) to these; do NOT flag when
+            # position_pairs_compared < 20 (volume floor).
+            "  POSITION ROBUST STATS (spike-vs-drift, 0070)",
+            f"    cur_realised_usdt: median={m.cur_realised_usdt_median_abs_delta} p95={m.cur_realised_usdt_p95_abs_delta} max={m.cur_realised_usdt_max_abs_delta} std={m.cur_realised_usdt_std_abs_delta} spike_int={m.cur_realised_usdt_spike_intensity} n>0.30={m.cur_realised_usdt_spike_count_30c} n>3xmed={m.cur_realised_usdt_spike_count_relative_3}",
+            f"    pos_value_usdt:    median={m.pos_value_usdt_median_abs_delta} p95={m.pos_value_usdt_p95_abs_delta} max={m.pos_value_usdt_max_abs_delta} std={m.pos_value_usdt_std_abs_delta} spike_int={m.pos_value_usdt_spike_intensity} n>0.30={m.pos_value_usdt_spike_count_30c} n>3xmed={m.pos_value_usdt_spike_count_relative_3}",
+            f"    cum_realised_usdt: median={m.cum_realised_usdt_median_abs_delta} p95={m.cum_realised_usdt_p95_abs_delta} max={m.cum_realised_usdt_max_abs_delta} std={m.cum_realised_usdt_std_abs_delta} spike_int={m.cum_realised_usdt_spike_intensity} n>0.30={m.cum_realised_usdt_spike_count_30c} n>3xmed={m.cum_realised_usdt_spike_count_relative_3}",
+            f"    upnl_usdt:         median={m.upnl_usdt_median_abs_delta} p95={m.upnl_usdt_p95_abs_delta} max={m.upnl_usdt_max_abs_delta} std={m.upnl_usdt_std_abs_delta} spike_int={m.upnl_usdt_spike_intensity} n>0.30={m.upnl_usdt_spike_count_30c} n>3xmed={m.upnl_usdt_spike_count_relative_3}",
+            f"    unrealised_pnl:    median={m.unrealised_pnl_median_abs_delta} p95={m.unrealised_pnl_p95_abs_delta} max={m.unrealised_pnl_max_abs_delta} std={m.unrealised_pnl_std_abs_delta} spike_int={m.unrealised_pnl_spike_intensity} n>0.30={m.unrealised_pnl_spike_count_30c} n>3xmed={m.unrealised_pnl_spike_count_relative_3}",
+            f"    liq_price:         median={m.liq_price_median_abs_delta} p95={m.liq_price_p95_abs_delta} max={m.liq_price_max_abs_delta} std={m.liq_price_std_abs_delta} spike_int={m.liq_price_spike_intensity} n>0.30={m.liq_price_spike_count_30c} n>3xmed={m.liq_price_spike_count_relative_3}",
+            f"    position_im:       median={m.position_im_median_abs_delta} p95={m.position_im_p95_abs_delta} max={m.position_im_max_abs_delta} std={m.position_im_std_abs_delta} spike_int={m.position_im_spike_intensity} n>0.30={m.position_im_spike_count_30c} n>3xmed={m.position_im_spike_count_relative_3}",
+            f"    position_mm:       median={m.position_mm_median_abs_delta} p95={m.position_mm_p95_abs_delta} max={m.position_mm_max_abs_delta} std={m.position_mm_std_abs_delta} spike_int={m.position_mm_spike_intensity} n>0.30={m.position_mm_spike_count_30c} n>3xmed={m.position_mm_spike_count_relative_3}",
             "",
             "=" * 60,
         ]
