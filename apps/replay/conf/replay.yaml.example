@@ -25,6 +25,9 @@ strategy:
   # Live-mirror examples below are operator-supplied, NOT repo-derived —
   # confirm against your own live config before use (the repo's only gridbot
   # config, gridbot.yaml.example, ships 0.15 / false as the verified baseline).
+  # To verify, read the gitignored live config on the bot host (per-strategy
+  # values live under each strategies[] entry):
+  #   grep -nE "min_liq_ratio|max_liq_ratio|min_total_margin|increase_same_position_on_low_margin|leverage" apps/gridbot/conf/gridbot.yaml
   # min_liq_ratio: 0.8
   # max_liq_ratio: 1.2
   # min_total_margin: 3      # LTC example — operator-supplied, confirm against your live config (SOL example: 2.5)
