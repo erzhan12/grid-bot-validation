@@ -13,6 +13,7 @@ strategies:
     min_liq_ratio: 0.8
     max_liq_ratio: 1.2
     min_total_margin: 0.15
+    # increase_same_position_on_low_margin: false  # true = boost own side x2 on low margin; false = suppress opposite side x0.5
     commission_rate: "0.0002"  # 0.02% maker fee
 
   # Add more strategies as needed

@@ -30,6 +30,8 @@ class TestBacktestStrategyConfig:
         assert config.strat_id == "test"
         assert config.grid_count == 50  # Default
         assert config.grid_step == 0.2  # Default
+        # Feature 0071: flag defaults False to match RiskConfig dataclass.
+        assert config.increase_same_position_on_low_margin is False
 
     def test_tick_size_from_string(self):
         """tick_size can be provided as string."""

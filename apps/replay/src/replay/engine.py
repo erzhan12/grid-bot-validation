@@ -340,6 +340,14 @@ class ReplayEngine:
             early_imbalance_multiplier=config.strategy.early_imbalance_multiplier,
             commission_rate=config.strategy.commission_rate,
             enable_risk_multipliers=config.strategy.enable_risk_multipliers,
+            # Feature 0071: risk-mgmt tunables pass-through (issue #162).
+            min_liq_ratio=config.strategy.min_liq_ratio,
+            max_liq_ratio=config.strategy.max_liq_ratio,
+            min_total_margin=config.strategy.min_total_margin,
+            increase_same_position_on_low_margin=(
+                config.strategy.increase_same_position_on_low_margin
+            ),
+            leverage=config.strategy.leverage,
         )
 
         # 2a. Load seed material (positions/wallet/orders/grid) when enabled.

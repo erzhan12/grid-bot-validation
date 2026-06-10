@@ -98,6 +98,53 @@ class TestReplayEngine:
         assert result.fill_mode == FillMode.LAST_CROSS
 
     @patch("replay.engine.InstrumentInfoProvider")
+    def test_run_passes_risk_fields_to_backtest_strategy_config(
+        self, mock_provider_cls, db, seeded_run_account, replay_config,
+    ):
+        """Feature 0071: run() passes the five risk-mgmt tunables from
+        ReplayStrategyConfig into BacktestStrategyConfig at the REAL build
+        site — mirror builds in test_config.py / test_engine_seed.py cannot
+        catch a missing engine.py wiring."""
+        mock_info = MagicMock()
+        mock_info.qty_step = Decimal("0.001")
+        mock_info.tick_size = Decimal("0.1")
+        mock_info.round_qty = lambda q: max(Decimal("0.001"), q.quantize(Decimal("0.001")))
+        mock_provider_cls.return_value.get.return_value = mock_info
+
+        risk_strategy = replay_config.strategy.model_copy(
+            update={
+                "min_liq_ratio": 0.7,
+                "max_liq_ratio": 1.3,
+                "min_total_margin": 3.0,
+                "increase_same_position_on_low_margin": True,
+                "leverage": 5,
+            }
+        )
+        config = replay_config.model_copy(update={"strategy": risk_strategy})
+
+        captured = {}
+        mock_runner = MagicMock()
+        # Real None so run() skips the position-writer flush logging path.
+        mock_runner._position_writer = None
+
+        def capture_init_runner(strategy_config, *args, **kwargs):
+            captured["strategy_config"] = strategy_config
+            return mock_runner
+
+        engine = ReplayEngine(config=config, db=db)
+        with patch.object(
+            ReplayEngine, "_init_runner", side_effect=capture_init_runner
+        ):
+            engine.run(data_provider=InMemoryDataProvider([]))
+
+        bt_config = captured["strategy_config"]
+        assert bt_config.min_liq_ratio == 0.7
+        assert bt_config.max_liq_ratio == 1.3
+        assert bt_config.min_total_margin == 3.0
+        assert bt_config.increase_same_position_on_low_margin is True
+        assert bt_config.leverage == 5
+
+    @patch("replay.engine.InstrumentInfoProvider")
     def test_replay_empty_data(self, mock_provider_cls, db, seeded_run_account, replay_config):
         """Replay with no data produces empty result."""
         mock_info = MagicMock()

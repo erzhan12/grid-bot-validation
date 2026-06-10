@@ -25,8 +25,6 @@ from grid_db import (
     PositionSnapshotRepository,
     Run,
     Strategy,
-    TickerSnapshot,
-    TickerSnapshotRepository,
     User,
     WalletSnapshot,
     WalletSnapshotRepository,
@@ -279,6 +277,15 @@ class TestReplayEngineSeedingPipeline:
             early_imbalance_multiplier=replay_config.strategy.early_imbalance_multiplier,
             commission_rate=replay_config.strategy.commission_rate,
             enable_risk_multipliers=replay_config.strategy.enable_risk_multipliers,
+            # Feature 0071: risk-mgmt tunables pass-through (keep in sync
+            # with the engine.py build site).
+            min_liq_ratio=replay_config.strategy.min_liq_ratio,
+            max_liq_ratio=replay_config.strategy.max_liq_ratio,
+            min_total_margin=replay_config.strategy.min_total_margin,
+            increase_same_position_on_low_margin=(
+                replay_config.strategy.increase_same_position_on_low_margin
+            ),
+            leverage=replay_config.strategy.leverage,
         )
         session = BacktestSession(initial_balance=wallet_seed.total_available_balance)
         runner = engine._init_runner(
@@ -324,6 +331,50 @@ class TestReplayEngineSeedingPipeline:
         # Grid seed → GridEngine.grid was restored from the seeded levels.
         # Grid.restore_grid keeps the level list intact.
         assert len(runner.engine.grid.grid) == 4
+
+    def test_seed_pipeline_wires_risk_config_to_positions(
+        self, seeded_db, replay_config, mock_instrument,
+    ):
+        """Feature 0071: non-default risk fields reach both linked Position
+        risk_configs through the BacktestStrategyConfig mirror build."""
+        risk_strategy = replay_config.strategy.model_copy(
+            update={
+                "min_total_margin": 3.0,
+                "increase_same_position_on_low_margin": True,
+            }
+        )
+        config = replay_config.model_copy(update={"strategy": risk_strategy})
+        engine = ReplayEngine(config=config, db=seeded_db)
+
+        from backtest.config import BacktestStrategyConfig
+        from backtest.session import BacktestSession
+
+        strategy_config = BacktestStrategyConfig(
+            strat_id="replay_btcusdt",
+            symbol=SYMBOL,
+            tick_size=config.strategy.tick_size,
+            grid_count=config.strategy.grid_count,
+            grid_step=config.strategy.grid_step,
+            amount=config.strategy.amount,
+            max_margin=config.strategy.max_margin,
+            early_imbalance_multiplier=config.strategy.early_imbalance_multiplier,
+            commission_rate=config.strategy.commission_rate,
+            enable_risk_multipliers=config.strategy.enable_risk_multipliers,
+            min_liq_ratio=config.strategy.min_liq_ratio,
+            max_liq_ratio=config.strategy.max_liq_ratio,
+            min_total_margin=config.strategy.min_total_margin,
+            increase_same_position_on_low_margin=(
+                config.strategy.increase_same_position_on_low_margin
+            ),
+            leverage=config.strategy.leverage,
+        )
+        session = BacktestSession(initial_balance=Decimal("10000"))
+        runner = engine._init_runner(strategy_config, session)
+
+        for position in (runner._long_position, runner._short_position):
+            assert position is not None
+            assert position.risk_config.min_total_margin == 3.0
+            assert position.risk_config.increase_same_position_on_low_margin is True
 
     def test_null_0042_wallet_fields_fall_back_to_config_balance(
         self, seeded_db, replay_config, mock_instrument,

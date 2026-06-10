@@ -18,6 +18,18 @@ strategy:
   grid_step: 0.2
   amount: "x0.001"
   commission_rate: 0.0002
+  # Risk-mgmt tunables (feature 0071, issue #162). When omitted they default
+  # to BacktestStrategyConfig values (0.8 / 1.2 / 0.15 / false / 10) — NOT
+  # your live gridbot values. Populate ALL five to mirror live risk-mgmt;
+  # a partial set silently mixes live and backtest-default semantics.
+  # Live-mirror examples below are operator-supplied, NOT repo-derived —
+  # confirm against your own live config before use (the repo's only gridbot
+  # config, gridbot.yaml.example, ships 0.15 / false as the verified baseline).
+  # min_liq_ratio: 0.8
+  # max_liq_ratio: 1.2
+  # min_total_margin: 3      # LTC example — operator-supplied, confirm against your live config (SOL example: 2.5)
+  # increase_same_position_on_low_margin: true  # live example — operator-supplied; true = boost own side x2 on low margin; false = suppress opposite side x0.5
+  # leverage: 10
 
 # Optional fill simulator mode:
 #   book_touch (default, uses recorded L1 bid/ask for parity with live exchange),

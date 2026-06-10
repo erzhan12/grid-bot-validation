@@ -35,6 +35,22 @@ class TestReplayStrategyConfig:
         with pytest.raises(ValidationError, match="renamed to 'early_imbalance_multiplier'"):
             ReplayStrategyConfig(tick_size=Decimal("0.1"), long_koef=1.5)
 
+    def test_risk_field_defaults_match_backtest(self):
+        """Feature 0071 — risk-field defaults match BacktestStrategyConfig so
+        existing replay YAMLs keep today's behaviour (backwards-compat)."""
+        config = ReplayStrategyConfig(tick_size=Decimal("0.1"))
+        assert config.min_liq_ratio == 0.8
+        assert config.max_liq_ratio == 1.2
+        assert config.min_total_margin == 0.15
+        assert config.increase_same_position_on_low_margin is False
+        assert config.leverage == 10
+
+    @pytest.mark.parametrize("leverage", [0, 126])
+    def test_leverage_bounds_rejected(self, leverage):
+        """Mirrors BacktestStrategyConfig leverage bounds (ge=1, le=125)."""
+        with pytest.raises(ValidationError):
+            ReplayStrategyConfig(tick_size=Decimal("0.1"), leverage=leverage)
+
 
 class TestReplayConfig:
     """Tests for ReplayConfig."""
@@ -147,6 +163,53 @@ class TestLoadConfig:
         monkeypatch.setenv("REPLAY_CONFIG_PATH", str(config_file))
         config = load_config()
         assert config.symbol == "BTCUSDT"
+
+    def test_risk_fields_round_trip_to_backtest_config(self, tmp_path):
+        """Feature 0071 — yaml → ReplayConfig → BacktestStrategyConfig carries
+        non-default risk-mgmt values across the type boundary. This mirrors
+        the engine's build; the real build site inside ReplayEngine.run() is
+        covered by test_engine.py."""
+        from backtest.config import BacktestStrategyConfig
+
+        config_file = tmp_path / "replay.yaml"
+        config_file.write_text(
+            "symbol: LTCUSDT\n"
+            "strategy:\n"
+            "  tick_size: 0.01\n"
+            "  min_liq_ratio: 0.7\n"
+            "  max_liq_ratio: 1.3\n"
+            "  min_total_margin: 3\n"
+            "  increase_same_position_on_low_margin: true\n"
+            "  leverage: 5\n"
+        )
+        config = load_config(str(config_file))
+
+        # Mirror ReplayEngine.run()'s BacktestStrategyConfig build.
+        bt_config = BacktestStrategyConfig(
+            strat_id="replay_ltcusdt",
+            symbol=config.symbol,
+            tick_size=config.strategy.tick_size,
+            grid_count=config.strategy.grid_count,
+            grid_step=config.strategy.grid_step,
+            amount=config.strategy.amount,
+            max_margin=config.strategy.max_margin,
+            early_imbalance_multiplier=config.strategy.early_imbalance_multiplier,
+            commission_rate=config.strategy.commission_rate,
+            enable_risk_multipliers=config.strategy.enable_risk_multipliers,
+            min_liq_ratio=config.strategy.min_liq_ratio,
+            max_liq_ratio=config.strategy.max_liq_ratio,
+            min_total_margin=config.strategy.min_total_margin,
+            increase_same_position_on_low_margin=(
+                config.strategy.increase_same_position_on_low_margin
+            ),
+            leverage=config.strategy.leverage,
+        )
+
+        assert bt_config.min_liq_ratio == 0.7
+        assert bt_config.max_liq_ratio == 1.3
+        assert bt_config.min_total_margin == 3.0
+        assert bt_config.increase_same_position_on_low_margin is True
+        assert bt_config.leverage == 5
 
     def test_default_search_path(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)

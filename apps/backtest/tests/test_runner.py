@@ -456,6 +456,53 @@ class TestBacktestRunnerRiskMultipliers:
         assert no_risk_runner._executor.qty_calculator is not None
         assert not hasattr(no_risk_runner, "_base_qty_calculator")
 
+    def test_low_margin_equal_position_boost_config_wired_true(self, risk_config):
+        """Feature 0071: config flag reaches both linked Position risk configs
+        (mirrors gridbot test_runner.py feature 0040 coverage)."""
+        boost_config = risk_config.model_copy(
+            update={"increase_same_position_on_low_margin": True}
+        )
+        session = BacktestSession(
+            session_id="test_risk_boost", initial_balance=Decimal("10000")
+        )
+        fill_sim = TradeThroughFillSimulator()
+        order_mgr = BacktestOrderManager(
+            fill_simulator=fill_sim,
+            commission_rate=boost_config.commission_rate,
+        )
+
+        def qty_from_usdt(intent, wallet_balance):
+            if intent.price <= 0:
+                return Decimal("0")
+            return Decimal("100") / intent.price
+
+        executor = BacktestExecutor(order_manager=order_mgr, qty_calculator=qty_from_usdt)
+        runner = BacktestRunner(
+            strategy_config=boost_config,
+            executor=executor,
+            session=session,
+        )
+
+        assert (
+            runner._long_position.risk_config.increase_same_position_on_low_margin
+            is True
+        )
+        assert (
+            runner._short_position.risk_config.increase_same_position_on_low_margin
+            is True
+        )
+
+    def test_low_margin_equal_position_boost_config_defaults_false(self, risk_runner):
+        """Default config keeps both linked Position risk configs off."""
+        assert (
+            risk_runner._long_position.risk_config.increase_same_position_on_low_margin
+            is False
+        )
+        assert (
+            risk_runner._short_position.risk_config.increase_same_position_on_low_margin
+            is False
+        )
+
     def test_get_amount_multiplier_default(self, risk_runner):
         """Default multipliers are 1.0 before any fills."""
         assert risk_runner.get_amount_multiplier(DirectionType.LONG, SideType.BUY) == 1.0
