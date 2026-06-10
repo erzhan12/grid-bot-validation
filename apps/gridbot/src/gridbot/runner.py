@@ -195,7 +195,7 @@ class StrategyRunner:
         rest_client: Optional["BybitRestClient"] = None,
         truncate_breaker: Optional[TruncateBreaker] = None,
         on_truncate_breaker_tripped: Optional[Callable[[str, str], None]] = None,
-        on_divergence_failure_mix: Optional[Callable[[str, str, int], None]] = None,
+        on_divergence_failure_mix: Optional[Callable[[str, str, int], bool]] = None,
         clock: Optional[Callable[[], float]] = None,
         wallet_provider: Optional["WalletProvider"] = None,
         wallet_ws_max_age_seconds: float = 45.0,

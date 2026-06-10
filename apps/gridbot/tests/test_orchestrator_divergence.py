@@ -147,14 +147,15 @@ def test_detector_fire_suppresses_breaker_warning(fixed_clock, caplog):
 
 def test_wrapper_detector_throttle(fixed_clock):
     orch, runner, reconciler = _wire(_gridbot_config())
-    orch._trigger_divergence_reconcile("btcusdt_test", "rest_failure_mix", 10)
+    assert orch._trigger_divergence_reconcile("btcusdt_test", "rest_failure_mix", 10) is True
     assert reconciler.reconcile_reconnect.call_count == 1
-    # Second within the 300s detector throttle → suppressed.
-    orch._trigger_divergence_reconcile("btcusdt_test", "rest_failure_mix", 11)
+    # Second within the 300s detector throttle → suppressed (False = edge not
+    # consumable by signal 2).
+    assert orch._trigger_divergence_reconcile("btcusdt_test", "rest_failure_mix", 11) is False
     assert reconciler.reconcile_reconnect.call_count == 1
     # After the detector throttle (and past the 60s breaker cooldown) → fires.
     fixed_clock["now"] = 1000.0 + 301.0
-    orch._trigger_divergence_reconcile("btcusdt_test", "rest_failure_mix", 12)
+    assert orch._trigger_divergence_reconcile("btcusdt_test", "rest_failure_mix", 12) is True
     assert reconciler.reconcile_reconnect.call_count == 2
 
 
@@ -162,7 +163,7 @@ def test_wrapper_kill_switch(fixed_clock):
     orch, runner, reconciler = _wire(
         _gridbot_config(_strategy_config(divergence_detector_enabled=False))
     )
-    orch._trigger_divergence_reconcile("btcusdt_test", "rest_failure_mix", 10)
+    assert orch._trigger_divergence_reconcile("btcusdt_test", "rest_failure_mix", 10) is False
     reconciler.reconcile_reconnect.assert_not_called()
 
 
@@ -177,7 +178,9 @@ def test_wrapper_suppressed_by_breaker_cooldown_no_misleading_warning(
     orch._force_reconcile_last_at["btcusdt_test"] = 1000.0
 
     with caplog.at_level("WARNING", logger="gridbot.orchestrator"):
-        orch._trigger_divergence_reconcile("btcusdt_test", "rest_failure_mix", 10)
+        assert orch._trigger_divergence_reconcile(
+            "btcusdt_test", "rest_failure_mix", 10
+        ) is False
     msgs = [r.getMessage() for r in caplog.records]
     assert not any("state-divergence detected" in m for m in msgs)
     reconciler.reconcile_reconnect.assert_not_called()
@@ -187,7 +190,9 @@ def test_wrapper_suppressed_by_breaker_cooldown_no_misleading_warning(
     # After the 60s breaker cooldown → fires fully.
     fixed_clock["now"] = 1000.0 + 61.0
     with caplog.at_level("WARNING", logger="gridbot.orchestrator"):
-        orch._trigger_divergence_reconcile("btcusdt_test", "rest_failure_mix", 10)
+        assert orch._trigger_divergence_reconcile(
+            "btcusdt_test", "rest_failure_mix", 10
+        ) is True
     msgs = [r.getMessage() for r in caplog.records]
     assert any("state-divergence detected" in m for m in msgs)
     runner.clear_dedup_cache.assert_called_once()
@@ -239,6 +244,58 @@ def test_signal2_disabled_does_not_fire():
     orch._trigger_divergence_reconcile = Mock()
     orch._health_check_once()
     orch._trigger_divergence_reconcile.assert_not_called()
+
+
+def test_signal2_retries_after_breaker_cooldown_suppresses_reconcile(fixed_clock):
+    """Budget edge must not be consumed when reconcile is rate-limited.
+
+    Otherwise a parked truncate_breaker_reconcile_count (no new 110017s while
+    placements are blocked) never gets the both-direction backstop reconcile.
+    """
+    orch, runner, reconciler = _wire(
+        _gridbot_config(_strategy_config(
+            divergence_retry_budget=5,
+            truncate_breaker_cooldown_seconds=60.0,
+        ))
+    )
+    runner.dirty_rest_refresh_failure_count = 0
+    runner.truncate_breaker_reconcile_count = 5
+    orch._force_reconcile_last_at["btcusdt_test"] = 1000.0
+    fixed_clock["now"] = 1030.0  # 30s later — still inside 60s cooldown
+
+    orch._health_check_once()
+    assert "btcusdt_test" not in orch._divergence_budget_last_fired
+    reconciler.reconcile_reconnect.assert_not_called()
+
+    fixed_clock["now"] = 1070.0  # cooldown expired — same edge should retry
+    orch._health_check_once()
+    assert orch._divergence_budget_last_fired["btcusdt_test"] == 5
+    reconciler.reconcile_reconnect.assert_called_once_with(runner)
+
+
+def test_signal2_retries_after_detector_throttle_suppresses_reconcile(fixed_clock):
+    """Edge-preservation must also hold for the 300s detector-throttle path.
+
+    The 110017 burst that exhausts divergence_retry_budget typically fires
+    signal 1 first, so the throttle (not the breaker cooldown) is the likely
+    suppressor when the health check observes the budget edge.
+    """
+    orch, runner, reconciler = _wire(
+        _gridbot_config(_strategy_config(divergence_retry_budget=5))
+    )
+    runner.dirty_rest_refresh_failure_count = 0
+    runner.truncate_breaker_reconcile_count = 5
+    orch._divergence_last_fire_at["btcusdt_test"] = 1000.0  # signal 1 just fired
+    fixed_clock["now"] = 1030.0  # 30s later — inside the 300s detector throttle
+
+    orch._health_check_once()
+    assert "btcusdt_test" not in orch._divergence_budget_last_fired
+    reconciler.reconcile_reconnect.assert_not_called()
+
+    fixed_clock["now"] = 1000.0 + 301.0  # throttle expired — same edge retries
+    orch._health_check_once()
+    assert orch._divergence_budget_last_fired["btcusdt_test"] == 5
+    reconciler.reconcile_reconnect.assert_called_once_with(runner)
 
 
 # ==========================================================================

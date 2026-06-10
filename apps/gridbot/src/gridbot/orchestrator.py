@@ -1117,10 +1117,12 @@ class Orchestrator:
                             runner.strat_id, -1
                         )
                     ):
-                        self._divergence_budget_last_fired[runner.strat_id] = trips
-                        self._trigger_divergence_reconcile(
+                        if self._trigger_divergence_reconcile(
                             runner.strat_id, "retry_budget", trips,
-                        )
+                        ):
+                            self._divergence_budget_last_fired[
+                                runner.strat_id
+                            ] = trips
 
             for account_name in list(self._public_ws.keys()):
                 # Check public WS
@@ -1420,11 +1422,13 @@ class Orchestrator:
         signal: str,
         evidence: object,
         direction: Optional[str] = None,
-    ) -> None:
+    ) -> bool:
         """Thin divergence wrapper around ``_force_reconcile_strat`` (issue #151).
 
-        All four detector signals funnel here. Fire-and-forget (returns None — no
-        caller, including signal 4's drain, inspects a return value). Order:
+        All four detector signals funnel here. Returns ``True`` only when a forced
+        reconcile was actually attempted (not kill-switched, detector-throttled,
+        or breaker-cooldown-suppressed). Signal 2 uses this to avoid consuming a
+        retry-budget edge when the reconcile was suppressed. Order:
 
         1. Master kill-switch (BEFORE the throttle): if the per-strat
            ``divergence_detector_enabled`` is False, RETURN immediately (no
@@ -1450,7 +1454,7 @@ class Orchestrator:
             (c for c in self._config.strategies if c.strat_id == strat_id), None
         )
         if cfg is None or not cfg.divergence_detector_enabled:
-            return
+            return False
 
         now = time.monotonic()
         last = self._divergence_last_fire_at.get(strat_id, 0.0)
@@ -1461,7 +1465,7 @@ class Orchestrator:
                 "— skipping",
                 strat_id, signal, now - last, min_interval,
             )
-            return
+            return False
 
         ran = self._force_reconcile_strat(strat_id, None, emit_breaker_warning=False)
         if not ran:
@@ -1470,7 +1474,7 @@ class Orchestrator:
                 "breaker cooldown",
                 strat_id, signal,
             )
-            return
+            return False
 
         logger.warning(
             "%s: state-divergence detected (signal=%s, evidence=%s), "
@@ -1487,6 +1491,7 @@ class Orchestrator:
                     error_key=f"divergence_dedup_clear_{strat_id}",
                 )
         self._divergence_last_fire_at[strat_id] = now
+        return True
 
     def _enqueue_post_recovery_reconcile(self, account_name: str) -> None:
         """Signal 4 — fan out an account-level WS recovery to its strats.
