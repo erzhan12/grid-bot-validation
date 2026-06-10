@@ -456,6 +456,28 @@ def test_chase_exit_before_drain_does_not_orphan_buffered_place(chase_runner):
     assert chase_runner._chase_state == "IDLE"
 
 
+def test_chase_exit_before_drain_drops_buffered_grow_side_cancels(chase_runner):
+    """Exit before drain must not leave buffered grow-side cancels that would
+    fire on the next dispatch tick after chase mode has ended."""
+    grow_buy = PlaceLimitIntent.create(
+        symbol="SOLUSDT", side="Buy", price=Decimal("95"), qty=Decimal("1"),
+        grid_level=1, direction="long", reduce_only=False,
+    )
+    chase_runner._tracked_orders[grow_buy.client_order_id] = TrackedOrder(
+        client_order_id=grow_buy.client_order_id, intent=grow_buy,
+        status="placed", order_id="grow-1",
+    )
+    chase_runner._low_balance = True
+    chase_runner._long_position.size = Decimal("10")
+    chase_runner._evaluate_chase(100.0, 8.0)  # enter → grow cancel + chase buffered
+    assert any(c.order_id == "grow-1" for c in _cancels(chase_runner._pending_chase_intents))
+    chase_runner._low_balance = False         # balance recovers before drain
+    chase_runner._evaluate_chase(100.0, 8.0)  # exit
+    assert _cancels(chase_runner._pending_chase_intents) == []
+    assert _places(chase_runner._pending_chase_intents) == []
+    assert chase_runner._chase_state == "IDLE"
+
+
 def test_chase_repeg_before_drain_replaces_not_accumulates(chase_runner):
     """Re-peg before drain replaces the still-buffered place (no accumulation)."""
     chase_runner._low_balance = True
