@@ -8,128 +8,9 @@ Successfully extracted pure strategy logic from `bbu2-master` into `packages/gri
 
 **Documentation**: See `docs/features/0001_IMPLEMENTATION_SUMMARY.md` for complete implementation summary and usage examples.
 
-### Key Implementation Notes
+### Legacy bbu2 paths intentionally not ported (gridcore scope)
 
-1. **Zero Exchange Dependencies**
-   - NO imports from `pybit`, `bybit`, or any exchange-specific libraries
-   - Validation command: `grep -r "^import pybit\|^from pybit" packages/gridcore/src/` should return nothing
-   - File: All modules in `packages/gridcore/src/gridcore/`
-
-2. **Grid Module (`grid.py`)**
-   - Extracted from: `bbu_reference/bbu2-master/greed.py`
-   - Key transformation: Replaced `BybitApiUsdt.round_price()` with internal `_round_price(tick_size)`
-   - **IMPORTANT**: `tick_size` must be passed as `Decimal` parameter, not looked up from exchange
-   - Removed: `read_from_db()`, `write_to_db()`, `strat` dependency
-   - Added: `is_price_sorted()`, `is_greed_correct()` validation methods
-   - **GridSideType enum (2026-01-23)**: Renamed from `GridSide` to `GridSideType` for clarity (BUY, SELL, WAIT are type constants)
-   - **is_grid_correct() Pattern Support (2026-01-10)**: Method accepts both BUY→WAIT→SELL and BUY→SELL patterns. Sometimes there's no WAIT state between BUY and SELL levels, which is now considered valid.
-   - **Extended Comparison Tests (2026-01-20)**: Added 8 new direct comparison tests to `test_comparison.py::TestGridComparisonExtended` covering:
-     - Sell-heavy rebalancing (opposite direction of existing buy-heavy test)
-     - Various grid_count values: small grids (10, 20) and large grids (100, 200)
-     - Various grid_step values (0.05%, 0.1%, 0.5%, 1.0%)
-     - Extreme prices with realistic tick_size pairs (0.0001 to 999999)
-     - None/empty input handling (defensive edge cases)
-     - Rebuild grid clearing verification (prevents doubling bug)
-     - Grid boundary conditions and consecutive rebuilds
-     - Total: 45 comparison tests (29 existing + 16 new with parametrization), all passing in 0.04s
-     - **Validation confidence**: Complete behavioral parity confirmed across full parameter space
-   - File: `packages/gridcore/src/gridcore/grid.py`
-
-3. **Engine Module (`engine.py`)**
-   - Extracted from: `bbu_reference/bbu2-master/strat.py` (Strat50 class)
-   - Event-driven pattern: `on_event(event) → list[Intent]`
-   - **CRITICAL**: Engine NEVER makes network calls or has side effects
-   - Returns intents (PlaceLimitIntent, CancelIntent), execution layer handles actual orders
-   - **Helper Methods Pattern (2026-01-23)**: Use `_cancel_limit()` and `_cancel_all_limits()` for DRY CancelIntent creation
-     - `_cancel_limit(limit, reason)` - Creates single CancelIntent from limit dict
-     - `_cancel_all_limits(limits, reason)` - Creates list of CancelIntents
-     - Benefits: Eliminates code duplication, centralizes field extraction pattern, improves readability
-     - Usage: `intents.extend(self._cancel_all_limits(limits, 'rebuild'))` instead of loop
-     - Applies to all CancelIntent creation: rebuild, side_mismatch, outside_grid
-   - **OrderUpdateEvent Handling (2026-01-23)**: Tracks order lifecycle to prevent duplicate placements
-     - Original bbu2: Used `handle_order()` to accumulate WebSocket updates in buffer, merged with cached state in `get_limit_orders()`
-     - gridcore: Engine tracks `pending_orders` dict (client_order_id → order_id) to know what IT placed
-     - Statuses tracked: 'New', 'PartiallyFilled' (pending), 'Filled', 'Cancelled', 'Rejected' (terminal)
-     - **IMPORTANT**: Does NOT track 'Active' status (see Pitfall #15 below)
-     - Returns empty intent list (order tracking is internal state management only)
-     - Execution layer provides full `limit_orders` dict to `on_event()` - engine doesn't maintain order state
-   - File: `packages/gridcore/src/gridcore/engine.py`
-
-4. **Position Risk Management Module (`position.py`)**
-   - Extracted from: `bbu_reference/bbu2-master/position.py`
-   - Manages position sizing multipliers based on liquidation risk, margin levels, and position ratios
-   - **TWO-POSITION ARCHITECTURE (2026-01-14)**: Matches Bybit's dual-position model
-     - Each trading pair has TWO separate Position objects (one for long, one for short)
-     - Positions are linked via `set_opposite()` to enable cross-position multiplier adjustments
-     - Example: Long position with moderate liq risk calls `opposite.set_amount_multiplier()` to modify SHORT multipliers
-     - **Usage pattern**:
-       ```python
-       long = Position('long', risk_config)
-       short = Position('short', risk_config)
-       long.set_opposite(short)
-       short.set_opposite(long)
-       ```
-     - `PositionRiskManager` is backward-compatibility alias for `Position`
-   - **CRITICAL BUG FIX (2026-01-01)**: Reference code had incorrect liquidation risk logic for short positions
-     - Reference used `liq_ratio < 0.95 * max_liq_ratio` which is backwards
-     - Correct logic: `liq_ratio > 0.95 * max_liq_ratio` (higher ratio = closer to liquidation for shorts)
-   - **MISSING LOGIC FIX (2026-01-03)**: Added moderate liquidation risk logic for short positions
-     - Original bbu2 code at `position.py:81-86` handles moderate liq risk for shorts via opposite position
-     - When short has moderate liq risk, modifies opposite (long) position's SELL multiplier to 0.5
-   - **SAFER PRIORITY ORDER (2026-01-14)**: Changed to liquidation-first approach matching original bbu2
-     - **Long positions**: High liq risk → Moderate liq risk (modifies opposite) → Low margin → Position ratio checks
-     - **Short positions**: High liq risk → Position ratio/margin → Moderate liq risk (modifies opposite)
-     - **Rationale**: Capital preservation > strategy optimization. Liquidation = 100% loss, missed trade = 0% loss
-     - Prevents position sizing strategies from executing during liquidation danger
-   - File: `packages/gridcore/src/gridcore/position.py`
-
-5. **Events and Intents**
-   - Events (`events.py`): Immutable dataclasses representing market data and order updates
-   - Intents (`intents.py`): Immutable dataclasses representing desired actions
-   - **PITFALL**: All event dataclass fields that extend Event must have default values (Python dataclass inheritance requirement)
-   - **OrderUpdateEvent vs Original bbu2 (2026-01-23)**:
-     - **Original bbu2**: `handle_order()` accumulated WebSocket updates in `order_data` buffer, `get_limit_orders()` merged buffer with cached state and cleared buffer
-     - **gridcore**: Engine receives `OrderUpdateEvent` per order status change, tracks minimal `pending_orders` state, execution layer maintains full order list
-     - **Transformation**: Pull model (poll `get_limit_orders()`) → Push model (receive `OrderUpdateEvent`)
-     - **Responsibility split**: Engine tracks what it placed, execution layer provides current order state via `limit_orders` parameter
-     - **Status filtering**: Original checked `['Active', 'New', 'PartiallyFilled']` (V3 legacy), gridcore checks `['New', 'PartiallyFilled']` (V5 correct)
-   - Files: `packages/gridcore/src/gridcore/events.py`, `packages/gridcore/src/gridcore/intents.py`
-
-6. **Testing**
-   - Must maintain ≥80% test coverage
-   - Run tests: `uv run pytest packages/gridcore/tests/ --cov=gridcore --cov-fail-under=80 -v`
-   - Current coverage: 93% (updated 2026-01-01)
-   - Test files: `packages/gridcore/tests/test_*.py`
-
-7. **Package Structure**
-   ```
-   packages/gridcore/
-   ├── pyproject.toml           # Zero external dependencies
-   ├── src/gridcore/
-   │   ├── __init__.py
-   │   ├── events.py            # Event models
-   │   ├── intents.py           # Intent models
-   │   ├── config.py            # GridConfig
-   │   ├── grid.py              # Grid calculations (from greed.py)
-   │   ├── engine.py            # GridEngine (from strat.py)
-   │   ├── position.py          # Position risk management
-   │   ├── pnl.py               # Pure PnL formulas + MMTiers + parse_risk_limit_tiers
-   │   └── persistence.py       # Full grid state persistence (GridStateStore)
-   └── tests/
-       ├── test_grid.py         # Grid calculation tests
-       ├── test_engine.py       # Engine event processing tests
-       ├── test_position.py     # Position risk tests
-       ├── test_persistence.py  # Grid state persistence tests
-       └── test_comparison.py   # Comparison with original (optional)
-   ```
-
-8. **Reference Code Location**
-   - Original code: `bbu_reference/bbu2-master/`
-   - Keep reference code for comparison tests
-   - Never modify reference code
-   - **WARNING**: Reference code may contain bugs (e.g., short position liquidation risk logic)
-
-9. **Legacy bbu2 paths intentionally not ported**
+1. **Legacy bbu2 paths intentionally not ported**
 
    These bbu2 code paths exist for products we do not target (Bybit
    inverse contracts: BTCUSD, ETHUSD, etc.). gridcore is intentionally
@@ -767,394 +648,7 @@ logging.getLogger('gridcore').addHandler(handler)
 - **engine.py**: Grid build from anchor/market price, rebuild due to too many orders
 - **position.py**: Position ratio adjustments, risk management triggers
 
-## Phase C: Multi-Tenant Database Layer (grid_db)
-
-### Completed: 2026-01-07
-
-Successfully implemented a multi-tenant database layer supporting SQLite (development) and PostgreSQL (production).
-
-### Key Implementation Notes
-
-1. **Package Structure**
-   ```
-   shared/db/
-   ├── pyproject.toml           # Dependencies: sqlalchemy, pydantic-settings
-   ├── src/grid_db/
-   │   ├── __init__.py          # Package exports
-   │   ├── settings.py          # DatabaseSettings (Pydantic)
-   │   ├── models.py            # SQLAlchemy ORM models (7 tables)
-   │   ├── database.py          # DatabaseFactory
-   │   ├── repositories.py      # CRUD with multi-tenant filtering
-   │   └── init_db.py           # CLI initialization script
-   └── tests/
-       ├── conftest.py          # Test fixtures
-       ├── test_models.py
-       ├── test_database.py
-       └── test_repositories.py
-   ```
-
-2. **Database Tables**
-   - `users` - User accounts for multi-tenant access control
-   - `bybit_accounts` - Exchange accounts per user
-   - `api_credentials` - API keys (plaintext for now)
-   - `strategies` - Grid strategy configurations (JSON config)
-   - `runs` - Live/backtest/shadow run tracking
-   - `public_trades` - Market trade data for fill simulation
-   - `private_executions` - Ground truth execution data
-
-3. **SQLite/PostgreSQL Compatibility**
-   - Use `String(36)` for UUIDs (not native UUID type)
-   - Use `BigInteger().with_variant(Integer, "sqlite")` for high-volume primary keys (trades/executions)
-   - SQLite requires `PRAGMA foreign_keys=ON` on every connection
-   - JSON type works as text in SQLite, native JSONB in PostgreSQL
-   - SQLite connection pooling must use `StaticPool` ONLY for `:memory:` databases
-   - **PostgreSQL URL encoding**: Connection components (user, password, host, db_name) are URL-encoded using `urllib.parse.quote_plus()` to handle special characters (e.g., `@`, `:`, `/`, `#`, `%` in passwords). The port is NOT encoded per RFC 3986 (ports are numeric-only URI components). Without encoding, passwords with special characters would break the connection string parsing.
-
-4. **Testing**
-   - Run tests: `uv run pytest shared/db/tests/ --cov=grid_db -v`
-   - Test fixtures use in-memory SQLite (`:memory:`)
-
-5. **Session Management**
-   - Use `DatabaseFactory.get_session()` context manager for auto commit/rollback
-   - For tests expecting IntegrityError, session fixture uses manual rollback
-
-6. **Multi-Tenant Access Control**
-   - **CRITICAL**: All queries MUST filter by `user_id` to enforce data isolation
-   - `RunRepository` enforces `user_id` filtering on all methods
-   - `ApiCredentialRepository` and `StrategyRepository` enforce `user_id` filtering (join via `BybitAccount`)
-   - `BaseRepository` does NOT expose `get_by_id`/`get_all` (removed for safety)
-   - `UserRepository` explicitly implements admin-style access methods
-
-7. **Cascade Deletes**
-   - All foreign keys have `ondelete="CASCADE"` to ensure referential integrity
-   - ORM relationships use `cascade="all, delete-orphan"` for automatic cleanup
-   - **Run model**: Foreign keys (`user_id`, `account_id`, `strategy_id`) cascade on parent deletion
-   - **PrivateExecution model**: `run_id` foreign key cascades when Run is deleted
-   - Deleting a User/BybitAccount/Strategy automatically deletes associated Runs
-   - Deleting a Run automatically deletes associated PrivateExecution records
-   - Tests verify cascade behavior: `test_*_cascade_delete` in `shared/db/tests/test_models.py`
-
-### Usage Example
-```python
-from grid_db import DatabaseFactory, DatabaseSettings
-from grid_db import User, BybitAccount, Strategy, Run
-from grid_db import UserRepository, RunRepository
-
-# Initialize database
-# Env vars loaded with GRIDBOT_ prefix (e.g. GRIDBOT_DB_TYPE)
-settings = DatabaseSettings()
-db = DatabaseFactory(settings)
-db.create_tables()
-
-# Use session context manager
-with db.get_session() as session:
-    # Create user
-    user = User(username="trader1", email="trader@example.com")
-    session.add(user)
-    session.flush()
-
-    # Create account
-    account = BybitAccount(
-        user_id=user.user_id,
-        account_name="main",
-        environment="testnet"
-    )
-    session.add(account)
-
-# Use repositories for multi-tenant queries
-with db.get_session() as session:
-    repo = RunRepository(session)
-    runs = repo.get_by_user_id(user_id)  # Only returns user's runs
-```
-
-### Environment Variables
-- `GRIDBOT_DB_TYPE` - "sqlite" or "postgresql"
-- `GRIDBOT_DB_NAME` - Database name or file path
-- `GRIDBOT_DB_HOST`, `GRIDBOT_DB_PORT`, `GRIDBOT_DB_USER`, `GRIDBOT_DB_PASSWORD` - PostgreSQL config
-
-## Phase D: Data Capture (bybit_adapter + event_saver)
-
-### Completed: 2026-01-07
-
-Successfully implemented Bybit data capture infrastructure with WebSocket normalization and bulk persistence.
-
-### Key Components
-
-1. **bybit_adapter Package** (`packages/bybit_adapter/`)
-   - `normalizer.py` - Converts Bybit WebSocket messages to gridcore events
-   - `ws_client.py` - PublicWebSocketClient and PrivateWebSocketClient
-   - `rest_client.py` - REST API for gap reconciliation
-   - `rate_limiter.py` - Sliding window rate limiting with exponential backoff
-   - Dependencies: `pybit>=5.8`, `gridcore` (workspace)
-
-2. **event_saver Application** (`apps/event_saver/`)
-   - `config.py` - Pydantic settings with `EVENTSAVER_*` env vars
-   - `collectors/` - PublicCollector, PrivateCollector with symbol filtering
-   - `writers/` - TradeWriter, ExecutionWriter with batch bulk insert
-   - `reconciler.py` - GapReconciler for REST gap filling
-   - `main.py` - EventSaver orchestrator with signal handling
-
-3. **Database Extensions** (`shared/db/`)
-   - Added `PositionSnapshot`, `WalletSnapshot` models
-   - Added `PublicTradeRepository`, `PrivateExecutionRepository`
-
-### Event Normalization Mapping
-
-**publicTrade.{symbol} → PublicTradeEvent**
-| Bybit | gridcore |
-|-------|----------|
-| `data[].i` | trade_id |
-| `data[].T` | exchange_ts (ms→datetime) |
-| `data[].S` | side ("Buy"/"Sell") |
-| `data[].p` | price (Decimal) |
-| `data[].v` | size (Decimal) |
-
-**execution → ExecutionEvent**
-| Bybit | gridcore |
-|-------|----------|
-| `data[].execId` | exec_id |
-| `data[].orderId` | order_id |
-| `data[].orderLinkId` | order_link_id |
-| `data[].execTime` | exchange_ts |
-| `data[].execPrice` | price |
-| `data[].execQty` | qty |
-| `data[].execFee` | fee |
-| `data[].closedPnl` | closed_pnl |
-
-**Filters**: `category=="linear"`, `execType=="Trade"`, `orderType=="Limit"`
-
-### Environment Variables
-- `EVENTSAVER_SYMBOLS` - Comma-separated symbol list (e.g., "BTCUSDT,ETHUSDT")
-- `EVENTSAVER_TESTNET` - Use testnet endpoints (default: true)
-- `EVENTSAVER_BATCH_SIZE` - Trades to batch before bulk insert (default: 100)
-- `EVENTSAVER_FLUSH_INTERVAL` - Seconds between forced flushes (default: 5.0)
-- `EVENTSAVER_GAP_THRESHOLD_SECONDS` - Trigger reconciliation if gap > this (default: 5.0)
-- `EVENTSAVER_DATABASE_URL` - Database connection URL (default: sqlite:///gridbot.db)
-
-### Usage Example
-```python
-from event_saver import EventSaver, EventSaverConfig, AccountContext
-from grid_db import DatabaseFactory
-from uuid import uuid4
-
-config = EventSaverConfig()
-db = DatabaseFactory(config.database_url)
-
-saver = EventSaver(config=config, db=db)
-
-# Add account for private data collection
-saver.add_account(AccountContext(
-    account_id=uuid4(),
-    user_id=uuid4(),
-    run_id=uuid4(),
-    api_key="your_api_key",
-    api_secret="your_api_secret",
-    environment="testnet",
-    symbols=["BTCUSDT"],
-))
-
-await saver.start()
-await saver.run_until_shutdown()
-```
-
-### Key Implementation Notes
-
-1. **Workspace Dependencies**
-   - Use `[tool.uv.sources]` to declare workspace dependencies
-   - Example: `gridcore = { workspace = true }` in bybit_adapter's pyproject.toml
-
-2. **Model Field Mapping**
-   - `PrivateExecution` model uses `exec_price`, `exec_qty`, `exec_fee` (not `price`, `qty`, `fee`)
-   - `run_id` is REQUIRED for PrivateExecution (foreign key to runs table)
-   - Events without `run_id` are filtered out during model conversion
-
-3. **Config Symbols Parsing**
-   - `symbols` field is stored as string, use `config.get_symbols()` to get list
-   - Pydantic-settings parses list[str] as JSON by default, use string + method pattern
-
-4. **Test Coverage**
-   - bybit_adapter: 37 tests (normalizer, rate_limiter)
-   - event_saver: 46 tests (config, writers, reconciler)
-   - Run separately to avoid conftest conflicts: `uv run pytest packages/bybit_adapter/tests -v`
-
-### Critical Pitfalls Fixed (2026-01-08)
-
-**IMPORTANT**: When initializing components in event_saver, avoid these errors:
-
-1. **WebSocket Handler Thread Safety (2026-01-08)**
-   - **Issue**: Handler methods (`_handle_ticker`, `_handle_trades`, etc.) called `asyncio.create_task()` but are invoked from pybit's WebSocket background thread (not asyncio event loop thread)
-   - **Error**: `RuntimeError: no running event loop` when WebSocket messages arrive
-   - **Fix**: Store event loop reference in `EventSaver.start()`, use `asyncio.run_coroutine_threadsafe()` instead of `asyncio.create_task()` in all handlers
-   - **Pattern**: When callbacks come from non-asyncio threads, use `run_coroutine_threadsafe(coro, loop)` to schedule work on the event loop
-   - **Files**: `apps/event_saver/src/event_saver/main.py:83,154-155,296-427`
-
-2. **DatabaseFactory Requires Settings Object**
-   - `DatabaseFactory` expects `DatabaseSettings` object, NOT a raw string
-   - **WRONG**: `db = DatabaseFactory(config.database_url)` ❌
-   - **CORRECT**: `db = DatabaseFactory(DatabaseSettings(database_url=config.database_url))` ✅
-   - File: `apps/event_saver/src/event_saver/main.py:363`
-
-2. **BybitRestClient Requires Credentials**
-   - `BybitRestClient` requires `api_key` and `api_secret` parameters (even if empty for public endpoints)
-   - **WRONG**: `BybitRestClient(testnet=True)` ❌
-   - **CORRECT**: `BybitRestClient(api_key="", api_secret="", testnet=True)` ✅
-   - File: `apps/event_saver/src/event_saver/main.py:118-124`
-
-3. **REST Client Methods Are Synchronous, Not Async**
-   - `BybitRestClient.get_recent_trades()` and `get_executions()` are synchronous `def` methods
-   - **WRONG**: `await self._rest_client.get_recent_trades(...)` ❌
-   - **CORRECT**: `self._rest_client.get_recent_trades(...)` ✅
-   - Files: `apps/event_saver/src/event_saver/reconciler.py:120, 216`
-
-4. **get_executions() Returns Tuple (list, cursor)**
-   - **WRONG**: `executions_data = self._rest_client.get_executions(...)` ❌
-   - **CORRECT**: `executions_data, next_cursor = self._rest_client.get_executions(...)` ✅
-   - File: `apps/event_saver/src/event_saver/reconciler.py:216`
-
-5. **PublicTradeRepository.exists_by_trade_id() Takes Only trade_id**
-   - Method signature: `exists_by_trade_id(trade_id: str) -> bool`
-   - **WRONG**: `repo.exists_by_trade_id(symbol, model.trade_id)` ❌
-   - **CORRECT**: `repo.exists_by_trade_id(model.trade_id)` ✅
-   - File: `apps/event_saver/src/event_saver/reconciler.py:150`
-
-See `docs/features/0003_FIXES.md` for detailed documentation of these fixes.
-
-### MEDIUM Priority Improvements (2026-01-08)
-
-**Database Uniqueness & Deduplication**:
-
-1. **Unique Constraints Added**
-   - `public_trades.trade_id` has unique index (prevents duplicate trades)
-   - `private_executions.exec_id` has unique index (prevents duplicate executions)
-   - Files: `shared/db/src/grid_db/models.py:235, 273`
-
-2. **Bulk Insert with ON CONFLICT DO NOTHING**
-   - `PublicTradeRepository.bulk_insert()` uses `INSERT ... ON CONFLICT DO NOTHING`
-   - `PrivateExecutionRepository.bulk_insert()` uses `INSERT ... ON CONFLICT DO NOTHING`
-   - Returns actual inserted count (excluding skipped duplicates)
-   - Works across SQLite and PostgreSQL
-   - File: `shared/db/src/grid_db/repositories.py:439-481, 571-619`
-
-3. **Simplified Reconciliation Logic**
-   - Removed N-query manual deduplication loops
-   - Database enforces uniqueness at insert time (single query)
-   - **BEFORE**: Loop through models calling `exists_by_trade_id()` for each (N queries) ❌
-   - **AFTER**: Bulk insert all, database skips duplicates (1 query) ✅
-   - File: `apps/event_saver/src/event_saver/reconciler.py:143-157, 229-243`
-
-4. **Position/Wallet Persistence - COMPLETE**
-   - Added `PositionSnapshotRepository` with `bulk_insert()` and `get_latest_by_account_symbol()`
-   - Added `WalletSnapshotRepository` with `bulk_insert()` and `get_latest_by_account_coin()`
-   - Exported in `grid_db.__init__.py`
-   - File: `shared/db/src/grid_db/repositories.py:646-772`
-   - Created `PositionWriter` and `WalletWriter` with buffering and auto-flush
-   - Files: `apps/event_saver/src/event_saver/writers/{position_writer,wallet_writer}.py`
-   - Wired into `EventSaver` main orchestrator
-   - File: `apps/event_saver/src/event_saver/main.py:66-67, 150-162, 207-211, 265-305, 376-380`
-   - Position and wallet snapshots are now persisted to database (not just logged)
-
-See `docs/features/0003_MEDIUM_PRIORITY_FIXES.md` for detailed documentation of MEDIUM priority fixes.
-
-### LOW Priority Cleanup (2026-01-08)
-
-**Code Quality Improvements**:
-
-1. **PublicCollector Cleanup**
-   - Removed unused `import asyncio`
-   - Removed unused field `_task: Optional[asyncio.Task]`
-   - Kept `_last_trade_ts` (actually used for tracking)
-   - File: `apps/event_saver/src/event_saver/collectors/public_collector.py:3, 69`
-
-2. **PrivateCollector Cleanup**
-   - Removed unused `import asyncio`
-   - Removed unused `UTC` from `datetime` import
-   - File: `apps/event_saver/src/event_saver/collectors/private_collector.py:3, 6`
-
-3. **__pycache__ Artifacts**
-   - Verified: No `__pycache__` files tracked in git
-   - `.gitignore` correctly excludes `__pycache__/`
-   - Runtime cache directories exist but are properly ignored
-
-See `docs/features/0003_LOW_PRIORITY_CLEANUP.md` for detailed documentation.
-
-### Critical Fixes (2026-01-09)
-
-**Phase D Code Review Resolutions**:
-
-1. **Heartbeat Watchdog Thread Safety**
-   - **Issue**: `disconnect_ts` variable referenced outside lock without initialization, causing `UnboundLocalError`
-   - **Fix**: Initialize `disconnect_ts = None` before lock block, assign within lock, use flag `should_fire_disconnect`
-   - Files: `packages/bybit_adapter/src/bybit_adapter/ws_client.py:219-249, 463-493`
-
-2. **Heartbeat Deadlock Prevention**
-   - **Issue**: `disconnect()` called `_stop_heartbeat_watchdog()` while holding `_lock`, causing deadlock during `join()`
-   - **Fix**: Call `_stop_heartbeat_watchdog()` BEFORE acquiring `_lock`
-   - Files: `packages/bybit_adapter/src/bybit_adapter/ws_client.py:143-148, 369-374`
-
-3. **Private Reconciliation Authentication**
-   - **Issue**: `reconcile_executions()` accepted `api_key`/`api_secret` but didn't use them (used shared client with empty credentials)
-   - **Fix**: Create per-account authenticated `BybitRestClient` inside `reconcile_executions()` using provided credentials
-   - File: `apps/event_saver/src/event_saver/reconciler.py:203-210`
-
-4. **Private Reconciliation Pagination**
-   - **Issue**: Only fetched first 100 executions, ignored `next_cursor`; later pagination could silently persist a truncated backfill and advance past missing executions
-   - **Fix**: Use `get_executions_all()` with pagination loop (max 100 pages), request `return_truncated=True`, and refuse to persist when the REST backfill is truncated
-   - File: `apps/event_saver/src/event_saver/reconciler.py:217-227`
-
-5. **REST Calls Blocking Event Loop**
-   - **Issue**: Synchronous `HTTP` calls in `async` methods blocked event loop
-   - **Fix**: Wrap sync REST calls in `asyncio.to_thread()` to run in thread executor
-   - Files: `apps/event_saver/src/event_saver/reconciler.py:3, 133-138, 221-227`
-
-6. **Reconciliation Algorithm Enhancement**
-   - **Issue**: Didn't query DB for `last_persisted_ts`, only used gap timestamps
-   - **Fix**: Query `PublicTradeRepository.get_last_trade_ts()` and `PrivateExecutionRepository.get_last_execution_ts()` before reconciliation, but private execution reconciliation must cap the REST start at `gap_start`; post-gap live writes can otherwise advance the account-wide latest timestamp past the outage and skip the missed executions
-   - Files: `apps/event_saver/src/event_saver/reconciler.py:116-131, 218-229`
-
-7. **Order Persistence Implementation**
-   - **Issue**: Order updates normalized and logged but not persisted to DB
-   - **Fix**: Created `Order` model, `OrderRepository`, and `OrderWriter` with bulk insert and conflict handling
-   - Files:
-     - Model: `shared/db/src/grid_db/models.py:277-316`
-     - Repository: `shared/db/src/grid_db/repositories.py:650-768`
-     - Writer: `apps/event_saver/src/event_saver/writers/order_writer.py`
-     - Wired: `apps/event_saver/src/event_saver/main.py:66, 89, 151-156, 215-216, 266-279, 392-393`
-   - **Order Table Features**:
-     - Stores latest state for each `order_id` + `exchange_ts` combination
-     - Uses `ON CONFLICT DO UPDATE` to keep latest `status`, `leaves_qty`, `raw_json`
-     - Cascades delete when parent `Run` is deleted
-     - Indexed by `account_id`, `exchange_ts`, and `order_id`+`exchange_ts`
-
-8. **Ticker Capture Wiring**
-   - **Issue**: `PublicCollector` implemented ticker support but `EventSaver` didn't supply `on_ticker` callback
-   - **Fix**: Added `_handle_ticker()` method and wired to `PublicCollector`
-   - File: `apps/event_saver/src/event_saver/main.py:177, 248-256`
-
-### Code Review Fixes (2026-01-09)
-
-**HIGH Priority - Order Persistence Unique Constraint**:
-- **Issue**: `OrderRepository.bulk_insert()` used `ON CONFLICT DO UPDATE` on `["order_id", "exchange_ts"]` but table only had non-unique index, causing runtime errors
-- **Fix**: Added composite unique constraint `(account_id, order_id, exchange_ts)` and updated conflict target
-- **Rationale**: Prevents same order_id across different accounts from conflicting; allows upsert to keep latest order status
-- Files: `shared/db/src/grid_db/models.py:315-320`, `shared/db/src/grid_db/repositories.py:741,754`
-
-**HIGH Priority - Reconciler Test REST Client Mocking**:
-- **Issue**: Test patched `reconciler._rest_client.get_executions_all` but method creates new local `BybitRestClient`, so mock was ineffective
-- **Fix**: Patch `BybitRestClient` constructor instead: `patch('event_saver.reconciler.BybitRestClient', return_value=mock_client)`
-- **Pattern**: When code creates instances locally, mock the constructor not instance methods
-- File: `apps/event_saver/tests/test_reconciler.py:247-254`
-
-**MEDIUM Priority - Private Reconciliation Environment Handling**:
-- **Issue**: `reconcile_executions()` used global `self._rest_client.testnet` instead of account's actual environment
-- **Fix**: Added `testnet` boolean parameter to `reconcile_executions()`, caller passes `context.environment == "testnet"`
-- **Impact**: Prevents mixed-environment reconciliation when accounts differ from global config
-- Files: `apps/event_saver/src/event_saver/reconciler.py:188,239`, `main.py:371`
-
-**MEDIUM Priority - run_id Requirement Documentation**:
-- **Issue**: Writers silently dropped events without `run_id`, behavior not documented
-- **Fix**: Added docstring to `AccountContext` explaining persistence requirements, added warning in `EventSaver.add_account()`
-- **Behavior**: Executions/orders REQUIRE `run_id` for persistence; position/wallet snapshots do NOT
-- Files: `apps/event_saver/src/event_saver/collectors/private_collector.py:24-28`, `main.py:86-90`
+## Private WS disconnect handling (event_saver / recorder)
 
 **Feature 0035 — private WS message-gap watchdog disabled on recorder side**:
 - **Parity with gridbot feature 0026**: pybit ping/pong frames bypass business-event handler, so the 30s message-gap watchdog produces false-positive disconnects on a healthy quiet private WS. Recorder now passes `message_gap_watchdog_enabled=False` to `PrivateWebSocketClient`, matching `gridbot.orchestrator._init_account`.
@@ -1172,948 +666,32 @@ See `docs/features/0003_LOW_PRIORITY_CLEANUP.md` for detailed documentation.
 - **Tests**: `try/finally` release of `threading.Event` gates is mandatory so parked worker threads do not leak between tests.
 - Files: `apps/event_saver/src/event_saver/collectors/private_collector.py:_run_in_daemon_thread`, `_ws_health_check_once`, `stop`.
 
-### Test Commands
-```bash
-# Run bybit_adapter tests
-uv run pytest packages/bybit_adapter/tests -v
+## Testing
 
-# Run event_saver tests
-uv run pytest apps/event_saver/tests -v
+### Cross-Package Integration Tests (`tests/integration/`)
 
-# Run all tests (separate commands due to conftest conflicts)
-uv run pytest packages/gridcore/tests -v
-uv run pytest packages/bybit_adapter/tests -v
-uv run pytest shared/db/tests -v
-uv run pytest apps/event_saver/tests -v
+```
+tests/integration/
+├── __init__.py
+├── conftest.py                    # Shared fixtures (make_ticker_event, generate_price_series)
+├── test_engine_to_executor.py     # 15 tests: GridEngine → IntentExecutor pipeline + REST payload mapping
+├── test_backtest_to_comparator.py # 5 tests: BacktestEngine → Comparator round-trip
+├── test_runner_lifecycle.py       # 9 tests: StrategyRunner full lifecycle (fills, position, same-order)
+├── test_eventsaver_db.py          # 10 tests: EventSaver → Database pipeline + writer integration
+└── test_shadow_validation.py      # 6 tests: Shadow-mode dual-path validation
 ```
 
-## Phase E: Live Bot Rewrite (gridbot)
-
-### Completed: 2026-01-24
-
-Successfully implemented a multi-tenant grid trading bot using gridcore strategy engine.
-
-### Key Components
-
-1. **Package Structure**
-   ```
-   apps/gridbot/
-   ├── pyproject.toml           # Dependencies: gridcore, bybit-adapter, grid-db, event-saver
-   ├── conf/
-   │   └── gridbot.yaml.example # Example configuration
-   ├── src/gridbot/
-   │   ├── __init__.py
-   │   ├── config.py            # Pydantic config models
-   │   ├── executor.py          # Intent → Bybit API calls
-   │   ├── retry_queue.py       # Failed intent retry (3 attempts, 30s max)
-   │   ├── runner.py            # StrategyRunner wrapping GridEngine
-   │   ├── reconciler.py        # Exchange state sync
-   │   ├── orchestrator.py      # Multi-strategy coordinator
-   │   └── main.py              # Entry point with signal handling
-   └── tests/
-       └── test_*.py            # 101 tests
-   ```
-
-2. **Architecture Decisions**
-   - Single process handles all accounts
-   - YAML configuration file
-   - Hybrid event loop: async WebSocket + periodic polling (~63s positions)
-   - In-memory order tracking, reconcile from exchange on startup
-   - Failed intents: queue for retry (3 attempts, 30s max, exponential backoff)
-   - Shadow mode: log intents without executing
-   - Startup sync: adopt existing orders from exchange
-
-3. **Data Flow**
-   ```
-   WebSocket Events → Orchestrator → StrategyRunner → GridEngine.on_event() → Intents
-                                                                                  ↓
-                                                              Executor (shadow: log | live: execute)
-                                                                                  ↓
-                                                                         Bybit REST API
-   ```
-
-4. **Key Files**
-   - `config.py`: `AccountConfig`, `StrategyConfig`, `GridbotConfig` Pydantic models
-   - `executor.py`: `IntentExecutor.execute_place()`, `execute_cancel()`, `execute_batch()`
-   - `retry_queue.py`: `RetryQueue` with exponential backoff (1s, 2s, 4s)
-   - `runner.py`: `StrategyRunner` wraps `GridEngine`, tracks orders, handles position updates
-   - `reconciler.py`: `Reconciler.reconcile_startup()`, `reconcile_reconnect()`
-   - `orchestrator.py`: `Orchestrator` coordinates multiple strategies, routes events
-
-5. **Configuration Example**
-   ```yaml
-   accounts:
-     - name: "main_account"
-       api_key: "YOUR_API_KEY"
-       api_secret: "YOUR_API_SECRET"
-       testnet: true
-
-   strategies:
-     - strat_id: "btcusdt_main"
-       account: "main_account"
-       symbol: "BTCUSDT"
-       tick_size: "0.1"
-       grid_count: 50
-       grid_step: 0.2
-       amount: "x0.001"  # 0.1% of wallet per order
-       max_margin: 8
-       shadow_mode: false
-   ```
-
-6. **Running the Bot**
-   ```bash
-   # Run with default config (conf/gridbot.yaml)
-   uv run python -m gridbot.main
-
-   # Run with custom config
-   uv run python -m gridbot.main --config path/to/config.yaml
-
-   # Run with debug logging
-   uv run python -m gridbot.main --debug
-   ```
-
-7. **Testing**
-   ```bash
-   uv run pytest apps/gridbot/tests -v
-   ```
-
-### Key Implementation Notes
-
-1. **Order Tracking Pattern**
-   - `TrackedOrder` dataclass tracks order lifecycle (pending → placed → filled/cancelled)
-   - Single primary dict `_tracked_orders` (keyed by client_order_id), no secondary indexes
-   - Lookups by exchange `order_id` use linear scan — fine for ~20-40 grid orders (matches bbu2 pattern)
-   - `_is_good_to_place(intent, limits)` accepts explicit order list — injectable data source (bbu2 style)
-   - Deterministic `client_order_id` (16-char hex from SHA256) enables deduplication
-   - `runner.inject_open_orders()` for startup reconciliation
-
-2. **Position Risk Management**
-   - `StrategyRunner` owns linked `Position` pair (long/short)
-   - `on_position_update()` calculates `position_ratio` and `amount_multiplier`
-   - Initial position fetch via REST at startup (`_fetch_and_update_positions()` in `start()`) so runners have multipliers before first ticker
-   - Periodic position check (default 63s) via `orchestrator._position_check_loop()` which calls the same `_fetch_and_update_positions()`
-
-3. **Event Routing**
-   - `_symbol_to_runners`: routes ticker events by symbol
-   - `_account_to_runners`: routes position/order/execution events by account
-   - WebSocket callbacks use `asyncio.run_coroutine_threadsafe()` for thread safety
-
-4. **Shadow Mode**
-   - `shadow_mode=True` in strategy config → intents logged but not executed
-   - `IntentExecutor` returns shadow order IDs: `shadow_{client_order_id}`
-   - Useful for validating strategy behavior before live trading
-
-5. **Reconciliation**
-   - **Startup**: fetch all open limit orders for the symbol, inject into runner via `inject_open_orders()`
-   - **Inject is NOT durable adoption (bbu2-faithful)**: Injected orders live for exactly one ticker event. On the first `on_ticker` after startup, `GridEngine._place_grid_orders` (`packages/gridcore/src/gridcore/engine.py:319-325`) cancels any injected order whose price is not in the current `grid_price_set` (`'outside_grid'` reason), and `engine.py:305-312` cancels any at a grid price with the wrong side (`'side_mismatch'` reason). Over-limit cases (`engine.py:237-243`) trigger a full rebuild that cancels everything. Direct port of bbu2 `strat.py:154-160`, `:145-149`, `:103-104`. This means: (a) a "silent adoption of manual orders" security review is a false alarm — the bot does not keep manual orders around, it destroys them on the next tick; (b) the **real** operational concern is the opposite — the bot will **cancel** any limit order on the symbol that doesn't match the grid; (c) do NOT add a refuse-to-start check in `reconcile_startup` — it would re-break normal crash-restart (the bot's own prior orders look identical to manual ones) and was already removed in commit `138737a` for that reason.
-   - **(account, symbol) uniqueness is enforced unconditionally at config load**: Even though `orderLinkId` IS sent to Bybit (since feature 0029, with a `-{millis}` suffix added in HOTFIX 2026-05-08), it cannot disambiguate strategies at runtime. The deterministic prefix is a SHA of `(symbol, side, price, direction)`, so two strategies on the same `(account, symbol)` would compute the SAME prefix for the same logical order — the wire-form suffix only differs across re-placements, not across strategies. Two strategies on the same `(account, symbol)` pair would therefore cancel each other's orders every tick via the cancel-on-mismatch pass described above. `GridbotConfig.validate_no_shared_symbol` (`apps/gridbot/src/gridbot/config.py`) rejects any such configuration at load time with **no escape hatch** — there is no flag to disable it. bbu2 enforces the same invariant structurally: its `amounts[].strat` field is a scalar pointing at a single `pair_timeframes[]` entry, and each `pair_timeframe` has a single `symbol`, so the bad configuration is physically unrepresentable in bbu2's config schema. grid-bot's schema is more flexible (independent `accounts` and `strategies` lists, FK goes `strategy.account → account.name`), so the constraint must be reconstructed as a pydantic validator — but it is enforced just as strictly. If you need a second strategy on the same symbol, use a different account.
-   - **Operational consequence (manual orders get cancelled)**: Any limit order on the symbol that is not at a current grid price, or is at a grid price with the wrong side, will be cancelled by the engine on the next ticker event after it is seen (see the "Inject is NOT durable adoption" bullet above for the exact mechanism). This applies to manual orders placed via the Bybit UI while the bot is running, orders from other tools/scripts on the same account, and stale orders left over from a prior run with different grid parameters. **Manual orders and the grid cannot coexist on the same symbol** — the bot treats "not in my grid" as "cancel it." To manually intervene, stop the bot, make your changes, restart, and accept that anything not matching the grid on restart will be cancelled on the first tick.
-   - **Before first start**: Closing existing orders for the symbol before the first start is recommended for operator clarity (otherwise the bot will cancel them within ~1 second of startup, which is surprising but not incorrect). There is no config flag to disable either the cancel-on-mismatch behavior or the `(account, symbol)` uniqueness check — both are unconditional.
-   - **Reconnect**: compare exchange state with in-memory, update tracked orders
-   - **Periodic Order Sync (2026-02-16)**: Matches bbu2's `LIMITS_READ_INTERVAL` pattern (61s by default)
-     - **Purpose**: Continuously reconcile order state via REST API to catch missed WebSocket updates
-     - **Implementation**: `Orchestrator._order_sync_loop()` runs as asyncio task, calls `reconciler.reconcile_reconnect()` for each runner
-     - **Configuration**: `order_sync_interval` in `GridbotConfig` (default 61.0 seconds, 0 to disable)
-     - **Behavior**: Logs discrepancies (orders missing on exchange, orders missing in memory), injects missing orders, marks cancelled orders
-     - **bbu2 reference**: Original bot used `LIMITS_READ_INTERVAL = 61` with hybrid WebSocket + REST pattern (WebSocket updates between REST syncs)
-     - **Files**: `apps/gridbot/src/gridbot/config.py:90-93`, `apps/gridbot/src/gridbot/orchestrator.py:620-672`, `apps/gridbot/src/gridbot/reconciler.py:138-226`
-
-6. **Wallet Balance Caching (2026-02-16)**: Reduces REST API load by caching wallet balance
-   - **Purpose**: Minimize wallet balance API calls while maintaining reasonable freshness for position risk calculations
-   - **Implementation**: `Orchestrator._get_wallet_balance()` checks cache before fetching from REST
-   - **Configuration**: `wallet_cache_interval` in `GridbotConfig` (default 300.0 seconds = 5 minutes, 0 to disable)
-   - **Behavior**: Returns cached balance if age < interval, otherwise fetches fresh and updates cache
-   - **API call reduction**: ~79% fewer calls (from 57/hour to 12/hour per account at default settings)
-   - **bbu2 reference**: Original bot cached for 620s (`GET_WALLET_INTERVAL = 10 * 62`); gridbot defaults to 300s for better freshness
-   - **Lock design**: Single `asyncio.Lock` covers all accounts. Acceptable for low account counts; if many accounts run concurrently, consider per-account locks (`dict[str, asyncio.Lock]`) to avoid unnecessary serialization
-   - **Files**: `apps/gridbot/src/gridbot/config.py:94-97`, `apps/gridbot/src/gridbot/orchestrator.py:479-525`
-
-7. **orderLinkId Wire Format & Matching (HOTFIX 2026-05-08)**: How the deterministic `client_order_id` survives Bybit's id-cache
-   - **Why the suffix exists**: Bybit caches `orderLinkId` for ~1-2h post-cancel/fill. Our `PlaceLimitIntent.client_order_id` is a deterministic 16-char SHA256 hex digest of `(symbol, side, price, direction)`, so re-placing the same logical intent collides with the cached id and triggers ErrCode 110072 "OrderLinkedID is duplicate" in a tight loop. Live-verified: ~12k duplicate-rejected attempts / 0 successful orders across a 2h window before the fix.
-   - **Wire format**: `{16-hex prefix}-{int(datetime.now(UTC).timestamp() * 1000)}`. The prefix is guaranteed not to contain `-` (`hashlib.sha256().hexdigest()[:16]` returns only `0-9a-f`), so splitting at the first `-` always recovers the deterministic prefix.
-   - **Wire-vs-key invariant**: The full suffixed value goes on the wire and is persisted verbatim in `private_executions.order_link_id` and `orders.order_link_id` (forensics). Internal dict keys (`Runner._tracked_orders`, comparator join key, replay seed `client_id`) use only the deterministic prefix.
-   - **Retry idempotency invariant (feature 0032)**: The wire suffix is minted once per `PlaceLimitIntent` placement lifecycle in `StrategyRunner` and stored on `PlaceLimitIntent.order_link_id`; runner reattempts, retry-queue retries, and fresh engine re-emissions after a failed placement reuse that same wire id. Executor-side generation is only a fallback for direct callers that bypass runner assignment.
-   - **Reconcile-upgrade path**: If REST order sync later reports an open order whose normalized prefix matches a pending/failed tracked placement, `Runner.inject_open_orders` upgrades that tracked order to `placed`, patches the tracked intent with the exchange-reported wire `orderLinkId`, and cancels queued retries for that prefix. This closes the ambiguous-failure window where Bybit accepted the first request but the bot only observed a timeout/error.
-   - **Helper**: `gridcore.intents.extract_client_order_prefix(order_link_id) -> Optional[str]` splits at the first `-` and returns the prefix. `None` or empty-string input → `None` (so callers using `prefix or fallback_id` cleanly fall back). No-hyphen input → unchanged (pre-hotfix backward compat).
-   - **Three call sites normalize on read**: (a) `gridbot.runner._find_tracked_order` and `inject_open_orders` — strip suffix before lookup/inject; (b) `comparator.loader.LiveTradeLoader.load` — strip before grouping live executions; (c) `replay.snapshot_loader.load_active_orders` — strip before seeding active orders for replay. Tests in `packages/gridcore/tests/test_intents.py`, `apps/gridbot/tests/test_runner.py`, `apps/comparator/tests/test_loader.py`, `apps/replay/tests/test_snapshot_loader.py`.
-   - **Files**: `packages/gridcore/src/gridcore/intents.py` (helper + `PlaceLimitIntent.order_link_id`), `apps/gridbot/src/gridbot/order_link_id.py`, `apps/gridbot/src/gridbot/executor.py` (wire-id fallback), `apps/gridbot/src/gridbot/runner.py` (wire-id assignment/reuse + read-side normalization), `apps/comparator/src/comparator/loader.py`, `apps/replay/src/replay/snapshot_loader.py`.
-
-### Common Pitfalls
-
-1. **BybitNormalizer Import**: Use `from bybit_adapter.normalizer import BybitNormalizer`, not `Normalizer`
-2. **RiskConfig Parameters**: `max_margin`, not `min_margin` (see `gridcore.position.RiskConfig`)
-3. **PositionState.margin is a RATIO, not a dollar amount**: `margin = positionValue / walletBalance` (bbu2 pattern). NOT Bybit's `positionIM`. All threshold configs (`max_margin`, `min_total_margin`) are ratio-based. See bbu2-master/position.py:105.
-4. **PositionState.direction**: Required parameter, use `"long"` or `"short"`
-4. **Test Isolation**: Run test suites separately due to conftest conflicts
-5. **Position WebSocket-First Pattern (2026-01-26)**: Position updates use WebSocket as primary source, REST as fallback
-   - **Original bbu2 pattern**: `handle_position()` stores WS data → `__get_position_status()` uses WS first, REST fallback
-   - **Orchestrator implementation**: `_on_position()` stores WS data in `_position_ws_data[account][symbol][side]`
-   - `_position_check_loop()` calls `_get_position_from_ws()` first, falls back to REST if None
-   - **Benefits**: Real-time position updates vs 63s polling delay
-   - File: `apps/gridbot/src/gridbot/orchestrator.py:337-391, 424-500`
-
-6. **Same-Order Detection & Blocking (2026-02-01)**: Detects AND blocks duplicate orders at same price level (bbu2-style safety)
-   - **Purpose**: Detect if two DIFFERENT orders at the SAME price got filled (indicates grid duplication bug). BLOCKS all new order placement when detected to prevent position accumulation that could cause liquidation.
-   - **Implementation**: `StrategyRunner._check_same_orders()` monitors execution events
-   - **Buffers**: Separate deques for long/short direction (maxlen=2, matches bbu2 `[:2]` per side)
-   - **Direction logic**: Uses `closed_size != 0` (Bybit's `closedSize` field, not `closed_pnl`) to determine closing trades
-     - `closed_pnl` can be 0 for break-even closes; `closed_size` is always non-zero for closing trades
-     - Buy + not closing = opening long → long buffer
-     - Sell + closing = closing long → long buffer
-     - Buy + closing = closing short → short buffer
-     - Sell + not closing = opening short → short buffer
-   - **Blocking behavior** (matches bbu2 `_check_pair_step` returning early):
-     - `on_ticker()`: Always passes event to engine (keeps `last_close` fresh), but skips intent execution
-     - `on_execution()`: Still passes event to engine (grid state update) but skips intent execution
-     - `on_order_update()`: Still passes event to engine (order state update) but skips intent execution
-     - **Pattern**: All three handlers follow the same structure: engine always runs, only `_execute_intents()` is gated by `not self._same_order_error`
-   - **CRITICAL: Both-side check** (matches bbu2): `_check_same_orders()` always checks BOTH long and short buffers on every execution event. If only the current side's buffer were checked, a clean fill on the opposite side would reset `_same_order_error` and silently clear the error. Pattern: check long → if error, return → check short.
-   - **Auto-recovery** (bbu2-style): `_check_same_orders_side()` resets `_same_order_error=False` at the start before re-evaluating. Error auto-clears when a new fill at a different price arrives (1 clean fill pushes the older entry out of the 2-entry buffer, matching bbu2 `[:2]` behavior).
-   - **Telegram alert**: Sends throttled Telegram notification on first detection via `Notifier`
-   - **Error state**: `runner.same_order_error` property, manual reset with `reset_same_order_error()`
-   - **NOT an error**: Same order_id at same price (partial fills are OK)
-   - **leavesQty filter** (2026-02-02): Only fully filled orders (`leaves_qty == 0`) enter the buffer, matching bbu2 `handle_execution` filter (`leavesQty == '0'`). Partial fills are skipped to prevent buffer dilution.
-   - **ExecutionEvent.closed_size / leaves_qty**: Added to `gridcore.events.ExecutionEvent`, extracted from Bybit `closedSize` and `leavesQty` in `bybit_adapter.normalizer`
-   - **Retry queue dispatcher**: `_init_strategy()` creates a `_dispatch_intent()` closure that routes `CancelIntent` to `executor.execute_cancel` and `PlaceLimitIntent` to `executor.execute_place`. Without this, failed cancels would be retried via `execute_place`, causing stale orders to persist.
-   - Files: `apps/gridbot/src/gridbot/runner.py`, `apps/gridbot/src/gridbot/orchestrator.py`, `packages/gridcore/src/gridcore/events.py`, `packages/bybit_adapter/src/bybit_adapter/normalizer.py`
-
-7. **Exception Handling at WS Dispatch Boundary (2026-02-01)**: Two-layer exception handling prevents WS events from crashing the bot
-   - **Orchestrator layer**: All WS callbacks (`_on_ticker`, `_on_position`, `_on_order`, `_on_execution`) wrapped with `try/except Exception` → catches normalization errors, logs + sends Telegram alert via `Notifier`
-   - **Runner layer**: All event handlers (`on_ticker`, `on_execution`, `on_order_update`, `on_position_update`) wrapped with `try/except Exception` → logs with `exc_info=True` + re-raises so orchestrator can handle notification
-   - **Pattern**: Runner logs + re-raises; orchestrator catches + notifies
-   - Files: `apps/gridbot/src/gridbot/orchestrator.py`, `apps/gridbot/src/gridbot/runner.py`
-
-8. **Telegram Notifier (2026-02-01)**: Thread-safe alert sender with throttling
-   - **Config**: `notification.telegram.bot_token` and `notification.telegram.chat_id` in YAML config (gitignored)
-   - **Throttle**: Max 1 Telegram alert per error key per 60 seconds (always logs)
-   - **Thread-safe**: Sends in background daemon thread (WS callbacks run on pybit's thread)
-   - **Graceful degradation**: If no Telegram config or `pyTelegramBotAPI` not installed, falls back to log-only
-   - **telebot token format**: Token must contain a colon (e.g., `123456:ABC-DEF...`), otherwise `TeleBot()` raises
-   - **Dependency**: `pytelegrambotapi>=4.24.0` in `apps/gridbot/pyproject.toml`
-   - File: `apps/gridbot/src/gridbot/notifier.py`
-
-9. **WebSocket Health Check Loop (2026-02-01)**: 10-second polling for connection health
-   - **Orchestrator**: `_health_check_loop()` runs as asyncio task, checks `is_connected()` on each public/private WS
-   - **Reconnect**: Only disconnected connections are reconnected (not all), re-subscribes all channels
-   - **Lifecycle**: Started in `start()`, cancelled in `stop()` alongside `_position_check_task`
-   - **Failure handling**: Reconnect failures are caught and alerted (don't crash the loop)
-   - **WS client API**: `ws_client.is_connected()` and `ws_client.get_connection_state()` already existed in bybit_adapter
-   - File: `apps/gridbot/src/gridbot/orchestrator.py`
-
-10. **Active WS reconnect with TCP-level probe (2026-05-03, feature 0024)**: bbu2 `_ensure_*_connection` pattern
-   - **Problem**: Wrapper's `is_connected()` is state-flag based — flips False only on explicit `disconnect()`. A dead TCP socket pybit hadn't noticed left it stuck True. Mainnet observed 6–15 min reconnect gaps.
-   - **Two health signals (both call `client.reset()`)**:
-     - **Primary** (TCP-level, every 10s): `Orchestrator._ws_health_check_once()` calls new `client.is_socket_alive()` → pybit's `ws.sock.connected`. Mirrors bbu2 `ENSURE_SOCKET_INTERVAL = 10`.
-     - **Secondary** (message-gap, on heartbeat fire): existing 30s gap detector → `on_disconnect` callback → `Orchestrator._on_ws_disconnect()` → `client.reset()`. Catches "socket alive but server silent" failure mode that TCP check misses.
-   - **`reset()`**: Stop heartbeat → `_disconnect_internal()` → `connect()` (re-subscribes all streams). Idempotent — back-to-back resets are a no-op + a single re-establishment.
-   - **Heartbeat thread sharp edge**: `on_disconnect` callback runs on the heartbeat thread. **Wrapper-level guard**: `_stop_heartbeat_watchdog` skips `Thread.join()` when `threading.current_thread() is self._heartbeat_thread`, so calling `reset()` inline from a callback is safe (no `RuntimeError`). The orchestrator still dispatches reset to a one-shot daemon worker (`WSReset-{account}-{kind}`) to avoid blocking the heartbeat thread on the full TCP teardown / handshake / subscription replay.
-   - **Zombie heartbeat protection**: `_start_heartbeat_watchdog` replaces `self._stop_heartbeat` with a fresh `threading.Event` each start; the old loop holds a reference to the old (still-set) event and exits cleanly. `_heartbeat_loop(stop_event)` takes the event as parameter.
-   - **`retries=0`**: Both `connect()` methods pass `retries=0` to `pybit.unified_trading.WebSocket(...)` → pybit's `infinitely_reconnect=True`. Removes the 10-attempt cliff at which pybit raises `WebSocketTimeoutException` and gives up.
-   - **Orchestrator wiring**: `_init_account` constructs WS clients with `on_disconnect=lambda ts, a=name: self._on_ws_disconnect(a, "public"|"private", ts)`. Periodic gate `_next_ws_health_check` in `_tick()` between `_next_health_check` and `_next_order_sync`.
-   - Files: `packages/bybit_adapter/src/bybit_adapter/ws_client.py`, `apps/gridbot/src/gridbot/orchestrator.py`
-
-### Test Commands
-```bash
-# Run gridbot tests
-uv run pytest apps/gridbot/tests -v
-
-# Run all project tests (separately due to conftest conflicts)
-uv run pytest packages/gridcore/tests -v
-uv run pytest packages/bybit_adapter/tests -v
-uv run pytest shared/db/tests -v
-uv run pytest apps/event_saver/tests -v
-uv run pytest apps/gridbot/tests -v
-uv run pytest apps/backtest/tests -v
-```
-
-## Phase F: Backtest Rewrite (backtest)
-
-### Completed: 2026-02-03
-
-Successfully implemented a backtest system using gridcore's GridEngine with trade-through fill model.
-
-### Key Components
-
-1. **Package Structure**
-   ```
-   apps/backtest/
-   ├── pyproject.toml           # Dependencies: gridcore, grid-db (NO bybit_adapter)
-   ├── conf/
-   │   └── backtest.yaml.example
-   ├── src/backtest/
-   │   ├── __init__.py
-   │   ├── config.py             # BacktestConfig, BacktestStrategyConfig
-   │   ├── fill_simulator.py     # TradeThroughFillSimulator
-   │   ├── position_tracker.py   # BacktestPositionTracker
-   │   ├── order_manager.py      # BacktestOrderManager
-   │   ├── executor.py           # BacktestExecutor
-   │   ├── runner.py             # BacktestRunner
-   │   ├── engine.py             # BacktestEngine
-   │   ├── session.py            # BacktestSession
-   │   ├── data_provider.py      # HistoricalDataProvider, InMemoryDataProvider
-   │   └── main.py               # CLI entry point
-   └── tests/
-       └── test_*.py             # 60 tests
-   ```
-
-2. **Trade-Through Fill Model**
-   - BUY fills when `current_price <= limit_price`
-   - SELL fills when `current_price >= limit_price`
-   - Fill price = limit price (conservative assumption)
-   - Reference: `bbu_reference/backtest_reference/bbu_backtest-main/src/backtest_order_manager.py`
-
-3. **Architecture**
-   - Reuses `GridEngine` directly from gridcore (no modifications)
-   - Separate from gridbot (no WebSocket, no bybit_adapter dependency)
-   - In-memory order book simulation
-   - Position tracking with PnL calculations
-   - Funding simulation (8-hour intervals)
-
-4. **Running Backtest**
-   ```bash
-   # Run with default config
-   uv run python -m backtest.main --config conf/backtest.yaml
-
-   # Run with date range
-   uv run python -m backtest.main --config conf/backtest.yaml \
-       --start "2025-01-01" --end "2025-01-31"
-
-   # Export results to CSV
-   uv run python -m backtest.main --config conf/backtest.yaml --export results.csv
-
-   # Strict mode: exit on first symbol failure in multi-symbol runs
-   uv run python -m backtest.main --config conf/backtest.yaml --strict
-   ```
-   - **Exit codes**: `0` = success, `1` = config/startup error, `2` = execution error
-
-5. **Testing**
-   ```bash
-   uv run pytest apps/backtest/tests -v
-   ```
-
-### Key Implementation Notes
-
-1. **Order Format for GridEngine**: Use camelCase keys (`orderId`, `orderLinkId`, `price` as string)
-   - GridEngine expects Bybit API response format
-   - `get_limit_orders()` returns `{"long": [...], "short": [...]}`
-   - Keys: `orderId`, `orderLinkId`, `price` (string), `qty` (string), `side`
-
-2. **Position Tracker vs gridcore.Position**
-   - `BacktestPositionTracker`: Tracks size, entry price, realized/unrealized PnL
-   - `gridcore.Position`: Handles risk multipliers (different purpose)
-   - Backtest does NOT use gridcore.Position for PnL tracking
-
-3. **Quantity Calculation**
-   - Uses same amount format as gridbot: `"100"` (fixed USDT), `"x0.001"` (wallet fraction). The legacy `"b..."` mode was removed in feature 0028 (see Section 9).
-   - `qty_calculator` function passed to executor
-
-4. **Data Sources**
-   - `HistoricalDataProvider`: From database (TickerSnapshot or PublicTrade tables)
-   - `InMemoryDataProvider`: For testing with pre-created events
-
-5. **Funding Simulation**
-   - 8-hour intervals (00:00, 08:00, 16:00 UTC)
-   - Long pays, short receives when rate > 0
-   - Configurable via `enable_funding` and `funding_rate`
-
-### Bug Fixes (2026-02-03)
-
-**HIGH Priority:**
-
-1. **Filled Orders Lose Direction**
-   - **Issue**: `get_order_by_client_id()` only searched `active_orders`, but filled orders are moved to `filled_orders` before `_process_fill()` can look them up
-   - **Fix**: Extended `get_order_by_client_id()` to also search `filled_orders`
-   - **File**: `apps/backtest/src/backtest/order_manager.py:236-247`
-
-2. **client_order_id Reuse Blocked Forever**
-   - **Issue**: `_client_order_ids` set never removed IDs on fill/cancel, blocking deterministic ID reuse
-   - **Fix**: Added `_client_order_ids.discard()` in `cancel_order()` and `check_fills()`
-   - **Files**: `apps/backtest/src/backtest/order_manager.py:133-137, 178-185`
-
-3. **Multi-Symbol Runs Contaminated**
-   - **Issue**: `BacktestEngine.run()` didn't reset `_runners` or `_funding_simulator` state between runs
-   - **Fix**: Added state reset at start of `run()`: `self._runners = {}`, `_last_prices = {}`, `_last_timestamp = None`, `_last_funding_time = None`
-   - **File**: `apps/backtest/src/backtest/engine.py:138-144`
-
-**MEDIUM Priority:**
-
-4. **Funding Sign Tracking Inverted**
-   - **Issue**: `get_total_pnl()` used `+ funding_paid` but `funding_paid` is positive when we paid (should decrease PnL)
-   - **Fix**: Changed to `- funding_paid` in `get_total_pnl()` with corrected comment
-   - **File**: `apps/backtest/src/backtest/position_tracker.py:196-203`
-
-5. **close_all Wind-Down Mode Not Implemented**
-   - **Issue**: `_wind_down()` only logged open positions, didn't actually close them
-   - **Fix**: Implemented `_force_close_position()` that realizes PnL and records closing trades
-   - **File**: `apps/backtest/src/backtest/engine.py:336-395`
-
-6. **Test String-Decimal Type Error**
-   - **Issue**: `test_process_tick_fills_order` did `buy_price - Decimal("100")` where `buy_price` was a string
-   - **Fix**: Converted to `Decimal(buy_price)`
-   - **File**: `apps/backtest/tests/test_runner.py:72`
-
-7. **Missing Tests for Core Modules**
-   - **Issue**: No tests for BacktestEngine, BacktestExecutor, InMemoryDataProvider, FundingSimulator
-   - **Fix**: Added `test_engine.py` (14 tests) and `test_executor.py` (7 tests)
-   - **Files**: `apps/backtest/tests/test_engine.py`, `apps/backtest/tests/test_executor.py`
-
-### Bug Fixes (2026-02-04)
-
-**HIGH Priority:**
-
-8. **Multi-Strategy Equity Incorrect**
-   - **Issue**: Each runner called `session.update_equity()` with only its own unrealized PnL; multi-strategy runs had incorrect equity/balance
-   - **Fix**: Moved equity update to engine level in `_process_tick()` BEFORE runners execute (aggregates all runners' unrealized PnL)
-   - **Files**: `apps/backtest/src/backtest/engine.py:327-330`, `apps/backtest/src/backtest/runner.py:186-188`
-
-**MEDIUM Priority:**
-
-9. **close_all Leaves Stale Unrealized PnL**
-   - **Issue**: After force-closing, `unrealized_pnl` in tracker wasn't recalculated, causing non-zero final unrealized in metrics
-   - **Fix**: Added `tracker.calculate_unrealized_pnl(price)` after `process_fill()` in `_force_close_position()`
-   - **File**: `apps/backtest/src/backtest/engine.py:410-411`
-
-10. **Wallet-Fraction Sizing Uses Stale Balance**
-    - **Issue**: Orders used `session.current_balance` before equity was updated, so sizing lagged by one tick
-    - **Fix**: Engine now updates equity BEFORE runners process tick (fix #8 addresses this)
-    - **File**: `apps/backtest/src/backtest/engine.py:327-330`
-
-11. **Equity Updates Before Fills Processed**
-    - **Issue**: Equity updated before fills processed, so fills from current tick weren't reflected until next tick
-    - **Fix**: Split `runner.process_tick()` into two phases: `process_fills()` and `execute_tick()`. Engine now: (1) processes fills for all runners, (2) updates equity, (3) executes tick intents
-    - **Files**: `apps/backtest/src/backtest/runner.py:134-199`, `apps/backtest/src/backtest/engine.py:316-347`
-
-### Design Decisions (2026-02-04)
-
-1. **DB Persistence Skipped** - Backtest results are kept in-memory + CSV export only
-   - No `BacktestExecution` or `Run` persistence models implemented
-   - Use `BacktestReporter` for CSV export instead of database storage
-   - Rationale: Simpler architecture, backtests are typically one-off runs not requiring persistent storage
-   - Future: Can add DB persistence if multi-run comparison or long-term storage becomes necessary
-
-2. **Strict Cross Fill Model** - Orders only fill when price CROSSES the limit (not touches)
-   - BUY fills when `current_price < limit_price` (price must go BELOW)
-   - SELL fills when `current_price > limit_price` (price must go ABOVE)
-   - At limit price (`==`), order does NOT fill
-   - Rationale: Conservative assumption - at limit price, fill is not guaranteed (queue position, volume at level)
-   - Better for grid trading where orders sit at common price levels with competition
-   - File: `apps/backtest/src/backtest/fill_simulator.py`
-
-### Metrics & Reporting (2026-02-04)
-
-1. **BacktestMetrics** - Full performance metrics in `session.py`:
-   - Trade stats: total_trades, winning_trades, losing_trades, win_rate, avg_win, avg_loss
-   - PnL: total_realized_pnl, total_unrealized_pnl, total_commission, total_funding, net_pnl
-   - Risk: max_drawdown, max_drawdown_pct, max_drawdown_duration (ticks), sharpe_ratio
-   - Balance: initial_balance, final_balance, return_pct
-   - Activity: total_volume, turnover (volume / initial_balance)
-   - Direction breakdown: long_trades, short_trades, long_pnl, short_pnl, long_profit_factor, short_profit_factor
-
-2. **Sharpe Ratio Calculation** - `_calculate_sharpe_ratio()` in `session.py`:
-   - Raw tick data has irregular spacing, so equity is resampled to fixed intervals before computing returns
-   - Interval is parameterized via `finalize(sharpe_interval=timedelta(hours=1))` (default: 1 hour)
-   - `_resample_equity(interval)`: Bins equity points into fixed-width buckets, takes last value per bucket, skips empty buckets
-   - Annualization uses 365.25 days/year (crypto 24/7)
-   - Formula: `(mean_return / std_return) * sqrt(periods_per_year)`
-
-3. **BacktestReporter** - CSV export in `reporter.py`:
-   - `export_trades(path)`: Trade history with notional values
-   - `export_equity_curve(path)`: Equity and return % over time
-   - `export_metrics(path)`: All metrics as key-value CSV
-   - `export_all(output_dir)`: All exports to directory
-   - `get_summary_dict()`: Metrics as Python dict (useful for programmatic access)
-
-### Bug Fixes (2026-02-05)
-
-**Unrealized PnL % (ROE) for Risk Management:**
-
-1. **Added `calculate_unrealized_pnl_percent(current_price, leverage)` to BacktestPositionTracker**
-   - Uses standard Bybit ROE formula: `(close - entry) / entry * leverage * 100` (long)
-   - Short formula: `(entry - close) / entry * leverage * 100`
-   - Added `unrealized_pnl_percent` field to `PositionState` dataclass
-   - **File**: `apps/backtest/src/backtest/position_tracker.py:167-203`
-
-**Instrument Info Fetching & Quantity Rounding:**
-
-2. **`InstrumentInfoProvider` class (OOP refactor of `instrument_info.py`)**
-   - Encapsulates `fetch_from_bybit`, `load_from_cache`, `save_to_cache`, `get` into a class
-   - `cache_path` and `cache_ttl` are instance attributes (no more module-level state)
-   - `pybit` import is lazy (inside `fetch_from_bybit` method only)
-   - **API validation**: Rejects zero `qty_step`/`tick_size` from API (returns `None` → triggers cache fallback)
-   - **24h cache TTL**: Each cache entry stores `cached_at` ISO timestamp; stale entries trigger API refresh
-   - **TTL configurable**: `BacktestConfig.instrument_cache_ttl_hours` (default 24, passed to provider via engine)
-   - **Fallback cascade**: fresh cache → API → stale cache → hardcoded defaults
-   - **Backward-compatible**: Old cache files without `cached_at` are treated as stale (triggers refresh)
-   - **Tests**: 30 tests in `test_instrument_info.py` (96% coverage)
-   - **Files**: `apps/backtest/src/backtest/instrument_info.py`, `apps/backtest/tests/test_instrument_info.py`
-
-3. **Integrated quantity rounding in BacktestEngine**
-   - `BacktestEngine.__init__` creates `InstrumentInfoProvider` with TTL from config
-   - `_init_runner()` calls `self._instrument_provider.get(symbol)` for instrument info
-   - `_create_qty_calculator()` applies `instrument_info.round_qty()` to all qty calculations
-   - **Files**: `apps/backtest/src/backtest/engine.py:112-114,235`, `apps/backtest/src/backtest/config.py:103-108`
-
-4. **Added `pybit>=5.8` dependency**
-   - Required for `HTTP().get_instruments_info()` public API call
-   - **File**: `apps/backtest/pyproject.toml`
-
-**Key Notes:**
-- Quantity rounding uses `math.ceil` (round UP), not round to nearest
-- Rationale: Ensures orders meet minimum size requirements, safer than rounding down
-- bbu2 reference: `bbu_reference/bbu2-master/bybit_api_usdt.py:271-273`
-
-### Test Improvements (2026-02-06)
-
-**State Reset Test Fix:**
-
-1. **Fixed `test_run_resets_state_between_runs` to actually validate reset**
-   - **Issue**: Test ran same symbol twice, checking `len(runners) == 1` - would pass even without reset (same key overwrite)
-   - **Fix**: Changed to run BTCUSDT then ETHUSDT (no strategy), assert `len(runners) == 0`
-   - **Validates**: Multi-symbol runs don't accumulate old runners
-   - **File**: `apps/backtest/tests/test_engine.py:145-169`
-
-2. **Added `test_run_creates_new_runner_instances` for object identity check**
-   - **Validates**: Each run creates new runner instances, not reusing old ones
-   - **Pattern**: Store first runner reference, run again, assert `first_runner is not second_runner`
-   - **File**: `apps/backtest/tests/test_engine.py:171-191`
-
-**Testing Pattern for State Reset:**
-- Use **multi-symbol approach** when testing cross-contamination between runs
-- Use **object identity (`is not`)** when verifying fresh instances are created
-- Both patterns together provide comprehensive validation of state reset
-
-**WindDownMode Enum Refactoring:**
-
-3. **Refactored `wind_down_mode` from string validation to StrEnum**
-   - **Before**: `wind_down_mode: str` with `@field_validator` checking valid strings
-   - **After**: `WindDownMode(StrEnum)` with values `LEAVE_OPEN`, `CLOSE_ALL`
-   - **Benefits**: Type safety, IDE autocomplete, refactorability, consistency with gridcore enums
-   - **Pattern**: Following established StrEnum pattern (DirectionType, SideType, GridSideType)
-   - **Files**:
-     - Enum: `apps/backtest/src/backtest/config.py:16-20`
-     - Usage: `apps/backtest/src/backtest/engine.py:15,385`
-     - Tests: `apps/backtest/tests/test_config.py:75`, `apps/backtest/tests/test_engine.py:82,93`
-     - Export: `apps/backtest/src/backtest/__init__.py`
-
-### Improvements (2026-02-11)
-
-1. **Direction Inference Warning** - `runner.py:_infer_direction()`
-   - Added `logger.warning` when fallback is used (indicates order tracking gap)
-   - Should never trigger in normal operation — every fill comes from an order we placed
-   - **File**: `apps/backtest/src/backtest/runner.py:254-271`
-
-2. **Sharpe Ratio Resampling** - `session.py:_calculate_sharpe_ratio()`
-   - Equity curve resampled to fixed intervals before computing returns (raw ticks are irregular)
-   - Parameterized via `finalize(sharpe_interval=timedelta(hours=1))`
-   - **Files**: `apps/backtest/src/backtest/session.py:302-390`
-
-3. **Reporter DRY** - `reporter.py:_ensure_path()`
-   - Extracted path creation helper to avoid repeating `Path(path)` + `mkdir(parents=True)` in every export method
-   - **File**: `apps/backtest/src/backtest/reporter.py:48-52`
-
-4. **CLI Exit Codes & --strict** - `main.py`
-   - Exit code `1` = config/startup error, `2` = execution error
-   - `--strict` flag: exit on first symbol failure in multi-symbol runs
-   - **File**: `apps/backtest/src/backtest/main.py`
-
-5. **Input Validation** - `position_tracker.py`
-   - Commission rate bounds check in `__init__` (must be in `[0, 0.01]`)
-   - Price/qty positive validation in `process_fill()`
-   - Warning log for unusually high funding rates (> 1%)
-   - **File**: `apps/backtest/src/backtest/position_tracker.py`
-
-### Test Commands
-```bash
-# Run backtest tests
-uv run pytest apps/backtest/tests -v
-
-# Run all project tests (separately due to conftest conflicts)
-uv run pytest packages/gridcore/tests -v
-uv run pytest packages/bybit_adapter/tests -v
-uv run pytest shared/db/tests -v
-uv run pytest apps/event_saver/tests -v
-uv run pytest apps/gridbot/tests -v
-uv run pytest apps/backtest/tests -v
-```
-
-## Phase G: Comparator (backtest-vs-live validation)
-
-### Completed: 2026-02-12
-
-Successfully implemented a comparator package that validates backtest results against live trade data.
-
-### Key Components
-
-1. **Package Structure**
-   ```
-   apps/comparator/
-   ├── pyproject.toml           # Dependencies: grid-db, backtest (workspace)
-   ├── src/comparator/
-   │   ├── __init__.py
-   │   ├── config.py            # ComparatorConfig (Pydantic)
-   │   ├── loader.py            # LiveTradeLoader, BacktestTradeLoader, NormalizedTrade
-   │   ├── matcher.py           # TradeMatcher (join on client_order_id)
-   │   ├── metrics.py           # ValidationMetrics, calculate_metrics()
-   │   ├── equity.py            # Equity curve comparison (resample, divergence)
-   │   ├── reporter.py          # CSV export and console summary
-   │   └── main.py              # CLI with --backtest-trades / --backtest-config
-   └── tests/
-       ├── conftest.py          # Shared fixtures (db, make_trade, sample data)
-       ├── test_loader.py       # 14 tests (partial fills, direction inference)
-       ├── test_matcher.py      # 7 tests
-       ├── test_metrics.py      # 19 tests
-       ├── test_equity.py       # 13 tests
-       ├── test_reporter.py     # 9 tests (incl. reused-ID CSV regression)
-       └── test_main.py         # 17 tests (CLI args, datetime, equity paths)
-   ```
-
-2. **Trade Matching**
-   - Joins on `(client_order_id, occurrence)` composite key (handles deterministic ID reuse)
-   - `occurrence` = nth time the same `client_order_id` appears chronologically (sorted by `timestamp, client_order_id, side` for deterministic tie-breaking)
-   - Produces: matched pairs, live-only (missed by backtest), backtest-only (phantom fills)
-   - Live trades: aggregates partial fills by `(order_link_id, order_id)` using VWAP price
-   - Same `order_link_id` + different `order_id` = lifecycle reuse (separate trades, not partial fills)
-
-3. **Direction Inference (Live Trades)**
-   - Live `PrivateExecution` has no direction field; inferred from `side` + `closed_pnl`:
-     - `closed_pnl != 0` → closing trade: Buy+closing = short, Sell+closing = long
-     - `closed_pnl == 0` → opening trade: Buy = long, Sell = short
-   - **LIMITATION**: Break-even closes (`closed_pnl==0`) are misclassified as opening trades
-   - Backtest trades carry direction from `BacktestTrade.direction`
-   - **For matched pairs**: Metrics direction breakdown prefers backtest direction (always correct) over inferred live direction
-
-4. **Validation Metrics**
-   - Coverage: match_rate, phantom_rate, live/backtest trade counts
-   - Price accuracy: mean/median/max absolute delta across matched pairs
-   - Quantity accuracy: mean/median/max absolute delta
-   - PnL: cumulative totals, delta, Pearson correlation of cumulative PnL curves
-   - Fees: total comparison and delta
-   - Volume: from both matched and unmatched trades
-   - Direction breakdown: long/short match counts and PnL deltas
-   - Timing: mean absolute time delta between matched pairs
-   - Tolerance breaches: `price_tolerance=0` means exact match required (flags any non-zero delta); `qty_tolerance` same semantics
-   - Equity curve: max/mean divergence, correlation
-
-5. **Equity Curve Comparison** (`EquityComparator` class in `equity.py`)
-   - OOP class following same pattern as `TradeMatcher` (no constructor args, methods are operations)
-   - `load_live(session, ...)`: from `WalletSnapshot.wallet_balance` via `WalletSnapshotRepository.get_by_account_range()`
-   - `load_backtest_from_csv(path)` / `load_backtest_from_session(equity_curve)`: from CSV export or `BacktestSession.equity_curve`
-   - `resample(live, backtest, interval)`: resampled to common 1-hour grid
-   - `compute_metrics(resampled)`: computes max/mean divergence and correlation
-   - `export(resampled, path)`: exports `equity_comparison.csv`
-
-6. **CLI Modes**
-   - `--backtest-trades path.csv`: Load pre-existing backtest CSV
-   - `--backtest-config path.yaml`: Run backtest from config, then compare
-   - `--backtest-equity path.csv`: Optional equity curve CSV for equity comparison
-   - `--coin USDT`: Coin for live wallet balance lookup
-   - Date parsing: date-only `--end` values auto-set to 23:59:59.999999
-
-7. **Testing**
-   ```bash
-   uv run pytest apps/comparator/tests --cov=comparator --cov-report=term-missing -v
-   ```
-   105 tests, 96% coverage (main.py: 83%)
-
-### Key Implementation Notes
-
-1. **OOP Consistency** - All comparator modules use classes, not standalone functions
-   - `LiveTradeLoader`, `BacktestTradeLoader` (loader.py)
-   - `TradeMatcher` (matcher.py)
-   - `EquityComparator` (equity.py)
-   - `ComparatorReporter` (reporter.py)
-   - Pattern: No-arg constructors for pure computation classes (`TradeMatcher`, `EquityComparator`); session/state passed per-method
-
-2. **NormalizedTrade Dataclass** - Common format bridging live and backtest data
-   - Fields: `client_order_id`, `symbol`, `side`, `price`, `qty`, `fee`, `realized_pnl`, `timestamp`, `source`, `direction`, `occurrence`
-   - `source` is "live" or "backtest"
-   - `direction` is "long" or "short" (inferred for live, carried for backtest)
-   - `occurrence` is 0-based index for client_order_id reuse handling
-
-2. **Pearson Correlation** - Custom implementation in `metrics.py`
-   - Used for both PnL curve and equity curve correlation
-   - Returns 0.0 for insufficient data or zero variance
-
-3. **End-Date Truncation Fix**
-   - `_parse_datetime("2025-01-31")` returns midnight, dropping the final day
-   - Fix: `end_of_day=True` param sets time to `23:59:59.999999` for date-only inputs
-
-4. **DB Layer Extension**
-   - Added `WalletSnapshotRepository.get_by_account_range()` for time-range equity queries
-   - File: `shared/db/src/grid_db/repositories.py`
-
-### Common Pitfalls
-
-1. **SQLite Strips Timezone Info** - Compare datetimes with `.replace(tzinfo=None)` in tests. In integration tests with in-memory SQLite, use naive timestamps for test data to match DB output.
-2. **Direction != Side** - A Sell can close a long position; use `direction` field, not `side`
-3. **Volume from Unmatched Trades** - Must be computed before early return on zero matched pairs
-4. **client_order_id Reuse** - Deterministic SHA256 produces same ID for same (symbol, side, price, direction). After fill/cancel, the ID can be reused for a new order lifecycle. Live data: use `(order_link_id, order_id)` to distinguish partial fills (same order_id) from reuse (different order_id). Matcher: use `(client_order_id, occurrence)` composite key.
-5. **Tolerance Semantics** - `tolerance=0` means exact match (any non-zero delta is flagged). Don't add `> 0` guards that would disable the check at zero.
-6. **Break-Even Close Direction** - Live direction inferred from `closed_pnl != 0` is fragile for break-even closes. Always prefer backtest direction for matched pair analysis.
-7. **Datetime UTC Normalization** - `_parse_datetime()` normalizes all inputs to UTC. Aware non-UTC inputs are converted via `.astimezone(timezone.utc)`. Naive inputs get UTC assigned.
-8. **Reporter Delta Lookup** - Use `zip(matched, trade_deltas)` not a dict keyed by `client_order_id` — the dict approach fails when IDs are reused. The deltas list is 1:1 with matched pairs by construction.
-9. **Breach Tuples** - `ValidationMetrics.breaches` stores `(client_order_id, occurrence)` tuples, not bare strings. This avoids ambiguity when IDs are reused.
-10. **Occurrence Tie-Breaking Limitation** - If two trades share exact `(timestamp, client_order_id, side)`, occurrence assignment is non-deterministic across sources. Extremely unlikely in practice (requires same hash reused at same millisecond with same side).
-11. **Timestamp Normalization** - All loader/equity entry points call `_normalize_ts()` from `loader.py` to strip timezone info, producing naive UTC datetimes. This prevents `TypeError` when comparing/subtracting timestamps from different sources (SQLite returns naive, CSV `fromisoformat()` can return aware). When adding new data entry points, always wrap timestamps with `_normalize_ts()`.
-12. **Config Mode Requires --symbol** - `--symbol` is required when using `--backtest-config` (returns exit code 1 if omitted). This prevents silent defaulting to BTCUSDT for non-BTC strategies. In CSV mode, `--symbol` remains optional.
-13. **Symmetric Symbol Filtering** - `run()` filters `backtest_trades` by `config.symbol` before matching. This ensures both live and backtest sides use the same symbol filter, whether trades come from CSV (which may contain multiple symbols) or config mode.
-
-## Phase H: Testing & Validation
-
-### Completed: 2026-02-14
-
-Successfully implemented comprehensive unit test coverage improvements, cross-package integration tests, and shadow-mode validation pipeline tests.
-
-### Key Components
-
-1. **Coverage Improvements (Unit Tests)**
-   - `bybit_adapter/rest_client.py`: 16% → 100% (45 tests in `test_rest_client.py`)
-   - `event_saver/main.py`: 18% → 70%+ (30 tests in `test_main.py`)
-   - `event_saver/collectors`: 26-29% → 70%+ (tests in `test_public_collector.py`, `test_private_collector.py`)
-   - `gridbot/main.py`: 0% → 60%+ (14 tests in `test_main.py`)
-   - `bybit_adapter/ws_client.py`: 6 new edge case tests added
-
-2. **Cross-Package Integration Tests** (`tests/integration/`)
-   ```
-   tests/integration/
-   ├── __init__.py
-   ├── conftest.py                    # Shared fixtures (make_ticker_event, generate_price_series)
-   ├── test_engine_to_executor.py     # 15 tests: GridEngine → IntentExecutor pipeline + REST payload mapping
-   ├── test_backtest_to_comparator.py # 5 tests: BacktestEngine → Comparator round-trip
-   ├── test_runner_lifecycle.py       # 9 tests: StrategyRunner full lifecycle (fills, position, same-order)
-   ├── test_eventsaver_db.py          # 10 tests: EventSaver → Database pipeline + writer integration
-   └── test_shadow_validation.py      # 6 tests: Shadow-mode dual-path validation
-   ```
-
-3. **Shadow-Mode Validation Pipeline** (`test_shadow_validation.py`)
-   - Feeds identical price data through two independently constructed paths:
-     - **Path A**: `BacktestEngine` (orchestrated, high-level)
-     - **Path B**: Manual `GridEngine + BacktestOrderManager` (low-level, mimics shadow mode)
-   - Validates: trade count match, deterministic client_order_ids, 100% comparator match rate, zero price/qty deltas, identical PnL totals
-   - Uses `generate_price_series()` for reproducible sine-wave price oscillation
-
-### Running Tests
-
-```bash
-# Run all tests (unit + integration)
-make test
-
-# Run integration tests only
-make test-integration
-
-# Run specific integration test
-uv run pytest tests/integration/test_shadow_validation.py -v
-```
-
-### Key Implementation Notes
-
-1. **Event Constructor Requirements**
-   - All gridcore event dataclasses require `event_type` and `local_ts` fields (Python dataclass inheritance)
-   - Example: `TickerEvent(event_type=EventType.TICKER, symbol=..., exchange_ts=..., local_ts=..., last_price=...)`
-
-2. **BybitNormalizer Does Not Fail on Invalid Input**
-   - `normalize_ticker({"invalid": "data"})` creates a default event instead of raising
-   - To test error paths, mock the normalizer: `collector._normalizer.normalize_ticker = MagicMock(side_effect=Exception(...))`
-
-3. **PrivateExecution Has No `user_id` Field**
-   - SQLAlchemy model does not have `user_id` column (only `run_id` and `account_id`)
-   - Cascade delete via `Run` → `PrivateExecution` (not direct user linkage)
-
-4. **IntentExecutor Attribute Names**
-   - REST client stored as `self._client` (not `self._rest_client`)
-   - File: `apps/gridbot/src/gridbot/executor.py`
-
-5. **Backtest Fill Parameters**
-   - Amplitude=2000 and num_ticks=500 needed for reliable trade generation with grid_step=0.5 and grid_count=20
-   - Smaller amplitudes may not cross enough grid levels to trigger fills
-
-6. **TradeMatcher Returns MatchResult Object**
-   - `matcher.match()` returns `MatchResult`, not a tuple
-   - Access via: `result.matched`, `result.live_only`, `result.backtest_only`
-
-7. **ValidationMetrics Field Names**
-   - Uses `price_mean_abs_delta` (not `price_mean_delta`)
-   - Uses `cumulative_pnl_delta` (not `pnl_delta`)
-
-8. **Qty Rounding for Shadow-Mode Tests**
-   - Must match `InstrumentInfo.round_qty()` which rounds UP via `math.ceil`
-   - Default qty_step for BTCUSDT: `Decimal("0.001")`
-   - Pattern: `steps = math.ceil(float(raw_qty) / float(qty_step)); return Decimal(str(steps)) * qty_step`
-
-9. **Makefile Integration Test Target**
-   - Integration tests run as the final step in `make test` (after all per-package tests)
-   - Coverage is appended (`--cov-append`) so integration test coverage counts toward total
-   - `make test-integration` runs integration tests in isolation
-
-### Common Pitfalls
-
-1. **conftest ImportPathMismatchError**: Run test suites separately (per-directory) to avoid conftest conflicts across packages
-2. **SQLite Strips Timezone**: Use naive UTC timestamps in test data for in-memory SQLite tests
-3. **Shadow-Mode Qty Calculator**: Must replicate `BacktestEngine._create_qty_calculator()` exactly, including `InstrumentInfo.round_qty()` ceil rounding
-4. **generate_price_series**: Uses sine-wave oscillation; period = `num_ticks / 4` (4 complete oscillations). Increase `amplitude` for more fills.
-5. **Mocking `async def` functions in cli() tests**: When `cli()` calls `asyncio.run(main(...))`, patching `main` with `return_value=0` auto-creates an `AsyncMock` that still returns a coroutine. Use `_close_dangling_coro(mock_run)` helper (in `test_main.py`) to close the unawaited coroutine after assertions, silencing warnings.
-6. **`asyncio.get_event_loop()` deprecation in tests**: Use `asyncio.new_event_loop()` instead of `asyncio.get_event_loop()` when setting up event loops in non-async test methods (e.g., `saver._event_loop = asyncio.new_event_loop()`).
-7. **PlaceLimitIntent constructor**: Requires `qty` and `grid_level` positional args — cannot construct with just symbol/side/price/direction/client_order_id.
-8. **Integration test discovery**: Must add `"tests/integration"` to `testpaths` in `pyproject.toml` for pytest to discover them.
-9. **Import ordering in test files**: Never place class/dataclass definitions between import blocks. All imports must be grouped at the top of the file before any class or function definitions (e.g., `test_eventsaver_db.py` had `SeededDb` splitting import blocks).
-10. **`asyncio.CancelledError` is a `BaseException`**: In nested try/except patterns, `CancelledError` passes through `except Exception` blocks. Always catch it in the outer loop with a comment explaining why. Also wrap any `await asyncio.sleep()` inside `except Exception` recovery handlers with its own `except asyncio.CancelledError: break` (see `orchestrator.py:_order_sync_loop`).
-11. **Blocking I/O in async code**: Use `asyncio.to_thread()` to wrap blocking calls (e.g., SQLAlchemy `session.commit()`) in async methods. Requires Python 3.9+ (`pyproject.toml` declares `>=3.11`).
-12. **Dict iteration in async loops**: Snapshot mutable dicts with `list(d.items())` before iterating in background tasks (`_position_check_loop`, `_order_sync_loop`). The main event loop can mutate `_account_to_runners` between `await` points, causing `RuntimeError: dictionary changed size during iteration`.
-13. **Logging style in orchestrator loops**: Use `%s`-style format args (`logger.error("msg: %s", var)`) not f-strings (`logger.error(f"msg: {var}")`) in loop error/warning/info/debug handlers. Avoids string interpolation when log level is disabled. File: `apps/gridbot/src/gridbot/orchestrator.py`.
-14. **`integration_helpers.py` import path**: `tests/integration/conftest.py` adds `tests/integration/` to `sys.path` explicitly so `import integration_helpers` works even when pytest is invoked without the root `pyproject.toml` `pythonpath` setting (e.g., per-app test runs).
-15. **`_fetch_wallet_balance` fallback**: Returns `0.0` when no USDT balance is found in the wallet API response, but now logs `logger.warning` first so unexpected API structures are visible in logs.
-
-## Phase I-1: Standalone Data Recorder (`apps/recorder/`)
-
-### Completed: 2026-02-18
-
-Standalone app that captures raw Bybit mainnet WebSocket data to SQLite for multi-day unattended runs, independent of any trading activity. Reuses `event_saver` collectors + writers directly.
-
-**Documentation**: See `docs/features/0008_PLAN.md` for architecture and `docs/features/0008_REVIEW.md` for review notes.
-
-### Key Implementation Notes
-
-1. **App Structure**
-   - Path: `apps/recorder/` (workspace package)
-   - Entry point: `recorder.main:cli` (`--config PATH`, `--debug`), registered in `pyproject.toml` `[project.scripts]`
-   - Run via: `uv run recorder --config path/to/config.yaml`
-   - Config: YAML-based with Pydantic validation (`recorder.config`)
-   - Core orchestrator: `recorder.recorder.Recorder`
-
-2. **Reuse Pattern**
-   - Imports `PublicCollector`, `PrivateCollector`, `AccountContext` from `event_saver.collectors`
-   - Imports all 6 writers from `event_saver.writers`
-   - Imports `GapReconciler` from `event_saver.reconciler`
-   - No code duplication — recorder is a thin orchestration wrapper
-
-3. **Fixed UUIDs for DB Seeding**
-   - Uses stable UUIDs (`_RECORDER_USER_ID`, `_RECORDER_ACCOUNT_ID`, `_RECORDER_STRATEGY_ID`) across restarts
-   - `_seed_db_records()` upserts User/BybitAccount/Strategy via `session.merge()`, creates new Run per session
-   - Required because execution/order writers need valid `run_id` FK chain
-
-4. **Strategy.symbol VARCHAR(20) Limit**
-   - Store only the first/primary symbol in `Strategy.symbol`
-   - Store full symbol list in `config_json["symbols"]` for reference
-   - Avoids overflow when recording multiple symbols
-
-5. **Private Gap Reconciliation**
-   - `_handle_private_gap()` calls `reconcile_executions()` per symbol (not just logging)
-   - Requires account credentials + run_id + symbols to be set
-
-6. **Thread-Safe Async Routing**
-   - All WS handlers use `asyncio.run_coroutine_threadsafe()` to route from WS thread to event loop
-   - `self._event_loop` captured during `start()` via `asyncio.get_running_loop()`
-   - **Every future gets a `_log_future_error()` done-callback** — never discard futures silently, especially in multi-day unattended tools
-
-7. **Config Search Order**
-   - `RECORDER_CONFIG_PATH` env var → `conf/recorder.yaml` → `recorder.yaml`
-   - Handles `yaml.YAMLError` (raises ValueError), empty YAML (defaults to `{}`)
-
-8. **SecretStr for API Credentials**
-   - `AccountConfig.api_key` and `api_secret` use Pydantic `SecretStr` to prevent accidental logging
-   - Access secrets via `.get_secret_value()` at the call site (e.g., `config.account.api_key.get_secret_value()`)
-   - Database URLs are sanitized via `redact_db_url()` from `grid_db.utils` before logging (strips passwords from PostgreSQL URLs)
-
-9. **Lifecycle Safety Patterns**
-   - `self._running = True` is set at the **top** of `start()` (before resource init), inside a `try/except` that re-raises. This ensures `stop()` can clean up partially-initialized resources (e.g. writer flush-loop tasks) if `start()` raises midway. The `except` block intentionally leaves `_running = True` so `main.py`'s `stop(error=True)` proceeds with cleanup.
-   - `stop(error=True)` marks the DB run as `"error"` instead of `"completed"` — called from the error path in `main.py`
-   - `_seed_db_records()` wraps DB ops in try/except → raises `RuntimeError` with clear message
-   - `_mark_run_status()` wraps DB ops in try/except → **logs** error (doesn't raise) to avoid interrupting shutdown
-   - Signal handlers in `run_until_shutdown()` are cleaned up via `try/finally` + `loop.remove_signal_handler()`
-
-10. **`setup_logging` Handler Guard**
-    - `root_logger.handlers.clear()` before `addHandler()` prevents handler accumulation on repeated calls
-
-11. **Logging Style: f-strings**
-    - Use f-strings for all `logger.*()` calls: `logger.info(f"Starting {name}")`
-    - Exception: %-style is acceptable in hot-path callbacks (e.g., `_log_future_error`) where deferred formatting matters
-
-### Common Pitfalls (Recorder-Specific)
-
-1. **TickerEvent fields**: Does NOT have `index_price` or `next_funding_time` — check `gridcore.events.TickerEvent` dataclass definition before constructing test fixtures.
-2. **Mock collectors need `stop = AsyncMock()`**: When mocking `PublicCollector`/`PrivateCollector`, must set `stop` as `AsyncMock()` since `Recorder.stop()` awaits them.
-3. **`_close_dangling_coro()` pattern**: When testing `cli()` that calls `asyncio.run(main(...))`, the mock creates an unawaited coroutine. Use the helper to close it after assertions (same pattern as gridbot `test_main.py`).
-4. **Testnet default differs**: Recorder defaults to `testnet=False` (mainnet), unlike gridbot which defaults to `testnet=True`.
-5. **Position/wallet test data format**: `PositionWriter` and `WalletWriter` expect Bybit-formatted dicts with `"data"` keys (e.g., `{"data": [{"symbol": "BTCUSDT", ...}]}`). Flat dicts silently produce zero snapshots.
-6. **Test fixture deduplication**: Shared `db` fixture lives in `conftest.py` — do not duplicate in individual test files. Same for `basic_config` and `config_with_account`.
-7. **Mock config completeness**: When using `MagicMock()` for config in tests, set all attributes that `main()` accesses before the code path under test. E.g., `mock_config.database_url = "sqlite:///test.db"` — bare MagicMock attributes break `urlparse()`.
-
-## Phase J: Replay Engine (`apps/replay/`)
-
-### Completed: 2026-02-21
-
-Replay engine that reads recorded mainnet data from the recorder's database, feeds it through GridEngine + simulated order book, and compares simulated trades against real recorded executions. Core shadow-mode validation pipeline: `record → replay → compare → report`.
-
-**Documentation**: See `docs/features/0009_PLAN.md` for architecture and `docs/features/0009_REVIEW.md` for review notes.
-
-### Key Implementation Notes
-
-1. **App Structure**
-   - Path: `apps/replay/` (workspace package)
-   - Entry point: `python -m replay.main` (`--config PATH`, `--run-id UUID`, `--start/--end`, `--debug`)
-   - Config: YAML-based with Pydantic validation (`replay.config`)
-   - Core orchestrator: `replay.engine.ReplayEngine`
-
-2. **Massive Reuse — No New Data/Matching Logic**
-   - `HistoricalDataProvider` (backtest) — reads TickerSnapshots from recorder DB
-   - `BacktestRunner` (backtest) — two-phase tick processing with GridEngine
-   - `BacktestOrderManager`, `TradeThroughFillSimulator`, `BacktestPositionTracker` (backtest)
-   - `LiveTradeLoader`, `BacktestTradeLoader`, `TradeMatcher`, `calculate_metrics` (comparator)
-   - `ComparatorReporter` (comparator) — CSV + console report
-   - Replay engine is a thin orchestrator wiring these together
-
-3. **Replay Fill Simulator Modes**
-   - `strict_cross`: conservative trade-tape model. BUY fills only below limit; SELL fills only above limit. Used as `BacktestEngine` default and as opt-in for replay backward-compat baseline.
-   - `trade_through_at_limit`: last-price model that includes exact limit touches (`<=` / `>=`).
-   - `book_touch`: parity mode using recorded L1 (`ask1 <= limit` for BUY, `bid1 >= limit` for SELL), falling back to `trade_through_at_limit` for legacy bare-price callers. Was the replay default through features 0033–0050; kept as opt-in for legacy L1-touch parity.
-   - `last_cross` (**replay default since feature 0051**): transition-based aggressor detection. BUY fires when `prev_last > limit_price` AND `curr_last <= limit_price`; SELL fires when `prev_last < limit_price` AND `curr_last >= limit_price`. Strict inequality on `prev_last` — `prev_last == limit_price` does **not** count as a cross. Sticky `last_price` (`prev == curr`) never fires. First-ever observation of a symbol returns `False` (no prior tick). Legacy bare-`Decimal` input on `check_fill` returns `False` for `LAST_CROSS` and does not mutate any state slot (no symbol/exchange_ts available to key the per-tick advance). v7 A/B re-validation cut fill-timing `|delta|` from 19.0s (`book_touch`) to 5.1s at match_rate=100%, closing issue #117's +12.6s lag.
-   - `advance_market(market: TickerEvent)` contract (feature 0051): `BacktestOrderManager.check_fills` calls `self.fill_simulator.advance_market(market)` as the first statement inside the `isinstance(market, TickerEvent)` branch, before the per-order loop. Runs unconditionally on every `TickerEvent` (including orderless ticks) so the `T -> T+1` transition signal is preserved when no order is active for the symbol. The legacy bare-`Decimal` `else`-branch never calls `advance_market`. The simulator owns three per-symbol state dicts: `_prev_last_price` (committed prior-tick value), `_tick_prev_last` (read slot for the in-flight tick), and `_tick_token` (idempotency guard keyed on `(symbol, exchange_ts, local_ts)`). Repeated calls within a tick are no-ops. `_should_fill_last_cross` reads only `_tick_prev_last` and never writes.
-   - **Test fixture timestamp discipline (pitfall, feature 0051)**: every snapshot in a multi-tick `LAST_CROSS` test MUST carry monotonically distinct `(exchange_ts, local_ts)` values. Reusing one timestamp across two snapshots makes the second `advance_market` call token-match the first and silently no-op — the stash never runs, `_tick_prev_last[symbol]` stays `None`, and the test asserts `False` on every cross. The `_ticker` / `_ticker_for` helpers in `apps/backtest/tests/test_fill_simulator.py` accept a `tick_index: int` parameter that offsets both timestamps by `timedelta(milliseconds=tick_index)`. Pass `tick_index=0` for prev and `tick_index=1` for curr. Production replay is protected from this collision by the DB unique constraint on `(symbol, exchange_ts)` at `shared/db/src/grid_db/models.py:265-267`; tests do not go through that path.
-   - Default split: `apps/replay` defaults to `last_cross` (timing-accurate transition detection; v7 A/B vs `book_touch` showed 19.0s → 5.1s fill-timing improvement at 100% match-rate); `BacktestEngine` keeps `strict_cross` because forward backtest data sources may lack the L1/last-price-history required by the parity-oriented modes.
-   - `BacktestOrderManager.check_fills(TickerEvent(...))` is always scoped to the ticker's own symbol; the legacy bare-Decimal path preserves all-symbol scanning when no `symbol` filter is supplied.
-   - Rationale: production backtests keep conservative semantics; replay parity smoke benefits from the richer bid/ask already stored in `ticker_snapshots`.
-
-4. **Config Shape: Root-Level Replay Parameters**
-   - `initial_balance`, `enable_funding`, `wind_down_mode` live at **root level** of `ReplayConfig`, NOT nested under `strategy`
-   - They are backtest/replay parameters, not grid-strategy parameters
-   - `strategy:` block only contains grid config (tick_size, grid_count, grid_step, amount, commission_rate)
-   - File: `apps/replay/src/replay/config.py`
-
-5. **Run Resolution (`_resolve_run()`)**
-   - Auto-discover: queries `RunRepository.get_latest_by_type("recording")` — filters to `("completed", "running")` status by default
-   - Explicit `run_id`: looks up Run row from DB if timestamps are missing (no hard-fail)
-   - Active runs (`end_ts=None`): falls back to `datetime.now(timezone.utc)` instead of failing
-   - File: `apps/replay/src/replay/engine.py`
-
-5. **ISO Datetime Parsing**
-   - `parse_datetime()` uses `datetime.fromisoformat()` as primary parser — handles `T` separator, `Z` suffix, `+00:00` offsets
-   - Falls back to strptime for non-ISO formats (slash separators)
-   - Parsing happens inside `try/except ValueError` block so invalid CLI input returns exit code 1
-   - File: `apps/replay/src/replay/main.py`
-
-6. **Credential Redaction in Logs — `redact_db_url()`**
-   - Shared utility: `from grid_db import redact_db_url` (or `from grid_db.utils import redact_db_url`)
-   - Replaces password with `***`, preserves username/host/port/path — SQLite URLs pass through unchanged
-   - Used by: `apps/replay/src/replay/main.py`, `apps/replay/src/replay/engine.py`, `apps/recorder/src/recorder/main.py`
-   - **Always use this** when logging database URLs — never log `config.database_url` directly
-   - File: `shared/db/src/grid_db/utils.py`, tests: `shared/db/tests/test_utils.py`
-
-7. **Config Search Order**
-   - `--config` CLI arg → `REPLAY_CONFIG_PATH` env var → `conf/replay.yaml` → `replay.yaml`
-   - Same pattern as recorder
-
-8. **`RunRepository.get_latest_by_type()` Status Filter**
-   - Added `statuses` parameter defaulting to `("completed", "running")` — skips failed/errored runs
-   - Pass `statuses=()` to disable filtering (returns any status)
-   - File: `shared/db/src/grid_db/repositories.py`
-
-### Common Pitfalls (Replay-Specific)
-
-1. **InMemoryDataProvider for tests**: Use `data_provider=` parameter in `engine.run()` to bypass DB reads — avoids needing real TickerSnapshot rows in test DB.
-2. **InstrumentInfoProvider must be mocked**: Tests use `@patch("replay.engine.InstrumentInfoProvider")` — the provider tries to fetch real instrument info otherwise.
-3. **Run resolution needs full FK chain**: When seeding test DB for run resolution tests, must create User → BybitAccount → Strategy → Run (foreign key constraints).
-4. **`datetime.fromisoformat()` requires Python 3.11+** for full timezone offset support. Earlier versions don't handle `+00:00`.
-5. **Test for `ValidationError` not `Exception`**: Pydantic config validation tests should use `from pydantic import ValidationError` for specific assertions.
+**Shadow-Mode Validation Pipeline** (`test_shadow_validation.py`): feeds identical price data through two independently constructed paths — **Path A** is `BacktestEngine` (orchestrated, high-level), **Path B** is manual `GridEngine + BacktestOrderManager` (low-level, mimics shadow mode) — and validates trade count match, deterministic client_order_ids, 100% comparator match rate, zero price/qty deltas, identical PnL totals. Uses `generate_price_series()` for reproducible sine-wave price oscillation.
+
+### Test Pitfalls
+
+1. **Mocking `async def` functions in cli() tests**: When `cli()` calls `asyncio.run(main(...))`, patching `main` with `return_value=0` auto-creates an `AsyncMock` that still returns a coroutine. Use `_close_dangling_coro(mock_run)` helper (in `test_main.py`) to close the unawaited coroutine after assertions, silencing warnings.
+2. **`asyncio.get_event_loop()` deprecation in tests**: Use `asyncio.new_event_loop()` instead of `asyncio.get_event_loop()` when setting up event loops in non-async test methods (e.g., `saver._event_loop = asyncio.new_event_loop()`).
+3. **Import ordering in test files**: Never place class/dataclass definitions between import blocks. All imports must be grouped at the top of the file before any class or function definitions (e.g., `test_eventsaver_db.py` had `SeededDb` splitting import blocks).
+4. **`integration_helpers.py` import path**: `tests/integration/conftest.py` adds `tests/integration/` to `sys.path` explicitly so `import integration_helpers` works even when pytest is invoked without the root `pyproject.toml` `pythonpath` setting (e.g., per-app test runs).
+5. **`_fetch_wallet_balance` fallback**: Returns `0.0` when no USDT balance is found in the wallet API response, but now logs `logger.warning` first so unexpected API structures are visible in logs.
+6. **generate_price_series**: Uses sine-wave oscillation; period = `num_ticks / 4` (4 complete oscillations). Increase `amplitude` for more fills.
+7. **Shadow-Mode Qty Calculator**: Must replicate `BacktestEngine._create_qty_calculator()` exactly, including `InstrumentInfo.round_qty()` ceil rounding.
 
 ## PnL Calculation Functions (`packages/gridcore/src/gridcore/pnl.py`) — Added 2026-02-24
 
@@ -2132,22 +710,6 @@ Pure PnL calculation functions extracted into gridcore as the single source of t
 - `parse_risk_limit_tiers(api_tiers)` — Bybit API response → `MMTiers`
 
 All take Decimal inputs; `position.py` keeps float copy for risk mgmt performance.
-
-### Grid Anchor Persistence
-
-Grid levels preserved across restarts via `GridAnchorStore` + `anchor_price` parameter.
-
-- On startup: load saved anchor for `strat_id`
-- If `grid_step` AND `grid_count` match → use saved anchor; otherwise rebuild fresh
-- After first grid build: save new anchor data
-- Storage: `db/grid_anchor.json` keyed by `strat_id`
-- `GridEngine` requires `strat_id` parameter
-
-### Logging
-
-Uses Python `logging` module. Loggers: `gridcore.grid`, `gridcore.engine`, `gridcore.position`.
-- `INFO`: grid rebuild, position adjustments
-- `DEBUG`: detailed state/calculations
 
 ---
 
@@ -2293,6 +855,39 @@ Two-layer: Runner logs + re-raises → Orchestrator catches + sends Telegram ale
 - `asyncio.CancelledError` is `BaseException` — passes through `except Exception`
 - Snapshot mutable dicts with `list(d.items())` before async iteration
 
+### Reconciliation & order-adoption invariants (Phase E)
+
+   - **Inject is NOT durable adoption (bbu2-faithful)**: Injected orders live for exactly one ticker event. On the first `on_ticker` after startup, `GridEngine._place_grid_orders` (`packages/gridcore/src/gridcore/engine.py:319-325`) cancels any injected order whose price is not in the current `grid_price_set` (`'outside_grid'` reason), and `engine.py:305-312` cancels any at a grid price with the wrong side (`'side_mismatch'` reason). Over-limit cases (`engine.py:237-243`) trigger a full rebuild that cancels everything. Direct port of bbu2 `strat.py:154-160`, `:145-149`, `:103-104`. This means: (a) a "silent adoption of manual orders" security review is a false alarm — the bot does not keep manual orders around, it destroys them on the next tick; (b) the **real** operational concern is the opposite — the bot will **cancel** any limit order on the symbol that doesn't match the grid; (c) do NOT add a refuse-to-start check in `reconcile_startup` — it would re-break normal crash-restart (the bot's own prior orders look identical to manual ones) and was already removed in commit `138737a` for that reason.
+   - **(account, symbol) uniqueness is enforced unconditionally at config load**: Even though `orderLinkId` IS sent to Bybit (since feature 0029, with a `-{millis}` suffix added in HOTFIX 2026-05-08), it cannot disambiguate strategies at runtime. The deterministic prefix is a SHA of `(symbol, side, price, direction)`, so two strategies on the same `(account, symbol)` would compute the SAME prefix for the same logical order — the wire-form suffix only differs across re-placements, not across strategies. Two strategies on the same `(account, symbol)` pair would therefore cancel each other's orders every tick via the cancel-on-mismatch pass described above. `GridbotConfig.validate_no_shared_symbol` (`apps/gridbot/src/gridbot/config.py`) rejects any such configuration at load time with **no escape hatch** — there is no flag to disable it. bbu2 enforces the same invariant structurally: its `amounts[].strat` field is a scalar pointing at a single `pair_timeframes[]` entry, and each `pair_timeframe` has a single `symbol`, so the bad configuration is physically unrepresentable in bbu2's config schema. grid-bot's schema is more flexible (independent `accounts` and `strategies` lists, FK goes `strategy.account → account.name`), so the constraint must be reconstructed as a pydantic validator — but it is enforced just as strictly. If you need a second strategy on the same symbol, use a different account.
+   - **Operational consequence (manual orders get cancelled)**: Any limit order on the symbol that is not at a current grid price, or is at a grid price with the wrong side, will be cancelled by the engine on the next ticker event after it is seen (see the "Inject is NOT durable adoption" bullet above for the exact mechanism). This applies to manual orders placed via the Bybit UI while the bot is running, orders from other tools/scripts on the same account, and stale orders left over from a prior run with different grid parameters. **Manual orders and the grid cannot coexist on the same symbol** — the bot treats "not in my grid" as "cancel it." To manually intervene, stop the bot, make your changes, restart, and accept that anything not matching the grid on restart will be cancelled on the first tick.
+   - **Before first start**: Closing existing orders for the symbol before the first start is recommended for operator clarity (otherwise the bot will cancel them within ~1 second of startup, which is surprising but not incorrect). There is no config flag to disable either the cancel-on-mismatch behavior or the `(account, symbol)` uniqueness check — both are unconditional.
+
+### orderLinkId wire format & matching
+
+**orderLinkId Wire Format & Matching (HOTFIX 2026-05-08)**: How the deterministic `client_order_id` survives Bybit's id-cache
+   - **Why the suffix exists**: Bybit caches `orderLinkId` for ~1-2h post-cancel/fill. Our `PlaceLimitIntent.client_order_id` is a deterministic 16-char SHA256 hex digest of `(symbol, side, price, direction)`, so re-placing the same logical intent collides with the cached id and triggers ErrCode 110072 "OrderLinkedID is duplicate" in a tight loop. Live-verified: ~12k duplicate-rejected attempts / 0 successful orders across a 2h window before the fix.
+   - **Wire format**: `{16-hex prefix}-{int(datetime.now(UTC).timestamp() * 1000)}`. The prefix is guaranteed not to contain `-` (`hashlib.sha256().hexdigest()[:16]` returns only `0-9a-f`), so splitting at the first `-` always recovers the deterministic prefix.
+   - **Wire-vs-key invariant**: The full suffixed value goes on the wire and is persisted verbatim in `private_executions.order_link_id` and `orders.order_link_id` (forensics). Internal dict keys (`Runner._tracked_orders`, comparator join key, replay seed `client_id`) use only the deterministic prefix.
+   - **Retry idempotency invariant (feature 0032)**: The wire suffix is minted once per `PlaceLimitIntent` placement lifecycle in `StrategyRunner` and stored on `PlaceLimitIntent.order_link_id`; runner reattempts, retry-queue retries, and fresh engine re-emissions after a failed placement reuse that same wire id. Executor-side generation is only a fallback for direct callers that bypass runner assignment.
+   - **Reconcile-upgrade path**: If REST order sync later reports an open order whose normalized prefix matches a pending/failed tracked placement, `Runner.inject_open_orders` upgrades that tracked order to `placed`, patches the tracked intent with the exchange-reported wire `orderLinkId`, and cancels queued retries for that prefix. This closes the ambiguous-failure window where Bybit accepted the first request but the bot only observed a timeout/error.
+   - **Helper**: `gridcore.intents.extract_client_order_prefix(order_link_id) -> Optional[str]` splits at the first `-` and returns the prefix. `None` or empty-string input → `None` (so callers using `prefix or fallback_id` cleanly fall back). No-hyphen input → unchanged (pre-hotfix backward compat).
+   - **Three call sites normalize on read**: (a) `gridbot.runner._find_tracked_order` and `inject_open_orders` — strip suffix before lookup/inject; (b) `comparator.loader.LiveTradeLoader.load` — strip before grouping live executions; (c) `replay.snapshot_loader.load_active_orders` — strip before seeding active orders for replay. Tests in `packages/gridcore/tests/test_intents.py`, `apps/gridbot/tests/test_runner.py`, `apps/comparator/tests/test_loader.py`, `apps/replay/tests/test_snapshot_loader.py`.
+   - **Files**: `packages/gridcore/src/gridcore/intents.py` (helper + `PlaceLimitIntent.order_link_id`), `apps/gridbot/src/gridbot/order_link_id.py`, `apps/gridbot/src/gridbot/executor.py` (wire-id fallback), `apps/gridbot/src/gridbot/runner.py` (wire-id assignment/reuse + read-side normalization), `apps/comparator/src/comparator/loader.py`, `apps/replay/src/replay/snapshot_loader.py`.
+
+### Active WS reconnect with TCP-level probe (feature 0024)
+
+**Active WS reconnect with TCP-level probe (2026-05-03, feature 0024)**: bbu2 `_ensure_*_connection` pattern
+   - **Problem**: Wrapper's `is_connected()` is state-flag based — flips False only on explicit `disconnect()`. A dead TCP socket pybit hadn't noticed left it stuck True. Mainnet observed 6–15 min reconnect gaps.
+   - **Two health signals (both call `client.reset()`)**:
+     - **Primary** (TCP-level, every 10s): `Orchestrator._ws_health_check_once()` calls new `client.is_socket_alive()` → pybit's `ws.sock.connected`. Mirrors bbu2 `ENSURE_SOCKET_INTERVAL = 10`.
+     - **Secondary** (message-gap, on heartbeat fire): existing 30s gap detector → `on_disconnect` callback → `Orchestrator._on_ws_disconnect()` → `client.reset()`. Catches "socket alive but server silent" failure mode that TCP check misses.
+   - **`reset()`**: Stop heartbeat → `_disconnect_internal()` → `connect()` (re-subscribes all streams). Idempotent — back-to-back resets are a no-op + a single re-establishment.
+   - **Heartbeat thread sharp edge**: `on_disconnect` callback runs on the heartbeat thread. **Wrapper-level guard**: `_stop_heartbeat_watchdog` skips `Thread.join()` when `threading.current_thread() is self._heartbeat_thread`, so calling `reset()` inline from a callback is safe (no `RuntimeError`). The orchestrator still dispatches reset to a one-shot daemon worker (`WSReset-{account}-{kind}`) to avoid blocking the heartbeat thread on the full TCP teardown / handshake / subscription replay.
+   - **Zombie heartbeat protection**: `_start_heartbeat_watchdog` replaces `self._stop_heartbeat` with a fresh `threading.Event` each start; the old loop holds a reference to the old (still-set) event and exits cleanly. `_heartbeat_loop(stop_event)` takes the event as parameter.
+   - **`retries=0`**: Both `connect()` methods pass `retries=0` to `pybit.unified_trading.WebSocket(...)` → pybit's `infinitely_reconnect=True`. Removes the 10-attempt cliff at which pybit raises `WebSocketTimeoutException` and gives up.
+   - **Orchestrator wiring**: `_init_account` constructs WS clients with `on_disconnect=lambda ts, a=name: self._on_ws_disconnect(a, "public"|"private", ts)`. Periodic gate `_next_ws_health_check` in `_tick()` between `_next_health_check` and `_next_order_sync`.
+   - Files: `packages/bybit_adapter/src/bybit_adapter/ws_client.py`, `apps/gridbot/src/gridbot/orchestrator.py`
+
 ---
 
 ## backtest — Backtest Engine
@@ -2374,6 +969,25 @@ Fields: `client_order_id`, `symbol`, `side`, `price`, `qty`, `fee`, `realized_pn
 - `--symbol` required with `--backtest-config` mode
 - `run()` filters backtest_trades by symbol before matching (symmetric filtering)
 
+### Robust spike-vs-drift stats (feature 0070, issue #156)
+
+Each per-snapshot abs-delta family in `position_metrics.py` AND the trade-level `pnl_*` family carry six robust stats alongside the existing `mean`/`max`, so an operator rule can tell a **sharp spike** (real divergence — few snapshots towering over baseline) from **sustained drift** (benign accumulation — many snapshots persistently above baseline). Today's flat `max > $0.30` gate conflates them (C108: `cur_realised_usdt_max_abs_delta = $0.307` tripped purely from drift).
+
+- **Six fields per family**: `<f>_median_abs_delta`, `<f>_p95_abs_delta`, `<f>_std_abs_delta`, `<f>_spike_intensity` (Decimal) + `<f>_spike_count_30c`, `<f>_spike_count_relative_3` (int). Helper: `comparator.metrics._spike_stats(abs_deltas) -> RobustStats` (single shared impl; `position_metrics._fold_family` and `metrics.calculate_metrics` both call it — do NOT duplicate). Position families folded in `fold_metrics_into._fold_family` over the same `matched` lists as mean/max (so they inherit the 0044 state-diverged exclusion). `pnl_*` folded in `calculate_metrics` over per-trade `pnl_delta`.
+- **Families instrumented (8 position + 1 trade)**: `cur_realised_usdt`, `pos_value_usdt`, `cum_realised_usdt`, `upnl_usdt`, `unrealised_pnl`, `liq_price`, `position_im`/`position_mm` (optional — issue #155 noise, folded for symmetry), and `pnl`. Price/qty keep mean/median/max only (out of scope).
+- **Definitions**: `median = deltas[len//2]` (**upper-mid** index — NOT the averaging `_decimal_median`; the spike rules are calibrated to this exact index, keep the two helpers distinct); `p95 = deltas[int(len*0.95)]` clamped to `len-1` (defensive — the truncating index is already always ≤ len-1, so it never actually fires; prevents IndexError reasoning on tiny lists); `std = statistics.pstdev` (Decimal in → Decimal out, `0` for one element); `spike_intensity = max - median`; `spike_count_30c = #(|delta| > ABS_THRESHOLD)`; `spike_count_relative_3 = #(|delta| > REL_K*median)` **only when `median > 0`** (the `median==0` guard is mandatory — the relative test is otherwise trivially true for every positive delta → returns 0).
+- **Comparator constants** (declarative, in `metrics.py`): `ABS_THRESHOLD = Decimal("0.30")`, `REL_K = Decimal("3")`. **Operator Layer 1–4 thresholds live HERE / in the external monitoring prompt, NOT in code** (comparator only emits metrics; operator applies the rule):
+  | Layer | Rule (substitute the family prefix) | Meaning |
+  |---|---|---|
+  | 1. Spike (real) | `spike_intensity > $0.20` AND `spike_count_30c ≤ 3` | sharp peak, few snapshots |
+  | 2. Drift (known) | `median > $0.10` AND `spike_count_30c > 10` | persistent gap — SHOW, don't flag if `bt_only > 0` |
+  | 3. Heavy tail | `p95 > $0.50` AND `median < $0.10` | quiet baseline, hot tail — investigate |
+  | 4. Volume floor | `position_pairs_compared < 20` | skip Layers 1–3 — too few samples for percentiles |
+
+  For `cur_realised_usdt` Layer-1 replaces the old `max > $0.30` rule; for `pos_value_usdt` use `spike_intensity > $0.30` (cleaner than the old `> $0.50`).
+- **Layer-shorthand → emitted-key**: the helper's internal `spike_count_abs`/`spike_count_rel` are exported as `<family>_spike_count_30c` / `<family>_spike_count_relative_3`; `median`→`<family>_median_abs_delta`, `spike_intensity`→`<family>_spike_intensity`. Never grep for a bare `spike_count_abs` key — it does not exist in `validation_metrics.csv`. Layer-2's `bt_only > 0` suppression qualifier maps to **`position_pairs_unmatched_bt`** (per-snapshot unmatched-backtest rows — the queue-priority accumulation the C108 example cites), NOT the trade-level `backtest_only_count`.
+- **CSV/console**: `export_metrics` appends the six rows contiguous per family (after each `_mean/_max` pair; `pnl_*` after `cumulative_pnl_delta`, before `pnl_correlation` — no pnl mean/max anchor) via `_robust_stat_rows`. `print_summary` adds a grouped `POSITION ROBUST STATS` block (median/p95/max side-by-side) + a `PnL robust:` line. Additive only — no existing row removed/reordered; per-snapshot `position_comparison.csv` unchanged.
+
 ---
 
 ## recorder — Standalone Data Recorder
@@ -2395,6 +1009,16 @@ Records raw Bybit mainnet WebSocket data to SQLite. Reuses `event_saver` collect
 - **Phase 4 shared DB + surgical wipe + identity bootstrap (features 0049 + 0053)**: Phase 4 default is a **shared SQLite DB** used by gridbot, recorder, replay, and comparator. All four processes must resolve `database_url` to the same physical file; the documented form is `sqlite:////<abs-path>/data/recorder_ltcusdt_phase4.db` (four slashes = absolute), avoiding gridbot CWD-dependent relative resolution. `scripts/phase4/start_recorder.sh` no longer parses YAML in shell — it invokes `scripts/phase4/prepare_recorder_session.py` (thin wrapper around `recorder.prepare_session.main`), which uses `recorder.config.load_config` so `database_url` env-var expansion (`${VAR}`) is honored. Prepare does three things in one pass: (1) **§5.1 + §5.2 surgical wipe** inside a single `BEGIN IMMEDIATE` transaction with `PRAGMA foreign_keys=ON` — §5.1 deletes any rows still stamped with the legacy placeholder `account_id='00000000-...-002'` (one-time 0053 migration; idempotent thereafter); §5.2 broad-deletes `private_executions`, `orders`, `wallet_snapshots`, `position_snapshots WHERE source='live'`, then `runs WHERE run_type='recording'`. The final `runs` delete cascades through `position_snapshots.run_id` and removes `source='backtest'` rows tied to the recording runs (intentional — old replay artifacts). `ticker_snapshots` is **not** wiped — public ticker data has no `account_id` column and is reusable across recorder restarts. (2) **Identity bootstrap (when `account:` set)**: insert-if-missing `User`/`BybitAccount`/`Strategy` rows derived from `--gridbot-config` so the recorder's verify-only `_seed_db_records` succeeds on a clean DB without requiring gridbot to start first. No `runs` row is inserted by prepare — gridbot still creates `run_type='live'`, recorder still creates `run_type='recording'`. (3) **Preflight verify**: runs the same `verify_shared_db_parents` (`apps/recorder/src/recorder/shared_db_parents.py`) the recorder uses — 3 existence + 5 metadata checks. Stale rows with mismatched `environment` / `strategy_type` / `symbol` / ownership fail here (`start_recorder.sh` aborts), not after the recorder has been launched into a guaranteed `_seed_db_records` failure. `BybitAccount.environment` is bootstrapped from gridbot `AccountConfig.testnet` (not recorder top-level `testnet`); the recorder/gridbot testnet config-parity check at prepare time guards against further drift. The wipe does **not** delete the DB file or the `-wal` / `-shm` sidecars. Preserved on each recorder start: `grid_state_snapshots` (gridbot-owned, feature 0047 seed data), `runs WHERE run_type='live'`, `bybit_accounts`, `strategies`, `users`, `ticker_snapshots`. If the DB file does not exist yet, the wipe is a no-op; prepare calls `db.create_tables()` before parent inserts. Helper scripts and runbook snippets that need the recorder identifiers must select the **latest `runs.run_type='recording'`** row — never unfiltered `ORDER BY start_ts DESC LIMIT 1` in a shared DB, since the newest row can belong to live gridbot. `ACCOUNT_ID` must come from that same recording-run row, not from `bybit_accounts LIMIT 1` (which can pick the wrong account when shared setup data contains multiple); after 0053 this `ACCOUNT_ID` is the uuid5 `account_id_for(name)` value, not the legacy placeholder. `public_trades` is **not** part of the wipe — Phase 4 LTCUSDT runs with `capture_public_trades: false`. Recorder credentials in Phase 4 configs are `${BYBIT_READONLY_API_KEY}` / `${BYBIT_READONLY_API_SECRET}` (read-only), distinct from gridbot's live `${BYBIT_API_KEY}` / `${BYBIT_API_SECRET}` (trade-permission). Resolved by feature 0052: replay's `grid_state_snapshots` lookup is cross-run by `(account_id, strat_id, symbol)`, so the recorder/gridbot `run_id` divergence no longer drops the DB grid-state seed (see the Grid State DB snapshots section for the contract).
 
 - **Phase 4 recorder startup — snapshot sentinels are the shell contract (feature 0055)**: `start_recorder.sh` must classify the initial REST snapshot result via terminal sentinels emitted by `recorder.py:_write_initial_rest_snapshot`, not by grepping the human-readable `Initial REST snapshot:` INFO line. The recorder emits the INFO line *before* the WARNING on the zero-count failure path (lines 308–326), so a wait loop that breaks on the INFO line races the failure and can declare success on an incomplete snapshot. Sentinels: `RECORDER_SNAPSHOT_OK` (wallet_count > 0 AND position_count > 0) and `RECORDER_SNAPSHOT_INCOMPLETE` (auth-client construction failure OR zero wallet/position rows). Two shell libs back this contract — both side-effect-free at top level so pytest can source them: `scripts/phase4/lib/recorder_snapshot_check.sh` (`_classify_recorder_snapshot` returns 0/1/2 for OK/INCOMPLETE/timeout) and `scripts/phase4/lib/recorder_stop.sh` (`_stop_recorder_pattern PATTERN [WAIT_SECONDS]` SIGINTs by `pkill -f`, polls `pgrep -f`, returns 0 on clean shutdown / 1 with a `ps aux` diagnostic on stderr if still alive). On INCOMPLETE or 15s timeout the launcher calls `_stop_recorder_pattern "recorder --config $CONFIG"` (pattern, not `$RECORDER_PID` — the `uv` wrapper PID may shadow the Python child), waits up to 10s, and exits non-zero with no `Recorder PID:` tail. Same helper is used for the stop-prior-recorder block at script start, so kill+verify lives in exactly one place. Adding new exit paths in `_write_initial_rest_snapshot` requires emitting one of the two sentinels — otherwise the wait loop hangs to timeout. The launcher process-management branches (kill on incomplete, kill on timeout, manual-intervention on stuck shutdown) are covered by `apps/recorder/tests/test_start_recorder_check.py:TestStopRecorderPattern` via bash-function stubs (`pkill`/`pgrep`/`sleep`/`ps` defined before sourcing the lib — function lookup wins over PATH). `start_recorder.sh` itself is still not sourced from pytest (top-level side effects); `TestStartRecorderLauncherIntegration` instead asserts the launcher sources the lib and calls the helper.
+
+### Recorder-specific test pitfalls
+
+1. **TickerEvent fields**: Does NOT have `index_price` or `next_funding_time` — check `gridcore.events.TickerEvent` dataclass definition before constructing test fixtures.
+2. **Mock collectors need `stop = AsyncMock()`**: When mocking `PublicCollector`/`PrivateCollector`, must set `stop` as `AsyncMock()` since `Recorder.stop()` awaits them.
+3. **`_close_dangling_coro()` pattern**: When testing `cli()` that calls `asyncio.run(main(...))`, the mock creates an unawaited coroutine. Use the helper to close it after assertions (same pattern as gridbot `test_main.py`).
+4. **Testnet default differs**: Recorder defaults to `testnet=False` (mainnet), unlike gridbot which defaults to `testnet=True`.
+5. **Position/wallet test data format**: `PositionWriter` and `WalletWriter` expect Bybit-formatted dicts with `"data"` keys (e.g., `{"data": [{"symbol": "BTCUSDT", ...}]}`). Flat dicts silently produce zero snapshots.
+6. **Test fixture deduplication**: Shared `db` fixture lives in `conftest.py` — do not duplicate in individual test files. Same for `basic_config` and `config_with_account`.
+7. **Mock config completeness**: When using `MagicMock()` for config in tests, set all attributes that `main()` accesses before the code path under test. E.g., `mock_config.database_url = "sqlite:///test.db"` — bare MagicMock attributes break `urlparse()`.
 
 ---
 
@@ -2423,6 +1047,27 @@ Reads recorded data, feeds through GridEngine + simulated order book, compares a
 - `position_snapshots` has a CHECK constraint `source IN ('live', 'backtest')` (Postgres) plus a B-tree index `(run_id, account_id, symbol, side, source, exchange_ts)`. Equality predicates precede the `exchange_ts` range — do not reorder.
 - One-off SQL migration for existing DBs: `scripts/migrate_0034_position_telemetry.py --database-url ...`. Fresh DBs get the columns via `Base.metadata.create_all()`.
 
+### Fill simulator modes
+
+3. **Replay Fill Simulator Modes**
+   - `strict_cross`: conservative trade-tape model. BUY fills only below limit; SELL fills only above limit. Used as `BacktestEngine` default and as opt-in for replay backward-compat baseline.
+   - `trade_through_at_limit`: last-price model that includes exact limit touches (`<=` / `>=`).
+   - `book_touch`: parity mode using recorded L1 (`ask1 <= limit` for BUY, `bid1 >= limit` for SELL), falling back to `trade_through_at_limit` for legacy bare-price callers. Was the replay default through features 0033–0050; kept as opt-in for legacy L1-touch parity.
+   - `last_cross` (**replay default since feature 0051**): transition-based aggressor detection. BUY fires when `prev_last > limit_price` AND `curr_last <= limit_price`; SELL fires when `prev_last < limit_price` AND `curr_last >= limit_price`. Strict inequality on `prev_last` — `prev_last == limit_price` does **not** count as a cross. Sticky `last_price` (`prev == curr`) never fires. First-ever observation of a symbol returns `False` (no prior tick). Legacy bare-`Decimal` input on `check_fill` returns `False` for `LAST_CROSS` and does not mutate any state slot (no symbol/exchange_ts available to key the per-tick advance). v7 A/B re-validation cut fill-timing `|delta|` from 19.0s (`book_touch`) to 5.1s at match_rate=100%, closing issue #117's +12.6s lag.
+   - `advance_market(market: TickerEvent)` contract (feature 0051): `BacktestOrderManager.check_fills` calls `self.fill_simulator.advance_market(market)` as the first statement inside the `isinstance(market, TickerEvent)` branch, before the per-order loop. Runs unconditionally on every `TickerEvent` (including orderless ticks) so the `T -> T+1` transition signal is preserved when no order is active for the symbol. The legacy bare-`Decimal` `else`-branch never calls `advance_market`. The simulator owns three per-symbol state dicts: `_prev_last_price` (committed prior-tick value), `_tick_prev_last` (read slot for the in-flight tick), and `_tick_token` (idempotency guard keyed on `(symbol, exchange_ts, local_ts)`). Repeated calls within a tick are no-ops. `_should_fill_last_cross` reads only `_tick_prev_last` and never writes.
+   - **Test fixture timestamp discipline (pitfall, feature 0051)**: every snapshot in a multi-tick `LAST_CROSS` test MUST carry monotonically distinct `(exchange_ts, local_ts)` values. Reusing one timestamp across two snapshots makes the second `advance_market` call token-match the first and silently no-op — the stash never runs, `_tick_prev_last[symbol]` stays `None`, and the test asserts `False` on every cross. The `_ticker` / `_ticker_for` helpers in `apps/backtest/tests/test_fill_simulator.py` accept a `tick_index: int` parameter that offsets both timestamps by `timedelta(milliseconds=tick_index)`. Pass `tick_index=0` for prev and `tick_index=1` for curr. Production replay is protected from this collision by the DB unique constraint on `(symbol, exchange_ts)` at `shared/db/src/grid_db/models.py:265-267`; tests do not go through that path.
+   - Default split: `apps/replay` defaults to `last_cross` (timing-accurate transition detection; v7 A/B vs `book_touch` showed 19.0s → 5.1s fill-timing improvement at 100% match-rate); `BacktestEngine` keeps `strict_cross` because forward backtest data sources may lack the L1/last-price-history required by the parity-oriented modes.
+   - `BacktestOrderManager.check_fills(TickerEvent(...))` is always scoped to the ticker's own symbol; the legacy bare-Decimal path preserves all-symbol scanning when no `symbol` filter is supplied.
+   - Rationale: production backtests keep conservative semantics; replay parity smoke benefits from the richer bid/ask already stored in `ticker_snapshots`.
+
+### Replay-specific test pitfalls
+
+1. **InMemoryDataProvider for tests**: Use `data_provider=` parameter in `engine.run()` to bypass DB reads — avoids needing real TickerSnapshot rows in test DB.
+2. **InstrumentInfoProvider must be mocked**: Tests use `@patch("replay.engine.InstrumentInfoProvider")` — the provider tries to fetch real instrument info otherwise.
+3. **Run resolution needs full FK chain**: When seeding test DB for run resolution tests, must create User → BybitAccount → Strategy → Run (foreign key constraints).
+4. **`datetime.fromisoformat()` requires Python 3.11+** for full timezone offset support. Earlier versions don't handle `+00:00`.
+5. **Test for `ValidationError` not `Exception`**: Pydantic config validation tests should use `from pydantic import ValidationError` for specific assertions.
+
 ---
 
 ## pnl_checker — Live PnL Validation
@@ -2439,6 +1084,13 @@ Read-only tool comparing our PnL/margin calculations against Bybit exchange valu
 - `BYBIT_API_KEY`/`BYBIT_API_SECRET` env vars override YAML config
 - `liqPrice` can be empty string — use `Decimal(pos.get("liqPrice", "0") or "0")`
 - Initial Margin comparison will show FAIL in hedge mode (expected — Bybit UTA uses mark_price + hedge optimization)
+- **Division guard constants**: `MIN_POSITION_IM` and `MIN_LEVERAGE` in `calculator.py` prevent division by near-zero values. Warnings are logged when these guards activate.
+- **Symbol validation**: `_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{4,20}$")` in `config.py`. Bybit symbols are uppercase alphanumeric only.
+- **`get_transaction_log_all()` return type**: Returns `tuple[list[dict], bool]` — the bool indicates whether data was truncated at `max_pages`. Callers must handle the truncation flag.
+- **Config redaction**: `_redact_config()` in `reporter.py` replaces API credentials with `[REDACTED]` before writing to JSON output. Never serialize raw `AccountConfig` to files.
+- **Tolerance scaling for percentages**: PnL % values are 100x USDT values. Use `PERCENTAGE_TOLERANCE_MULTIPLIER = 100` in `comparator.py` to scale tolerance for ROE comparisons.
+- **Test coverage**: Currently at 92%. Run: `uv run pytest apps/pnl_checker/tests --cov=pnl_checker --cov-report=term-missing -v`
+- **Workspace dependency**: `pnl-checker` must be in root `pyproject.toml` dev deps AND `tool.uv.sources` for test discovery to work.
 
 ---
 
@@ -2496,7 +1148,16 @@ All risk config thresholds (`max_margin=8`, `min_total_margin=0.15`) are ratios.
     - **#3a integration tests MUST use `wind_down_mode: leave_open`** — `_wind_down` (close_all) does not call `refresh_balances`/`update_equity` and `finalize()` does not rewrite `total_equity`, so read `session.total_equity` after the tick loop, NOT post-`finalize()`. Static-balance limitation: `coin_balances` are frozen at seed; live deposits/withdrawals/spot-trades of the coin during the window are un-modelled (#3a WARN). Empty `collateral_coins` → term is identically zero (USDT-only no-op, acceptance #4).
     - Real-data attribution: `scripts/verify_0065_collateral.py` shows `balance × (mark_end − mark_seed)` against live `totalEquity` drift on a recorder DB. See `docs/features/0065_PLAN.md`.
 
-## Dynamic Risk Limit Tiers (Feature/dynamic risk limit tiers)
+26. **`claude-code-action` workflow file must match default branch** — The `.github/workflows/claude-code-review.yml` on a PR branch must be identical to the version on `main`. Modify it on `main` first, then all future PRs pick it up. If you change it on a feature branch, the OIDC token validation fails with "Workflow validation failed."
+27. **`_margin_ratio` in calculator.py** — Distinguishes `pos is None` (no position, returns 0 silently) from `wallet_balance <= 0` (logs warning then returns 0). This aids debugging when wallet data is missing.
+28. **`grid.py __center_grid` rebalancing** — `lowest_buy_price` must be tracked in the loop (not just initialized from `grid[0]`). After `update_grid` changes sides, grid[0] may be WAIT, not BUY. Fixed 2026-04-11.
+29. **f-string division in `runner.py _process_fill`** — Decimal division by `session.current_balance` inside f-strings crashes even when debug logging is disabled. Always guard balance divisions with `> 0` check outside the f-string. Fixed 2026-04-11.
+30. **`reconciler.py` public trade reconciliation** — Bybit's `/v5/market/recent-trade` only returns the most recent trades; it does NOT support time-range queries. The reconciler logs a warning when fetched data doesn't cover the gap. Execution reconciliation (`get_executions_all`) correctly passes `start_time`/`end_time`. Fixed 2026-04-11.
+31. **`runner.py _execute_intents` stale limits snapshot** — `_execute_intents()` must refresh the `limits` snapshot after each successful `_execute_place_intent()` call. Without this, multiple reduce-only intents in the same batch all check against the same stale snapshot, over-covering the position and causing Bybit 110017 reduce-only rejections. Path: `apps/gridbot/src/gridbot/runner.py`. Fixed 2026-04-11.
+32. **Backtest `_should_place_close` must resolve intent qty** — Engine emits `qty=0`; the gate must resolve it via `executor.qty_calculator` before checking `pos_size > (pending + intent_qty)`. Without this, the backtest gate is weaker than live `_is_good_to_place()` and allows over-closing positions. Path: `apps/backtest/src/backtest/runner.py`. Fixed 2026-04-11.
+33. **Backtest `_apply_risk_to_qty` must re-round after multiplier** — Base qty is rounded to `qty_step`, but multiplying by the risk multiplier can produce sub-step values (e.g., 0.001 * 0.5 = 0.0005). Must call `instrument_info.round_qty()` after multiplying, matching live `_resolve_qty`. Path: `apps/backtest/src/backtest/runner.py`. Fixed 2026-04-11.
+
+## Dynamic Risk Limit Tiers
 
 Per-symbol maintenance-margin tiers are now fetched from Bybit's `/v5/market/risk-limit` API instead of relying solely on hardcoded tables. This fixed LTCUSDT MM mismatch (our DEFAULT used 1% MMR at $1M, Bybit actual is 1% at $200k).
 
@@ -2519,60 +1180,6 @@ Per-symbol maintenance-margin tiers are now fetched from Bybit's `/v5/market/ris
 2. **Non-fatal failure** — Risk limit fetch failures return `None` everywhere. `calc_maintenance_margin(tiers=None)` gracefully falls back to hardcoded tables. No crash path.
 3. **Cache strategy** — `RiskLimitProvider.get()`: fresh cache → API → stale cache → hardcoded fallback. Cache at `conf/risk_limits_cache.json`, 24h TTL. Force refresh: `provider.get("BTCUSDT", force_fetch=True)`.
 4. **`get_risk_limit()` is a public endpoint** — No API keys needed. In pnl_checker it goes through the authenticated `BybitRestClient` (shared rate limiter). In backtest it uses the injected client.
-
-### Pitfalls
-
-1. **`claude-code-action` workflow file must match default branch** — The `.github/workflows/claude-code-review.yml` on a PR branch must be identical to the version on `main`. Modify it on `main` first, then all future PRs pick it up. If you change it on a feature branch, the OIDC token validation fails with "Workflow validation failed."
-2. **`_margin_ratio` in calculator.py** — Distinguishes `pos is None` (no position, returns 0 silently) from `wallet_balance <= 0` (logs warning then returns 0). This aids debugging when wallet data is missing.
-3. **`grid.py __center_grid` rebalancing** — `lowest_buy_price` must be tracked in the loop (not just initialized from `grid[0]`). After `update_grid` changes sides, grid[0] may be WAIT, not BUY. Fixed 2026-04-11.
-4. **f-string division in `runner.py _process_fill`** — Decimal division by `session.current_balance` inside f-strings crashes even when debug logging is disabled. Always guard balance divisions with `> 0` check outside the f-string. Fixed 2026-04-11.
-5. **`reconciler.py` public trade reconciliation** — Bybit's `/v5/market/recent-trade` only returns the most recent trades; it does NOT support time-range queries. The reconciler logs a warning when fetched data doesn't cover the gap. Execution reconciliation (`get_executions_all`) correctly passes `start_time`/`end_time`. Fixed 2026-04-11.
-6. **`runner.py _execute_intents` stale limits snapshot** — `_execute_intents()` must refresh the `limits` snapshot after each successful `_execute_place_intent()` call. Without this, multiple reduce-only intents in the same batch all check against the same stale snapshot, over-covering the position and causing Bybit 110017 reduce-only rejections. Path: `apps/gridbot/src/gridbot/runner.py`. Fixed 2026-04-11.
-7. **Backtest `_should_place_close` must resolve intent qty** — Engine emits `qty=0`; the gate must resolve it via `executor.qty_calculator` before checking `pos_size > (pending + intent_qty)`. Without this, the backtest gate is weaker than live `_is_good_to_place()` and allows over-closing positions. Path: `apps/backtest/src/backtest/runner.py`. Fixed 2026-04-11.
-8. **Backtest `_apply_risk_to_qty` must re-round after multiplier** — Base qty is rounded to `qty_step`, but multiplying by the risk multiplier can produce sub-step values (e.g., 0.001 * 0.5 = 0.0005). Must call `instrument_info.round_qty()` after multiplying, matching live `_resolve_qty`. Path: `apps/backtest/src/backtest/runner.py`. Fixed 2026-04-11.
-
-## Phase K: PnL Checker (`apps/pnl_checker/`)
-
-## Reference Code
-
-- Location: `bbu_reference/bbu2-master/`
-- Keep for comparison tests; never modify
-- **WARNING**: Contains bugs (e.g., short position liq risk logic)
-
-## Docs
-
-Feature documentation lives in `docs/features/` — see `0001_IMPLEMENTATION_SUMMARY.md`, `ORDER_IDENTITY_DESIGN.md`, `0003_FIXES.md`, `0008_PLAN.md`, `0009_PLAN.md`, etc.
-
-### Key Implementation Notes
-
-1. **Mark Price Source**: Use `pos.mark_price` (from position endpoint) NOT `ticker.mark_price` (from ticker endpoint) for unrealized PnL — matches what Bybit uses for `unrealisedPnl` in the same API response.
-
-2. **Funding Data Is Informational**: Funding records from transaction log are display-only (no tolerance check). Attach funding fields to the first position per symbol only (avoid duplication in hedge mode).
-
-3. **Rate Limiting**: `BybitRestClient` integrates `RateLimiter` with 10 req/sec for queries (well under Bybit's 50 req/sec). All API methods call `_wait_for_rate_limit()` before making requests.
-
-4. **Division Guard Constants**: `MIN_POSITION_IM` and `MIN_LEVERAGE` in `calculator.py` prevent division by near-zero values. Warnings are logged when these guards activate.
-
-5. **Environment Variable Credentials**: `BYBIT_API_KEY`/`BYBIT_API_SECRET` env vars override YAML config values via Pydantic `model_validator`. Config file uses `default=""` to allow empty values when env vars are set.
-
-6. **Symbol Validation**: `_SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]{4,20}$")` in `config.py`. Bybit symbols are uppercase alphanumeric only.
-
-7. **`get_transaction_log_all()` Return Type**: Returns `tuple[list[dict], bool]` — the bool indicates whether data was truncated at `max_pages`. Callers must handle the truncation flag.
-
-8. **Config Redaction**: `_redact_config()` in `reporter.py` replaces API credentials with `[REDACTED]` before writing to JSON output. Never serialize raw `AccountConfig` to files.
-
-### Common Pitfalls (PnL Checker)
-
-1. **`liqPrice` can be empty string**: Bybit returns `""` for liq price when not applicable. Use `Decimal(pos.get("liqPrice", "0") or "0")` — the `or "0"` handles empty string.
-2. **Tolerance scaling for percentages**: PnL % values are 100x USDT values. Use `PERCENTAGE_TOLERANCE_MULTIPLIER = 100` in `comparator.py` to scale tolerance for ROE comparisons.
-3. **Test coverage**: Currently at 92%. Run: `uv run pytest apps/pnl_checker/tests --cov=pnl_checker --cov-report=term-missing -v`
-4. **Workspace dependency**: `pnl-checker` must be in root `pyproject.toml` dev deps AND `tool.uv.sources` for test discovery to work.
-5. **Initial Margin comparison (known mismatch)**: Our `calc_initial_margin` uses `positionValue / leverage` (entry-based). Bybit UTA cross-margin uses mark_price and hedge optimization. The IM comparison will show FAIL in hedge mode — this is expected. The comparison exists for visibility, not accuracy validation.
-
-## Dynamic Risk Limit Tiers
-
-### Overview
-Risk limit tiers determine maintenance margin (MM) and initial margin (IM) rates based on position size. These tiers are fetched dynamically from Bybit API and cached locally.
 
 ### Files Involved
 - `packages/gridcore/src/gridcore/pnl.py` — `MMTiers` type, hardcoded fallback tiers (`MM_TIERS_BTCUSDT`, etc.), `parse_risk_limit_tiers()`, `calc_maintenance_margin()`, `calc_initial_margin()`
@@ -2616,6 +1223,16 @@ Risk limit tiers determine maintenance margin (MM) and initial margin (IM) rates
 14. **_open_lock_file TOCTOU**: Uses `os.lstat()` (not `is_symlink()`) for pre-check and always validates path identity post-open via inode/device comparison, regardless of O_NOFOLLOW support.
 15. **Negative position_value**: `calc_initial_margin` logs a warning and returns zero for negative `position_value` (likely a data error).
 16. **In-process lock registry location**: `_IN_PROCESS_LOCKS` and `acquire_in_process_lock` / `release_in_process_lock` live in `cache_lock.py`, not `risk_limit_info.py`. Integration tests that assert ref-counts must import `backtest.cache_lock`; oversized-cache warnings log `CacheSizeExceededError` text (`"Cache file size"` … `"exceeds"`), not the legacy `"Cache file exceeds"` substring.
+
+## Reference Code
+
+- Location: `bbu_reference/bbu2-master/`
+- Keep for comparison tests; never modify
+- **WARNING**: Contains bugs (e.g., short position liq risk logic)
+
+## Docs
+
+Feature documentation lives in `docs/features/` — see `0001_IMPLEMENTATION_SUMMARY.md`, `ORDER_IDENTITY_DESIGN.md`, `0003_FIXES.md`, `0008_PLAN.md`, `0009_PLAN.md`, etc.
 
 ## Risk Limit Cache Format Evolution
 
