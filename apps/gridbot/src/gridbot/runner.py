@@ -1943,6 +1943,13 @@ class StrategyRunner:
 
     def _exit_chase(self) -> None:
         self._retire_live_chase_order("chase_exit")
+        # Drop buffered grow-side cancel intents queued on _enter_chase. They are
+        # only valid while CHASING; if exit happens before the next drain, leaving
+        # them would cancel resting grid opens after chase mode has ended.
+        self._pending_chase_intents = [
+            i for i in self._pending_chase_intents
+            if not (isinstance(i, CancelIntent) and i.reason == "chase_close")
+        ]
         logger.info("%s: chase-close EXIT %s", self.strat_id, self._chase_direction)
         self._chase_state = "IDLE"
         self._chase_direction = None
