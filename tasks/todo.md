@@ -1,25 +1,17 @@
-# 0069 — Auto state-divergence detector + on-demand forced reconcile (issue #151)
+# 0072 — Event-driven follower fill mode (issue #168)
 
-Plan: docs/features/0069_PLAN.md  |  Branch: feature/0069-divergence-detector
+Plan: docs/features/0072_PLAN.md  |  Branch: feature/0072-event-follower
 
-## Status: implementation + tests + docs COMPLETE (adversarial review running)
+## Status: implementation + tests + docs COMPLETE (awaiting review)
 
-- [x] error_codes.py — `ORDER_LINK_ID_DUPLICATE = 110072`
-- [x] executor.py — `is_network_error`, `is_duplicate_link_error` classifiers
-- [x] config.py — 7 new `divergence_*` StrategyConfig fields (ge=1 / gt=0 constraints)
-- [x] runner.py — `_record_placement_failure` (signal 1), `clear_dedup_cache`,
-      `rest_position_size` (pure read), `on_divergence_failure_mix` ctor param,
-      `_placement_failure_window`, two `_execute_place_intent` call sites
-- [x] orchestrator.py — `_force_reconcile_strat` refactor (`direction:str|None`,
-      `emit_breaker_warning`, `-> bool`, both-directions internal), wrapper
-      `_trigger_divergence_reconcile`, `_enqueue_post_recovery_reconcile`,
-      `_divergence_size_check_once`/`_interval`, signal-1 wiring, signal-2 edge in
-      `_health_check_once`, signal-3 gate+priming, signal-4 enqueues (3 private
-      sources) + pinned `_tick` drain + order-sync fast-track, new __init__ state
-- [x] analyze.py — merged `force_reconcile_fired` event_coverage key + label + scan
-- [x] Tests: test_runner_divergence.py, test_orchestrator_divergence.py,
-      test_executor.py classifiers, test_config.py, test_analyze.py
-- [x] Docs: RULES.md 0069 section, SKILL.md Table 13 note
-- [x] Full suite green: 1258 passed, 1 skipped (apps/gridbot + packages)
+- [x] Step 1 — Foundations: repo secondary sort (exchange_ts, exec_id); FillMode.EVENT_FOLLOWER + _should_fill raise; config Literal + docstring
+- [x] Step 2 — RecordedExecution dataclass + EventFollower (drain/match, tz-normalized, initial_prev_ts boundary) + unit tests
+- [x] Step 3 — order_manager.apply_recorded_fill (placed-qty cap, pro-rated fee/pnl, partial/full) + unit tests
+- [x] Step 4 — session.py: shared _pnl_delta + set_pending_wallet/clear_pending_wallet (pending fold-in)
+- [x] Step 5 — runner.py: _event_follower attr, _prev_tick_ts, _dispatch_intents extraction (trigger-3 hook), iterative drain in process_fills, _FillRollup buffers + triggers 1-4, finalize_event_follower, EPS basis check
+- [x] Step 6 — replay engine.py wiring: load+materialize inside session, symbol filter, _init_runner kwarg + post-construction stash, finalize call after tick loop before wind-down
+- [x] Step 7 — reporter mode-aware relabel (backtest_only/live_only)
+- [x] Step 8 — tests: test_fill_simulator_event_follower.py (23 unit), test_engine_event_follower.py (4 integration incl. oracle round-trip: live_only=0, backtest_only=0, pnl delta 0, partial aggregation, same-window open→close, ETH symbol canary)
+- [x] Step 9 — RULES.md event_follower entry; regression: 830 passed (backtest+replay+comparator) + 155 (shared/db)
 
 ## Not committed — awaiting user review/approval before any commit.

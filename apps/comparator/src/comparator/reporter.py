@@ -457,8 +457,26 @@ class ComparatorReporter:
         return paths
 
     def print_summary(self) -> None:
-        """Print summary metrics to console."""
+        """Print summary metrics to console.
+
+        0072: in event_follower mode the labels shift meaning — fills are
+        sourced from the recorded live execution stream, so the backtest
+        never invents a fill (``backtest_only`` is structurally 0) and
+        ``live_only`` measures where the strategy's kept-open order set
+        diverged from live (intent-set divergence), not simulator misses.
+        """
         m = self._metrics
+        is_event_follower = self._metadata.get("fill_mode") == "event_follower"
+        live_only_note = (
+            "(intent-set divergence from live)"
+            if is_event_follower
+            else "(missed by backtest)"
+        )
+        backtest_only_note = (
+            "(structurally 0 in event_follower)"
+            if is_event_follower
+            else "(phantom fills)"
+        )
         lines = [
             "",
             "=" * 60,
@@ -468,8 +486,8 @@ class ComparatorReporter:
             f"  Live trades:      {m.total_live_trades}",
             f"  Backtest trades:  {m.total_backtest_trades}",
             f"  Matched:          {m.matched_count}",
-            f"  Live-only:        {m.live_only_count} (missed by backtest)",
-            f"  Backtest-only:    {m.backtest_only_count} (phantom fills)",
+            f"  Live-only:        {m.live_only_count} {live_only_note}",
+            f"  Backtest-only:    {m.backtest_only_count} {backtest_only_note}",
             f"  Match rate:       {m.match_rate:.1%}",
             f"  Phantom rate:     {m.phantom_rate:.1%}",
             "",

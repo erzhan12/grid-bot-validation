@@ -240,6 +240,7 @@ class FillSimulatorConfig(BaseModel):
         "trade_through_at_limit",
         "book_touch",
         "last_cross",
+        "event_follower",
     ] = Field(
         default="last_cross",
         description=(
@@ -253,7 +254,13 @@ class FillSimulatorConfig(BaseModel):
             "runs (issue #117). Override to 'book_touch' for the "
             "legacy L1-touch behaviour, 'trade_through_at_limit' for "
             "the sticky-last-price model, or 'strict_cross' for "
-            "backward-compat parity runs."
+            "backward-compat parity runs. 'event_follower' (feature "
+            "0072) sources fills from the recorded live "
+            "private_executions stream instead of simulating against "
+            "the ticker: recorded exec_price/exec_qty/exec_fee/"
+            "closed_pnl are applied as-is, backtest_only is "
+            "structurally 0, and live_only measures intent-set "
+            "divergence from live (not simulator misses)."
         ),
     )
 

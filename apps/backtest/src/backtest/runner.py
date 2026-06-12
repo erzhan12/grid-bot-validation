@@ -6,7 +6,9 @@ The runner is responsible for:
 - Tracking positions and PnL
 """
 
+import dataclasses
 import logging
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -41,12 +43,44 @@ from grid_db.models import PositionSnapshot
 
 from backtest.config import BacktestStrategyConfig
 from backtest.executor import BacktestExecutor
+from backtest.fill_simulator import EventFollower, RecordedExecution
 from backtest.order_manager import BacktestOrderManager
 from backtest.position_tracker import BacktestPositionTracker
 from backtest.session import BacktestSession, BacktestTrade
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _FillRollup:
+    """Per-order-lifecycle aggregation buffer (event_follower, feature 0072).
+
+    Accumulates applied partial recorded fills for one
+    ``(matcher_key, recorded_order_id)`` order lifecycle until a flush
+    trigger fires, then becomes exactly one ``BacktestTrade`` — mirroring
+    ``LiveTradeLoader._aggregate_fills`` (one ``NormalizedTrade`` per
+    ``(client_id, order_id)``) so the post-run matcher pairs them.
+    """
+
+    matcher_key: str
+    recorded_order_id: str
+    symbol: str
+    side: str
+    direction: str
+    qty: Decimal = field(default_factory=lambda: Decimal("0"))
+    notional: Decimal = field(default_factory=lambda: Decimal("0"))  # Σ price×qty (VWAP)
+    fee: Decimal = field(default_factory=lambda: Decimal("0"))
+    closed_pnl: Decimal = field(default_factory=lambda: Decimal("0"))
+    # Σ tracker-derived realized for the EPS basis-agreement check only —
+    # never feeds the wallet (recorded closed_pnl is authoritative).
+    tracker_realized: Decimal = field(default_factory=lambda: Decimal("0"))
+    last_ts: Optional[datetime] = None
+    last_exec_id: str = ""
+    # Replay order ids that fed this rollup — lets a flush drop the
+    # _rollup_by_replay_order_id entries directly instead of rebuilding
+    # the whole index per flush.
+    replay_order_ids: set[str] = field(default_factory=set)
 
 
 class BacktestRunner:
@@ -78,6 +112,12 @@ class BacktestRunner:
     # `_estimate_pair_liq_prices` and the matching Open Decisions entry
     # in docs/features/0043_PLAN.md.
     _SHORT_ONLY_LIQ_CAP_MULTIPLIER: Decimal = Decimal("2")
+
+    # 0072: tolerance for the recorded-closed_pnl vs tracker-derived-realized
+    # basis-agreement check on flush. A few cents — the funding/rounding band
+    # (cf. memory project-pos-value-mark-jitter). Breach logs WARN only; the
+    # recorded value always wins for the wallet.
+    _FOLLOWER_BASIS_EPS: Decimal = Decimal("0.05")
 
     def __init__(
         self,
@@ -214,6 +254,25 @@ class BacktestRunner:
         self.position_snapshot_callback: Optional[
             Callable[[PositionSnapshot], None]
         ] = None
+
+        # 0072 event_follower: recorded-execution fill source. Stashed
+        # post-construction by the replay engine (same pattern as
+        # _position_writer) — NOT an __init__ kwarg. None ⇒ simulator
+        # modes; every follower branch below is dormant.
+        self._event_follower: Optional[EventFollower] = None
+        # Previous tick's exchange_ts (drain window left edge). Lazily
+        # initialized from EventFollower.initial_prev_ts on the first
+        # process_fills call (start_ts − 1µs; see EventFollower).
+        self._prev_tick_ts: Optional[datetime] = None
+        # Aggregation state: one rollup per (matcher_key, recorded_order_id)
+        # order lifecycle, plus a replay-order-id → rollup-key index for the
+        # trigger-3 (cancel-with-partial) flush in _dispatch_intents.
+        self._fill_rollups: dict[tuple[str, str], _FillRollup] = {}
+        self._rollup_by_replay_order_id: dict[str, tuple[str, str]] = {}
+        # Informational counter: recorded executions that found no active
+        # replay order after the within-tick fixpoint (the authoritative
+        # live_only_count still comes from the post-run matcher).
+        self._follower_live_only_count = 0
 
     def _copy_seeded_state_to_positions(self) -> None:
         """Mirror seeded tracker state into gridcore.Position instances.
@@ -364,6 +423,12 @@ class BacktestRunner:
         # 0034: cache the ticker mark so backtest snapshots store the mark
         # in PositionSnapshot.mark_price (matches recorder semantics).
         self._last_mark_price = event.mark_price
+
+        # 0072: event_follower sources fills from the recorded live
+        # execution stream — the simulator's check_fills is skipped wholesale.
+        if self._event_follower is not None:
+            return self._process_recorded_fills(event)
+
         intents: list[PlaceLimitIntent | CancelIntent] = []
 
         # Check for fills
@@ -379,6 +444,407 @@ class BacktestRunner:
             intents.extend(fill_intents)
 
         return intents
+
+    def _process_recorded_fills(
+        self, event: TickerEvent
+    ) -> list[PlaceLimitIntent | CancelIntent]:
+        """event_follower fill phase (feature 0072): iterative within-tick drain.
+
+        Drains all recorded executions in ``(prev_tick_ts, event.exchange_ts]``
+        and match-applies them against ``active_orders`` to a fixpoint. The
+        loop is iterative because a grid level often closes within the same
+        tick window it opened: the reactive close order only exists after the
+        open fill's intents are placed (via the ticker path at the fill's
+        exchange_ts), so a single forward pass would leave the close fill
+        unmatched (spurious live_only).
+
+        Executions still unmatched at the fixpoint had no active replay order
+        — they stay ``live_only`` (intent-set divergence; the backtest never
+        invents a fill).
+        """
+        follower = self._event_follower
+        if self._prev_tick_ts is None:
+            self._prev_tick_ts = follower.initial_prev_ts
+
+        buffer = follower.drain(self._prev_tick_ts, event.exchange_ts)
+        intents: list[PlaceLimitIntent | CancelIntent] = []
+
+        while True:
+            progress = False
+            leftover: list[RecordedExecution] = []
+            for execution in buffer:
+                match = follower.match(
+                    execution, self.order_manager.active_orders
+                )
+                if match is None:
+                    leftover.append(execution)
+                    continue
+                fill_event, is_fully_filled = (
+                    self.order_manager.apply_recorded_fill(
+                        match.replay_order_id,
+                        exec_price=execution.exec_price,
+                        exec_qty=execution.exec_qty,
+                        exec_fee=execution.exec_fee,
+                        closed_pnl=execution.closed_pnl,
+                        timestamp=execution.exchange_ts,
+                        exec_id=execution.exec_id,
+                    )
+                )
+                if fill_event is None:
+                    # Matched id but the order's placed qty is already fully
+                    # consumed (apply_qty == 0) — treat as unmatched.
+                    leftover.append(execution)
+                    continue
+                progress = True
+
+                rollup_key = (match.matcher_key, match.recorded_order_id)
+                self._rollup_by_replay_order_id[match.replay_order_id] = (
+                    rollup_key
+                )
+                self._apply_recorded_fill_row(
+                    fill_event, rollup_key, match.replay_order_id
+                )
+
+                # Trigger 1 — replay placed qty exhausted (intra-loop; the
+                # ONLY trigger evaluated inside the drain loop besides the
+                # cancel hook in _dispatch_intents). The flush itself drops
+                # the _rollup_by_replay_order_id entries for the lifecycle.
+                if is_fully_filled:
+                    self._maybe_flush_aggregated_trade(
+                        rollup_key, trigger=1, is_fully_filled=True
+                    )
+
+                # Grid mutation only — GridEngine._handle_execution_event
+                # updates last_filled_price / update_grid and always
+                # returns [] (never emits placement intents).
+                self._engine.on_event(fill_event)
+
+                # Reactive placement via the TICKER path at the fill's
+                # exchange_ts (same _handle_ticker_event → _check_and_place
+                # path execute_tick uses) so e.g. the close order placed
+                # after an open fill enters active_orders before the next
+                # buffered execution is matched. Orders placed here reuse
+                # the deterministic client_order_id the engine would emit
+                # again at tick end; place_order's _client_order_ids dedup
+                # rejects the duplicate in execute_tick.
+                synthetic_ticker = dataclasses.replace(
+                    event,
+                    exchange_ts=fill_event.exchange_ts,
+                    local_ts=fill_event.exchange_ts,
+                )
+                tick_intents = self._engine.on_event(
+                    synthetic_ticker, self.order_manager.get_limit_orders()
+                )
+                self._dispatch_intents(tick_intents, fill_event.exchange_ts)
+                intents.extend(tick_intents)
+
+            buffer = leftover
+            if not progress or not buffer:
+                break
+
+        if buffer:
+            self._follower_live_only_count += len(buffer)
+            for execution in buffer:
+                logger.debug(
+                    "%s: live_only recorded exec %s (order_id=%s, link=%s): "
+                    "no matching active replay order after fixpoint",
+                    self.strat_id, execution.exec_id, execution.order_id,
+                    execution.order_link_id,
+                )
+
+        # Trigger 2 — last-in-stream flush, post-fixpoint only (never inside
+        # the drain loop: same-order partials may still sit in the buffer).
+        self._flush_post_fixpoint(buffer)
+
+        # The engine's update_equity call (between process_fills and
+        # execute_tick) must see in-flight partial pnl/fees.
+        self._set_session_pending()
+
+        self._prev_tick_ts = event.exchange_ts
+        return intents
+
+    def _apply_recorded_fill_row(
+        self,
+        fill_event: ExecutionEvent,
+        rollup_key: tuple[str, str],
+        replay_order_id: str,
+    ) -> None:
+        """Apply one recorded partial fill row: tracker + pending wallet +
+        downstream liq/risk/snapshot — mirrors ``_process_fill`` minus
+        ``record_trade`` (the aggregated trade is recorded on flush).
+
+        The tracker is fed the recorded exec_price/apply_qty for its
+        size/entry side-effects; its derived realized return is accumulated
+        ONLY for the EPS basis-agreement check. The recorded ``closed_pnl`` /
+        ``fee`` (already pro-rated to the applied slice by
+        ``apply_recorded_fill``) go to the pending accumulators so
+        ``refresh_balances`` / ``update_equity`` fold them into the wallet
+        before the lifecycle's ``record_trade``.
+        """
+        # Determine direction from the order (active for partials, filled
+        # for the final slice — get_order_by_client_id searches both).
+        order = self._executor.order_manager.get_order_by_client_id(
+            fill_event.order_link_id
+        )
+        direction = (
+            order.direction if order else self._infer_direction(fill_event.side)
+        )
+        tracker = (
+            self._long_tracker
+            if direction == DirectionType.LONG
+            else self._short_tracker
+        )
+
+        # Size/entry side-effects; realized return used for the EPS check
+        # only — recorded closed_pnl is authoritative for the wallet.
+        tracker_realized = tracker.process_fill(
+            side=fill_event.side,
+            qty=fill_event.qty,
+            price=fill_event.price,
+        )
+
+        rollup = self._fill_rollups.get(rollup_key)
+        if rollup is None:
+            matcher_key, recorded_order_id = rollup_key
+            rollup = _FillRollup(
+                matcher_key=matcher_key,
+                recorded_order_id=recorded_order_id,
+                symbol=fill_event.symbol,
+                side=fill_event.side,
+                direction=direction,
+            )
+            self._fill_rollups[rollup_key] = rollup
+        rollup.qty += fill_event.qty
+        rollup.notional += fill_event.price * fill_event.qty
+        rollup.fee += fill_event.fee
+        rollup.closed_pnl += fill_event.closed_pnl
+        rollup.tracker_realized += tracker_realized
+        rollup.last_ts = fill_event.exchange_ts
+        rollup.last_exec_id = fill_event.exec_id
+        rollup.replay_order_ids.add(replay_order_id)
+
+        # Refresh margin fields (same as _process_fill).
+        tracker._update_margin()
+
+        # Pending sums must be visible BEFORE refresh_balances so
+        # intra-drain reactive execute_place (same tick window) sees the
+        # correct current_balance.
+        self._set_session_pending()
+        mark_for_unrealized = (
+            self._last_mark_price
+            if self._last_mark_price is not None
+            else fill_event.price
+        )
+        fresh_unrealized = (
+            self._long_tracker.calculate_unrealized_pnl(mark_for_unrealized)
+            + self._short_tracker.calculate_unrealized_pnl(mark_for_unrealized)
+        )
+        self._session.refresh_balances(fresh_unrealized)
+
+        # Pair liq computed once per fill, passed to the downstream
+        # consumers (same 0043 pattern as _process_fill).
+        liq_long, liq_short = self._estimate_pair_liq_prices(
+            self._long_tracker.state,
+            self._short_tracker.state,
+            self._session.total_equity,
+        )
+
+        logger.debug(
+            "%s: Recorded fill %s %s @ %s, closed_pnl=%s, direction=%s, "
+            "pos_size=%s, leaves_qty=%s",
+            self.strat_id, fill_event.side, fill_event.qty, fill_event.price,
+            fill_event.closed_pnl, direction, tracker.state.size,
+            fill_event.leaves_qty,
+        )
+
+        if (
+            self._enable_risk
+            and self._last_price is not None
+            and self._long_position is not None
+            and self._short_position is not None
+        ):
+            self._update_risk_multipliers(
+                float(self._last_price),
+                liq_long=liq_long,
+                liq_short=liq_short,
+            )
+
+        if self.position_snapshot_callback is not None:
+            mark_price = (
+                self._last_mark_price
+                if self._last_mark_price is not None
+                else fill_event.price
+            )
+            snap = self._emit_position_snapshot(
+                direction, fill_event.exchange_ts, mark_price,
+                liq_long=liq_long, liq_short=liq_short,
+            )
+            self.position_snapshot_callback(snap)
+
+    def _set_session_pending(self) -> None:
+        """Push Σ in-flight pending recorded pnl/fees to the session.
+
+        Summed fresh from the open rollups each call (bounded by active
+        order count) — no incremental drift.
+        """
+        pending_realized = sum(
+            (r.closed_pnl for r in self._fill_rollups.values()), Decimal("0")
+        )
+        pending_commission = sum(
+            (r.fee for r in self._fill_rollups.values()), Decimal("0")
+        )
+        self._session.set_pending_wallet(pending_realized, pending_commission)
+
+    def _maybe_flush_aggregated_trade(
+        self,
+        rollup_key: tuple[str, str],
+        *,
+        trigger: int,
+        is_fully_filled: bool = False,
+    ) -> None:
+        """Trigger-gated flush of one order lifecycle's rollup.
+
+        Triggers (feature 0072 design — evaluation sites are fixed):
+        1. ``is_fully_filled`` — intra-loop, after an applied fill.
+        2. Last-in-stream — per-tick post-fixpoint only
+           (``_flush_post_fixpoint``).
+        3. Cancel-with-partial — in ``_dispatch_intents`` immediately
+           before ``execute_cancel``.
+        4. End-of-replay sweep — ``finalize_event_follower()`` only.
+
+        Args:
+            rollup_key: ``(matcher_key, recorded_order_id)`` lifecycle key.
+            trigger: Calling-site id, 1–4 per the list above. Only trigger 1
+                is gated (``is_fully_filled``); 2–4 flush any non-empty
+                rollup. There is no runtime validation — any other value
+                behaves like 2–4, so a new call site must be added to the
+                trigger list above, not invented ad hoc.
+            is_fully_filled: Trigger-1 gate — replay placed qty exhausted.
+        """
+        rollup = self._fill_rollups.get(rollup_key)
+        if rollup is None or rollup.qty <= 0:
+            return
+        if trigger == 1 and not is_fully_filled:
+            return
+        self._flush_aggregated_trade(rollup_key)
+
+    def _flush_aggregated_trade(self, rollup_key: tuple[str, str]) -> None:
+        """Emit ONE ``BacktestTrade`` for a completed order lifecycle.
+
+        VWAP price + summed applied qty/fee/closed_pnl, stamped with
+        ``client_order_id = matcher_key`` and ``order_id =
+        recorded_order_id`` — exactly the live normalization key
+        (``LiveTradeLoader``: one ``NormalizedTrade`` per
+        ``(client_id, order_id)``), so the post-run matcher pairs them and
+        ``backtest_only = 0`` holds by construction. ``realized_pnl`` /
+        ``commission`` come from the aggregated RECORDED sums, not the
+        tracker derivation.
+        """
+        rollup = self._fill_rollups.pop(rollup_key)
+        vwap = rollup.notional / rollup.qty
+
+        # EPS basis-agreement check: tracker-derived realized vs recorded
+        # closed_pnl. A breach means the tracker's entry basis diverged from
+        # Bybit's (e.g. a missed open fill the strategy never placed) — WARN
+        # with both values; the recorded value still wins for the wallet.
+        basis_diff = abs(rollup.closed_pnl - rollup.tracker_realized)
+        if basis_diff > self._FOLLOWER_BASIS_EPS:
+            logger.warning(
+                "%s: event_follower basis drift on %s (order %s): recorded "
+                "closed_pnl=%s vs tracker-derived=%s (|diff|=%s > eps=%s)",
+                self.strat_id, rollup.matcher_key, rollup.recorded_order_id,
+                rollup.closed_pnl, rollup.tracker_realized, basis_diff,
+                self._FOLLOWER_BASIS_EPS,
+            )
+
+        trade = BacktestTrade(
+            trade_id=rollup.last_exec_id,
+            symbol=rollup.symbol,
+            side=rollup.side,
+            price=vwap,
+            qty=rollup.qty,
+            direction=rollup.direction,
+            timestamp=rollup.last_ts,
+            order_id=rollup.recorded_order_id,
+            client_order_id=rollup.matcher_key,
+            realized_pnl=rollup.closed_pnl,
+            commission=rollup.fee,
+            strat_id=self.strat_id,
+        )
+        self._session.record_trade(trade)
+
+        # Drop replay-order index entries pointing at the flushed lifecycle
+        # — direct pops via the rollup's id set, no full-index rebuild.
+        for replay_oid in rollup.replay_order_ids:
+            self._rollup_by_replay_order_id.pop(replay_oid, None)
+
+        # Flushed values now live in total_realized_pnl / total_commission;
+        # re-set the (reduced) pending sums, then refresh balances so the
+        # wallet reflects the migration immediately.
+        self._set_session_pending()
+        mark_for_unrealized = (
+            self._last_mark_price if self._last_mark_price is not None else vwap
+        )
+        fresh_unrealized = (
+            self._long_tracker.calculate_unrealized_pnl(mark_for_unrealized)
+            + self._short_tracker.calculate_unrealized_pnl(mark_for_unrealized)
+        )
+        self._session.refresh_balances(fresh_unrealized)
+
+    def _flush_post_fixpoint(
+        self, leftover: list["RecordedExecution"]
+    ) -> None:
+        """Trigger 2 — last-in-stream flush after the tick's drain fixpoint.
+
+        Flush each non-empty rollup whose recorded order has no further
+        executions in the follower's unconsumed tail AND none left in this
+        tick's unmatched leftover. Trigger 4 (end-of-replay) is NOT here —
+        it would flush in-flight partials every tick mid-run.
+
+        The two guards are complementary, not redundant: ``drain`` has
+        already consumed this tick's rows, so ``has_pending_for_order``
+        (last stream index >= cursor) sees only the UNDRAINED tail and is
+        blind to drained-but-unmatched rows sitting in ``leftover`` —
+        ``leftover_order_ids`` covers exactly those. Dropping either check
+        would flush lifecycles that still have rows in flight this tick.
+        """
+        leftover_order_ids = {ex.order_id for ex in leftover}
+        for rollup_key in list(self._fill_rollups):
+            _, recorded_order_id = rollup_key
+            if recorded_order_id in leftover_order_ids:
+                continue
+            if self._event_follower.has_pending_for_order(recorded_order_id):
+                continue
+            self._maybe_flush_aggregated_trade(rollup_key, trigger=2)
+
+    def finalize_event_follower(self) -> None:
+        """Trigger 4 — end-of-replay sweep (called by the replay engine
+        immediately after the tick loop, BEFORE wind-down, position-writer
+        flush, and session.finalize).
+
+        Flushes every remaining non-empty rollup (safety net for trigger-2
+        edge cases) so swept trades land in ``session.trades`` before
+        wind-down inputs, DB telemetry, and finalize stats; then clears the
+        session pending wallet. No-op for simulator modes.
+        """
+        if self._event_follower is None:
+            return
+        for rollup_key in list(self._fill_rollups):
+            self._maybe_flush_aggregated_trade(rollup_key, trigger=4)
+        self._session.clear_pending_wallet()
+        follower = self._event_follower
+        logger.info(
+            "%s: event_follower finalized: live_only(no-active-order)=%d, "
+            "qty_excess=%d, no_link_id=%d, fallback_order_id=%d, "
+            "fallback_price=%d, undrained=%d",
+            self.strat_id,
+            self._follower_live_only_count,
+            self.order_manager.qty_excess_divergence_count,
+            follower.no_link_id_count,
+            follower.fallback_order_id_count,
+            follower.fallback_price_count,
+            follower.remaining,
+        )
 
     def execute_tick(self, event: TickerEvent) -> list[PlaceLimitIntent | CancelIntent]:
         """Phase 2: Get intents from engine and execute them.
@@ -404,6 +870,31 @@ class BacktestRunner:
             self._grid_built = True
 
         # Execute intents (wallet_balance now reflects fills from phase 1)
+        self._dispatch_intents(intents, event.exchange_ts)
+
+        return intents
+
+    def _dispatch_intents(
+        self,
+        intents: list[PlaceLimitIntent | CancelIntent],
+        timestamp: datetime,
+    ) -> None:
+        """Execute engine intents (shared by execute_tick and the 0072
+        event_follower within-tick drain — extracted so the two paths cannot
+        drift).
+
+        For each ``PlaceLimitIntent``: gate close orders via
+        ``_should_place_close`` (skip if no position to close or already
+        fully covered — matches BBU2 ``_is_good_to_place()``), then
+        ``execute_place`` against the CURRENT ``session.current_balance``.
+
+        For each ``CancelIntent``: in event_follower mode, flush the
+        cancelled order's partial-fill rollup (trigger 3) BEFORE
+        ``execute_cancel`` removes it from ``active_orders`` — the recorded
+        partials are the complete live lifecycle for that placement. This is
+        the only cancel hook (``order_manager.cancel_order`` owns no rollup
+        state).
+        """
         for intent in intents:
             if isinstance(intent, PlaceLimitIntent):
                 # Gate close orders: skip if no position to close or position
@@ -413,7 +904,7 @@ class BacktestRunner:
                     continue
                 result = self._executor.execute_place(
                     intent,
-                    timestamp=event.exchange_ts,
+                    timestamp=timestamp,
                     wallet_balance=self._session.current_balance,
                 )
                 logger.debug(
@@ -422,13 +913,17 @@ class BacktestRunner:
                     intent.direction, intent.reduce_only, result.success,
                 )
             elif isinstance(intent, CancelIntent):
-                self._executor.execute_cancel(intent, timestamp=event.exchange_ts)
+                if self._event_follower is not None:
+                    rollup_key = self._rollup_by_replay_order_id.get(
+                        intent.order_id
+                    )
+                    if rollup_key is not None:
+                        self._maybe_flush_aggregated_trade(rollup_key, trigger=3)
+                self._executor.execute_cancel(intent, timestamp=timestamp)
                 logger.debug(
                     "%s: Cancel order %s, reason=%s",
                     self.strat_id, intent.order_id, intent.reason,
                 )
-
-        return intents
 
     def _should_place_close(self, intent: PlaceLimitIntent) -> bool:
         """Check whether a reduce_only (close) order should be placed.

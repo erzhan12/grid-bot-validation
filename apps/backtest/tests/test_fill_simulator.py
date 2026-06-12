@@ -313,7 +313,11 @@ class TestFillModeMatrix:
             ),
         ],
     )
-    @pytest.mark.parametrize("mode", list(FillMode))
+    # EVENT_FOLLOWER is not a per-order simulator mode (0072): fills are
+    # injected from recorded executions in the runner; check_fill raises.
+    @pytest.mark.parametrize(
+        "mode", [m for m in FillMode if m is not FillMode.EVENT_FOLLOWER]
+    )
     def test_fill_mode_matrix(self, market, buy_expected, sell_expected, mode):
         simulator = TradeThroughFillSimulator(mode=mode)
 
@@ -322,6 +326,16 @@ class TestFillModeMatrix:
 
         assert buy_result.should_fill is buy_expected[mode]
         assert sell_result.should_fill is sell_expected[mode]
+
+    def test_event_follower_never_reaches_per_order_check(self):
+        """0072: the per-order fill check must raise under event_follower."""
+        simulator = TradeThroughFillSimulator(mode=FillMode.EVENT_FOLLOWER)
+
+        with pytest.raises(ValueError, match="event_follower"):
+            simulator.check_fill(
+                _order("Buy"),
+                _ticker(Decimal("58.59"), Decimal("58.58"), Decimal("58.59")),
+            )
 
     def test_book_touch_falls_back_to_trade_through_on_bare_decimal_buy(self):
         simulator = TradeThroughFillSimulator(mode=FillMode.BOOK_TOUCH)
@@ -358,7 +372,9 @@ class TestFillModeMatrix:
         assert buy_result.should_fill is False
         assert sell_result.should_fill is True
 
-    @pytest.mark.parametrize("mode", list(FillMode))
+    @pytest.mark.parametrize(
+        "mode", [m for m in FillMode if m is not FillMode.EVENT_FOLLOWER]
+    )
     def test_non_positive_last_price_never_fills(self, mode):
         """Default zero last_price is invalid market data, not a cross."""
         simulator = TradeThroughFillSimulator(mode=mode)

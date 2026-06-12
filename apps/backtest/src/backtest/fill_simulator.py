@@ -1,17 +1,26 @@
 """Trade-through fill simulator for backtest.
 
 Implements the fill logic: orders fill when price crosses their limit price.
+
+Also home to the event_follower fill source (feature 0072):
+``RecordedExecution`` + ``EventFollower`` replay the recorded live
+``private_executions`` stream instead of inferring fills from the ticker.
 """
 
+import logging
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from gridcore import SideType, TickerEvent
+from gridcore import SideType, TickerEvent, extract_client_order_prefix
 
 if TYPE_CHECKING:
     from backtest.order_manager import SimulatedOrder
+
+
+logger = logging.getLogger(__name__)
 
 
 class FillMode(StrEnum):
@@ -21,6 +30,10 @@ class FillMode(StrEnum):
     TRADE_THROUGH_AT_LIMIT = "trade_through_at_limit"
     BOOK_TOUCH = "book_touch"
     LAST_CROSS = "last_cross"
+    # Fills sourced from recorded live private_executions (feature 0072).
+    # Dispatched as a pre-tick injection in BacktestRunner.process_fills —
+    # never reaches TradeThroughFillSimulator._should_fill.
+    EVENT_FOLLOWER = "event_follower"
 
 
 @dataclass(frozen=True)
@@ -200,6 +213,14 @@ class TradeThroughFillSimulator:
                 return self._should_fill_book_touch(side, limit_price, snapshot)
             case FillMode.LAST_CROSS:
                 return self._should_fill_last_cross(side, limit_price, snapshot)
+            case FillMode.EVENT_FOLLOWER:
+                # event_follower fills are injected from recorded
+                # private_executions in BacktestRunner.process_fills; the
+                # per-order simulator check must never be consulted.
+                raise ValueError(
+                    "event_follower mode must not reach the per-order fill "
+                    "check; fills are injected from recorded executions"
+                )
 
         raise ValueError(f"Unsupported fill mode: {self._mode}")
 
@@ -293,3 +314,257 @@ class TradeThroughFillSimulator:
             Fill price (always the limit price)
         """
         return order.price
+
+
+def _to_naive_utc(ts: datetime) -> datetime:
+    """Normalize a tz-aware datetime to naive UTC; pass naive through.
+
+    Recorded executions are naive UTC (SQLite strips tz at load); ticker
+    events may carry tzinfo. Same convention as the loaders'
+    ``_normalize_ts`` / ``_strip_tz`` — comparisons inside the follower are
+    always naive-vs-naive.
+    """
+    if ts.tzinfo is not None:
+        return ts.astimezone(timezone.utc).replace(tzinfo=None)
+    return ts
+
+
+@dataclass(frozen=True)
+class RecordedExecution:
+    """One recorded live execution, materialized from ``PrivateExecution``.
+
+    Plain frozen dataclass — the follower NEVER holds raw ORM rows. The
+    replay engine converts each ``PrivateExecution`` to a
+    ``RecordedExecution`` inside the DB session context (avoids
+    ``DetachedInstanceError`` on lazy attribute access after the session
+    closes; cf. feature 0038). ``exchange_ts`` is naive UTC (normalized at
+    conversion time with the same tz-strip helper the loaders use).
+    ``exec_fee`` / ``closed_pnl`` default to ``Decimal("0")`` when the DB
+    column is NULL.
+    """
+
+    exec_id: str
+    order_link_id: str | None
+    order_id: str
+    side: str  # 'Buy' or 'Sell'
+    exec_price: Decimal
+    exec_qty: Decimal
+    exec_fee: Decimal
+    closed_pnl: Decimal
+    exchange_ts: datetime
+
+
+@dataclass(frozen=True)
+class MatchResult:
+    """Result of matching a recorded execution against active replay orders.
+
+    Two distinct order-id namespaces — never conflate:
+
+    - ``replay_order_id``: the matched ``SimulatedOrder.order_id``
+      (``sim_*``, or exchange id for seeded orders) used to locate the
+      order in ``active_orders`` for ``apply_recorded_fill``.
+    - ``recorded_order_id``: the live Bybit ``order_id`` from the recorded
+      execution, used (with ``matcher_key``) as the rollup/aggregation key
+      mirroring ``LiveTradeLoader`` grouping.
+
+    ``matcher_key`` is ``extract_client_order_prefix(order_link_id) or
+    recorded_order_id`` — the exact key the post-run matcher uses, stamped
+    onto the produced ``BacktestTrade.client_order_id``.
+    """
+
+    replay_order_id: str
+    matcher_key: str
+    recorded_order_id: str
+
+
+class EventFollower:
+    """Replays the recorded live execution stream as the replay fill source.
+
+    Constructed with the full window's executions, sorted
+    ``(exchange_ts, exec_id)`` by
+    ``PrivateExecutionRepository.get_by_run_range`` (the single sort site —
+    no re-sort here). Holds a forward-only ``exchange_ts``-advancing cursor;
+    ``drain`` consumes the stream tick by tick and ``match`` selects the
+    active replay order for one execution (key-faithful: deterministic
+    ``client_order_id`` prefix first, documented fallbacks after).
+    """
+
+    def __init__(
+        self,
+        executions: list[RecordedExecution],
+        symbol: str,
+        start_ts: datetime,
+    ):
+        self._executions = executions
+        self._symbol = symbol
+        # Left edge for the very first drain window. The drain window is
+        # (prev_ts, tick_ts] (open on the left) while get_by_run_range loads
+        # exchange_ts >= start_ts inclusive — initializing prev_ts to
+        # start_ts itself would silently exclude executions at the window
+        # left edge from every drain (spurious live_only). The microsecond
+        # offset aligns the first drain with the inclusive load boundary.
+        self.initial_prev_ts = start_ts - timedelta(microseconds=1)
+        self._cursor = 0
+        self._last_tick_ts: datetime | None = None
+        # Last index in the stream per recorded (Bybit) order_id — lets
+        # trigger-2 (last-in-stream flush) check the unconsumed tail in O(1).
+        self._last_index_by_order_id: dict[str, int] = {}
+        for i, ex in enumerate(executions):
+            self._last_index_by_order_id[ex.order_id] = i
+        # Diagnostics: rows with no order_link_id (pre-hotfix fallback rows)
+        # and fallback-matched rows, so a window full of them is visible.
+        self.no_link_id_count = 0
+        self.fallback_order_id_count = 0
+        self.fallback_price_count = 0
+
+    @property
+    def remaining(self) -> int:
+        """Count of executions not yet drained."""
+        return len(self._executions) - self._cursor
+
+    def drain(self, prev_ts: datetime, tick_ts: datetime) -> list[RecordedExecution]:
+        """Return all executions in ``(prev_ts, tick_ts]``, advancing cursor.
+
+        Forward-only: ``tick_ts`` must be non-decreasing across calls
+        (mirrors ``CollateralMarkFeed.mark_at``'s monotonicity guard —
+        replay ticks must be ordered by exchange_ts).
+        """
+        prev_ts = _to_naive_utc(prev_ts)
+        tick_ts = _to_naive_utc(tick_ts)
+        if self._last_tick_ts is not None and tick_ts < self._last_tick_ts:
+            raise ValueError(
+                f"EventFollower.drain: non-monotonic tick_ts {tick_ts} "
+                f"precedes previous {self._last_tick_ts}; the forward-only "
+                f"cursor cannot rewind (replay ticks must be ordered by "
+                f"exchange_ts)."
+            )
+        self._last_tick_ts = tick_ts
+
+        drained: list[RecordedExecution] = []
+        while self._cursor < len(self._executions):
+            ex = self._executions[self._cursor]
+            if ex.exchange_ts > tick_ts:
+                break
+            self._cursor += 1
+            if ex.exchange_ts <= prev_ts:
+                # Defensive: window is open on the left; with sequential
+                # prev_ts = previous tick_ts this only skips rows older
+                # than the very first drain window.
+                continue
+            drained.append(ex)
+        return drained
+
+    def has_pending_for_order(self, recorded_order_id: str) -> bool:
+        """True if undrained executions remain for this recorded order_id.
+
+        Used by the trigger-2 (last-in-stream) flush check: a rollup buffer
+        may only flush once no further execution for its recorded order
+        remains in the unconsumed tail.
+        """
+        last_idx = self._last_index_by_order_id.get(recorded_order_id)
+        return last_idx is not None and last_idx >= self._cursor
+
+    def match(
+        self,
+        execution: RecordedExecution,
+        active_orders: dict[str, "SimulatedOrder"],
+    ) -> MatchResult | None:
+        """Select the active replay order for one recorded execution.
+
+        Key-faithful selection (feature 0072 design):
+
+        1. Primary: ``extract_client_order_prefix(order_link_id)`` — the
+           deterministic grid identity — equals the active order's
+           ``client_order_id``. Side/price sanity violations log WARN but
+           the id match is authoritative.
+        2. ``order_link_id`` is None (pre-hotfix rows): fall back to
+           ``order_id`` against ``SimulatedOrder.order_id`` (covers seeded
+           orders keyed by exchange id), then same-side closest-price as a
+           deterministic last resort.
+
+        Returns None when no active order matches — the execution stays
+        ``live_only`` (intent-set divergence; the backtest never invents a
+        fill).
+        """
+        key = extract_client_order_prefix(execution.order_link_id)
+
+        if key is not None:
+            for order in active_orders.values():
+                if order.client_order_id == key:
+                    self._warn_on_sanity_violation(execution, order)
+                    return MatchResult(
+                        replay_order_id=order.order_id,
+                        matcher_key=key,
+                        recorded_order_id=execution.order_id,
+                    )
+            return None
+
+        # No order_link_id: rare pre-orderLinkId-hotfix rows. Mirror
+        # LiveTradeLoader's `client_id = link_prefix or ex.order_id`.
+        self.no_link_id_count += 1
+        matcher_key = execution.order_id
+
+        order = active_orders.get(execution.order_id)
+        if order is not None:
+            self.fallback_order_id_count += 1
+            self._warn_on_sanity_violation(execution, order)
+            return MatchResult(
+                replay_order_id=order.order_id,
+                matcher_key=matcher_key,
+                recorded_order_id=execution.order_id,
+            )
+
+        # Last resort: same side, closest price. Deterministic tie-break on
+        # (price distance, order_id).
+        candidates = [
+            o for o in active_orders.values() if o.side == execution.side
+        ]
+        if not candidates:
+            return None
+        best = min(
+            candidates,
+            key=lambda o: (abs(o.price - execution.exec_price), o.order_id),
+        )
+        self.fallback_price_count += 1
+        logger.warning(
+            "EventFollower: matched exec %s (order_id=%s, no order_link_id) "
+            "to replay order %s by side/closest-price (limit=%s, exec=%s)",
+            execution.exec_id, execution.order_id, best.order_id,
+            best.price, execution.exec_price,
+        )
+        return MatchResult(
+            replay_order_id=best.order_id,
+            matcher_key=matcher_key,
+            recorded_order_id=execution.order_id,
+        )
+
+    def _warn_on_sanity_violation(
+        self,
+        execution: RecordedExecution,
+        order: "SimulatedOrder",
+    ) -> None:
+        """WARN when side/price disagree with the matched order.
+
+        The deterministic id is authoritative — a violation is logged and
+        the match stands. Buy limits fill at-or-below limit; Sell limits
+        at-or-above.
+        """
+        if order.side != execution.side:
+            logger.warning(
+                "EventFollower: side mismatch on matched id %s: order side=%s "
+                "vs exec side=%s (exec_id=%s) — id match kept",
+                order.client_order_id, order.side, execution.side,
+                execution.exec_id,
+            )
+            return
+        if order.side == SideType.BUY:
+            price_ok = order.price >= execution.exec_price
+        else:
+            price_ok = order.price <= execution.exec_price
+        if not price_ok:
+            logger.warning(
+                "EventFollower: price sanity violation on matched id %s: "
+                "%s limit=%s vs exec_price=%s (exec_id=%s) — id match kept",
+                order.client_order_id, order.side, order.price,
+                execution.exec_price, execution.exec_id,
+            )

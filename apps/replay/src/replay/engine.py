@@ -22,6 +22,7 @@ from grid_db import (
     DatabaseFactory,
     PositionSnapshot,
     PositionSnapshotRepository,
+    PrivateExecutionRepository,
     Run,
     RunRepository,
     TickerSnapshot,
@@ -36,7 +37,12 @@ from backtest.config import BacktestStrategyConfig, WindDownMode
 from backtest.data_provider import HistoricalDataProvider, InMemoryDataProvider
 from backtest.engine import FundingSimulator
 from backtest.executor import BacktestExecutor
-from backtest.fill_simulator import FillMode, TradeThroughFillSimulator
+from backtest.fill_simulator import (
+    EventFollower,
+    FillMode,
+    RecordedExecution,
+    TradeThroughFillSimulator,
+)
 from backtest.instrument_info import InstrumentInfoProvider
 from backtest.order_manager import BacktestOrderManager
 from backtest.position_tracker import BacktestPositionTracker
@@ -388,6 +394,57 @@ class ReplayEngine:
             collateral_balances=collateral_balances,
             collateral_seed_marks=collateral_seed_marks,
         )
+
+        # 2b. 0072: event_follower fill source — load the recorded live
+        # execution stream for the window. ORM rows are materialized to
+        # plain RecordedExecution dataclasses INSIDE the session context
+        # (DetachedInstanceError on lazy access otherwise; cf. feature
+        # 0038). get_by_run_range filters run_id + time only (same as
+        # LiveTradeLoader), so other-symbol rows are skipped here.
+        event_follower: Optional[EventFollower] = None
+        if fill_mode == FillMode.EVENT_FOLLOWER:
+            recorded_execs: list[RecordedExecution] = []
+            skipped_other_symbol = 0
+            with self._db.get_session() as db_session:
+                exec_repo = PrivateExecutionRepository(db_session)
+                # Ordered (exchange_ts, exec_id) by the repository — the
+                # single sort site; not re-sorted here or in the follower.
+                for ex in exec_repo.get_by_run_range(run_id, start_ts, end_ts):
+                    if ex.symbol != config.symbol:
+                        skipped_other_symbol += 1
+                        continue
+                    recorded_execs.append(
+                        RecordedExecution(
+                            exec_id=ex.exec_id,
+                            order_link_id=ex.order_link_id,
+                            order_id=ex.order_id,
+                            side=ex.side,
+                            exec_price=ex.exec_price,
+                            exec_qty=ex.exec_qty,
+                            exec_fee=(
+                                ex.exec_fee
+                                if ex.exec_fee is not None
+                                else Decimal("0")
+                            ),
+                            closed_pnl=(
+                                ex.closed_pnl
+                                if ex.closed_pnl is not None
+                                else Decimal("0")
+                            ),
+                            exchange_ts=_strip_tz(ex.exchange_ts),
+                        )
+                    )
+            event_follower = EventFollower(
+                recorded_execs,
+                symbol=config.symbol,
+                start_ts=_strip_tz(start_ts),
+            )
+            logger.info(
+                "event_follower: loaded %d recorded executions for %s "
+                "(%d other-symbol rows skipped)",
+                len(recorded_execs), config.symbol, skipped_other_symbol,
+            )
+
         runner = self._init_runner(
             strategy_config,
             session,
@@ -398,6 +455,7 @@ class ReplayEngine:
             fill_mode=fill_mode,
             run_id=run_id,
             account_id=account_id,
+            event_follower=event_follower,
         )
 
         if config.seed.enabled:
@@ -509,6 +567,13 @@ class ReplayEngine:
                 logger.info(f"Processed {tick_count} ticks...")
 
         logger.info(f"Replay complete: {tick_count} ticks processed")
+
+        # 0072: trigger-4 end-of-replay sweep of remaining partial-fill
+        # rollups. MUST run before wind-down, position-writer flush, and
+        # session.finalize so swept record_trade rows land in session.trades
+        # for wind-down inputs, DB telemetry, finalize stats, and
+        # BacktestTradeLoader.load_from_session. No-op for simulator modes.
+        runner.finalize_event_follower()
 
         # 0065: surface collateral coins that never got an intra-run ticker mark
         # (ran on the seed mark all window — usually a missing collateral symbol
@@ -726,6 +791,7 @@ class ReplayEngine:
         fill_mode: FillMode = FillMode.STRICT_CROSS,
         run_id: Optional[str] = None,
         account_id: Optional[str] = None,
+        event_follower: Optional[EventFollower] = None,
     ) -> BacktestRunner:
         """Initialize a BacktestRunner for the replay.
 
@@ -752,6 +818,12 @@ class ReplayEngine:
                 pre-loads the ``BacktestOrderManager`` so they participate
                 in fill checks on the first tick.
             fill_mode: Fill simulator mode for the replay runner.
+            event_follower: 0072 recorded-execution fill source. Stashed on
+                the runner post-construction (same pattern as
+                ``_position_writer``) — NOT a ``BacktestRunner.__init__``
+                kwarg. The ``TradeThroughFillSimulator`` is still constructed
+                unconditionally below; in event_follower mode it is never
+                consulted because ``process_fills`` skips ``check_fills``.
         """
         instrument_info = self._instrument_provider.get(strategy_config.symbol)
         logger.info(
@@ -823,6 +895,11 @@ class ReplayEngine:
             runner.position_snapshot_callback = position_writer.write
             # Stash on runner so the engine can call .flush() at end-of-run.
             runner._position_writer = position_writer  # type: ignore[attr-defined]
+
+        # 0072: stash the recorded-execution fill source. process_fills
+        # detects the mode via `self._event_follower is not None`.
+        if event_follower is not None:
+            runner._event_follower = event_follower
 
         return runner
 

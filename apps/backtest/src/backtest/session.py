@@ -190,6 +190,15 @@ class BacktestSession:
         self.total_commission = Decimal("0")
         self.total_funding = Decimal("0")
 
+        # event_follower (0072): in-flight partial-fill pending sums.
+        # record_trade only runs when an aggregated order lifecycle flushes;
+        # until then, applied partial fills' recorded closed_pnl / exec_fee
+        # live here so refresh_balances / update_equity see them. Always
+        # zero on simulator paths (set/cleared only by the runner's
+        # event_follower branch).
+        self._pending_realized_pnl = Decimal("0")
+        self._pending_commission = Decimal("0")
+
         # Peak for drawdown calculation
         self._peak_equity = initial_balance
         self._max_drawdown = Decimal("0")
@@ -224,6 +233,46 @@ class BacktestSession:
         self.total_commission += trade.commission
         # Track volume for turnover calculation
         self.total_volume += trade.qty * trade.price
+
+    def set_pending_wallet(
+        self,
+        pending_realized: Decimal,
+        pending_commission: Decimal,
+    ) -> None:
+        """Set global in-flight partial-fill sums (event_follower only).
+
+        The runner calls this with Σ pending recorded closed_pnl / exec_fee
+        across all un-flushed order lifecycles — immediately before each
+        intra-drain ``refresh_balances`` and again at the end of
+        ``process_fills`` so the engine's ``update_equity`` sees the same
+        wallet. Values migrate to ``total_realized_pnl`` /
+        ``total_commission`` via ``record_trade`` on flush; the runner
+        re-sets the (reduced) pending sums afterwards.
+        """
+        self._pending_realized_pnl = pending_realized
+        self._pending_commission = pending_commission
+
+    def clear_pending_wallet(self) -> None:
+        """Reset pending sums to zero (runner-owned lifecycle)."""
+        self._pending_realized_pnl = Decimal("0")
+        self._pending_commission = Decimal("0")
+
+    def _pnl_delta(self, unrealized_pnl: Decimal) -> Decimal:
+        """Shared per-tick PnL delta for both balance baselines.
+
+        ``total_*`` running sums plus the supplied unrealized term, with
+        event_follower in-flight pending sums folded in (structurally zero
+        on simulator paths — arithmetic is byte-equivalent to the historical
+        inline expression).
+        """
+        return (
+            self.total_realized_pnl
+            + self._pending_realized_pnl
+            + unrealized_pnl
+            - self.total_commission
+            - self._pending_commission
+            + self.total_funding
+        )
 
     def record_funding(self, amount: Decimal) -> None:
         """Record funding payment.
@@ -306,12 +355,7 @@ class BacktestSession:
           fields. Calling one without the other will desynchronize the
           equity curve from the balances.
         """
-        pnl_delta = (
-            self.total_realized_pnl
-            + unrealized_pnl
-            - self.total_commission
-            + self.total_funding
-        )
+        pnl_delta = self._pnl_delta(unrealized_pnl)
         self.current_balance = self.initial_balance + pnl_delta
         # 0065: total_equity ALSO floats with non-USDT collateral marks (delta
         # from seed). MUST be applied here too — process_fills calls this right
@@ -340,12 +384,7 @@ class BacktestSession:
         """
         # Per-tick PnL delta is identical across both baselines; only the
         # starting offset differs (available vs. equity).
-        pnl_delta = (
-            self.total_realized_pnl
-            + unrealized_pnl
-            - self.total_commission
-            + self.total_funding
-        )
+        pnl_delta = self._pnl_delta(unrealized_pnl)
         equity = self.initial_balance + pnl_delta
 
         # equity_curve / current_balance stay available-based (futures-only);

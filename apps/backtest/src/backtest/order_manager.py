@@ -68,6 +68,11 @@ class BacktestOrderManager:
         # Order ID counter for generating unique IDs
         self._order_counter = 0
 
+        # event_follower (feature 0072): count of recorded executions whose
+        # exec_qty exceeded the replay order's remaining placed qty (capped
+        # at placed qty; excess is intent-set / sizing divergence).
+        self.qty_excess_divergence_count = 0
+
     def place_order(
         self,
         client_order_id: str,
@@ -330,6 +335,108 @@ class BacktestOrderManager:
                 fills.append(exec_event)
 
         return fills
+
+    def apply_recorded_fill(
+        self,
+        replay_order_id: str,
+        exec_price: Decimal,
+        exec_qty: Decimal,
+        exec_fee: Decimal,
+        closed_pnl: Decimal,
+        timestamp: datetime,
+        exec_id: Optional[str] = None,
+    ) -> tuple[Optional[ExecutionEvent], bool]:
+        """Apply an externally-decided (recorded live) fill to an active order.
+
+        event_follower mode (feature 0072): the fill decision comes from the
+        recorded ``private_executions`` stream, not the fill simulator. The
+        recorded values are applied as-is — never recomputed — subject to the
+        placed-qty invariant: application never exceeds what replay actually
+        placed.
+
+        Args:
+            replay_order_id: The replay ``SimulatedOrder.order_id`` (``sim_*``,
+                or exchange id for seeded orders) — NOT the recorded live
+                Bybit order_id.
+            exec_price: Recorded execution price.
+            exec_qty: Recorded execution qty (may exceed remaining placed qty
+                on intent-set divergence — capped, WARN, counted).
+            exec_fee: Recorded fee for the full row (pro-rated to the applied
+                slice when capped).
+            closed_pnl: Recorded closed PnL for the full row (pro-rated like
+                the fee).
+            timestamp: Execution exchange_ts.
+            exec_id: Recorded exec_id for traceability; generated when absent.
+
+        Returns:
+            ``(ExecutionEvent | None, is_fully_filled)``. ``(None, False)``
+            when the order is unknown or already fully consumed
+            (``apply_qty == 0``) — caller treats the row as unmatched
+            (``live_only``). The event covers ONLY the applied slice:
+            ``qty=apply_qty``, pro-rated fee/pnl, ``leaves_qty`` = remaining
+            placed qty after this partial.
+        """
+        order = self.active_orders.get(replay_order_id)
+        if order is None:
+            return None, False
+
+        apply_qty = min(exec_qty, order.qty)
+        if apply_qty <= 0:
+            return None, False
+
+        if exec_qty > order.qty:
+            self.qty_excess_divergence_count += 1
+            logger.warning(
+                "qty_excess_divergence: recorded exec_qty=%s exceeds remaining "
+                "placed qty=%s on replay order %s (client_order_id=%s); "
+                "applying only %s — excess is intent-set/sizing divergence",
+                exec_qty, order.qty, replay_order_id,
+                order.client_order_id, apply_qty,
+            )
+
+        # Pro-rate recorded fee/pnl to the applied slice.
+        if apply_qty == exec_qty:
+            apply_fee = exec_fee
+            apply_pnl = closed_pnl
+        else:
+            ratio = apply_qty / exec_qty
+            apply_fee = exec_fee * ratio
+            apply_pnl = closed_pnl * ratio
+
+        is_fully_filled = apply_qty == order.qty
+        if is_fully_filled:
+            # Same pop path as the should_fill branch of check_fills.
+            self.active_orders.pop(replay_order_id)
+            order.status = "filled"
+            order.filled_ts = timestamp
+            self.filled_orders.append(order)
+            self._client_order_ids.discard(order.client_order_id)
+            leaves_qty = Decimal("0")
+        else:
+            # Partial: decrement remaining qty, keep active; client_order_id
+            # stays reserved until full fill.
+            order.qty -= apply_qty
+            leaves_qty = order.qty
+
+        return (
+            ExecutionEvent(
+                event_type=EventType.EXECUTION,
+                symbol=order.symbol,
+                exchange_ts=timestamp,
+                local_ts=timestamp,
+                exec_id=exec_id or f"exec_{uuid.uuid4().hex[:8]}",
+                order_id=order.order_id,
+                order_link_id=order.client_order_id,
+                side=order.side,
+                price=exec_price,
+                qty=apply_qty,
+                fee=apply_fee,
+                closed_pnl=apply_pnl,
+                closed_size=Decimal("0"),  # Not used in backtest
+                leaves_qty=leaves_qty,
+            ),
+            is_fully_filled,
+        )
 
     def get_limit_orders(self) -> dict[str, list[dict]]:
         """Get orders in format expected by GridEngine.

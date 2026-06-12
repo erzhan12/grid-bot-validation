@@ -689,7 +689,12 @@ class PrivateExecutionRepository(BaseRepository[PrivateExecution]):
             end_ts: End timestamp (inclusive).
 
         Returns:
-            List of PrivateExecution instances ordered by exchange_ts.
+            List of PrivateExecution instances ordered by
+            ``(exchange_ts, exec_id)``. The secondary sort makes the order
+            deterministic for same-timestamp executions — required by the
+            event_follower replay mode (feature 0072), which consumes this
+            stream with a forward-only cursor. This repository is the single
+            sort site; consumers must not re-sort.
         """
         return (
             self.session.query(PrivateExecution)
@@ -698,7 +703,7 @@ class PrivateExecutionRepository(BaseRepository[PrivateExecution]):
                 PrivateExecution.exchange_ts >= start_ts,
                 PrivateExecution.exchange_ts <= end_ts,
             )
-            .order_by(PrivateExecution.exchange_ts)
+            .order_by(PrivateExecution.exchange_ts, PrivateExecution.exec_id)
             .all()
         )
 
