@@ -191,6 +191,15 @@ Always run tests through `uv run` — bare `python -m pytest` skips the workspac
 make lint   # ruff over the whole workspace
 ```
 
+### Continuous Integration
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `make test` and
+`make lint` (as separate jobs) on every pull request and on every push to
+`main`. **CI green is the source of truth for repo health** — reproduce any
+failure locally with the same `make` target. Both jobs fail on any non-zero
+exit; while the repo is being made green (issues #177–#180) the check is not
+yet required for merge in branch protection.
+
 ### Adding a Dependency
 
 ```bash

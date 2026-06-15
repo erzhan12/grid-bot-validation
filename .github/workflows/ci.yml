@@ -1,0 +1,66 @@
+name: CI
+
+# Source of truth for repo health: every PR and every push to main runs
+# `make test` and `make lint`. Both jobs fail the workflow on non-zero exit.
+#
+# Rollout (see docs/features/0073_PLAN.md, Phase 0): the repo is currently
+# RED (ruff errors tracked in #180, GTC assertion in #177). These jobs run as
+# REAL failing checks but are NOT yet a required status check in branch
+# protection, so they do not block the fix PRs for #177-#180. Once those land
+# and both jobs are green, enable the required check in GitHub branch
+# protection (a repo setting, not a file).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref to save CI minutes during the
+# "make green" loop.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Tests are hermetic (no Bybit keys / network); read-only is sufficient.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run tests
+        run: make test
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run lint
+        run: make lint

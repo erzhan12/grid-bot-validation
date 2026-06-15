@@ -71,6 +71,17 @@ make test-integration
 
 **`make test` note**: Runs pytest separately per package to avoid `conftest` ImportPathMismatchError. Coverage is appended; final run prints `term-missing`. `--cov-fail-under` not applied to merged total (~73%).
 
+## Continuous Integration (`.github/workflows/ci.yml`)
+
+The merge gate (feature 0073, issue #176). Two parallel jobs — `test` (`make test`) and `lint` (`make lint`) — run on every PR and on push to `main`; both fail the workflow on any non-zero exit. **CI green is the source of truth for repo health.**
+
+Phase-0 rollout while the repo is red:
+- **Step A (current)** — real failing jobs, no `continue-on-error`; the check is NOT required in branch protection, so it doesn't block the fix PRs for #177–#180.
+- **Step A′** — advisory green via `continue-on-error: true` on `lint` ONLY (never `test`); opt-in scaffolding, avoid unless explicitly requested.
+- **Step B** — after #177–#180 land and both jobs are green, drop any `continue-on-error` and mark the check required.
+
+**Branch protection (making the check "required") is a GitHub repo setting, not a file** — it cannot be enforced from `ci.yml`; set it manually.
+
 ## Development Workflow
 
 1. Define task clearly
