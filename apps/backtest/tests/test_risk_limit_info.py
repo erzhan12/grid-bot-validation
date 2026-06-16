@@ -426,7 +426,7 @@ class TestRiskLimitProvider:
         assert any("exceeds" in r.message and "byte limit" in r.message for r in caplog.records)
 
     def test_save_to_cache_write_permission_error(self, tmp_path, caplog):
-        """save_to_cache logs warning and doesn't crash on write failure."""
+        """save_to_cache logs warning and doesn't crash on temp file write permission error."""
         cache_file = tmp_path / "cache.json"
         provider = RiskLimitProvider(cache_path=cache_file, allowed_cache_root=None)
 
@@ -434,12 +434,12 @@ class TestRiskLimitProvider:
         # it with a path-discriminating mock: only the temp cache write (path
         # ends ".tmp") fails; the lock-file open and cache read delegate to the
         # real os.open. This is deterministic and OS-independent (no chmod).
-        real_open = os.open
+        original_os_open = os.open
 
         def fail_only_temp(path, *args, **kwargs):
             if str(path).endswith(".tmp"):
                 raise PermissionError("simulated read-only filesystem")
-            return real_open(path, *args, **kwargs)
+            return original_os_open(path, *args, **kwargs)
 
         with caplog.at_level(logging.WARNING):
             with patch("backtest.risk_limit_info.os.open", side_effect=fail_only_temp):
