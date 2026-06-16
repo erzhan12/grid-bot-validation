@@ -44,7 +44,7 @@ if 'pybit.unified_trading' not in sys.modules:
 if 'pybit.exceptions' not in sys.modules:
     sys.modules['pybit.exceptions'] = MockPybit.exceptions
 
-from gridcore.grid import Grid, GridSideType
+from gridcore.grid import Grid, GridSideType  # noqa: E402
 
 
 def normalize_side(side: str) -> str:
@@ -615,7 +615,7 @@ class TestEngineStrat50Behavior:
             last_price=Decimal('100000.0')
         )
 
-        intents = engine.on_event(event, {'long': [], 'short': []})
+        engine.on_event(event, {'long': [], 'short': []})
 
         # Grid should now be built
         assert len(engine.grid.grid) > 1, "Grid should be built after ticker event"
@@ -784,8 +784,6 @@ class TestEngineStrat50Behavior:
         )
         engine.on_event(ticker_event, {'long': [], 'short': []})
 
-        # Record grid state before execution
-        grid_before = [{'side': g['side'], 'price': g['price']} for g in engine.grid.grid]
 
         # Simulate execution at 99800
         execution_event = ExecutionEvent(
@@ -973,9 +971,6 @@ class TestGridEdgeCaseBehavior:
         grid.build_grid(100000.0)
         initial_grid_prices = [g['price'] for g in grid.grid]
 
-        # Get grid bounds
-        min_price = min(initial_grid_prices)
-        max_price = max(initial_grid_prices)
 
         # Update with price way outside bounds
         grid.update_grid(99800.0, 120000.0)  # Way above max_price
@@ -1012,16 +1007,10 @@ class TestGridEdgeCaseBehavior:
             if g['side'] == 'Sell' and g['price'] > 100500:
                 g['side'] = 'Wait'
 
-        # Count before rebalancing
-        buy_count_before = sum(1 for g in grid.grid if g['side'] == 'Buy')
-        sell_count_before = sum(1 for g in grid.grid if g['side'] == 'Sell')
 
         # Trigger update which should call __center_grid
         grid.update_grid(99000.0, 100000.0)
 
-        # Count after rebalancing
-        buy_count_after = sum(1 for g in grid.grid if g['side'] == 'Buy')
-        sell_count_after = sum(1 for g in grid.grid if g['side'] == 'Sell')
 
         # Should have shifted grid upward (removed bottom buy, added top sell)
         # Note: exact counts depend on how many were marked WAIT, but grid should be more balanced
@@ -1073,12 +1062,6 @@ class TestGridEdgeCaseBehavior:
         wait_items = [g for g in grid.grid if g['side'] == 'Wait']
         assert len(wait_items) > 0, "Should have WAIT items near filled price"
 
-        # Verify wait items are close to filled price
-        for wait_item in wait_items:
-            # Should be within grid_step/4 = 0.05% of filled price
-            diff_pct = abs(wait_item['price'] - 99800.0) / 99800.0 * 100
-            # If marked as WAIT, should be close enough OR was already WAIT
-            # The middle line is always WAIT initially
 
     def test_side_assignment_based_on_current_price(self):
         """
@@ -1567,9 +1550,7 @@ class TestGridComparisonExtended:
 
         # Get grid boundaries
         orig_min = min(g['price'] for g in original_greed.greed)
-        orig_max = max(g['price'] for g in original_greed.greed)
         new_min = min(g['price'] for g in new_grid.grid)
-        new_max = max(g['price'] for g in new_grid.grid)
 
         # Test 1: Price at boundary (should NOT rebuild)
         original_greed.update_greed(99800.0, orig_min + 100)  # Just inside

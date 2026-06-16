@@ -6,16 +6,14 @@ requiring an actual Windows environment, enabling cross-platform CI.
 
 import os
 import threading
-from io import BytesIO
 from pathlib import Path
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
 
 import pytest
 
 from backtest.cache_lock import (
     _LOCK_REGION_BYTES,
     _IN_PROCESS_LOCKS,
-    _IN_PROCESS_LOCKS_GUARD,
     acquire_in_process_lock,
     release_in_process_lock,
     acquire_file_lock,

@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 # peek_wallet_snapshot reader injected for the Phase-4 preflight (feature 0066).
 WalletProvider = Callable[[], "Optional[tuple[WalletSnapshot, float]]"]
 
-from gridcore import (
+from gridcore import (  # noqa: E402
     GridEngine,
     GridConfig,
     InstrumentInfo,
@@ -49,17 +49,17 @@ from gridcore import (
     apply_early_imbalance,
 )
 
-from gridbot.config import StrategyConfig
-from gridbot.executor import (
+from gridbot.config import StrategyConfig  # noqa: E402
+from gridbot.executor import (  # noqa: E402
     IntentExecutor,
     is_duplicate_link_error,
     is_insufficient_balance,
     is_network_error,
     is_truncate_error,
 )
-from gridbot.notifier import Notifier
-from gridbot.order_link_id import make_order_link_id
-from gridbot.truncate_breaker import TruncateBreaker
+from gridbot.notifier import Notifier  # noqa: E402
+from gridbot.order_link_id import make_order_link_id  # noqa: E402
+from gridbot.truncate_breaker import TruncateBreaker  # noqa: E402
 
 
 logger = logging.getLogger(__name__)

@@ -10,7 +10,7 @@ from typing import Callable, Optional
 
 from gridcore import PlaceLimitIntent, CancelIntent
 
-from backtest.order_manager import BacktestOrderManager, SimulatedOrder
+from backtest.order_manager import BacktestOrderManager
 
 
 @dataclass

@@ -22,7 +22,6 @@ from gridcore.position import DirectionType
 from gridbot.config import StrategyConfig
 from gridbot.executor import IntentExecutor, OrderResult
 from gridbot.runner import StrategyRunner
-from gridbot.truncate_breaker import TruncateBreaker
 
 EMPTY_LIMITS: dict[str, list[dict]] = {"long": [], "short": []}
 

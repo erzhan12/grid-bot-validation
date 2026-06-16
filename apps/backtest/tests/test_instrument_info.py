@@ -3,7 +3,6 @@
 import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -404,7 +403,7 @@ class TestInstrumentInfoProvider:
         cache_path.write_text(json.dumps({"BTCUSDT": sample_info.to_dict()}))
 
         with patch.object(provider, "fetch_from_bybit", return_value=sample_info) as mock_fetch:
-            result = provider.get("BTCUSDT")
+            provider.get("BTCUSDT")
 
         # Should try API because no cached_at means stale
         mock_fetch.assert_called_once_with("BTCUSDT")

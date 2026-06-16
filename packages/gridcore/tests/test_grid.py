@@ -316,7 +316,6 @@ class TestGridRebalancing:
         assert grid.is_grid_correct() is True
 
         # Record original grid bounds
-        min_price_before = grid.grid[0]['price']
         max_price_before = grid.grid[-1]['price']
         grid_length_before = len(grid.grid)
 
@@ -343,7 +342,6 @@ class TestGridRebalancing:
         sell_after = sum(1 for g in grid.grid if g['side'] == GridSideType.SELL)
         total_after = buy_after + sell_after
         if total_after > 0:
-            imbalance_after = abs(buy_after - sell_after) / total_after
             # Rebalancing shifts one level at a time, so imbalance may still be above threshold
             # but should be improving (one more sell, one fewer buy than before rebalancing)
             assert sell_after > 0, "Should have at least one sell after rebalancing"
@@ -358,7 +356,6 @@ class TestGridRebalancing:
 
         # Record original grid bounds
         min_price_before = grid.grid[0]['price']
-        max_price_before = grid.grid[-1]['price']
         grid_length_before = len(grid.grid)
 
         # Create sell-heavy imbalance by setting last_close near the bottom of the grid
@@ -384,7 +381,6 @@ class TestGridRebalancing:
         sell_after = sum(1 for g in grid.grid if g['side'] == GridSideType.SELL)
         total_after = buy_after + sell_after
         if total_after > 0:
-            imbalance_after = abs(sell_after - buy_after) / total_after
             # Rebalancing shifts one level at a time, so imbalance may still be above threshold
             # but should be improving (one more buy, one fewer sell than before rebalancing)
             assert buy_after > 0, "Should have at least one buy after rebalancing"

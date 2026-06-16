@@ -338,8 +338,8 @@ class TestStartRecorderLauncherIntegration:
         launcher = REPO_ROOT / "scripts" / "phase4" / "start_recorder.sh"
         content = launcher.read_text()
         assert "lib/recorder_stop.sh" in content, (
-            f"start_recorder.sh must source lib/recorder_stop.sh; not found"
+            "start_recorder.sh must source lib/recorder_stop.sh; not found"
         )
         assert "_stop_recorder_pattern" in content, (
-            f"start_recorder.sh must call _stop_recorder_pattern"
+            "start_recorder.sh must call _stop_recorder_pattern"
         )
