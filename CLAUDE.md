@@ -1,3 +1,16 @@
+# Project
+Monorepo to run, record, and validate a Bybit USDT-perp **grid trading bot** — live bot, event-driven backtester, mainnet recorder, replay engine, and a backtest-vs-live comparator.
+
+**Stack:** Python ≥3.11, `uv` workspace, pytest + pytest-asyncio, ruff, SQLAlchemy/SQLite.
+
+**Layout** (full tree + component docs in `README.md`):
+- `packages/gridcore` — grid strategy engine, zero external deps (core logic)
+- `packages/bybit_adapter` — Bybit REST + WS client wrappers
+- `shared/db` — `grid-db`, SQLAlchemy multi-tenant models
+- `apps/*` — runnable CLIs: `gridbot` (live), `backtest`, `recorder`, `replay`, `comparator`, `event_saver`, `pnl_checker`
+
+**Entry points:** each app at `apps/<name>/src/<name>/main.py`; run via `uv run <name>`.
+
 # Workflow
 Always follow the workflow listed below in order and try to understand which step you're on so that you can stay on task and follow our development process.
 
