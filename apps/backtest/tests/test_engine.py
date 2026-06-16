@@ -1,6 +1,6 @@
 """Tests for backtest engine."""
 
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -8,7 +8,7 @@ import pytest
 from gridcore import TickerEvent, EventType
 
 from backtest.engine import BacktestEngine, FundingSimulator
-from backtest.config import BacktestConfig, BacktestStrategyConfig, WindDownMode
+from backtest.config import BacktestConfig, WindDownMode
 from backtest.data_provider import InMemoryDataProvider
 
 

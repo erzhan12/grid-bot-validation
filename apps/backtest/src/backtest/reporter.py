@@ -4,12 +4,10 @@ Supports CSV export for trades, equity curve, and metrics summary.
 """
 
 import csv
-from datetime import datetime
-from decimal import Decimal
 from pathlib import Path
 from typing import Union
 
-from backtest.session import BacktestSession, BacktestMetrics, BacktestTrade
+from backtest.session import BacktestSession, BacktestMetrics
 
 
 class BacktestReporter:

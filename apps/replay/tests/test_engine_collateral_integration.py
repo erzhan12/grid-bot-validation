@@ -40,7 +40,6 @@ from gridcore.persistence import GridStateStore
 
 from replay.config import ReplayConfig, ReplayStrategyConfig, SeedConfig
 from replay.engine import ReplayEngine
-from replay.snapshot_loader import load_wallet_seed_full
 
 
 SYMBOL = "BTCUSDT"

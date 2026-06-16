@@ -53,6 +53,7 @@ from grid_db import (
     OrderRepository,
     PositionSnapshotRepository,
     TickerSnapshotRepository,
+    WalletSnapshot,
     WalletSnapshotRepository,
 )
 

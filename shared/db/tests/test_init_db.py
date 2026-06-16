@@ -1,10 +1,9 @@
 """Tests for database initialization script."""
 
 import sys
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 from grid_db.init_db import main, initialize_database
-from grid_db.settings import DatabaseSettings
 
 
 class TestInitDb:

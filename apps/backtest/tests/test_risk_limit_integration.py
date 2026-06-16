@@ -143,11 +143,6 @@ class TestCacheTTL:
             },
         }))
 
-        fresh_tiers: MMTiers = [
-            (Decimal("300000"), Decimal("0.008"), Decimal("0"), Decimal("0.015")),
-            (Decimal("Infinity"), Decimal("0.015"), Decimal("2100"), Decimal("0.03")),
-        ]
-
         client = MagicMock()
         client.get_risk_limit.return_value = [
             {

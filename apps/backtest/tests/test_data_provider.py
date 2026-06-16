@@ -3,12 +3,11 @@
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-import pytest
 
 from gridcore import EventType
 from grid_db import TickerSnapshot, PublicTrade
 
-from backtest.data_provider import HistoricalDataProvider, DataRangeInfo
+from backtest.data_provider import HistoricalDataProvider
 
 
 # ---------------------------------------------------------------------------

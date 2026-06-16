@@ -612,7 +612,8 @@ def test_preflight_uses_fresh_provider_value(
     strategy_config, mock_executor, instrument_info
 ):
     """A fresh LOW provider balance blocks even when _available_balance is stale-high."""
-    provider = lambda: (WalletSnapshot(available_balance=5.0), 1.0)  # fresh, age 1s
+    def provider():  # fresh, age 1s
+        return (WalletSnapshot(available_balance=5.0), 1.0)
     r = _runner_with_provider(strategy_config, mock_executor, instrument_info, provider)
     r._available_balance = Decimal("100000")  # stale-high — must be ignored
     # est_cost = 100 ≫ fresh 5 → blocked via the provider value, not the latch.
@@ -627,7 +628,8 @@ def test_preflight_blocks_on_fresh_zero_provider(
     The fresh zero means 'no free margin', NOT 'no data'; it must block every
     open and must NOT be replaced by a stale-high _available_balance.
     """
-    provider = lambda: (WalletSnapshot(available_balance=0.0), 1.0)  # fresh zero
+    def provider():  # fresh zero
+        return (WalletSnapshot(available_balance=0.0), 1.0)
     r = _runner_with_provider(strategy_config, mock_executor, instrument_info, provider)
     r._available_balance = Decimal("100000")  # stale-high — must not mask the zero
     assert r._is_good_to_place(_open_short("100.0", "1.0"), EMPTY_LIMITS) is False
@@ -642,7 +644,8 @@ def test_preflight_fails_open_when_peek_stale(
     Both the stale-peek value and _available_balance are set LOW (would block if
     used); the open still passes, proving the check was skipped entirely.
     """
-    provider = lambda: (WalletSnapshot(available_balance=5.0), 100.0)  # stale (>=45)
+    def provider():  # stale (>=45)
+        return (WalletSnapshot(available_balance=5.0), 100.0)
     r = _runner_with_provider(strategy_config, mock_executor, instrument_info, provider)
     r._available_balance = Decimal("5")  # also low — must NOT be used as fallback
     assert r._is_good_to_place(_open_short("100.0", "1.0"), EMPTY_LIMITS) is True
@@ -652,7 +655,8 @@ def test_preflight_fails_open_when_peek_none(
     strategy_config, mock_executor, instrument_info
 ):
     """peek None (no WS, no REST cache) in the provider path → fail-open, no fallback."""
-    provider = lambda: None
+    def provider():
+        return None
     r = _runner_with_provider(strategy_config, mock_executor, instrument_info, provider)
     r._available_balance = Decimal("5")  # low — must NOT be used as fallback
     assert r._is_good_to_place(_open_short("100.0", "1.0"), EMPTY_LIMITS) is True
@@ -673,7 +677,8 @@ def test_preflight_fresh_provider_allows_affordable_open(
     strategy_config, mock_executor, instrument_info
 ):
     """A fresh ample provider balance allows the open."""
-    provider = lambda: (WalletSnapshot(available_balance=200.0), 1.0)
+    def provider():
+        return (WalletSnapshot(available_balance=200.0), 1.0)
     r = _runner_with_provider(strategy_config, mock_executor, instrument_info, provider)
     r._available_balance = Decimal("0")
     assert r._is_good_to_place(_open_short("100.0", "1.0"), EMPTY_LIMITS) is True
@@ -697,7 +702,8 @@ def test_storm_blocked_end_to_end_via_provider(
     that ships with ``wallet_ws_enabled=True``), not only the legacy
     ``_available_balance`` latch (covered by test_110007_storm_blocked_by_preflight).
     """
-    provider = lambda: (WalletSnapshot(available_balance=5.0), 1.0)  # fresh, low
+    def provider():  # fresh, low
+        return (WalletSnapshot(available_balance=5.0), 1.0)
     r = _runner_with_provider(strategy_config, mock_executor, instrument_info, provider)
     enqueued = []
     r._on_intent_failed = lambda intent, error: enqueued.append((intent, error))
@@ -721,7 +727,8 @@ def test_low_balance_predicate_uses_fresh_provider(
     strategy_config, mock_executor, instrument_info
 ):
     """A FRESH provider value drives the predicate even when the latch is stale-high."""
-    provider = lambda: (WalletSnapshot(available_balance=5.0), 1.0)  # fresh, low
+    def provider():  # fresh, low
+        return (WalletSnapshot(available_balance=5.0), 1.0)
     r = _runner_with_provider(strategy_config, mock_executor, instrument_info, provider)
     r._available_balance = Decimal("100000")  # stale-high latch must be ignored
     assert r._is_low_balance(Decimal("100")) is True  # 5 < 100*0.10
@@ -732,7 +739,8 @@ def test_low_balance_predicate_fresh_zero_is_low_balance(
 ):
     """A FRESH provider zero = genuinely no free margin = the MOST extreme
     low-balance state → True (NOT treated as 'no data' like a latch 0)."""
-    provider = lambda: (WalletSnapshot(available_balance=0.0), 1.0)  # fresh zero
+    def provider():  # fresh zero
+        return (WalletSnapshot(available_balance=0.0), 1.0)
     r = _runner_with_provider(strategy_config, mock_executor, instrument_info, provider)
     r._available_balance = Decimal("100000")  # stale-high latch must not mask it
     assert r._is_low_balance(Decimal("100")) is True
@@ -743,7 +751,8 @@ def test_low_balance_predicate_stale_provider_falls_back_to_latch(
 ):
     """A stale/None/raising provider falls back to the position-cadence latch
     (best-available), unlike the preflight which fails open."""
-    stale = lambda: (WalletSnapshot(available_balance=1.0), 100.0)  # stale (>=45)
+    def stale():  # stale (>=45)
+        return (WalletSnapshot(available_balance=1.0), 100.0)
     r = _runner_with_provider(strategy_config, mock_executor, instrument_info, stale)
     r._available_balance = Decimal("50")  # latch ample → not low (50 >= 10)
     assert r._is_low_balance(Decimal("100")) is False

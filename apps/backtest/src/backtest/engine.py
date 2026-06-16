@@ -7,13 +7,13 @@ import logging
 import uuid
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Iterator, Optional
+from typing import Optional
 
 from grid_db import DatabaseFactory
 from gridcore import DirectionType, SideType, create_qty_calculator
 
 from backtest.config import BacktestConfig, BacktestStrategyConfig, WindDownMode
-from backtest.data_provider import HistoricalDataProvider, InMemoryDataProvider, DataRangeInfo
+from backtest.data_provider import HistoricalDataProvider, InMemoryDataProvider
 from backtest.fill_simulator import TradeThroughFillSimulator
 from backtest.instrument_info import InstrumentInfoProvider, InstrumentInfo
 from backtest.order_manager import BacktestOrderManager
@@ -21,7 +21,7 @@ from backtest.executor import BacktestExecutor
 from backtest.position_tracker import BacktestPositionTracker
 from backtest.risk_limit_info import RiskLimitProvider
 from backtest.runner import BacktestRunner
-from backtest.session import BacktestSession, BacktestMetrics, BacktestTrade
+from backtest.session import BacktestSession, BacktestTrade
 
 
 logger = logging.getLogger(__name__)
