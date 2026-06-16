@@ -23,3 +23,6 @@ Step one is to identify and document the specific task or problem we're solving.
 
 # Tools
 - Use `uv` to run tests and Python commands (e.g., `uv run pytest ...`), not bare `python -m pytest`.
+
+# Coding principles
+- See `.claude/rules/code-style.md` for coding principles (simplicity first, surgical changes, plan-first, goal-driven execution) and safety rules.
