@@ -3,6 +3,7 @@
 import gc
 import json
 import logging
+import os
 import threading
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -425,24 +426,32 @@ class TestRiskLimitProvider:
         assert any("exceeds" in r.message and "byte limit" in r.message for r in caplog.records)
 
     def test_save_to_cache_write_permission_error(self, tmp_path, caplog):
-        """save_to_cache logs warning and doesn't crash on read-only directory."""
-        read_only_dir = tmp_path / "readonly"
-        read_only_dir.mkdir()
-        cache_file = read_only_dir / "cache.json"
-        read_only_dir.chmod(0o444)
-
+        """save_to_cache logs warning and doesn't crash on write failure."""
+        cache_file = tmp_path / "cache.json"
         provider = RiskLimitProvider(cache_path=cache_file, allowed_cache_root=None)
 
+        # The real write uses os.open (not Path.write_text/open), so intercept
+        # it with a path-discriminating mock: only the temp cache write (path
+        # ends ".tmp") fails; the lock-file open and cache read delegate to the
+        # real os.open. This is deterministic and OS-independent (no chmod).
+        real_open = os.open
+
+        def fail_only_temp(path, *args, **kwargs):
+            if str(path).endswith(".tmp"):
+                raise PermissionError("simulated read-only filesystem")
+            return real_open(path, *args, **kwargs)
+
         with caplog.at_level(logging.WARNING):
-            # Should not raise — permission error is caught and logged
-            provider.save_to_cache("BTCUSDT", SAMPLE_TIERS)
+            with patch("backtest.risk_limit_info.os.open", side_effect=fail_only_temp):
+                # Should not raise — permission error is caught and logged
+                provider.save_to_cache("BTCUSDT", SAMPLE_TIERS)
 
         # Verify warning was logged
         assert any("Failed to write cache file" in r.message for r in caplog.records)
 
-        # Restore permissions for cleanup, then verify no file was created
-        read_only_dir.chmod(0o755)
+        # os.open(temp_path) raised before any bytes were written, so no file remains
         assert not cache_file.exists()
+        assert not cache_file.with_suffix(".tmp").exists()
 
     def test_load_from_cache_rejects_symlink_path(self, tmp_path, caplog):
         """Cache reads are rejected when cache_path is a symlink."""
