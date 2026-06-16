@@ -1,0 +1,4 @@
+# Local replay experiment configs. Tracked templates use the *.yaml.example
+# suffix (committed); live/experiment configs and scratch sweep scripts are local.
+_*.py
+*.yaml
