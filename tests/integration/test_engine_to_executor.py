@@ -213,6 +213,7 @@ class TestExecutorRESTPayloadMapping:
             "reduce_only": intent.reduce_only,
             "position_idx": 1 if intent.direction == "long" else 2,
             "order_link_id": result.order_link_id,
+            "time_in_force": "GTC",
         }
         assert result.order_link_id is not None
         prefix, sep, suffix = result.order_link_id.partition("-")
