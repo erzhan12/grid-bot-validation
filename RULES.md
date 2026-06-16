@@ -79,7 +79,7 @@ uv run pytest apps/pnl_checker/tests --cov=pnl_checker --cov-report=term-missing
 make test-integration
 ```
 
-**`make test` note**: Runs pytest separately per package to avoid `conftest` ImportPathMismatchError. Coverage is appended; final run prints `term-missing`. `--cov-fail-under` not applied to merged total (~73%).
+**`make test` note**: Runs pytest separately per package to avoid `conftest` ImportPathMismatchError. Coverage is appended; final run prints `term-missing`. `--cov-fail-under` not applied to merged total (~73%). Covers every `pyproject.toml` `testpaths` entry, including `apps/backtest/tests` (added for issue #178 — its prior omission was an oversight with no documented justification).
 
 ## Continuous Integration (`.github/workflows/ci.yml`)
 
