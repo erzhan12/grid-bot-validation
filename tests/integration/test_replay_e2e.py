@@ -207,6 +207,9 @@ def _make_replay_config() -> ReplayConfig:
         run_id=RUN_ID,
         symbol=SYMBOL,
         strategy=ReplayStrategyConfig(
+            # Feature 0080: salt the replay hash with the recording's live strat_id
+            # so client_order_ids match the recorded executions (comparator join).
+            strat_id=STRAT_ID,
             tick_size=Decimal(TICK_SIZE),
             grid_count=GRID_COUNT,
             grid_step=GRID_STEP,

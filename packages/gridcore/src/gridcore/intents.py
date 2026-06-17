@@ -84,6 +84,7 @@ class PlaceLimitIntent:
         direction: str,
         reduce_only: bool = False,
         post_only: bool = False,
+        strat_id: str | None = None,
     ) -> "PlaceLimitIntent":
         """
         Factory method to create a PlaceLimitIntent with deterministic client_order_id.
@@ -111,6 +112,13 @@ class PlaceLimitIntent:
             reduce_only: Whether this is a reduce-only order (NOT part of identity hash)
             post_only: Whether this is a post-only (maker-only) order for
                 chase-close (NOT part of identity hash; feature 0066)
+            strat_id: Optional strategy identifier (feature 0080, issue #183).
+                When provided, namespaces the deterministic hash so two strategies
+                on the same (account, symbol) produce DISTINCT client_order_ids.
+                It is a salt applied here, NOT an _IDENTITY_PARAMS entry (dedup and
+                the survive-rebalance property are unaffected). When None (default),
+                the hash is byte-for-byte identical to the pre-0080 id, preserving
+                existing callers and historical-row matching.
 
         Returns:
             PlaceLimitIntent with deterministic client_order_id
@@ -120,6 +128,12 @@ class PlaceLimitIntent:
         params = locals()
         id_components = [str(params[param]) for param in cls._IDENTITY_PARAMS]
         id_string = "_".join(id_components)
+        # Feature 0080 (issue #183): namespace the identity hash by strat_id so two
+        # strategies on the same (account, symbol) produce DISTINCT client_order_ids.
+        # strat_id is a salt, NOT an _IDENTITY_PARAMS entry. When None, id_string is
+        # byte-for-byte the pre-0080 value (back-compat for callers + historical rows).
+        if strat_id is not None:
+            id_string = f"{strat_id}_{id_string}"
         deterministic_id = hashlib.sha256(id_string.encode()).hexdigest()[:16]
 
         return cls(

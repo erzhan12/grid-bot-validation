@@ -1872,6 +1872,7 @@ class StrategyRunner:
             symbol=self._config.symbol, side=close_side, price=chase_price,
             qty=qty, grid_level=-1, direction=direction,
             reduce_only=True, post_only=True,
+            strat_id=self._config.strat_id,
         )
 
     def _enter_chase(self, direction: str, price: float) -> None:
@@ -2438,6 +2439,7 @@ class StrategyRunner:
                 grid_level=0,
                 direction=direction,
                 reduce_only=reduce_only,
+                strat_id=self._config.strat_id,
             )
 
             # Prefer orderLinkId prefix as key for backward compatibility:
