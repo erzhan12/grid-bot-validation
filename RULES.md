@@ -92,6 +92,15 @@ Phase-0 rollout while the repo is red:
 
 **Branch protection (making the check "required") is a GitHub repo setting, not a file** — it cannot be enforced from `ci.yml`; set it manually.
 
+### Lint / Ruff (Feature 0078, issue #181)
+
+`make lint` = `uv run ruff check .`. Root config lives in `pyproject.toml` `[tool.ruff]` (ruff defaults; only an additive `exclude` list). Excluded trees, each with a rationale comment in the config:
+- `apps/backtest/debug_walkthrough.py` — interactive debug walkthrough; not app code.
+- `bbu_reference` — vendored bbu2 reference; not maintained, has its own nested `ruff.toml` (line-length 140).
+- `scripts` — one-off research/migration tooling; disposable, not imported by apps.
+
+Maintained code is NOT excluded. When a maintained file has an intentional lint error, prefer a targeted `# noqa: <code>` over excluding it — e.g. `tests/integration/conftest.py:16` carries `# noqa: E402` on the `gridcore.config` import that must follow the `sys.path.insert` block.
+
 ## Development Workflow
 
 1. Define task clearly

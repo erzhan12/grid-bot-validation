@@ -13,7 +13,7 @@ _INTEGRATION_DIR = str(Path(__file__).resolve().parent)
 if _INTEGRATION_DIR not in sys.path:
     sys.path.insert(0, _INTEGRATION_DIR)
 
-from gridcore.config import GridConfig
+from gridcore.config import GridConfig  # noqa: E402
 
 
 @pytest.fixture

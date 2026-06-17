@@ -27,3 +27,12 @@ pythonpath = ["packages/gridcore/src", "packages/bybit_adapter/src", "shared/db/
 testpaths = ["packages/gridcore/tests", "packages/bybit_adapter/tests", "shared/db/tests", "apps/event_saver/tests", "apps/gridbot/tests", "apps/backtest/tests", "apps/comparator/tests", "apps/recorder/tests", "apps/replay/tests", "apps/pnl_checker/tests", "tests/integration"]
 asyncio_mode = "auto"
 addopts = ["--import-mode=importlib"]
+
+[tool.ruff]
+# Lint all maintained code; skip intentionally-unmaintained trees (issue #181).
+# Additive to ruff's built-in defaults (.venv, __pycache__, .git, build dirs, etc.).
+exclude = [
+    "apps/backtest/debug_walkthrough.py",  # interactive debug walkthrough; not app code
+    "bbu_reference",                        # vendored bbu2 reference; not maintained, has its own ruff config
+    "scripts",                              # one-off research/migration scripts; disposable, not imported by apps
+]
