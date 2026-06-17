@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from gridbot.config import (
     AccountConfig,
     StrategyConfig,
+    SafetyCapsConfig,
     GridbotConfig,
     load_config,
 )
@@ -415,5 +416,98 @@ class TestLoadConfig:
         try:
             with pytest.raises(ValueError):
                 load_config(config_path)
+        finally:
+            Path(config_path).unlink()
+
+
+class TestSafetyCapsConfig:
+    """Feature 0079 (issue #182) — production safety caps config."""
+
+    _BASE = dict(
+        strat_id="btc_main", account="main", symbol="BTCUSDT",
+        tick_size=Decimal("0.1"),
+    )
+
+    def test_safety_caps_defaults_disabled(self):
+        """An existing YAML (no safety_caps block) loads with every cap disabled.
+
+        Safe-defaults contract: enabled=True wires the machinery but every
+        per-cap value is None, so upgrade is byte-for-byte the pre-0079 path
+        (no order is ever rejected until the operator opts a cap in).
+        """
+        strategy = StrategyConfig(**self._BASE)
+        caps = strategy.safety_caps
+        assert isinstance(caps, SafetyCapsConfig)
+        assert caps.enabled is True
+        assert caps.max_notional_per_symbol is None
+        assert caps.max_open_orders is None
+        assert caps.session_loss_limit is None
+        assert caps.session_loss_auto_reset_utc_midnight is True
+        assert caps.max_orders_per_minute is None
+
+    def test_safety_caps_explicit_values_and_decimal_coercion(self):
+        """Money fields coerce str/float → Decimal; counts stay int."""
+        strategy = StrategyConfig(
+            **self._BASE,
+            safety_caps={
+                "enabled": True,
+                "max_notional_per_symbol": "500.5",
+                "max_open_orders": 40,
+                "session_loss_limit": 25,
+                "session_loss_auto_reset_utc_midnight": False,
+                "max_orders_per_minute": 30,
+            },
+        )
+        caps = strategy.safety_caps
+        assert caps.max_notional_per_symbol == Decimal("500.5")
+        assert isinstance(caps.max_notional_per_symbol, Decimal)
+        assert caps.max_open_orders == 40
+        assert caps.session_loss_limit == Decimal("25")
+        assert isinstance(caps.session_loss_limit, Decimal)
+        assert caps.session_loss_auto_reset_utc_midnight is False
+        assert caps.max_orders_per_minute == 30
+
+    def test_safety_caps_invalid_values_rejected(self):
+        """Money caps use > 0; count caps use ge=1; degenerate YAML rejected."""
+        with pytest.raises(ValidationError):
+            StrategyConfig(**self._BASE, safety_caps={"max_notional_per_symbol": 0})
+        with pytest.raises(ValidationError):
+            StrategyConfig(**self._BASE, safety_caps={"max_notional_per_symbol": "-1"})
+        with pytest.raises(ValidationError):
+            StrategyConfig(**self._BASE, safety_caps={"max_open_orders": 0})  # ge=1
+        with pytest.raises(ValidationError):
+            StrategyConfig(**self._BASE, safety_caps={"session_loss_limit": 0})  # > 0
+        with pytest.raises(ValidationError):
+            StrategyConfig(**self._BASE, safety_caps={"max_orders_per_minute": 0})  # ge=1
+
+    def test_safety_caps_loaded_from_yaml(self):
+        """A safety_caps: block under a strategy round-trips through load_config."""
+        yaml_text = """
+accounts:
+  - name: main
+    api_key: k
+    api_secret: s
+    testnet: true
+strategies:
+  - strat_id: btc_main
+    account: main
+    symbol: BTCUSDT
+    tick_size: "0.1"
+    safety_caps:
+      max_notional_per_symbol: "1000"
+      max_open_orders: 50
+      session_loss_limit: "40"
+      max_orders_per_minute: 20
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml_text)
+            config_path = f.name
+        try:
+            cfg = load_config(config_path)
+            caps = cfg.strategies[0].safety_caps
+            assert caps.max_notional_per_symbol == Decimal("1000")
+            assert caps.max_open_orders == 50
+            assert caps.session_loss_limit == Decimal("40")
+            assert caps.max_orders_per_minute == 20
         finally:
             Path(config_path).unlink()

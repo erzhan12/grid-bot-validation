@@ -6,6 +6,7 @@ and the exchange. It handles the actual order placement and cancellation.
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from typing import Callable, Optional
@@ -19,9 +20,14 @@ from bybit_adapter.error_codes import (
 from gridcore.intents import PlaceLimitIntent, CancelIntent
 from gridcore.position import DirectionType
 from gridbot.order_link_id import make_order_link_id
+from gridbot.safety_caps import SafetyCaps
 
 
 logger = logging.getLogger(__name__)
+
+# Feature 0079 (issue #182) — throttle the C4 rate-limit WARNING so a sustained
+# rate-limit (every queued/re-dispatched intent rejected) does not flood the log.
+_RATE_LIMIT_WARN_THROTTLE_SEC = 60.0
 
 # Bybit error codes that indicate auth/permission problems (not retryable)
 AUTH_ERROR_CODES = {10003, 10004, 10005, 33004}
@@ -168,6 +174,8 @@ class IntentExecutor:
         position_idx_short: int = 2,
         max_auth_failures: int = 5,
         on_cooldown_entered: Optional[Callable[[], None]] = None,
+        safety_caps: Optional[SafetyCaps] = None,
+        clock: Callable[[], float] = time.monotonic,
     ):
         """Initialize executor.
 
@@ -178,6 +186,14 @@ class IntentExecutor:
             position_idx_short: Position index for short direction (hedge mode).
             max_auth_failures: Consecutive auth errors before entering cooldown.
             on_cooldown_entered: Callback fired when auth cooldown activates.
+            safety_caps: Optional shared ``SafetyCaps`` (feature 0079 / issue
+                #182). The orchestrator passes the SAME instance it gives the
+                StrategyRunner so the C4 rate-limit window and the runner's
+                C1/C2/C3 share one source of truth. When None (direct/test
+                callers) C4 is inert.
+            clock: Monotonic clock for the C4 window; MUST be the same callable
+                the shared SafetyCaps uses (the orchestrator passes one value to
+                both). Defaults to ``time.monotonic``; injectable for tests.
         """
         self._client = rest_client
         self._shadow_mode = shadow_mode
@@ -187,6 +203,12 @@ class IntentExecutor:
         self._auth_failure_count = 0
         self._auth_cooldown = False
         self._on_cooldown_entered = on_cooldown_entered
+        # Feature 0079 (issue #182) — C4 max-orders-per-minute rate limit. The
+        # executor is the single live-submit choke point (catches retry-queue
+        # re-dispatch, which bypasses the runner). Inert when safety_caps is None.
+        self._safety_caps = safety_caps
+        self._clock = clock
+        self._rate_limit_warn_last: float = 0.0
 
     @property
     def shadow_mode(self) -> bool:
@@ -261,6 +283,30 @@ class IntentExecutor:
                 order_link_id=unique_link_id,
             )
 
+        # Feature 0079 (issue #182) — C4 rate limit. Checked AFTER the shadow
+        # early-return (so shadow placements never consume the window) and
+        # BEFORE the real submit, on EVERY caller (runner first-dispatch AND
+        # retry-queue re-dispatch), so a rate-limited order never reaches Bybit.
+        # Returns the non-retryable "safety_cap_rate_limit" sentinel: the runner
+        # drops it on first dispatch (never enqueues — see _execute_place_intent);
+        # an already-enqueued item that trips this on re-dispatch is not
+        # re-submitted and simply exhausts its bounded retry budget.
+        if self._safety_caps is not None:
+            now = self._clock()  # read once: same instant gates the window + throttle
+            if self._safety_caps.rate_limited(now):
+                if (now - self._rate_limit_warn_last) >= _RATE_LIMIT_WARN_THROTTLE_SEC:
+                    self._rate_limit_warn_last = now
+                    logger.warning(
+                        f"Safety cap rate limit: dropping {intent.side} order "
+                        f"{intent.symbol} qty={intent.qty} price={intent.price} "
+                        f"link_id={unique_link_id} (not submitted, not enqueued)"
+                    )
+                return OrderResult(
+                    success=False,
+                    order_link_id=unique_link_id,
+                    error="safety_cap_rate_limit",
+                )
+
         try:
             # Determine position index based on direction
             position_idx = self._get_position_idx(intent.direction)
@@ -292,6 +338,10 @@ class IntentExecutor:
             )
 
             self._auth_failure_count = 0
+            # Feature 0079 — count this accepted real submission toward the C4
+            # trailing-60s window (only real successes, never shadow).
+            if self._safety_caps is not None:
+                self._safety_caps.record_accepted_submission(self._clock())
             return OrderResult(
                 success=True,
                 order_id=order_id,

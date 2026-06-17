@@ -22,6 +22,17 @@ strategies:
     min_total_margin: 0.15
     increase_same_position_on_low_margin: false  # true = boost own side x2 on low margin; false = suppress opposite side x0.5
     shadow_mode: false  # Set to true to log without executing
+    # Feature 0079 (issue #182) — production safety caps. Hard, last-resort caps
+    # enforced outside strategy logic; ADDITIVE to min_liq_ratio / low-balance
+    # preflight (they are not replaced). Omitting a field disables that cap, so
+    # an existing config with no safety_caps block keeps the pre-0079 behavior.
+    safety_caps:
+      enabled: true  # master kill-switch; false = every cap inert (pre-0079 path)
+      max_notional_per_symbol: "1000"  # C1: halt new OPENs when long+short notional (USDT) >= this; reduce-only closes always allowed. Omit to disable.
+      max_open_orders: 60  # C2: reject place intents (open AND reduce-only — a count limit) at/above this many tracked orders. Omit to disable.
+      session_loss_limit: "50"  # C3: positive USDT magnitude; when session realized PnL <= -this, cancel working orders once then suppress all new places. Omit to disable.
+      session_loss_auto_reset_utc_midnight: true  # C3 recovery: true = latch clears at the next UTC date; false = stays latched until process restart.
+      max_orders_per_minute: 30  # C4: reject submissions above this many accepted real orders in any trailing 60s (at the executor; shadow placements don't count). Omit to disable.
 
   - strat_id: "ethusdt_main"
     account: "main_account"

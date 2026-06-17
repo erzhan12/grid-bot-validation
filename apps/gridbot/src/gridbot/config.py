@@ -23,6 +23,87 @@ class AccountConfig(BaseModel):
     testnet: bool = Field(default=True, description="Use testnet endpoints")
 
 
+class SafetyCapsConfig(BaseModel):
+    """Feature 0079 (issue #182) — production safety caps.
+
+    Hard, last-resort caps enforced OUTSIDE strategy logic (in
+    ``StrategyRunner`` / ``IntentExecutor``), additive to and independent of
+    ``min_liq_ratio`` / ``max_liq_ratio`` / the low-balance preflight. Every
+    per-cap value defaults to ``None`` (that cap disabled), so an existing
+    deployment that has no ``safety_caps:`` block sees NO behavioral change on
+    upgrade — no order is ever rejected until the operator opts a cap in.
+    ``enabled`` is the master kill-switch: when False every cap is inert.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "Master kill-switch. When False every cap is inert (no state, no "
+            "checks, no logs) — the byte-for-byte pre-0079 path. When True the "
+            "machinery is wired but each still-None cap remains disabled."
+        ),
+    )
+    max_notional_per_symbol: Optional[Decimal] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "C1 — max live total position notional per symbol in USDT "
+            "(long.position_value + short.position_value). When the cap is "
+            "reached the runner suppresses new OPEN place intents; reduce-only "
+            "closes always pass. None disables C1."
+        ),
+    )
+    max_open_orders: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "C2 — max tracked (placed) open orders per strat. A pure count "
+            "limit: rejects BOTH open and reduce-only place intents at/above "
+            "the cap. None disables C2."
+        ),
+    )
+    session_loss_limit: Optional[Decimal] = Field(
+        default=None,
+        gt=0,
+        description=(
+            "C3 — session realized-loss circuit breaker, a POSITIVE USDT "
+            "magnitude (tripped when session realized PnL <= -value). On trip "
+            "the runner cancels working orders once and then suppresses ALL new "
+            "place intents until recovery. None disables C3."
+        ),
+    )
+    session_loss_auto_reset_utc_midnight: bool = Field(
+        default=True,
+        description=(
+            "C3 recovery mode. True = the loss latch auto-clears on the first "
+            "position update of the next UTC calendar date. False = stay "
+            "latched until process restart."
+        ),
+    )
+    max_orders_per_minute: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "C4 — max accepted real order submissions in any trailing 60s, "
+            "enforced at IntentExecutor.execute_place (the single live-submit "
+            "choke point, so retry-queue re-dispatch is rate-limited too). "
+            "Shadow placements do not consume the window. None disables C4."
+        ),
+    )
+
+    @field_validator(
+        "max_notional_per_symbol", "session_loss_limit", mode="before"
+    )
+    @classmethod
+    def _coerce_decimal(cls, v):
+        """Coerce str/int/float money fields to Decimal (mirrors tick_size)."""
+        if v is None:
+            return v
+        if isinstance(v, (str, int, float)):
+            return Decimal(str(v))
+        return v
+
+
 class StrategyConfig(BaseModel):
     """Grid trading strategy configuration."""
 
@@ -300,6 +381,11 @@ class StrategyConfig(BaseModel):
             "breaker cooldown (truncate_breaker_cooldown_seconds)."
         ),
     )
+
+    # Feature 0079 (issue #182) — production safety caps (exposure / order /
+    # loss / rate limits) enforced outside strategy logic. default_factory so
+    # existing YAMLs load unchanged and get the all-disabled SafetyCapsConfig.
+    safety_caps: SafetyCapsConfig = Field(default_factory=SafetyCapsConfig)
 
     # Mode
     shadow_mode: bool = Field(default=False, description="Log intents without executing")
