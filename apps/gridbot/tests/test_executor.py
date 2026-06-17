@@ -283,6 +283,31 @@ class TestExecutorPlaceOrder:
         assert order_link_id.partition("-")[2].isdigit()
         assert result.order_link_id == order_link_id
 
+    def test_strat_id_namespaced_intent_emitted_on_shadow_wire(self, shadow_executor):
+        """Feature 0080: the strat-namespaced client_order_id reaches the wire id.
+
+        create(strat_id=...) salts the deterministic id upstream; both the real
+        and shadow paths emit it verbatim as the orderLinkId prefix with no
+        executor change (acceptance #2). Shadow path asserted here.
+        """
+        plain = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Sell", price=Decimal("50000.0"),
+            qty=Decimal("0.001"), grid_level=10, direction="short",
+        )
+        owned = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Sell", price=Decimal("50000.0"),
+            qty=Decimal("0.001"), grid_level=10, direction="short",
+            strat_id="ownerA",
+        )
+        assert owned.client_order_id != plain.client_order_id  # salting changed the id
+
+        result = shadow_executor.execute_place(owned)
+
+        assert result.success is True
+        assert result.order_id == f"shadow_{owned.client_order_id}"
+        assert result.order_link_id.startswith(f"{owned.client_order_id}-")
+        assert result.order_link_id.partition("-")[2].isdigit()
+
     def test_post_only_intent_passes_postonly_tif(self, executor, mock_rest_client):
         """Feature 0066: post_only=True → place_order time_in_force='PostOnly'."""
         intent = PlaceLimitIntent.create(

@@ -323,13 +323,22 @@ class TestGridbotConfig:
         assert len(config.get_strategies_for_account("multi")) == 2
 
     def test_shared_symbol_rejected(self):
-        """Two strategies on same (account, symbol) are rejected by default."""
+        """Two strategies on same (account, symbol) are still rejected.
+
+        Feature 0080 resolved the orderLinkId-prefix-collision reason, but the
+        guard stays because positionIdx/cancel-on-mismatch sharing remains a
+        blocker — the message must reflect that updated rationale.
+        """
         account = AccountConfig(name="acc", api_key="k", api_secret="s")
         strategies = [
             StrategyConfig(strat_id="s1", account="acc", symbol="BTCUSDT", tick_size=Decimal("0.1")),
             StrategyConfig(strat_id="s2", account="acc", symbol="BTCUSDT", tick_size=Decimal("0.1")),
         ]
         with pytest.raises(ValueError, match="share account.*symbol"):
+            GridbotConfig(accounts=[account], strategies=strategies)
+        # New rationale wording (feature 0080): prefix collision resolved, but
+        # positionIdx sharing remains the blocker.
+        with pytest.raises(ValueError, match="positionIdx"):
             GridbotConfig(accounts=[account], strategies=strategies)
 
     def test_same_symbol_different_accounts_ok(self):

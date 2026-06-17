@@ -28,6 +28,53 @@ def create_client_order_id(symbol, side, price, direction):
 
 **Result:** Same `(symbol, side, price, direction)` → Same `client_order_id`
 
+### Strategy Namespacing (Feature 0080, issue #183, 2026-06-17)
+
+`PlaceLimitIntent.create` accepts an OPTIONAL `strat_id` that namespaces the
+hash so two strategies on the same `(account, symbol)` no longer collide on the
+deterministic prefix:
+
+```python
+# strat_id is a SALT, not an _IDENTITY_PARAMS entry:
+if strat_id is not None:
+    id_string = f"{strat_id}_{symbol}_{side}_{price}_{direction}"
+else:
+    id_string = f"{symbol}_{side}_{price}_{direction}"   # pre-0080, byte-for-byte
+client_order_id = sha256(id_string.encode()).hexdigest()[:16]
+```
+
+- **`strat_id` is a salt, NOT in `_IDENTITY_PARAMS`.** Adding it to the param set
+  would also feed dedup/equality; instead it is applied only inside `create`, so
+  the survive-rebalance property and intra-engine dedup are unchanged.
+- **`None` default = old hash byte-for-byte.** Existing callers and historical
+  recorded rows keep the same id; only the 3 production call sites
+  (`engine.py`, `runner.py` ×2) thread `strat_id`.
+- **Wire form unchanged:** `{hash16}-{millis}` = 30 chars. Bybit caps
+  `orderLinkId` at **36 chars** (`gridbot.order_link_id._BYBIT_ORDER_LINK_ID_MAX`);
+  `make_order_link_id` raises if exceeded. `extract_client_order_prefix`
+  (partition-on-first-`-`) is unchanged.
+
+#### Collision rules
+
+| symbol | side | price | direction | strat_id | → client_order_id |
+|--------|------|-------|-----------|----------|-------------------|
+| = | = | = | = | = | SAME (deterministic survival) |
+| = | = | = | = | ≠ | DIFFERENT (the #183 fix) |
+| any one differs | | | | any | DIFFERENT |
+
+#### Replay / comparator boundary rule
+
+The comparator joins live vs backtest trades on `client_order_id`. Recorded LIVE
+orders were salted with the live `strat_id`, so **replay MUST salt with the same
+live id**. The recording's `strat_id` is NOT stored on any `Order` /
+`PrivateExecution` / `Strategy` DB row, so it is supplied via config:
+`apps/replay/src/replay/engine.py` resolves the engine `strat_id` with precedence
+`ReplayStrategyConfig.strat_id` → `seed.strat_id` (when seeding) → synthetic
+`replay_{symbol}` (no recorded orders to match). When comparing a **blank-start**
+replay against recorded executions, set `strategy.strat_id` to the recording's
+live id — otherwise the synthetic fallback diverges and the match rate collapses.
+A replay over a PRE-0080 window uses `strat_id=None`, reproducing the old hash.
+
 ## Key Design Decision: grid_level Excluded from Hash
 
 ### Rationale
@@ -160,6 +207,18 @@ _IDENTITY_PARAMS = ['symbol', 'side', 'price', 'direction']
 - Orders survive grid rebalancing
 - Safety checks prevent price collisions
 - Full tracking capability retained
+
+### Strategy Namespacing (Feature 0080, 2026-06-17)
+
+```python
+# strat_id salted into the hash INPUT (not _IDENTITY_PARAMS); None = pre-0080 hash
+id_string = f"{strat_id}_{symbol}_{side}_{price}_{direction}"  # when strat_id set
+```
+
+- Two strats on the same `(account, symbol)` get DISTINCT prefixes (issue #183).
+- Resolves the orderLinkId-prefix reason in `validate_no_shared_symbol`; that
+  guard STAYS (positionIdx / cancel-on-mismatch sharing remains a blocker).
+- Wire form + `extract_client_order_prefix` unchanged; 36-char Bybit limit guarded.
 
 ## Testing
 

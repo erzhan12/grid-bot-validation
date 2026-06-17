@@ -435,4 +435,5 @@ class GridEngine:
             grid_level=grid_level,
             direction=direction,
             reduce_only=self._REDUCE_ONLY_MAP[(direction, grid['side'])],
+            strat_id=self.strat_id,
         )

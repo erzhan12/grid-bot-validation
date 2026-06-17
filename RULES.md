@@ -568,6 +568,7 @@ short with mult=2.0; the grown open exceeded free margin → 110007 every attemp
   - `build_grid()` validates no duplicate prices
   - When adding params: if it affects uniqueness → add to `_IDENTITY_PARAMS`; if not → don't
   - See `docs/features/ORDER_IDENTITY_DESIGN.md`
+  - **Feature 0080 (issue #183) — strat_id namespacing**: `create(strat_id=...)` salts the hash by `strat_id` so two strategies on the same `(account, symbol)` get DISTINCT prefixes. `strat_id` is a SALT, NOT in `_IDENTITY_PARAMS`; the `None` default reproduces the pre-0080 hash byte-for-byte (back-compat for callers + historical rows — only the 3 production call sites thread it). Wire form `{hash16}-{millis}` and `extract_client_order_prefix` unchanged; Bybit `orderLinkId` ≤ 36 chars (`gridbot.order_link_id._BYBIT_ORDER_LINK_ID_MAX`; `make_order_link_id` raises if over). **Replay must salt with the live `strat_id`** or the comparator's `client_order_id` join breaks — the recording's strat_id is on NO DB row, so supply it via config; `apps/replay/src/replay/engine.py` resolves precedence `ReplayStrategyConfig.strat_id` → `seed.strat_id` → synthetic `replay_{symbol}`. For blank-start comparison set `strategy.strat_id` to the recording's live id. `validate_no_shared_symbol` still rejects co-location (positionIdx/cancel-on-mismatch sharing remains the blocker, not the prefix).
 
 ### PnL Calculations (`pnl.py`)
 

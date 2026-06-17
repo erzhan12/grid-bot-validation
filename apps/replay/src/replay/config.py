@@ -29,6 +29,17 @@ class ReplayStrategyConfig(BaseModel):
 
     tick_size: Decimal = Field(..., description="Price tick size for rounding")
 
+    # Feature 0080 (issue #183): the deterministic client_order_id is namespaced
+    # by strat_id. To match orders recorded by the LIVE strategy, replay must salt
+    # with the SAME strat_id. Set this to the recording's live strat_id when
+    # comparing against recorded executions (blank-start OR seeded). When None,
+    # falls back to seed.strat_id (if seeding), then a synthetic id.
+    strat_id: Optional[str] = Field(
+        default=None,
+        description="Live strategy id used to namespace client_order_id hashes "
+        "for comparator matching (feature 0080). None -> seed.strat_id -> synthetic.",
+    )
+
     # Grid parameters
     grid_count: int = Field(default=50, ge=4, description="Total grid levels")
     grid_step: float = Field(default=0.2, gt=0, description="Grid step percentage")

@@ -437,24 +437,26 @@ class GridbotConfig(BaseModel):
     def validate_no_shared_symbol(self):
         """Reject multiple strategies on the same (account, symbol) pair.
 
-        Even though orderLinkId IS sent to Bybit (deterministic prefix +
-        millis suffix post-2026-05-08), it cannot disambiguate two
-        strategies on the same (account, symbol). The deterministic prefix
-        is a SHA of (symbol, side, price, direction) — both strategies
-        would compute the SAME prefix for the same logical order, and the
-        wire-form suffix only differs across re-placements, not across
-        strategies. So at runtime there is no way to tell which strategy
-        placed a given open order, and two strategies on the same pair
-        would cancel each other's orders on every tick via the engine's
-        cancel-on-mismatch pass (gridcore/engine.py:_place_grid_orders).
+        Feature 0080 (issue #183) namespaced the deterministic client_order_id
+        prefix by strat_id (the SHA input is now
+        (strat_id, symbol, side, price, direction)), so the orderLinkId-prefix
+        collision that originally motivated this guard is RESOLVED — two
+        strategies now compute DISTINCT prefixes for the same logical order.
+
+        This validator is NOT relaxed, however: Bybit hedge-mode positionIdx is
+        shared per (account, symbol), and the engine's cancel-on-mismatch pass
+        (gridcore/engine.py:_place_grid_orders) would still make two co-located
+        strategies fight over the same position buckets every tick. That
+        position-bucket sharing is an independent blocker 0080 does not address,
+        so co-location stays rejected until a future positionIdx-sharing fix
+        lands. If you need a second strategy on the same symbol today, use a
+        different account.
 
         bbu2 makes this configuration unrepresentable by construction: its
         amounts[].strat field is a scalar pointing at a single pair_timeframes
         entry, and each pair_timeframe has a single symbol, so the bad config
         cannot be written. Our schema is more flexible, so we reconstruct
-        the same invariant as a pydantic validator. There is no escape hatch —
-        if you need a second strategy on the same symbol, use a different
-        account.
+        the same invariant as a pydantic validator.
         """
         seen: dict[tuple[str, str], str] = {}
         for strategy in self.strategies:
@@ -463,14 +465,14 @@ class GridbotConfig(BaseModel):
                 raise ValueError(
                     f"Strategies '{seen[key]}' and '{strategy.strat_id}' share "
                     f"account='{strategy.account}' symbol='{strategy.symbol}'. "
-                    f"This is not allowed: the deterministic client_order_id "
-                    f"prefix is a SHA of (symbol, side, price, direction), so "
-                    f"two strategies on the same (account, symbol) compute the "
-                    f"same orderLinkId prefix and cannot be distinguished at "
-                    f"runtime — they would cancel each other's orders every "
-                    f"tick. bbu2 makes this unrepresentable by construction; "
-                    f"here we reject it at config load. Use a different "
-                    f"account for the second strategy."
+                    f"The orderLinkId-prefix collision is resolved by feature "
+                    f"0080 (client_order_id is now namespaced by strat_id), but "
+                    f"co-location is still not allowed: Bybit hedge-mode "
+                    f"positionIdx and the engine's cancel-on-mismatch pass are "
+                    f"shared per (account, symbol), so the two strategies would "
+                    f"fight over the same position buckets every tick. Use a "
+                    f"different account for the second strategy until a "
+                    f"positionIdx-sharing fix lands."
                 )
             seen[key] = strategy.strat_id
         return self

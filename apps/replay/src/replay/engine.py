@@ -334,7 +334,20 @@ class ReplayEngine:
         )
 
         # 2. Build backtest components
-        strat_id = f"replay_{config.symbol.lower()}"
+        # Feature 0080 (issue #183): client_order_id is now namespaced by strat_id.
+        # Recorded LIVE orders were salted with the live strat_id, so replay MUST
+        # salt with the SAME id to keep the comparator's (client_order_id,
+        # occurrence) join and the seed round-trip matching. The recording's
+        # strat_id is NOT stored on the Order/PrivateExecution/Strategy DB rows, so
+        # it must be supplied via config. Precedence: explicit strategy.strat_id
+        # (set when comparing against a recording, incl. blank-start) -> seed.strat_id
+        # (when seeding) -> synthetic id (no recorded orders to match).
+        if config.strategy.strat_id:
+            strat_id = config.strategy.strat_id
+        elif config.seed.enabled and config.seed.strat_id:
+            strat_id = config.seed.strat_id
+        else:
+            strat_id = f"replay_{config.symbol.lower()}"
         strategy_config = BacktestStrategyConfig(
             strat_id=strat_id,
             symbol=config.symbol,
