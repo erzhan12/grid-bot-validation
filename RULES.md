@@ -45,7 +45,7 @@ Project-specific "what not to do" — pairs with the universal Constraints in `.
 - **Don't edit `bbu_reference/`** — vendored legacy BBU2 bot our code was ported from (its own `ruff.toml`, line-length 140; outside our lint/test scope). Read it to understand original behavior (see "Legacy bbu2 paths" above), but never modify it.
 - **Don't hand-edit generated/data dirs** — `data/`, `output/`, `results/`, `db/` are gitignored recorder/replay/backtest artifacts and SQLite DBs, not source. `conf/` holds real tracked config (risk-limit tiers, instrument caches) — leave unless asked.
 - **Backward-compat is deliberate, not speculative** — existing compat (`DirectionType`/`SideType` StrEnum aliases, replay `strict_cross` baseline, `extract_client_order_prefix` no-hyphen fallback) is intentional. Don't add new compat shims without a stated reason.
-- **No dead config fields** — don't add YAML fields/flags "for later"; e.g. `max_margin` is declared but never read (the bot has no automatic position cap).
+- **No dead config fields** — don't add YAML fields/flags "for later"; e.g. `max_margin` is declared but never read. (Feature 0079 added a real automatic position cap via the **C1 `safety_caps.max_notional_per_symbol`** notional limit — see "Production safety caps"; `max_margin` itself remains dead/unrevived.)
 - **Don't point tooling at live state without explicit ask** — the account is Bybit **mainnet** (`mainnet_live`); never run against the live gridbot DB or live orders unless told.
 
 ## Package Management with uv
@@ -540,6 +540,68 @@ short with mult=2.0; the grown open exceeded free margin → 110007 every attemp
   hook), `config.py`. Tests: `test_runner_lowbalance_storm.py` (17 new, keyed
   `test_low_balance_skip_*`). Record floats (`avail_min/max`,
   `first_blocked_price`) are `float`; affordability comparison stays `Decimal`.
+
+### Production safety caps (feature 0079, issue #182)
+
+Hard, **last-resort** caps enforced OUTSIDE strategy logic so they cannot be
+overridden by grid-engine decisions (the #159 storm motivated them). They are
+**additive** to `min_liq_ratio` / `max_liq_ratio` / the low-balance preflight —
+they do NOT replace them. All cap state + decision logic lives in ONE place,
+`gridbot/safety_caps.py` (`SafetyCaps` + frozen `CapDecision`); the orchestrator
+builds ONE instance per strat in `_init_strategy` and passes the SAME object
+(and the same monotonic clock) to both the `StrategyRunner` (C1/C2/C3) and the
+`IntentExecutor` (C4) so the C4 window and the loss latch are one source of truth.
+
+- **Four caps** (`StrategyConfig.safety_caps`, a `SafetyCapsConfig`; every
+  per-cap value defaults to `None` = that cap disabled, so an existing YAML with
+  no `safety_caps:` block is byte-for-byte pre-0079 — no order is ever rejected
+  until the operator opts in; `enabled` is the master kill-switch):
+  - **C1 `max_notional_per_symbol`** (USDT) — halt new OPENs when live
+    `long.position_value + short.position_value >= cap`. Reduce-only closes are
+    EXEMPT.
+  - **C2 `max_open_orders`** — pure count limit on tracked `placed` orders;
+    rejects BOTH open and reduce-only at/above the cap.
+  - **C3 `session_loss_limit`** (positive USDT magnitude) + flag
+    `session_loss_auto_reset_utc_midnight`. Evaluated in `on_position_update`
+    (where realized PnL lands) off the per-cycle `cur_realized_pnl` sum (the
+    Bybit UI "Realized", NOT the ~80x lifetime `cumRealisedPnl`). On trip it is a
+    **full circuit breaker**: cancel ALL working orders once (via
+    `_execute_cancel_intent` → honors shadow mode + tracked-order state; uses the
+    wire `orderId`, not `orderLinkId`) then suppress ALL new places (open AND
+    reduce-only) via `loss_tripped()`. Recovery: latch clears on the first
+    position update of the next UTC date (auto-reset True) or only on process
+    restart (False). The UTC reset date is seeded lazily on the first
+    `check_loss_breaker` (the constructor has only a monotonic clock; UTC enters
+    via the `now_utc` arg).
+  - **C4 `max_orders_per_minute`** — trailing-60s rate limit at
+    `IntentExecutor.execute_place` (the single live-submit choke point, so
+    retry-queue re-dispatch is rate-limited too). Returns the non-retryable
+    `error="safety_cap_rate_limit"` sentinel; only real successes consume the
+    window — **shadow placements do not**.
+- **Precedence**: caps run in `_execute_place_intent` as **Step 2.5** — AFTER
+  qty-resolve (Step 1) + the 110017 breaker (Step 2) and BEFORE the dirty refresh
+  / `_is_good_to_place` guard — so a capped intent never reaches the strategy
+  guard or the exchange. When a cap and a strategy guard both want to reject, the
+  cap wins (it runs first / fail-closed). A capped or rate-limited intent is
+  **dropped, NOT enqueued** to the retry queue (mirrors the 110007 / 110017
+  drop): the runner short-circuits any `error.startswith("safety_cap")`.
+- **Live-only → replay/backtest parity preserved by construction**: caps run in
+  `StrategyRunner` / `IntentExecutor` only; `apps/backtest` / `apps/replay` /
+  `apps/comparator` use `BacktestRunner` and import neither, so the cap code
+  never runs there. `max_margin` remains dead/unused — C1 supersedes its original
+  intent with a real notional cap (it does NOT revive `max_margin`).
+- **Shadow mode**: the runner-level C1/C2/C3 run BEFORE the executor, so a
+  tripped cap suppresses even the `[SHADOW] Would place …` log (faithful); C4 is
+  after the executor's shadow early-return, so shadow never consumes its window.
+- Rejection logging is throttled per reason (`_SAFETY_CAP_WARN_THROTTLE_SEC`,
+  runner) and per executor (`_RATE_LIMIT_WARN_THROTTLE_SEC`); Telegram alerts
+  throttle via `error_key=f"safety_cap_{reason}_{strat_id}"`.
+- Files: `config.py` (`SafetyCapsConfig`), `safety_caps.py` (**new**),
+  `runner.py` (Step 2.5, C3 in `on_position_update`, cached per-direction
+  `position_value`, drop-not-enqueue), `executor.py` (C4 + `record_accepted_submission`),
+  `orchestrator.py` (`_init_strategy` builds + shares one instance),
+  `gridbot.yaml.example`. Tests: `test_safety_caps.py` (**new**, unit trip+recovery
+  per cap), `test_runner.py` / `test_executor.py` (integration).
 
 ### SAME ORDER detection
 

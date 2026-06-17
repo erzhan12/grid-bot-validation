@@ -10,10 +10,11 @@ import pytest
 from gridcore import TickerEvent, ExecutionEvent, OrderUpdateEvent, EventType, InstrumentInfo
 from gridcore.intents import PlaceLimitIntent, CancelIntent
 
-from gridbot.config import StrategyConfig
+from gridbot.config import StrategyConfig, SafetyCapsConfig
 from gridbot.executor import IntentExecutor, OrderResult, CancelResult
 from gridbot.retry_queue import RetryQueue
 from gridbot.runner import StrategyRunner, TrackedOrder
+from gridbot.safety_caps import SafetyCaps
 
 EMPTY_LIMITS: dict[str, list[dict]] = {'long': [], 'short': []}
 
@@ -4530,3 +4531,192 @@ class TestOnGridChangeExchangeTsPropagation:
         assert all(ts == exec_ts for ts in observed)
         # Ticker ts must NOT bleed in via stale _current_exchange_ts.
         assert ticker_ts not in observed
+
+
+class TestSafetyCapsIntegration:
+    """Feature 0079 (issue #182) — caps wired through the runner dispatch path."""
+
+    def _runner(self, strategy_config, mock_executor, instrument_info, caps, **kw):
+        r = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+            safety_caps=caps,
+            **kw,
+        )
+        r._wallet_balance = Decimal("10000")
+        return r
+
+    def _open(self, side="Buy", direction="long", price="50000", qty="0.001"):
+        return PlaceLimitIntent.create(
+            symbol="BTCUSDT", side=side, price=Decimal(price), qty=Decimal(qty),
+            grid_level=1, direction=direction, reduce_only=False,
+        )
+
+    def _close(self, side="Sell", direction="long", price="51000", qty="0.001"):
+        return PlaceLimitIntent.create(
+            symbol="BTCUSDT", side=side, price=Decimal(price), qty=Decimal(qty),
+            grid_level=1, direction=direction, reduce_only=True,
+        )
+
+    def test_c1_suppresses_open_but_allows_reduce_only_close(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        caps = SafetyCaps(
+            SafetyCapsConfig(max_notional_per_symbol="500"), strat_id="btcusdt_test"
+        )
+        r = self._runner(strategy_config, mock_executor, instrument_info, caps)
+        # Exposure at the C1 cap.
+        r._long_position_value = Decimal("500")
+        r._short_position_value = Decimal("0")
+
+        # OPEN is suppressed before the executor.
+        r._execute_place_intent(self._open(), {"long": [], "short": []})
+        mock_executor.execute_place.assert_not_called()
+
+        # Reduce-only close is C1-exempt and reaches the executor (position big
+        # enough to pass _is_good_to_place).
+        r._long_position.size = Decimal("1.0")
+        r._execute_place_intent(self._close(), {"long": [], "short": []})
+        mock_executor.execute_place.assert_called_once()
+
+    def test_c2_blocks_open_and_reduce_only(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        caps = SafetyCaps(
+            SafetyCapsConfig(max_open_orders=2), strat_id="btcusdt_test"
+        )
+        r = self._runner(strategy_config, mock_executor, instrument_info, caps)
+        r._long_position.size = Decimal("1.0")
+        # Two working orders == cap.
+        limits = {
+            "long": [
+                {"orderId": "a", "orderLinkId": "a", "price": "49000",
+                 "qty": "0.001", "side": "Buy", "reduceOnly": False},
+                {"orderId": "b", "orderLinkId": "b", "price": "49500",
+                 "qty": "0.001", "side": "Buy", "reduceOnly": False},
+            ],
+            "short": [],
+        }
+        r._execute_place_intent(self._open(), limits)
+        r._execute_place_intent(self._close(), limits)
+        mock_executor.execute_place.assert_not_called()
+
+    def test_c3_trip_cancels_working_orders_then_suppresses_places(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        caps = SafetyCaps(
+            SafetyCapsConfig(session_loss_limit="25"), strat_id="btcusdt_test"
+        )
+        r = self._runner(strategy_config, mock_executor, instrument_info, caps)
+        # One working order so the trip has something to cancel.
+        intent = self._open(price="49000", qty="0.01")
+        tracked = TrackedOrder(
+            client_order_id=intent.client_order_id, intent=intent, status="placed"
+        )
+        tracked.order_id = "wire_1"
+        r._tracked_orders[intent.client_order_id] = tracked
+
+        # A position update whose session realized PnL breaches the limit trips C3.
+        r.on_position_update(
+            long_position={
+                "size": "0.01", "avgPrice": "50000",
+                "curRealisedPnl": "-30", "leverage": "10",
+            },
+            short_position=None,
+            wallet_balance=10000.0,
+            last_close=50000.0,
+        )
+        assert caps.loss_tripped() is True
+        # Working order cancelled once via the executor (wire id, not link id).
+        mock_executor.execute_cancel.assert_called_once()
+        cancel_arg = mock_executor.execute_cancel.call_args.args[0]
+        assert cancel_arg.order_id == "wire_1"
+        assert cancel_arg.symbol == "BTCUSDT"
+        assert cancel_arg.reason == "safety_cap_loss_breaker"
+
+        # Subsequent places are suppressed by the latch.
+        mock_executor.execute_place.reset_mock()
+        r._execute_place_intent(self._open(), {"long": [], "short": []})
+        mock_executor.execute_place.assert_not_called()
+
+    def test_rate_limit_sentinel_is_dropped_not_enqueued(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        # Disable the preflight so the OPEN reaches the executor unconditionally.
+        cfg = strategy_config.model_copy(
+            update={"preflight_balance_check_enabled": False}
+        )
+        on_failed = Mock()
+        mock_executor.execute_place = MagicMock(
+            return_value=OrderResult(success=False, error="safety_cap_rate_limit")
+        )
+        r = StrategyRunner(
+            strategy_config=cfg,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+            on_intent_failed=on_failed,
+        )
+        r._wallet_balance = Decimal("10000")
+        r._execute_place_intent(self._open(), {"long": [], "short": []})
+        # C4 sentinel must NOT be enqueued to the retry queue.
+        on_failed.assert_not_called()
+
+    def test_non_cap_failure_still_enqueues(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """Discriminator: a non-safety_cap failure (110072) still enqueues."""
+        cfg = strategy_config.model_copy(
+            update={"preflight_balance_check_enabled": False}
+        )
+        on_failed = Mock()
+        mock_executor.execute_place = MagicMock(
+            return_value=OrderResult(
+                success=False, error="place_order failed (ErrCode: 110072) duplicate"
+            )
+        )
+        r = StrategyRunner(
+            strategy_config=cfg,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+            on_intent_failed=on_failed,
+        )
+        r._wallet_balance = Decimal("10000")
+        r._execute_place_intent(self._open(), {"long": [], "short": []})
+        on_failed.assert_called_once()
+
+    def test_c3_trip_cancels_working_orders_in_shadow_mode(
+        self, shadow_config, mock_executor, instrument_info
+    ):
+        """C3 cancel routes through the executor even in shadow mode (the runner
+        dispatches the CancelIntent; the executor honors shadow downstream)."""
+        mock_executor.shadow_mode = True
+        caps = SafetyCaps(
+            SafetyCapsConfig(session_loss_limit="25"), strat_id="btcusdt_shadow"
+        )
+        r = StrategyRunner(
+            strategy_config=shadow_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+            safety_caps=caps,
+        )
+        r._wallet_balance = Decimal("10000")
+        intent = self._open(price="49000", qty="0.01")
+        tracked = TrackedOrder(
+            client_order_id=intent.client_order_id, intent=intent, status="placed"
+        )
+        tracked.order_id = "wire_1"
+        r._tracked_orders[intent.client_order_id] = tracked
+
+        r.on_position_update(
+            long_position={
+                "size": "0.01", "avgPrice": "50000",
+                "curRealisedPnl": "-30", "leverage": "10",
+            },
+            short_position=None,
+            wallet_balance=10000.0,
+            last_close=50000.0,
+        )
+        assert caps.loss_tripped() is True
+        mock_executor.execute_cancel.assert_called_once()
+        assert mock_executor.execute_cancel.call_args.args[0].order_id == "wire_1"

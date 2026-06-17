@@ -59,6 +59,7 @@ from gridbot.executor import (  # noqa: E402
 )
 from gridbot.notifier import Notifier  # noqa: E402
 from gridbot.order_link_id import make_order_link_id  # noqa: E402
+from gridbot.safety_caps import SafetyCaps  # noqa: E402
 from gridbot.truncate_breaker import TruncateBreaker  # noqa: E402
 
 
@@ -105,6 +106,11 @@ _SAME_ORDER_WARN_THROTTLE_SEC = 60.0
 # WS position-size mismatches while dirty (REST baseline held each time). Signals
 # a WS feed stuck beyond the normal recovery window. Re-fires every multiple.
 _DIRTY_WS_MISMATCH_ALERT_THRESHOLD = 10
+
+# Feature 0079 (issue #182) — throttle the per-reason safety-cap rejection
+# WARNING to at most one per this many seconds per reason, so a cap held at its
+# threshold (e.g. notional pinned at C1) does not flood the log every tick.
+_SAFETY_CAP_WARN_THROTTLE_SEC = 60.0
 
 
 @dataclass
@@ -199,6 +205,7 @@ class StrategyRunner:
         clock: Optional[Callable[[], float]] = None,
         wallet_provider: Optional["WalletProvider"] = None,
         wallet_ws_max_age_seconds: float = 45.0,
+        safety_caps: Optional[SafetyCaps] = None,
     ):
         """Initialize strategy runner.
 
@@ -241,6 +248,13 @@ class StrategyRunner:
                 the preflight uses the position-cadence ``_available_balance``.
             wallet_ws_max_age_seconds: Max age (s) of a provider peek the preflight
                 will trust before failing open (feature 0066 Phase 4).
+            safety_caps: Optional shared ``SafetyCaps`` instance (feature 0079 /
+                issue #182). The runner ACCEPTS it (the orchestrator constructs
+                ONE per strat and passes the SAME object to this runner and the
+                IntentExecutor so C4's window and C1/C2/C3 share one source of
+                truth). When None (direct/test callers) every cap call is
+                short-circuited to allow / no-op; SafetyCaps itself also
+                short-circuits internally when its config.enabled is False.
         """
         # 0047: if a DB writer is wired, account_id MUST be explicitly set —
         # the dummy default would FK-mismatch with replay's account scope
@@ -335,6 +349,18 @@ class StrategyRunner:
         self._available_balance: Decimal = Decimal("0")
         self._total_available_balance: Decimal = Decimal("0")
         self._total_maintenance_margin: Decimal = Decimal("0")
+
+        # Feature 0079 (issue #182) — production safety caps. `_safety_caps` is
+        # the shared SafetyCaps (or None for direct/test callers → caps inert).
+        # `_long_position_value`/`_short_position_value` cache the latest
+        # per-direction notional from on_position_update so the place-path C1
+        # read is O(1). `_safety_cap_warn_last` throttles the per-reason
+        # rejection WARNING (one per reason per _SAFETY_CAP_WARN_THROTTLE_SEC)
+        # so a notional-at-cap storm does not flood the log (cf. feature 0067).
+        self._safety_caps = safety_caps
+        self._long_position_value: Decimal = Decimal("0")
+        self._short_position_value: Decimal = Decimal("0")
+        self._safety_cap_warn_last: dict[str, float] = {}
         # Raw low-balance predicate (single source of truth, recomputed each
         # on_position_update), shared by the moderate_liq_risk fix (3a) and
         # chase-close (3b). Each consumer applies its own kill-switch.
@@ -881,6 +907,18 @@ class StrategyRunner:
             # Build PositionState objects
             long_state = self._build_position_state(long_position, wallet_balance, DirectionType.LONG)
             short_state = self._build_position_state(short_position, wallet_balance, DirectionType.SHORT)
+
+            # Feature 0079 (issue #182) — cache per-direction notional for the
+            # place-path C1 read, and evaluate the C3 session-loss breaker.
+            # Realized PnL is price-independent, so this runs BEFORE the
+            # no-valid-price early-return below.
+            self._long_position_value = (
+                long_state.position_value if long_state else Decimal("0")
+            )
+            self._short_position_value = (
+                short_state.position_value if short_state else Decimal("0")
+            )
+            self._evaluate_loss_breaker(long_state, short_state)
 
             # Update position sizes (used by _is_good_to_place). While a
             # direction is dirty (feature 0064), the size write is gated so a
@@ -2060,6 +2098,39 @@ class StrategyRunner:
             )
             return
 
+        # Step 2.5 — production safety caps (feature 0079 / issue #182). Runs
+        # AFTER qty-resolve + the 110017 breaker and BEFORE the dirty refresh /
+        # _is_good_to_place guard, so a capped intent never reaches the strategy
+        # guard or the exchange. Inert when no SafetyCaps is wired (None) or its
+        # config is disabled. A capped intent is dropped, NOT enqueued.
+        if self._safety_caps is not None:
+            # C3 latch: once the session-loss breaker has tripped, suppress ALL
+            # new places (open AND reduce-only — it is a full circuit breaker;
+            # the trip ERROR/alert + working-order cancel already fired once in
+            # on_position_update).
+            if self._safety_caps.loss_tripped():
+                logger.debug(
+                    "%s: safety-cap loss breaker latched — dropping %s @ %s",
+                    self.strat_id, intent.side, intent.price,
+                )
+                return
+            open_order_count = sum(len(v) for v in limits.values())
+            if intent.reduce_only:
+                decision = self._safety_caps.allow_reduce_only(
+                    open_order_count=open_order_count
+                )
+            else:
+                total_notional = (
+                    self._long_position_value + self._short_position_value
+                )
+                decision = self._safety_caps.allow_open(
+                    total_notional=total_notional,
+                    open_order_count=open_order_count,
+                )
+            if not decision.allowed:
+                self._emit_safety_cap_rejection(intent, decision.reason)
+                return
+
         # Step 3 — dirty-mirror REST refresh before the guard (reduce-only only).
         # `dirty_refresh_enabled` is the FIRST term so flipping it off is a true
         # kill-switch. intent.direction is the position being closed (a
@@ -2135,6 +2206,17 @@ class StrategyRunner:
 
         tracked.mark_failed()
 
+        # Feature 0079 (issue #182) — a C4 rate-limit sentinel from the executor
+        # ("safety_cap_rate_limit") must be DROPPED, not enqueued (else the
+        # rate-limited intent re-storms the retry queue). Mirrors the 110007 /
+        # 110017 "drop, don't enqueue" decisions below.
+        if result.error and result.error.startswith("safety_cap"):
+            logger.warning(
+                "%s: %s on %s %s @ %s — dropping (not enqueued)",
+                self.strat_id, result.error, intent.direction, intent.side, intent.price,
+            )
+            return
+
         # Feature 0066 (issue #159) — 110007 "available balance not enough" on an
         # OPEN order: do NOT enqueue to the retry queue. A boundary race (balance
         # moved between the preflight read and submit) can still surface 110007;
@@ -2207,6 +2289,85 @@ class StrategyRunner:
 
         if not result.success and self._on_intent_failed:
             self._on_intent_failed(intent, result.error)
+
+    def _emit_safety_cap_rejection(self, intent: PlaceLimitIntent, reason: str) -> None:
+        """Log (throttled) + alert a safety-cap rejection (feature 0079).
+
+        The WARNING is throttled per reason (``_SAFETY_CAP_WARN_THROTTLE_SEC``)
+        so a cap pinned at its threshold does not flood the log every tick; the
+        Telegram alert is throttled by the notifier via ``error_key``. The
+        caller drops the intent (does NOT enqueue it).
+        """
+        now = self._clock()
+        last = self._safety_cap_warn_last.get(reason)
+        if last is None or (now - last) >= _SAFETY_CAP_WARN_THROTTLE_SEC:
+            self._safety_cap_warn_last[reason] = now
+            logger.warning(
+                "%s: safety cap '%s' rejecting %s %s @ %s (not enqueued)",
+                self.strat_id, reason, intent.direction, intent.side, intent.price,
+            )
+            if self._notifier is not None:
+                self._notifier.alert(
+                    f"Gridbot: safety cap '{reason}' tripped for {self.strat_id}",
+                    error_key=f"safety_cap_{reason}_{self.strat_id}",
+                )
+        else:
+            logger.debug(
+                "%s: safety cap '%s' rejecting %s @ %s (throttled)",
+                self.strat_id, reason, intent.side, intent.price,
+            )
+
+    def _evaluate_loss_breaker(
+        self,
+        long_state: Optional[PositionState],
+        short_state: Optional[PositionState],
+    ) -> None:
+        """C3 — evaluate the session realized-loss circuit breaker (feature 0079).
+
+        Uses the per-cycle "Realized" value (``cur_realized_pnl`` — the Bybit UI
+        Realized column), NOT the ~80x lifetime ``cumRealisedPnl``. On a NEW
+        trip: emit one ERROR + alert and cancel ALL working orders for the
+        symbol via ``_execute_cancel_intent`` (honors shadow mode + tracked-order
+        state). After the trip, every ``_execute_place_intent`` short-circuits
+        via ``loss_tripped()``. No-op when no SafetyCaps is wired.
+        """
+        if self._safety_caps is None:
+            return
+        session_realized_pnl = (
+            (long_state.cur_realized_pnl if long_state else Decimal("0"))
+            + (short_state.cur_realized_pnl if short_state else Decimal("0"))
+        )
+        newly_tripped = self._safety_caps.check_loss_breaker(
+            session_realized_pnl=session_realized_pnl,
+            now_utc=datetime.now(UTC),
+        )
+        if not newly_tripped:
+            return
+        logger.error(
+            "%s: SAFETY CAP session-loss breaker TRIPPED — session realized "
+            "PnL %s reached the configured loss limit; cancelling working "
+            "orders and suppressing new places",
+            self.strat_id, session_realized_pnl,
+        )
+        if self._notifier is not None:
+            self._notifier.alert(
+                f"Gridbot: safety-cap session-loss breaker tripped for "
+                f"{self.strat_id} (session realized {session_realized_pnl})",
+                error_key=f"safety_cap_loss_breaker_{self.strat_id}",
+            )
+        # Cancel all working orders (both directions). order['orderId'] is the
+        # wire id (get_limit_orders maps tracked.order_id → 'orderId'); a
+        # CancelIntent requires symbol + order_id + reason.
+        limits = self.get_limit_orders()
+        for side_orders in limits.values():
+            for order in side_orders:
+                self._execute_cancel_intent(
+                    CancelIntent(
+                        symbol=self._config.symbol,
+                        order_id=order["orderId"],
+                        reason="safety_cap_loss_breaker",
+                    )
+                )
 
     def inject_open_orders(self, orders: list[dict]) -> None:
         """Inject open orders from exchange (for reconciliation on startup).

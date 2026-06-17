@@ -7,6 +7,7 @@ from unittest.mock import Mock, MagicMock
 import pytest
 
 from gridcore.intents import PlaceLimitIntent, CancelIntent
+from gridbot.config import SafetyCapsConfig
 from gridbot.executor import (
     IntentExecutor,
     OrderResult,
@@ -17,6 +18,7 @@ from gridbot.executor import (
     is_network_error,
     is_duplicate_link_error,
 )
+from gridbot.safety_caps import SafetyCaps
 from bybit_adapter.error_codes import (
     ORDER_QTY_TRUNCATED_TO_ZERO,
     INSUFFICIENT_BALANCE,
@@ -645,3 +647,89 @@ class TestAuthErrorDetection:
         # More failures during cooldown — callback should not fire again
         executor.execute_place(place_intent)
         assert callback.call_count == 1
+
+
+class _FakeClock:
+    """Deterministic monotonic clock for the C4 window."""
+
+    def __init__(self, t: float = 1000.0):
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+
+class TestExecutorRateLimitC4:
+    """Feature 0079 (issue #182) — C4 max-orders-per-minute at the executor.
+
+    The executor is the single live-submit choke point (catches retry-queue
+    re-dispatch that bypasses the runner), so C4 lives here.
+    """
+
+    def _caps(self, clock, cap=2):
+        return SafetyCaps(
+            SafetyCapsConfig(max_orders_per_minute=cap),
+            strat_id="btcusdt_test",
+            clock=clock,
+        )
+
+    def test_blocks_above_cap_and_does_not_submit(self, mock_rest_client, place_intent):
+        clock = _FakeClock(1000.0)
+        caps = self._caps(clock, cap=2)
+        ex = IntentExecutor(mock_rest_client, safety_caps=caps, clock=clock)
+
+        # First two real submissions succeed and consume the window.
+        assert ex.execute_place(place_intent).success is True
+        assert ex.execute_place(place_intent).success is True
+        assert mock_rest_client.place_order.call_count == 2
+
+        # Third within the window is rate-limited: non-retryable sentinel,
+        # and place_order is NOT called again.
+        result = ex.execute_place(place_intent)
+        assert result.success is False
+        assert result.error == "safety_cap_rate_limit"
+        assert mock_rest_client.place_order.call_count == 2
+
+    def test_recovers_after_window_decay(self, mock_rest_client, place_intent):
+        clock = _FakeClock(1000.0)
+        caps = self._caps(clock, cap=2)
+        ex = IntentExecutor(mock_rest_client, safety_caps=caps, clock=clock)
+        ex.execute_place(place_intent)
+        ex.execute_place(place_intent)
+        assert ex.execute_place(place_intent).error == "safety_cap_rate_limit"
+
+        # Advance the clock past the 60s window — submissions resume.
+        clock.t = 1061.0
+        result = ex.execute_place(place_intent)
+        assert result.success is True
+        assert mock_rest_client.place_order.call_count == 3
+
+    def test_shadow_mode_does_not_consume_window(self, mock_rest_client, place_intent):
+        clock = _FakeClock(1000.0)
+        caps = self._caps(clock, cap=2)
+        ex = IntentExecutor(
+            mock_rest_client, shadow_mode=True, safety_caps=caps, clock=clock
+        )
+        # Many shadow placements never reach the gate / record path.
+        for _ in range(10):
+            assert ex.execute_place(place_intent).success is True
+        assert caps.rate_limited(clock()) is False
+        mock_rest_client.place_order.assert_not_called()
+
+    def test_inert_when_no_caps(self, mock_rest_client, place_intent):
+        ex = IntentExecutor(mock_rest_client)  # no safety_caps
+        for _ in range(5):
+            assert ex.execute_place(place_intent).success is True
+        assert mock_rest_client.place_order.call_count == 5
+
+    def test_failed_submit_does_not_consume_window(self, mock_rest_client, place_intent):
+        """Only REAL successes record into the C4 window — a failed/raised
+        submit must not consume a slot (record happens after place_order)."""
+        clock = _FakeClock(1000.0)
+        caps = self._caps(clock, cap=2)
+        mock_rest_client.place_order = MagicMock(side_effect=Exception("boom"))
+        ex = IntentExecutor(mock_rest_client, safety_caps=caps, clock=clock)
+        for _ in range(5):
+            assert ex.execute_place(place_intent).success is False
+        # No accepted submission recorded → window empty → not rate-limited.
+        assert caps.rate_limited(clock()) is False

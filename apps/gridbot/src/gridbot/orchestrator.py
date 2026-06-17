@@ -36,6 +36,7 @@ from gridbot.config import GridbotConfig, AccountConfig, StrategyConfig
 from gridbot.executor import IntentExecutor
 from gridbot.notifier import Notifier
 from gridbot.runner import StrategyRunner
+from gridbot.safety_caps import SafetyCaps
 from gridbot.reconciler import Reconciler
 from gridbot.retry_queue import RetryQueue
 from gridbot.position_fetcher import PositionFetcher, _POSITION_TICK_BASE
@@ -791,12 +792,25 @@ class Orchestrator:
         strat_id = strategy_config.strat_id
         account_name = strategy_config.account
 
+        # Feature 0079 (issue #182) — build ONE SafetyCaps per strat and pass
+        # the SAME instance (and the SAME monotonic clock) to both the executor
+        # (C4 rate-limit window) and the runner (C1/C2/C3) so they share one
+        # source of truth. Production clock is time.monotonic.
+        safety_caps_clock = time.monotonic
+        safety_caps = SafetyCaps(
+            strategy_config.safety_caps,
+            strat_id=strat_id,
+            clock=safety_caps_clock,
+        )
+
         # Get executor for this account (with correct shadow mode)
         base_executor = self._executors[account_name]
         executor = IntentExecutor(
             base_executor._client,
             shadow_mode=strategy_config.shadow_mode,
             on_cooldown_entered=lambda sid=strat_id: self._auth_cooldown.enter(sid),
+            safety_caps=safety_caps,
+            clock=safety_caps_clock,
         )
 
         # Create retry queue with dispatcher that routes by intent type
@@ -847,6 +861,8 @@ class Orchestrator:
             # Feature 0066 Phase 4 — real-time wallet preflight source.
             wallet_provider=wallet_provider,
             wallet_ws_max_age_seconds=self._config.wallet_ws_max_age_seconds,
+            # Feature 0079 (issue #182) — SAME SafetyCaps instance as the executor.
+            safety_caps=safety_caps,
         )
         self._runners[strat_id] = runner
         self._strategy_executors[strat_id] = executor
