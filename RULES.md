@@ -905,7 +905,23 @@ The bot writes a machine-readable JSON snapshot to `status_file_path` (default
 `/tmp/gridbot_status.json`, config key; `status_file_enabled=false` disables) every
 ~10s health sweep and once as `state="starting"` at the end of `start()`. Read it
 with `jq . /tmp/gridbot_status.json` (or `jq .state ...`) for an instant read — no
-log parsing.
+log parsing. Example:
+
+```json
+{
+  "state": "healthy",
+  "generated_at": "2026-06-18T12:00:00+00:00",
+  "strategies": [
+    {"strat_id": "ltcusdt_test", "symbol": "LTCUSDT", "state": "healthy",
+     "shadow": false, "net_position_size": 1.2, "preflight_skips": 0}
+  ],
+  "metrics": {"orders_placed": 42, "orders_placed_shadow": 0, "orders_rejected": {},
+              "cancels": 7, "cancels_failed": 0, "rest_errors_by_code": {},
+              "ws_reconnects": {}},
+  "gauges": {"runners": 1, "auth_cooldown_active": 0, "loss_breaker_latched": 0,
+             "preflight_skips": 0, "auth_cooldown_cycles": 0, "uptime_seconds": 3600.0}
+}
+```
 
 - **`state`** — worst-wins overall: `circuit_open` (C3 loss breaker latched) >
   `auth_cooldown` > `degraded` (dirty-REST failures / C4 rate-limit) >

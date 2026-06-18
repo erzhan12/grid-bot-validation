@@ -207,6 +207,9 @@ class IntentExecutor:
             clock: Monotonic clock for the C4 window; MUST be the same callable
                 the shared SafetyCaps uses (the orchestrator passes one value to
                 both). Defaults to ``time.monotonic``; injectable for tests.
+            health_metrics: Optional shared ``HealthMetrics`` collector (feature
+                0082 / issue #185). The orchestrator passes its shared instance;
+                None for direct/test callers (then metric recording is inert).
         """
         self._client = rest_client
         self._shadow_mode = shadow_mode

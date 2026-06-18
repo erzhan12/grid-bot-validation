@@ -449,7 +449,11 @@ class GridbotConfig(BaseModel):
     # Feature 0082 (issue #185) — operational observability status file.
     status_file_path: str = Field(
         default="/tmp/gridbot_status.json",
-        description="Path for the periodic JSON health/metrics snapshot (feature 0082).",
+        description=(
+            "Path for the periodic JSON health/metrics snapshot (feature 0082). "
+            "Note: /tmp may not persist across reboots on some systems — choose a "
+            "durable path for production monitoring."
+        ),
     )
     status_file_enabled: bool = Field(
         default=True,

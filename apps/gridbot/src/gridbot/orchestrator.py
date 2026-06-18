@@ -51,6 +51,7 @@ from gridbot.writers import GridStateWriter
 
 _HEALTH_CHECK_INTERVAL = 10  # seconds
 _WS_HEALTH_CHECK_INTERVAL = 10.0  # seconds — bbu2 ENSURE_SOCKET_INTERVAL parity
+_STATUS_WRITE_WARN_THROTTLE = 60.0  # seconds — throttle health status-write error logs (0082)
 _CHECK_INTERVAL = 0.1  # 100 ms main loop tick (bbu2 value)
 _RETRY_TICK_INTERVAL = 1.0  # seconds between retry-queue drains
 _WS_RECONNECT_SLOW_THRESHOLD = 5.0  # log a warning if a single WS disconnect+connect takes longer
@@ -1310,7 +1311,7 @@ class Orchestrator:
             self._health_writer.write(snapshot)
         except Exception as e:
             warn_now = time.monotonic()
-            if (warn_now - self._status_write_warn_last) >= 60.0:
+            if (warn_now - self._status_write_warn_last) >= _STATUS_WRITE_WARN_THROTTLE:
                 self._status_write_warn_last = warn_now
                 logger.warning("Health status write failed (throttled): %s", e)
 

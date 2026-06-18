@@ -13,7 +13,7 @@ import logging
 import os
 from collections import defaultdict
 from enum import StrEnum
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -113,13 +113,14 @@ def build_snapshot(
     gauges: dict,
     generated_at: str,
     overall: Optional[HealthState] = None,
-) -> dict:
+) -> dict[str, Any]:
     """Pure builder: assemble the status snapshot dict.
 
     ``strat_states`` is a list of per-strat dicts each carrying at least
     ``{"strat_id": str, "state": HealthState, "shadow": bool}``. ``overall`` lets
     the caller force a state (e.g. STARTING before the loop); otherwise the worst
-    per-strat state wins. ``generated_at`` is supplied by the caller (UTC iso).
+    per-strat state wins. ``generated_at`` is supplied by the caller — a UTC
+    ISO-8601 string (e.g. ``datetime.now(UTC).isoformat()``); not validated here.
     """
     if overall is None:
         overall = worst_state(s["state"] for s in strat_states) if strat_states else HealthState.HEALTHY
