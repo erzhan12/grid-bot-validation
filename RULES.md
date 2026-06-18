@@ -822,6 +822,7 @@ All take Decimal inputs; `position.py` keeps float copy for risk mgmt performanc
 - Use `DatabaseFactory.get_session()` context manager for auto commit/rollback
 - Bulk inserts use `ON CONFLICT DO NOTHING` (trades/executions) or `ON CONFLICT DO UPDATE` (orders)
 - `redact_db_url()` from `grid_db.utils` — **always** use when logging DB URLs
+- **Repository module layout (feature 0081, issue #184)**: repositories live in the `grid_db.repositories` **package**, not a flat module — `base.py` (`BaseRepository` + `T`), `identity.py` (User/BybitAccount/ApiCredential/Strategy/Run), `market_data.py` (PublicTrade/TickerSnapshot), `execution.py` (PrivateExecution/Order), `snapshots.py` (Position/Wallet/GridState). Add a new repository to the matching domain module **and re-export it from `repositories/__init__.py`**. Both `from grid_db import XRepository` and `from grid_db.repositories import XRepository` must keep resolving (guarded by `shared/db/tests/test_repository_imports.py`).
 
 ### Enums
 
