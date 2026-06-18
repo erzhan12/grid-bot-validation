@@ -48,6 +48,9 @@ def worst_state(states: Iterable[HealthState]) -> HealthState:
     worst = HealthState.HEALTHY
     for state in states:
         if state not in _PRECEDENCE:
+            # A new enum value added without a precedence entry would land here;
+            # warn so the gap is visible rather than silently down-ranked.
+            logger.warning("Unknown health state ignored in precedence: %s", state)
             continue
         if _PRECEDENCE.index(state) > _PRECEDENCE.index(worst):
             worst = state
@@ -120,6 +123,8 @@ def build_snapshot(
     """
     if overall is None:
         overall = worst_state(s["state"] for s in strat_states) if strat_states else HealthState.HEALTHY
+    # str(...) coerces HealthState (a StrEnum) to a plain str — redundant for
+    # json.dump (StrEnum serializes as its value) but explicit about the contract.
     return {
         "state": str(overall),
         "generated_at": generated_at,

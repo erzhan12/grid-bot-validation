@@ -118,3 +118,31 @@ def test_starting_snapshot_written_on_start(_mock_priv, _mock_pub, _mock_rest, t
     snap = _read(cfg.status_file_path)
     assert snap["state"] == "starting"
     assert snap["gauges"]["uptime_seconds"] >= 0
+
+
+@patch("gridbot.orchestrator.BybitRestClient")
+@patch("gridbot.orchestrator.PublicWebSocketClient")
+@patch("gridbot.orchestrator.PrivateWebSocketClient")
+def test_health_status_degraded_delta_then_recovery(
+    _mock_priv, _mock_pub, _mock_rest, tmp_path,
+):
+    cfg = _config(tmp_path)
+    orch = Orchestrator(cfg)
+    orch._init_account(cfg.accounts[0])
+    orch._init_strategy(cfg.strategies[0])
+    path = cfg.status_file_path
+    runner = orch._runners["btcusdt_test"]
+
+    # Baseline sweep: no failures -> healthy (seeds the last-count for the delta).
+    orch._health_check_once()
+    assert _read(path)["state"] == "healthy"
+
+    # Simulate a NEW dirty-REST failure since the last sweep (delta > 0) -> degraded.
+    runner._dirty_rest_refresh_failure_count += 1
+    orch._health_check_once()
+    assert _read(path)["state"] == "degraded"
+
+    # No NEW failure on the next sweep -> delta clears -> recovers to healthy.
+    # Guards against the sticky monotonic-absolute bug (review #195 P1).
+    orch._health_check_once()
+    assert _read(path)["state"] == "healthy"

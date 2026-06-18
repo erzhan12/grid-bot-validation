@@ -149,6 +149,9 @@ class Orchestrator:
             enabled=self._config.status_file_enabled,
         )
         self._safety_caps: dict[str, SafetyCaps] = {}  # strat_id -> caps (health sweep)
+        # strat_id -> dirty-REST count observed at the previous sweep, so degraded
+        # keys off a RECENT delta (not the sticky monotonic absolute) — review #195.
+        self._dirty_rest_last_count: dict[str, int] = {}
         self._start_time: Optional[float] = None
         self._status_write_warn_last: float = 0.0
 
@@ -1254,9 +1257,15 @@ class Orchestrator:
                 executor = self._strategy_executors.get(strat_id)
                 in_cooldown = bool(executor and executor.auth_cooldown)
                 circuit = bool(caps and caps.loss_tripped())
+                # Degraded keys off a RECENT soft signal, not a sticky absolute:
+                # a new dirty-REST failure SINCE THE LAST SWEEP (delta), or a
+                # sustained C4 rate-limit. The monotonic count would otherwise pin
+                # degraded forever after one transient failure (review #195 P1).
+                cur_dirty = runner.dirty_rest_refresh_failure_count
+                prev_dirty = self._dirty_rest_last_count.get(strat_id, cur_dirty)
+                self._dirty_rest_last_count[strat_id] = cur_dirty
                 degraded = bool(
-                    (caps and caps.rate_limited(now))
-                    or runner.dirty_rest_refresh_failure_count > 0
+                    (caps and caps.rate_limited(now)) or cur_dirty > prev_dirty
                 )
                 if circuit:
                     state = HealthState.CIRCUIT_OPEN
