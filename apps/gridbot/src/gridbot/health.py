@@ -50,7 +50,10 @@ def worst_state(states: Iterable[HealthState]) -> HealthState:
         if state not in _PRECEDENCE:
             # A new enum value added without a precedence entry would land here;
             # warn so the gap is visible rather than silently down-ranked.
-            logger.warning("Unknown health state ignored in precedence: %s", state)
+            logger.warning(
+                "Unknown health state ignored in precedence: %s (type=%s)",
+                state, type(state).__name__,
+            )
             continue
         if _PRECEDENCE.index(state) > _PRECEDENCE.index(worst):
             worst = state
@@ -61,7 +64,11 @@ class HealthMetrics:
     """Process-lifetime monotonic counters (reset only on restart).
 
     Inert by construction: a caller that holds no reference simply never
-    increments. All methods are O(1) and main-thread-only.
+    increments. All methods are O(1).
+
+    Thread safety: every ``record_*`` method MUST be called from the main thread
+    only (the executor / runner / orchestrator choke points) — the same threading
+    model as SafetyCaps and AuthCooldownManager; no locking is used.
     """
 
     def __init__(self) -> None:
@@ -166,6 +173,11 @@ class HealthStatusWriter:
                 os.fsync(f.fileno())
             os.replace(tmp_path, self._path)
         except BaseException:
+            # BaseException (not Exception) is intentional, mirroring
+            # GridStateStore._atomic_write: remove the half-written .tmp even on
+            # KeyboardInterrupt/SystemExit, then re-raise so the interrupt still
+            # propagates. The caller (_write_health_snapshot) catches Exception, so
+            # a re-raised interrupt is never swallowed — only tmp cleanup is added.
             try:
                 os.remove(tmp_path)
             except FileNotFoundError:

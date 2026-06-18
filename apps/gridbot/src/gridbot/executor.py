@@ -36,7 +36,7 @@ AUTH_ERROR_CODES = {10003, 10004, 10005, 33004}
 # Feature 0082 (issue #185) — map a coarse error category to the
 # rest_errors_by_code key used by HealthMetrics. The C4 "rate_limit" sentinel is
 # NOT a REST error (no submit reached Bybit) and never reaches _handle_error.
-_REST_CODE_BY_CATEGORY = {
+_CATEGORY_TO_REST_CODE = {
     "insufficient_balance": "110007",
     "truncate": "110017",
     "duplicate_link": "110072",
@@ -280,7 +280,7 @@ class IntentExecutor:
         """Track auth errors and enter cooldown if threshold reached."""
         if self._health_metrics is not None:
             self._health_metrics.record_rest_error(
-                _REST_CODE_BY_CATEGORY.get(self._classify_error(error), "other")
+                _CATEGORY_TO_REST_CODE.get(self._classify_error(error), "other")
             )
         if self._is_auth_error(error):
             self._auth_failure_count += 1
