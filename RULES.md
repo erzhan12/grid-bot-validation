@@ -899,6 +899,27 @@ Valid: `New`, `PartiallyFilled`, `Filled`, `Cancelled`, `Rejected`, `Untriggered
 - Data flow: `WebSocket → Orchestrator → StrategyRunner → GridEngine.on_event() → Intents → Executor → Bybit REST`
 - Shadow mode: `shadow_mode=True` → intents logged, not executed; returns `shadow_{client_order_id}`
 
+### Health status file — check health without tailing logs (Feature 0082, issue #185)
+
+The bot writes a machine-readable JSON snapshot to `status_file_path` (default
+`/tmp/gridbot_status.json`, config key; `status_file_enabled=false` disables) every
+~10s health sweep and once as `state="starting"` at the end of `start()`. Read it
+with `jq . /tmp/gridbot_status.json` (or `jq .state ...`) for an instant read — no
+log parsing.
+
+- **`state`** — worst-wins overall: `circuit_open` (C3 loss breaker latched) >
+  `auth_cooldown` > `degraded` (dirty-REST failures / C4 rate-limit) >
+  `healthy`; `starting` pre-loop. Per-strat breakdown under `strategies[]` (with a
+  `shadow` flag — live↔shadow snapshot shape is identical).
+- **`metrics`** — process-lifetime monotonic counters (reset on restart): orders
+  placed / placed_shadow / rejected-by-reason, `rest_errors_by_code`, cancels /
+  cancels_failed, `ws_reconnects`. **`gauges`** — point-in-time: runners, auth-cooldown active/cycles,
+  loss-breaker latched, preflight skips, uptime.
+- Last-value-wins snapshot, NOT a time series — no history/rotation (non-goal: no
+  Prometheus). Additive, no trading impact. **Complements** the `gridbot-health` skill
+  (which owns the durable cross-restart `health_state.json` ledger); this file does
+  not touch `health_state.json`.
+
 ### Key Patterns
 
 - **Order tracking**: `TrackedOrder` dataclass, deterministic 16-char hex `client_order_id`

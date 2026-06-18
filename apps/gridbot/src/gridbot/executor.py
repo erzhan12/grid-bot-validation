@@ -21,6 +21,7 @@ from gridcore.intents import PlaceLimitIntent, CancelIntent
 from gridcore.position import DirectionType
 from gridbot.order_link_id import make_order_link_id
 from gridbot.safety_caps import SafetyCaps
+from gridbot.health import HealthMetrics
 
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,17 @@ _RATE_LIMIT_WARN_THROTTLE_SEC = 60.0
 
 # Bybit error codes that indicate auth/permission problems (not retryable)
 AUTH_ERROR_CODES = {10003, 10004, 10005, 33004}
+
+# Feature 0082 (issue #185) — map a coarse error category to the
+# rest_errors_by_code key used by HealthMetrics. The C4 "rate_limit" sentinel is
+# NOT a REST error (no submit reached Bybit) and never reaches _handle_error.
+_REST_CODE_BY_CATEGORY = {
+    "insufficient_balance": "110007",
+    "truncate": "110017",
+    "duplicate_link": "110072",
+    "auth": "auth",
+    "network": "network",
+}
 
 # Matches both our _check_response format [NNNNN] and pybit's native format (ErrCode: NNNNN)
 _ERR_CODE_RE = re.compile(r"(?:\[(\d+)\]|\(ErrCode:\s*(\d+)\))")
@@ -176,6 +188,7 @@ class IntentExecutor:
         on_cooldown_entered: Optional[Callable[[], None]] = None,
         safety_caps: Optional[SafetyCaps] = None,
         clock: Callable[[], float] = time.monotonic,
+        health_metrics: Optional[HealthMetrics] = None,
     ):
         """Initialize executor.
 
@@ -209,6 +222,10 @@ class IntentExecutor:
         self._safety_caps = safety_caps
         self._clock = clock
         self._rate_limit_warn_last: float = 0.0
+        # Feature 0082 (issue #185) — optional process-lifetime metrics collector.
+        # The orchestrator passes its shared HealthMetrics; None for direct/test
+        # callers (then every record_* below is skipped — no behavior change).
+        self._health_metrics = health_metrics
 
     @property
     def shadow_mode(self) -> bool:
@@ -240,8 +257,28 @@ class IntentExecutor:
             return code in AUTH_ERROR_CODES
         return False
 
+    def _classify_error(self, error: str) -> str:
+        """Coarse error category for feature 0082 metrics (reject reason / REST code)."""
+        if error == "safety_cap_rate_limit":
+            return "rate_limit"
+        if self._is_auth_error(error):
+            return "auth"
+        if is_insufficient_balance(error):
+            return "insufficient_balance"
+        if is_truncate_error(error):
+            return "truncate"
+        if is_duplicate_link_error(error):
+            return "duplicate_link"
+        if is_network_error(error):
+            return "network"
+        return "other"
+
     def _handle_error(self, error: str) -> None:
         """Track auth errors and enter cooldown if threshold reached."""
+        if self._health_metrics is not None:
+            self._health_metrics.record_rest_error(
+                _REST_CODE_BY_CATEGORY.get(self._classify_error(error), "other")
+            )
         if self._is_auth_error(error):
             self._auth_failure_count += 1
             logger.warning(
@@ -277,6 +314,8 @@ class IntentExecutor:
                 f"reduce_only={intent.reduce_only} "
                 f"client_id={intent.client_order_id} link_id={unique_link_id}"
             )
+            if self._health_metrics is not None:
+                self._health_metrics.record_place(shadow=True)
             return OrderResult(
                 success=True,
                 order_id=f"shadow_{intent.client_order_id}",
@@ -301,6 +340,8 @@ class IntentExecutor:
                         f"{intent.symbol} qty={intent.qty} price={intent.price} "
                         f"link_id={unique_link_id} (not submitted, not enqueued)"
                     )
+                if self._health_metrics is not None:
+                    self._health_metrics.record_reject("rate_limit")
                 return OrderResult(
                     success=False,
                     order_link_id=unique_link_id,
@@ -342,6 +383,8 @@ class IntentExecutor:
             # trailing-60s window (only real successes, never shadow).
             if self._safety_caps is not None:
                 self._safety_caps.record_accepted_submission(self._clock())
+            if self._health_metrics is not None:
+                self._health_metrics.record_place(shadow=False)
             return OrderResult(
                 success=True,
                 order_id=order_id,
@@ -351,6 +394,8 @@ class IntentExecutor:
         except Exception as e:
             logger.error(f"Failed to place order: {e}")
             self._handle_error(str(e))
+            if self._health_metrics is not None:
+                self._health_metrics.record_reject(self._classify_error(str(e)))
             return OrderResult(
                 success=False,
                 order_link_id=unique_link_id,
@@ -391,11 +436,15 @@ class IntentExecutor:
                     f"order_id={intent.order_id} (may already be filled/cancelled)"
                 )
 
+            if self._health_metrics is not None:
+                self._health_metrics.record_cancel(success=success)
             return CancelResult(success=success)
 
         except Exception as e:
             logger.error(f"Failed to cancel order: {e}")
             self._handle_error(str(e))
+            if self._health_metrics is not None:
+                self._health_metrics.record_cancel(success=False)
             return CancelResult(success=False, error=str(e))
 
     def execute_batch(

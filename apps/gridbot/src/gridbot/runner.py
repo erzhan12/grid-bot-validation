@@ -317,6 +317,9 @@ class StrategyRunner:
         }
         # Monotonic count of breaker trips that fired a forced reconcile.
         self._truncate_breaker_reconcile_count: int = 0
+        # Feature 0082 (issue #185) — monotonic process-lifetime count of genuine
+        # preflight skips (distinct from the resettable _skip_window summary dict).
+        self._preflight_skip_count: int = 0
         # Observability (review v3): monotonic count of dirty REST refreshes that
         # failed (get_positions raised / unparseable size) — surfaced by the
         # health sweep so persistent REST issues blocking self-heal are visible.
@@ -498,6 +501,19 @@ class StrategyRunner:
         signal without per-occurrence ERROR spam.
         """
         return self._truncate_breaker_reconcile_count
+
+    @property
+    def preflight_skip_count(self) -> int:
+        """Monotonic count of genuine preflight (low-balance) skips for the runner
+        lifetime (feature 0082). Distinct from the per-summary-window `_skip_window`
+        dict (which resets each flush); read/summed by the health sweep."""
+        return self._preflight_skip_count
+
+    @property
+    def net_position_size(self) -> float:
+        """Signed net position size (long - short) as a float, for the health
+        snapshot gauge (feature 0082). Read-only; no behavior change."""
+        return float(self._long_position.size - self._short_position.size)
 
     @property
     def dirty_rest_refresh_failure_count(self) -> int:
@@ -1628,6 +1644,7 @@ class StrategyRunner:
             # summary works even when transition logging is off (M1). Reset only
             # by the summary flush itself.
             self._skip_window[key] = self._skip_window.get(key, 0) + 1
+            self._preflight_skip_count += 1
             self._skip_window_avail_min = (
                 avail_f if self._skip_window_avail_min is None
                 else min(self._skip_window_avail_min, avail_f))

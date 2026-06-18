@@ -59,6 +59,10 @@ class AuthCooldownManager:
         self._auth_cooldown_until: dict[str, datetime] = {}  # strat_id -> expiry
         self._auth_cooldown_cycles: dict[str, int] = {}  # strat_id -> cumulative cycle count
 
+    def cooldown_cycles(self, strat_id: str) -> int:
+        """Cumulative auth-cooldown cycles for ``strat_id`` (feature 0082 metric)."""
+        return self._auth_cooldown_cycles.get(strat_id, 0)
+
     def enter(self, strat_id: str) -> None:
         """Called by executor when auth cooldown activates.
 

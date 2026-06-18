@@ -41,6 +41,12 @@ from gridbot.reconciler import Reconciler
 from gridbot.retry_queue import RetryQueue
 from gridbot.position_fetcher import PositionFetcher, _POSITION_TICK_BASE
 from gridbot.auth_cooldown_manager import AuthCooldownManager
+from gridbot.health import (
+    HealthMetrics,
+    HealthState,
+    HealthStatusWriter,
+    build_snapshot,
+)
 from gridbot.writers import GridStateWriter
 
 _HEALTH_CHECK_INTERVAL = 10  # seconds
@@ -132,6 +138,19 @@ class Orchestrator:
         # tripped breaker cannot itself spam REST during an outage. strat_id ->
         # monotonic ts of the last forced reconcile.
         self._force_reconcile_last_at: dict[str, float] = {}
+
+        # Feature 0082 (issue #185) — operational observability. HealthMetrics is
+        # the shared process-lifetime counter set (passed by-ref into each executor);
+        # _safety_caps mirrors the per-strat caps so the sweep can read
+        # loss_tripped()/rate_limited(); the writer emits the JSON status snapshot.
+        self._health_metrics = HealthMetrics()
+        self._health_writer = HealthStatusWriter(
+            self._config.status_file_path,
+            enabled=self._config.status_file_enabled,
+        )
+        self._safety_caps: dict[str, SafetyCaps] = {}  # strat_id -> caps (health sweep)
+        self._start_time: Optional[float] = None
+        self._status_write_warn_last: float = 0.0
 
         # Feature 0069 (issue #151) — state-divergence detector. Logic lives on
         # the orchestrator (no separate class). All four signals converge on
@@ -377,6 +396,10 @@ class Orchestrator:
 
         self._running = True
         self._started = True
+        # Feature 0082 — uptime origin + emit the initial `starting` snapshot
+        # before run() enters the blocking poll loop.
+        self._start_time = time.monotonic()
+        self._write_health_snapshot(overall=HealthState.STARTING)
         logger.info(f"Orchestrator started with {len(self._runners)} strategies")
 
     def run(self) -> None:
@@ -811,6 +834,7 @@ class Orchestrator:
             on_cooldown_entered=lambda sid=strat_id: self._auth_cooldown.enter(sid),
             safety_caps=safety_caps,
             clock=safety_caps_clock,
+            health_metrics=self._health_metrics,
         )
 
         # Create retry queue with dispatcher that routes by intent type
@@ -866,6 +890,8 @@ class Orchestrator:
         )
         self._runners[strat_id] = runner
         self._strategy_executors[strat_id] = executor
+        # Feature 0082 — retain caps so _health_check_once can read circuit/C4 state.
+        self._safety_caps[strat_id] = safety_caps
 
         logger.info(
             f"Initialized strategy: {strat_id} (symbol={strategy_config.symbol}, "
@@ -1153,6 +1179,7 @@ class Orchestrator:
                         pub_ws.disconnect()
                         pub_ws.connect()  # re-subscribes automatically via callbacks
                         logger.info(f"Public WS reconnected for {account_name}")
+                        self._health_metrics.record_ws_reconnect("public")
                     except Exception as e:
                         self._notifier.alert_exception(
                             f"Public WS reconnect {account_name}", e,
@@ -1179,6 +1206,7 @@ class Orchestrator:
                         priv_ws.disconnect()
                         priv_ws.connect()  # re-subscribes automatically via callbacks
                         logger.info(f"Private WS reconnected for {account_name}")
+                        self._health_metrics.record_ws_reconnect("private")
                     except Exception as e:
                         self._notifier.alert_exception(
                             f"Private WS reconnect {account_name}", e,
@@ -1196,10 +1224,86 @@ class Orchestrator:
                     # reconnected; schedule a forced reconcile (drained next _tick).
                     # Private-only — the public branch above does NOT enqueue.
                     self._enqueue_post_recovery_reconcile(account_name)
+
+            # Feature 0082 (issue #185) — emit the health/metrics snapshot at the
+            # end of the sweep. The writer is guarded, but the whole sweep is also
+            # wrapped, so a status-write failure can never perturb the loop.
+            self._write_health_snapshot()
         except Exception as e:
             self._notifier.alert_exception(
                 "_health_check_once", e, error_key="health_check_loop",
             )
+
+    def _write_health_snapshot(self, overall: Optional[HealthState] = None) -> None:
+        """Build the health/metrics snapshot and write it atomically (feature 0082).
+
+        ``overall`` forces the state (e.g. STARTING before the loop); otherwise the
+        worst per-strat state wins. Any failure is logged (throttled) and swallowed
+        so a status-write error NEVER perturbs the trading loop.
+        """
+        try:
+            now = time.monotonic()
+            uptime = (now - self._start_time) if self._start_time is not None else 0.0
+            strat_states: list[dict] = []
+            auth_active = 0
+            loss_latched = 0
+            preflight_skips = 0
+            auth_cooldown_cycles = 0
+            for strat_id, runner in self._runners.items():
+                caps = self._safety_caps.get(strat_id)
+                executor = self._strategy_executors.get(strat_id)
+                in_cooldown = bool(executor and executor.auth_cooldown)
+                circuit = bool(caps and caps.loss_tripped())
+                degraded = bool(
+                    (caps and caps.rate_limited(now))
+                    or runner.dirty_rest_refresh_failure_count > 0
+                )
+                if circuit:
+                    state = HealthState.CIRCUIT_OPEN
+                elif in_cooldown:
+                    state = HealthState.AUTH_COOLDOWN
+                elif degraded:
+                    state = HealthState.DEGRADED
+                else:
+                    state = HealthState.HEALTHY
+                # Gauges count the underlying condition regardless of which state
+                # won the worst-wins precedence (a strat both circuit_open AND in
+                # cooldown contributes to BOTH gauges).
+                if circuit:
+                    loss_latched += 1
+                if in_cooldown:
+                    auth_active += 1
+                preflight_skips += runner.preflight_skip_count
+                auth_cooldown_cycles += self._auth_cooldown.cooldown_cycles(strat_id)
+                strat_states.append({
+                    "strat_id": strat_id,
+                    "symbol": runner.symbol,
+                    "state": state,
+                    "shadow": runner.shadow_mode,
+                    "net_position_size": runner.net_position_size,
+                    "preflight_skips": runner.preflight_skip_count,
+                })
+            gauges = {
+                "runners": len(self._runners),
+                "auth_cooldown_active": auth_active,
+                "loss_breaker_latched": loss_latched,
+                "preflight_skips": preflight_skips,
+                "auth_cooldown_cycles": auth_cooldown_cycles,
+                "uptime_seconds": round(uptime, 1),
+            }
+            snapshot = build_snapshot(
+                strat_states=strat_states,
+                metrics=self._health_metrics,
+                gauges=gauges,
+                generated_at=datetime.now(UTC).isoformat(),
+                overall=overall,
+            )
+            self._health_writer.write(snapshot)
+        except Exception as e:
+            warn_now = time.monotonic()
+            if (warn_now - self._status_write_warn_last) >= 60.0:
+                self._status_write_warn_last = warn_now
+                logger.warning("Health status write failed (throttled): %s", e)
 
     def _ws_health_check_once(self) -> None:
         """TCP-level WS socket probe with active reset on dead sockets.

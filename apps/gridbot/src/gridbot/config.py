@@ -446,6 +446,16 @@ class GridbotConfig(BaseModel):
         description="Database connection URL",
     )
 
+    # Feature 0082 (issue #185) — operational observability status file.
+    status_file_path: str = Field(
+        default="/tmp/gridbot_status.json",
+        description="Path for the periodic JSON health/metrics snapshot (feature 0082).",
+    )
+    status_file_enabled: bool = Field(
+        default=True,
+        description="When False the health status file is not written (no-op writer).",
+    )
+
     # Timing
     position_check_interval: float = Field(
         default=63.0,
