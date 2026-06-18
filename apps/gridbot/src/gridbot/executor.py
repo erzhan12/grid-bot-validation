@@ -37,9 +37,9 @@ AUTH_ERROR_CODES = {10003, 10004, 10005, 33004}
 # rest_errors_by_code key used by HealthMetrics. The C4 "rate_limit" sentinel is
 # NOT a REST error (no submit reached Bybit) and never reaches _handle_error.
 _CATEGORY_TO_REST_CODE = {
-    "insufficient_balance": "110007",
-    "truncate": "110017",
-    "duplicate_link": "110072",
+    "insufficient_balance": str(INSUFFICIENT_BALANCE),
+    "truncate": str(ORDER_QTY_TRUNCATED_TO_ZERO),
+    "duplicate_link": str(ORDER_LINK_ID_DUPLICATE),
     "auth": "auth",
     "network": "network",
 }

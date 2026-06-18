@@ -452,9 +452,10 @@ class GridbotConfig(BaseModel):
         description=(
             "Path for the periodic JSON health/metrics snapshot (feature 0082). "
             "Note: /tmp may not persist across reboots on some systems — choose a "
-            "durable path for production monitoring. The file holds strat_id / "
-            "symbol / net position size (no secrets); set appropriate file "
-            "permissions if writing outside /tmp."
+            "durable path for production monitoring (e.g. /var/lib/gridbot/status.json "
+            "— ensure the dir exists and is writable by the bot). The file holds "
+            "strat_id / symbol / net position size (no secrets); set appropriate "
+            "file permissions if writing outside /tmp."
         ),
     )
     status_file_enabled: bool = Field(

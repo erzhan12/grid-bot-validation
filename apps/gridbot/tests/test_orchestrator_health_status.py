@@ -146,3 +146,32 @@ def test_health_status_degraded_delta_then_recovery(
     # Guards against the sticky monotonic-absolute bug (review #195 P1).
     orch._health_check_once()
     assert _read(path)["state"] == "healthy"
+
+
+@patch("gridbot.orchestrator.BybitRestClient")
+@patch("gridbot.orchestrator.PublicWebSocketClient")
+@patch("gridbot.orchestrator.PrivateWebSocketClient")
+def test_health_status_degraded_requires_new_failure_not_sticky(
+    _mock_priv, _mock_pub, _mock_rest, tmp_path,
+):
+    """Degraded keys off a strict delta (cur > prev), not the absolute count.
+
+    A strat that ALREADY had dirty-REST failures before the first sweep must NOT
+    be stuck degraded: the first sweep seeds prev=cur (so cur > prev is False),
+    and a later sweep at the SAME count stays healthy. Proves `>` not `>=`.
+    """
+    cfg = _config(tmp_path)
+    orch = Orchestrator(cfg)
+    orch._init_account(cfg.accounts[0])
+    orch._init_strategy(cfg.strategies[0])
+    path = cfg.status_file_path
+    runner = orch._runners["btcusdt_test"]
+
+    # Pre-existing (historical) failures already on the monotonic counter.
+    runner._dirty_rest_refresh_failure_count = 3
+    orch._health_check_once()
+    assert _read(path)["state"] == "healthy"  # seeded prev=cur -> no delta
+
+    # Same count on the next sweep -> still healthy (strict >, not >=).
+    orch._health_check_once()
+    assert _read(path)["state"] == "healthy"
