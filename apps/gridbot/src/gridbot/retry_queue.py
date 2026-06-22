@@ -228,6 +228,16 @@ class RetryQueue:
                     logger.info(f"Retry succeeded: {type(item.intent).__name__}")
                     items_to_remove.append(item)
                     processed += 1
+                elif result.error and result.error.startswith("safety_cap"):
+                    # Feature 0079 — cap-blocked retries are dropped, not
+                    # re-backed-off (mirrors runner drop-not-enqueue on first
+                    # dispatch for safety_cap sentinels).
+                    logger.warning(
+                        "Retry dropped (safety cap): %s — %s",
+                        type(item.intent).__name__, result.error,
+                    )
+                    items_to_remove.append(item)
+                    processed += 1
                 else:
                     # Calculate backoff
                     backoff = self._initial_backoff * (

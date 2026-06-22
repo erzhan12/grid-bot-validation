@@ -841,17 +841,23 @@ class Orchestrator:
             health_metrics=self._health_metrics,
         )
 
-        # Create retry queue with dispatcher that routes by intent type
+        # Create retry queue with dispatcher that routes by intent type.
+        # Place retries go through runner.retry_dispatch_place so C1/C2/C3 are
+        # re-checked (the executor alone only enforces C4).
+        _retry_runner: dict[str, StrategyRunner] = {}
+
         def _dispatch_intent(intent):
             if isinstance(intent, CancelIntent):
                 return executor.execute_cancel(intent)
-            return executor.execute_place(intent)
+            return _retry_runner["runner"].retry_dispatch_place(intent)
 
         retry_queue = RetryQueue(
             executor_func=_dispatch_intent,
             max_attempts=3,
             max_elapsed_seconds=30.0,
-            is_paused=lambda: executor.auth_cooldown,
+            is_paused=lambda: (
+                executor.auth_cooldown or safety_caps.loss_tripped()
+            ),
         )
         self._retry_queues[strat_id] = retry_queue
 
@@ -879,6 +885,7 @@ class Orchestrator:
             grid_state_writer=self._grid_state_writer,
             on_intent_failed=lambda intent, error: retry_queue.add(intent, error),
             on_retry_cancel_for_prefix=lambda prefix: retry_queue.cancel_for_prefix(prefix),
+            on_retry_queue_clear=retry_queue.clear,
             on_unknown_order=self._request_immediate_order_sync,
             notifier=self._notifier,
             # Feature 0064 — dirty-mirror REST refresh + breaker forced reconcile.
@@ -892,6 +899,7 @@ class Orchestrator:
             # Feature 0079 (issue #182) — SAME SafetyCaps instance as the executor.
             safety_caps=safety_caps,
         )
+        _retry_runner["runner"] = runner
         self._runners[strat_id] = runner
         self._strategy_executors[strat_id] = executor
         # Feature 0082 — retain caps so _health_check_once can read circuit/C4 state.

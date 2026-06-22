@@ -9,6 +9,7 @@ from unittest.mock import Mock
 import pytest
 
 from gridcore.intents import PlaceLimitIntent, CancelIntent
+from gridbot.executor import OrderResult
 from gridbot.retry_queue import RetryQueue, RetryItem
 
 
@@ -429,6 +430,26 @@ class TestRetryQueuePaused:
             is_paused=lambda: False,
         )
         queue.add(place_intent, "error")
+        _force_due(queue)
+
+        processed = queue.process_due()
+
+        assert processed == 1
+        assert queue.size == 0
+
+    def test_process_due_drops_safety_cap_failure(self, place_intent):
+        """Cap-blocked retries are removed, not re-backed-off (feature 0079)."""
+        executor = Mock(
+            return_value=OrderResult(
+                success=False, error="safety_cap_max_notional"
+            )
+        )
+        queue = RetryQueue(
+            executor_func=executor,
+            max_attempts=10,
+            initial_backoff_seconds=0.01,
+        )
+        queue.add(place_intent, "network error")
         _force_due(queue)
 
         processed = queue.process_due()

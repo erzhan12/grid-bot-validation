@@ -52,6 +52,7 @@ from gridcore import (  # noqa: E402
 from gridbot.config import StrategyConfig  # noqa: E402
 from gridbot.executor import (  # noqa: E402
     IntentExecutor,
+    OrderResult,
     is_duplicate_link_error,
     is_insufficient_balance,
     is_network_error,
@@ -198,6 +199,7 @@ class StrategyRunner:
         on_unknown_order: Optional[Callable[[str], None]] = None,
         notifier: Optional[Notifier] = None,
         on_retry_cancel_for_prefix: Optional[Callable[[str], int]] = None,
+        on_retry_queue_clear: Optional[Callable[[], int]] = None,
         rest_client: Optional["BybitRestClient"] = None,
         truncate_breaker: Optional[TruncateBreaker] = None,
         on_truncate_breaker_tripped: Optional[Callable[[str, str], None]] = None,
@@ -227,6 +229,8 @@ class StrategyRunner:
             notifier: Alert notifier for same-order error Telegram alerts.
             on_retry_cancel_for_prefix: Optional callback to cancel queued
                 placement retries after reconcile proves the order was accepted.
+            on_retry_queue_clear: Optional callback to drain the retry queue
+                on C3 session-loss trip (mirrors auth-cooldown queue clear).
             rest_client: Optional Bybit REST client for the dirty-mirror
                 position refresh (feature 0064). When None (unit tests/dry-run)
                 the dirty path logs a WARNING and falls back to the in-memory
@@ -281,6 +285,7 @@ class StrategyRunner:
         self._on_unknown_order = on_unknown_order
         self._notifier = notifier
         self._on_retry_cancel_for_prefix = on_retry_cancel_for_prefix
+        self._on_retry_queue_clear = on_retry_queue_clear
 
         # Feature 0064 — 110017 retry-storm self-heal + circuit-breaker (#149).
         self._rest_client = rest_client
@@ -2297,6 +2302,52 @@ class StrategyRunner:
             if self._config.truncate_breaker_reconcile and self._on_truncate_breaker_tripped:
                 self._on_truncate_breaker_tripped(self.strat_id, intent.direction)
 
+    def retry_dispatch_place(self, intent: PlaceLimitIntent) -> OrderResult:
+        """Retry-queue choke point: re-apply C1/C2/C3 before re-submit.
+
+        The first attempt already ran qty-resolve, dirty refresh, and
+        ``_is_good_to_place`` via ``_execute_place_intent``; retries reuse the
+        assigned wire ``order_link_id`` and only need a fresh cap read plus
+        executor submit + tracking bookkeeping.
+        """
+        if self._safety_caps is not None:
+            if self._safety_caps.loss_tripped():
+                return OrderResult(
+                    success=False,
+                    order_link_id=intent.order_link_id,
+                    error="safety_cap_loss_breaker",
+                )
+            limits = self.get_limit_orders()
+            open_order_count = sum(len(v) for v in limits.values())
+            if intent.reduce_only:
+                decision = self._safety_caps.allow_reduce_only(
+                    open_order_count=open_order_count
+                )
+            else:
+                total_notional = (
+                    self._long_position_value + self._short_position_value
+                )
+                decision = self._safety_caps.allow_open(
+                    total_notional=total_notional,
+                    open_order_count=open_order_count,
+                )
+            if not decision.allowed:
+                return OrderResult(
+                    success=False,
+                    order_link_id=intent.order_link_id,
+                    error=f"safety_cap_{decision.reason}",
+                )
+
+        result = self._executor.execute_place(intent)
+        if result.success:
+            tracked = self._tracked_orders.get(intent.client_order_id)
+            if tracked is not None:
+                tracked.mark_placed(result.order_id)
+            self._truncate_breaker.record_success(intent.side, intent.price)
+            if intent.reduce_only:
+                self._clear_dirty(intent.direction)
+        return result
+
     def _execute_cancel_intent(self, intent: CancelIntent) -> None:
         """Execute a cancel order intent."""
         result = self._executor.execute_cancel(intent)
@@ -2373,6 +2424,15 @@ class StrategyRunner:
                 f"{self.strat_id} (session realized {session_realized_pnl})",
                 error_key=f"safety_cap_loss_breaker_{self.strat_id}",
             )
+        # Drain queued placement retries — stale intents would bypass the latch
+        # via RetryQueue.process_due (mirrors auth-cooldown queue clear).
+        if self._on_retry_queue_clear is not None:
+            cleared = self._on_retry_queue_clear()
+            if cleared:
+                logger.info(
+                    "%s: Cleared %d items from retry queue on session-loss trip",
+                    self.strat_id, cleared,
+                )
         # Cancel all working orders (both directions). order['orderId'] is the
         # wire id (get_limit_orders maps tracked.order_id → 'orderId'); a
         # CancelIntent requires symbol + order_id + reason.
