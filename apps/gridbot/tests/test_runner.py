@@ -4776,6 +4776,27 @@ class TestSafetyCapsIntegration:
         assert result.error == "safety_cap_max_notional"
         mock_executor.execute_place.assert_not_called()
 
+    def test_retry_dispatch_place_blocks_c2_max_orders(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        caps = SafetyCaps(
+            SafetyCapsConfig(max_open_orders=2), strat_id="btcusdt_test"
+        )
+        r = self._runner(strategy_config, mock_executor, instrument_info, caps)
+        # Two working orders == cap (get_limit_orders counts status="placed").
+        for cid in ("a", "b"):
+            tracked = TrackedOrder(
+                client_order_id=cid,
+                intent=self._open(price="49000", qty="0.01"),
+                status="placed",
+            )
+            tracked.order_id = f"wire_{cid}"
+            r._tracked_orders[cid] = tracked
+        result = r.retry_dispatch_place(self._assign_wire(self._open()))
+        assert result.success is False
+        assert result.error == "safety_cap_max_open_orders"
+        mock_executor.execute_place.assert_not_called()
+
     def test_retry_dispatch_place_submits_when_caps_allow(
         self, strategy_config, mock_executor, instrument_info
     ):

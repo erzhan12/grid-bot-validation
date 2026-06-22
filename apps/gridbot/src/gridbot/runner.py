@@ -2089,6 +2089,43 @@ class StrategyRunner:
         wire_id = existing_order_link_id or make_order_link_id(intent.client_order_id)
         return replace(intent, order_link_id=wire_id)
 
+    def _evaluate_safety_caps(
+        self, intent: PlaceLimitIntent, limits: dict[str, list[dict]]
+    ) -> tuple[bool, Optional[str]]:
+        """Evaluate C1/C2/C3 production safety caps for a place intent.
+
+        Shared by the first-dispatch path (``_execute_place_intent`` Step 2.5)
+        and the retry-queue re-dispatch (``retry_dispatch_place``) so the cap
+        evaluation lives in one place; callers own the response (silent drop +
+        log / rejection alert vs ``OrderResult`` error).
+
+        Returns ``(allowed, reason)``. ``reason`` is ``None`` when allowed (or
+        no SafetyCaps is wired); otherwise it is the cap sentinel WITHOUT the
+        ``safety_cap_`` prefix — ``"loss_breaker"`` for the C3 latch, else the
+        ``CapDecision.reason`` (``"max_notional"`` / ``"max_open_orders"``).
+        """
+        if self._safety_caps is None:
+            return True, None
+        # C3 latch (full circuit breaker — open AND reduce-only).
+        if self._safety_caps.loss_tripped():
+            return False, "loss_breaker"
+        open_order_count = sum(len(v) for v in limits.values())
+        if intent.reduce_only:
+            decision = self._safety_caps.allow_reduce_only(
+                open_order_count=open_order_count
+            )
+        else:
+            total_notional = (
+                self._long_position_value + self._short_position_value
+            )
+            decision = self._safety_caps.allow_open(
+                total_notional=total_notional,
+                open_order_count=open_order_count,
+            )
+        if not decision.allowed:
+            return False, decision.reason
+        return True, None
+
     def _execute_place_intent(self, intent: PlaceLimitIntent, limits: dict[str, list[dict]]) -> None:
         """Execute a place order intent.
 
@@ -2126,33 +2163,20 @@ class StrategyRunner:
         # _is_good_to_place guard, so a capped intent never reaches the strategy
         # guard or the exchange. Inert when no SafetyCaps is wired (None) or its
         # config is disabled. A capped intent is dropped, NOT enqueued.
-        if self._safety_caps is not None:
-            # C3 latch: once the session-loss breaker has tripped, suppress ALL
-            # new places (open AND reduce-only — it is a full circuit breaker;
-            # the trip ERROR/alert + working-order cancel already fired once in
-            # on_position_update).
-            if self._safety_caps.loss_tripped():
+        allowed, reason = self._evaluate_safety_caps(intent, limits)
+        if not allowed:
+            if reason == "loss_breaker":
+                # C3 latch: once the session-loss breaker has tripped, suppress
+                # ALL new places (open AND reduce-only — full circuit breaker;
+                # the trip ERROR/alert + working-order cancel already fired once
+                # in on_position_update). Silent drop here, no rejection alert.
                 logger.debug(
                     "%s: safety-cap loss breaker latched — dropping %s @ %s",
                     self.strat_id, intent.side, intent.price,
                 )
-                return
-            open_order_count = sum(len(v) for v in limits.values())
-            if intent.reduce_only:
-                decision = self._safety_caps.allow_reduce_only(
-                    open_order_count=open_order_count
-                )
             else:
-                total_notional = (
-                    self._long_position_value + self._short_position_value
-                )
-                decision = self._safety_caps.allow_open(
-                    total_notional=total_notional,
-                    open_order_count=open_order_count,
-                )
-            if not decision.allowed:
-                self._emit_safety_cap_rejection(intent, decision.reason)
-                return
+                self._emit_safety_cap_rejection(intent, reason)
+            return
 
         # Step 3 — dirty-mirror REST refresh before the guard (reduce-only only).
         # `dirty_refresh_enabled` is the FIRST term so flipping it off is a true
@@ -2310,33 +2334,15 @@ class StrategyRunner:
         assigned wire ``order_link_id`` and only need a fresh cap read plus
         executor submit + tracking bookkeeping.
         """
-        if self._safety_caps is not None:
-            if self._safety_caps.loss_tripped():
-                return OrderResult(
-                    success=False,
-                    order_link_id=intent.order_link_id,
-                    error="safety_cap_loss_breaker",
-                )
-            limits = self.get_limit_orders()
-            open_order_count = sum(len(v) for v in limits.values())
-            if intent.reduce_only:
-                decision = self._safety_caps.allow_reduce_only(
-                    open_order_count=open_order_count
-                )
-            else:
-                total_notional = (
-                    self._long_position_value + self._short_position_value
-                )
-                decision = self._safety_caps.allow_open(
-                    total_notional=total_notional,
-                    open_order_count=open_order_count,
-                )
-            if not decision.allowed:
-                return OrderResult(
-                    success=False,
-                    order_link_id=intent.order_link_id,
-                    error=f"safety_cap_{decision.reason}",
-                )
+        allowed, reason = self._evaluate_safety_caps(
+            intent, self.get_limit_orders()
+        )
+        if not allowed:
+            return OrderResult(
+                success=False,
+                order_link_id=intent.order_link_id,
+                error=f"safety_cap_{reason}",
+            )
 
         result = self._executor.execute_place(intent)
         if result.success:
