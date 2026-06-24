@@ -456,3 +456,23 @@ class TestRetryQueuePaused:
 
         assert processed == 1
         assert queue.size == 0
+
+    def test_process_due_drops_truncate_breaker_failure(self, place_intent):
+        """Breaker-blocked retries are removed, not re-backed-off."""
+        executor = Mock(
+            return_value=OrderResult(
+                success=False, error="truncate_breaker_blocked"
+            )
+        )
+        queue = RetryQueue(
+            executor_func=executor,
+            max_attempts=10,
+            initial_backoff_seconds=0.01,
+        )
+        queue.add(place_intent, "network error")
+        _force_due(queue)
+
+        processed = queue.process_due()
+
+        assert processed == 1
+        assert queue.size == 0

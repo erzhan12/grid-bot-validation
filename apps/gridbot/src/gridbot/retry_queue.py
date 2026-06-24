@@ -228,12 +228,19 @@ class RetryQueue:
                     logger.info(f"Retry succeeded: {type(item.intent).__name__}")
                     items_to_remove.append(item)
                     processed += 1
-                elif result.error and result.error.startswith("safety_cap"):
+                elif result.error and (
+                    result.error.startswith("safety_cap")
+                    or result.error == "truncate_breaker_blocked"
+                ):
                     # Feature 0079 — cap-blocked retries are dropped, not
                     # re-backed-off (mirrors runner drop-not-enqueue on first
-                    # dispatch for safety_cap sentinels).
+                    # dispatch for safety_cap sentinels). The truncate-breaker
+                    # sentinel mirrors Step 2 silent drop on first dispatch.
                     logger.warning(
-                        "Retry dropped (safety cap): %s — %s",
+                        "Retry dropped (%s): %s — %s",
+                        "truncate breaker"
+                        if result.error == "truncate_breaker_blocked"
+                        else "safety cap",
                         type(item.intent).__name__, result.error,
                     )
                     items_to_remove.append(item)

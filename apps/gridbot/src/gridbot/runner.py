@@ -2333,7 +2333,24 @@ class StrategyRunner:
         ``_is_good_to_place`` via ``_execute_place_intent``; retries reuse the
         assigned wire ``order_link_id`` and only need a fresh cap read plus
         executor submit + tracking bookkeeping.
+
+        Re-checks the 110017 truncate breaker (Step 2 on first dispatch): a
+        queued place can outlive a breaker trip on the same ``(side, price)``
+        scope, so retries must honor the cooldown or they partially bypass the
+        0064 storm backstop.
         """
+        now = self._clock()
+        if self._truncate_breaker.is_blocked(intent.side, intent.price, now):
+            logger.debug(
+                "%s: 110017 breaker tripped — dropping retry %s @ %s",
+                self.strat_id, intent.side, intent.price,
+            )
+            return OrderResult(
+                success=False,
+                order_link_id=intent.order_link_id,
+                error="truncate_breaker_blocked",
+            )
+
         allowed, reason = self._evaluate_safety_caps(
             intent, self.get_limit_orders()
         )

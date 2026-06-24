@@ -4747,6 +4747,30 @@ class TestSafetyCapsIntegration:
         assert caps.loss_tripped() is True
         assert retry_queue.size == 0
 
+    def test_retry_dispatch_place_blocks_when_truncate_breaker_tripped(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """Queued retries must honor the 110017 breaker cooldown on (side, price)."""
+        r = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+            clock=lambda: 0.0,
+        )
+        r._wallet_balance = Decimal("10000")
+        close = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Sell", price=Decimal("51000"),
+            qty=Decimal("0.001"), grid_level=1, direction="long", reduce_only=True,
+        )
+        intent = self._assign_wire(close)
+        # Trip the breaker for this scope key (3× 110017 within the window).
+        for t in (0.0, 1.0, 2.0):
+            r._truncate_breaker.record_110017("Sell", Decimal("51000"), t)
+        result = r.retry_dispatch_place(intent)
+        assert result.success is False
+        assert result.error == "truncate_breaker_blocked"
+        mock_executor.execute_place.assert_not_called()
+
     def test_retry_dispatch_place_blocks_when_loss_breaker_latched(
         self, strategy_config, mock_executor, instrument_info
     ):

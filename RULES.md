@@ -580,11 +580,13 @@ builds ONE instance per strat in `_init_strategy` and passes the SAME object
     window — **shadow placements do not**.
 - **Retry-queue cap enforcement (critical)**: place retries are dispatched via
   `StrategyRunner.retry_dispatch_place` (orchestrator wires this in
-  `_init_strategy`), which re-applies C1/C2/C3 before calling the executor — the
-  executor alone only enforces C4. On C3 trip the retry queue is **cleared**
-  (mirrors auth-cooldown). `RetryQueue.is_paused` also gates on
-  `loss_tripped()`. Cap-blocked retries return `error.startswith("safety_cap")`
-  and are **dropped** from the queue (not re-backed-off).
+  `_init_strategy`), which re-applies the 110017 truncate breaker (Step 2) and
+  C1/C2/C3 before calling the executor — the executor alone only enforces C4. On
+  C3 trip the retry queue is **cleared** (mirrors auth-cooldown).
+  `RetryQueue.is_paused` also gates on `loss_tripped()`. Cap-blocked retries
+  return `error.startswith("safety_cap")` and breaker-blocked retries return
+  `error="truncate_breaker_blocked"`; both are **dropped** from the queue (not
+  re-backed-off).
 - **Precedence**: caps run in `_execute_place_intent` as **Step 2.5** — AFTER
   qty-resolve (Step 1) + the 110017 breaker (Step 2) and BEFORE the dirty refresh
   / `_is_good_to_place` guard — so a capped intent never reaches the strategy
