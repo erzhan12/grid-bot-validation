@@ -138,11 +138,17 @@ class TestReconcilePublicTrades:
 
         mock_rest_client.get_recent_trades.return_value = []
 
-        await reconciler.reconcile_public_trades(
-            symbol="BTCUSDT",
-            gap_start=gap_start,
-            gap_end=gap_end,
-        )
+        mock_repo = MagicMock()
+        mock_repo.get_last_trade_ts.return_value = None
+        with unittest.mock.patch(
+            "event_saver.reconciler.PublicTradeRepository",
+            return_value=mock_repo,
+        ):
+            await reconciler.reconcile_public_trades(
+                symbol="BTCUSDT",
+                gap_start=gap_start,
+                gap_end=gap_end,
+            )
 
         mock_rest_client.get_recent_trades.assert_called_once()
 
@@ -160,13 +166,68 @@ class TestReconcilePublicTrades:
 
         mock_rest_client.get_recent_trades.return_value = []
 
-        count = await reconciler.reconcile_public_trades(
-            symbol="BTCUSDT",
-            gap_start=gap_start,
-            gap_end=gap_end,
-        )
+        mock_repo = MagicMock()
+        mock_repo.get_last_trade_ts.return_value = None
+        with unittest.mock.patch(
+            "event_saver.reconciler.PublicTradeRepository",
+            return_value=mock_repo,
+        ):
+            count = await reconciler.reconcile_public_trades(
+                symbol="BTCUSDT",
+                gap_start=gap_start,
+                gap_end=gap_end,
+            )
 
         assert count == 0
+        mock_rest_client.get_recent_trades.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reconcile_start_is_capped_at_gap_start(
+        self, mock_db, mock_rest_client
+    ):
+        """Post-gap live writes must not cause public-trade backfill to skip the gap."""
+        reconciler = GapReconciler(
+            db=mock_db,
+            rest_client=mock_rest_client,
+            gap_threshold_seconds=5.0,
+        )
+
+        gap_start = datetime.now(UTC)
+        gap_end = gap_start + timedelta(seconds=10)
+        trade_ts_ms = int((gap_start + timedelta(seconds=5)).timestamp() * 1000)
+
+        mock_session = MagicMock()
+        mock_repo = MagicMock()
+        mock_repo.get_last_trade_ts.return_value = gap_end + timedelta(seconds=30)
+        mock_repo.bulk_insert.return_value = 1
+        mock_db.get_session.return_value.__enter__.return_value = mock_session
+        mock_db.get_session.return_value.__exit__.return_value = None
+
+        mock_rest_client.get_recent_trades.return_value = [
+            {
+                "execId": "gap_trade",
+                "time": trade_ts_ms,
+                "side": "Buy",
+                "price": "50000.00",
+                "size": "0.001",
+            }
+        ]
+
+        with unittest.mock.patch(
+            "event_saver.reconciler.PublicTradeRepository",
+            return_value=mock_repo,
+        ):
+            count = await reconciler.reconcile_public_trades(
+                symbol="BTCUSDT",
+                gap_start=gap_start,
+                gap_end=gap_end,
+            )
+
+        assert count == 1
+        mock_repo.bulk_insert.assert_called_once()
+        inserted = mock_repo.bulk_insert.call_args.args[0]
+        assert len(inserted) == 1
+        assert inserted[0].trade_id == "gap_trade"
 
     @pytest.mark.asyncio
     async def test_handles_api_error(self, mock_db, mock_rest_client):
@@ -182,11 +243,17 @@ class TestReconcilePublicTrades:
 
         mock_rest_client.get_recent_trades.side_effect = Exception("API Error")
 
-        count = await reconciler.reconcile_public_trades(
-            symbol="BTCUSDT",
-            gap_start=gap_start,
-            gap_end=gap_end,
-        )
+        mock_repo = MagicMock()
+        mock_repo.get_last_trade_ts.return_value = None
+        with unittest.mock.patch(
+            "event_saver.reconciler.PublicTradeRepository",
+            return_value=mock_repo,
+        ):
+            count = await reconciler.reconcile_public_trades(
+                symbol="BTCUSDT",
+                gap_start=gap_start,
+                gap_end=gap_end,
+            )
 
         assert count == 0
 

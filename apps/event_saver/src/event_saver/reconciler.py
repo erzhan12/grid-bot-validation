@@ -120,8 +120,15 @@ class GapReconciler:
                 repo = PublicTradeRepository(session)
                 last_persisted_ts = repo.get_last_trade_ts(symbol)
 
-            # Use last persisted timestamp if available, otherwise use gap_start
-            reconcile_start = last_persisted_ts if last_persisted_ts else gap_start
+            # Never let post-gap live writes move the filter window past the
+            # detected outage; duplicates are filtered by trade_id on insert.
+            if (
+                last_persisted_ts
+                and last_persisted_ts.timestamp() < gap_start.timestamp()
+            ):
+                reconcile_start = last_persisted_ts
+            else:
+                reconcile_start = gap_start
 
             # Add buffer to ensure we capture all trades
             start_ms = int((reconcile_start - timedelta(seconds=1)).timestamp() * 1000)
