@@ -195,10 +195,72 @@ class TestReconcilePublicTrades:
         gap_start = datetime.now(UTC)
         gap_end = gap_start + timedelta(seconds=10)
         trade_ts_ms = int((gap_start + timedelta(seconds=5)).timestamp() * 1000)
+        # A trade well before the gap: must be excluded by the gap_start-based
+        # lower bound. If the filter window started earlier it would leak in.
+        pre_gap_ts_ms = int((gap_start - timedelta(seconds=30)).timestamp() * 1000)
 
         mock_session = MagicMock()
         mock_repo = MagicMock()
         mock_repo.get_last_trade_ts.return_value = gap_end + timedelta(seconds=30)
+        mock_repo.bulk_insert.return_value = 1
+        mock_db.get_session.return_value.__enter__.return_value = mock_session
+        mock_db.get_session.return_value.__exit__.return_value = None
+
+        mock_rest_client.get_recent_trades.return_value = [
+            {
+                "execId": "pre_gap_trade",
+                "time": pre_gap_ts_ms,
+                "side": "Buy",
+                "price": "50000.00",
+                "size": "0.001",
+            },
+            {
+                "execId": "gap_trade",
+                "time": trade_ts_ms,
+                "side": "Buy",
+                "price": "50000.00",
+                "size": "0.001",
+            },
+        ]
+
+        with unittest.mock.patch(
+            "event_saver.reconciler.PublicTradeRepository",
+            return_value=mock_repo,
+        ):
+            count = await reconciler.reconcile_public_trades(
+                symbol="BTCUSDT",
+                gap_start=gap_start,
+                gap_end=gap_end,
+            )
+
+        assert count == 1
+        mock_repo.bulk_insert.assert_called_once()
+        inserted = mock_repo.bulk_insert.call_args.args[0]
+        # Only the in-gap trade survives: window floored at gap_start (capturing
+        # the outage) while excluding the unrelated pre-gap trade. Proves the
+        # lower bound is gap_start, not last_persisted_ts (gap_end + 30s).
+        assert len(inserted) == 1
+        assert inserted[0].trade_id == "gap_trade"
+
+    @pytest.mark.asyncio
+    async def test_reconcile_start_when_last_persisted_equals_gap_start(
+        self, mock_db, mock_rest_client
+    ):
+        """last_persisted_ts == gap_start falls through to gap_start (strict <)."""
+        reconciler = GapReconciler(
+            db=mock_db,
+            rest_client=mock_rest_client,
+            gap_threshold_seconds=5.0,
+        )
+
+        gap_start = datetime.now(UTC)
+        gap_end = gap_start + timedelta(seconds=10)
+        trade_ts_ms = int((gap_start + timedelta(seconds=3)).timestamp() * 1000)
+
+        mock_session = MagicMock()
+        mock_repo = MagicMock()
+        # Equality must NOT take the if-branch (comparison is strict <).
+        mock_repo.get_last_trade_ts.return_value = gap_start
         mock_repo.bulk_insert.return_value = 1
         mock_db.get_session.return_value.__enter__.return_value = mock_session
         mock_db.get_session.return_value.__exit__.return_value = None
@@ -224,9 +286,7 @@ class TestReconcilePublicTrades:
             )
 
         assert count == 1
-        mock_repo.bulk_insert.assert_called_once()
         inserted = mock_repo.bulk_insert.call_args.args[0]
-        assert len(inserted) == 1
         assert inserted[0].trade_id == "gap_trade"
 
     @pytest.mark.asyncio
