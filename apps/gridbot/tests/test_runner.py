@@ -367,6 +367,71 @@ class TestStrategyRunnerOrderTracking:
         retry_queue.process_due()
         mock_executor.execute_place.assert_not_called()
 
+    def test_inject_open_orders_upgrades_failed_salted_place_against_legacy_wire_prefix(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """0080 migration: reconcile adopts pre-salt wire id after salted retry enqueue."""
+        retry_queue = RetryQueue(executor_func=mock_executor.execute_place)
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+            on_intent_failed=lambda intent, error: retry_queue.add(intent, error),
+            on_retry_cancel_for_prefix=lambda prefix: retry_queue.cancel_for_prefix(prefix),
+        )
+        runner._wallet_balance = Decimal("10000")
+        mock_executor.execute_place.return_value = OrderResult(
+            success=False,
+            error="Connection timeout",
+        )
+
+        salted_intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            grid_level=5,
+            direction="long",
+            strat_id=strategy_config.strat_id,
+        )
+        legacy_intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            grid_level=5,
+            direction="long",
+            strat_id=None,
+        )
+        assert salted_intent.client_order_id != legacy_intent.client_order_id
+
+        runner._execute_place_intent(salted_intent, EMPTY_LIMITS)
+        assert runner._tracked_orders[salted_intent.client_order_id].status == "failed"
+        assert retry_queue.size == 1
+
+        legacy_wire_id = f"{legacy_intent.client_order_id}-1715170809999"
+        runner.inject_open_orders([
+            {
+                "orderId": "exchange_legacy",
+                "orderLinkId": legacy_wire_id,
+                "price": "49000.0",
+                "qty": "0.001",
+                "side": "Buy",
+                "reduceOnly": False,
+            },
+        ])
+
+        assert salted_intent.client_order_id not in runner._tracked_orders
+        tracked = runner._tracked_orders[legacy_intent.client_order_id]
+        assert tracked.status == "placed"
+        assert tracked.order_id == "exchange_legacy"
+        assert tracked.intent.order_link_id == legacy_wire_id
+        assert retry_queue.size == 0
+
+        mock_executor.execute_place.reset_mock()
+        retry_queue.process_due()
+        mock_executor.execute_place.assert_not_called()
+
     def test_inject_open_orders_upgrade_skips_when_existing_intent_missing(
         self, runner, caplog
     ):
@@ -4836,6 +4901,22 @@ class TestSafetyCapsIntegration:
         result = r.retry_dispatch_place(intent)
         assert result.success is True
         assert r._tracked_orders[intent.client_order_id].status == "placed"
+
+    def test_retry_dispatch_place_blocks_exact_duplicate_on_book(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        r = self._runner(strategy_config, mock_executor, instrument_info, None)
+        intent = self._assign_wire(self._open())
+        r._tracked_orders[intent.client_order_id] = TrackedOrder(
+            client_order_id="legacy_prefix",
+            order_id="live_1",
+            intent=intent,
+            status="placed",
+        )
+        result = r.retry_dispatch_place(intent)
+        assert result.success is False
+        assert result.error == "duplicate_order_blocked"
+        mock_executor.execute_place.assert_not_called()
 
     @staticmethod
     def _assign_wire(intent: PlaceLimitIntent) -> PlaceLimitIntent:

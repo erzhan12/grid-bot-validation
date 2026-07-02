@@ -1233,6 +1233,34 @@ class StrategyRunner:
             return DirectionType.LONG if reduce_only else DirectionType.SHORT
         return None
 
+    def _find_failed_tracked_by_order_identity(
+        self,
+        price: Decimal,
+        qty: Decimal,
+        side: str,
+        reduce_only: bool,
+    ) -> tuple[Optional[str], Optional[TrackedOrder]]:
+        """Find a failed tracked placement matching exchange order identity.
+
+        Feature 0080 salts ``client_order_id`` by ``strat_id``, but pre-0080
+        resting orders on the exchange still carry the unsalted wire prefix.
+        When reconcile adopts such an order after an ambiguous failed place,
+        the dict keys differ even though it is the same grid level — upgrade
+        by (price, qty, side, reduce_only) instead of prefix alone.
+        """
+        for key, tracked in self._tracked_orders.items():
+            if tracked.status != "failed" or tracked.intent is None:
+                continue
+            intent = tracked.intent
+            if (
+                intent.price == price
+                and intent.qty == qty
+                and intent.side == side
+                and intent.reduce_only == reduce_only
+            ):
+                return key, tracked
+        return None, None
+
     def _find_tracked_order(
         self, order_link_id: Optional[str], order_id: Optional[str]
     ) -> Optional[TrackedOrder]:
@@ -2351,14 +2379,24 @@ class StrategyRunner:
                 error="truncate_breaker_blocked",
             )
 
-        allowed, reason = self._evaluate_safety_caps(
-            intent, self.get_limit_orders()
-        )
+        limits = self.get_limit_orders()
+        allowed, reason = self._evaluate_safety_caps(intent, limits)
         if not allowed:
             return OrderResult(
                 success=False,
                 order_link_id=intent.order_link_id,
                 error=f"safety_cap_{reason}",
+            )
+
+        if not self._is_good_to_place(intent, limits):
+            logger.warning(
+                "%s: duplicate order on retry %s %s @ %s — dropping (not re-backed-off)",
+                self.strat_id, intent.direction, intent.side, intent.price,
+            )
+            return OrderResult(
+                success=False,
+                order_link_id=intent.order_link_id,
+                error="duplicate_order_blocked",
             )
 
         result = self._executor.execute_place(intent)
@@ -2590,6 +2628,50 @@ class StrategyRunner:
                     f"{self.strat_id}: Skipping injected order {order_id} — "
                     f"key collision on client_id={client_id}"
                 )
+                continue
+
+            # Feature 0080 migration: a failed ambiguous place is keyed by the
+            # salted client_order_id, but the exchange order still carries the
+            # pre-0080 wire prefix. Upgrade by order identity and re-key to the
+            # exchange prefix so WS events continue to resolve.
+            failed_key, failed_tracked = self._find_failed_tracked_by_order_identity(
+                dec_price, dec_qty, side, reduce_only
+            )
+            if failed_tracked is not None and failed_key is not None:
+                if failed_tracked.intent is None:
+                    logger.warning(
+                        f"{self.strat_id}: identity-matched upgrade skipped: "
+                        f"tracked order has no intent (prefix={failed_key})"
+                    )
+                    continue
+
+                exchange_link_id = (
+                    order_link_id or failed_tracked.intent.order_link_id
+                )
+                upgraded_intent = replace(
+                    failed_tracked.intent,
+                    order_link_id=exchange_link_id,
+                )
+                prev_state = failed_tracked.status
+                failed_tracked.intent = upgraded_intent
+                failed_tracked.mark_placed(order_id)
+                if failed_key != client_id:
+                    del self._tracked_orders[failed_key]
+                    failed_tracked.client_order_id = client_id
+                    self._tracked_orders[client_id] = failed_tracked
+                removed = (
+                    self._on_retry_cancel_for_prefix(failed_key)
+                    if self._on_retry_cancel_for_prefix
+                    else 0
+                )
+                logger.info(
+                    f"{self.strat_id}: tracked order upgraded from {prev_state} "
+                    f"via reconcile identity match "
+                    f"(failed_prefix={failed_key}, exchange_prefix={client_id}, "
+                    f"order_id={order_id}, link_id={exchange_link_id}, "
+                    f"retry_cancelled={removed})"
+                )
+                injected += 1
                 continue
 
             tracked = TrackedOrder(

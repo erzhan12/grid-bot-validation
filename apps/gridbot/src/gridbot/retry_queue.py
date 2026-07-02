@@ -231,16 +231,24 @@ class RetryQueue:
                 elif result.error and (
                     result.error.startswith("safety_cap")
                     or result.error == "truncate_breaker_blocked"
+                    or result.error == "duplicate_order_blocked"
                 ):
                     # Feature 0079 — cap-blocked retries are dropped, not
                     # re-backed-off (mirrors runner drop-not-enqueue on first
                     # dispatch for safety_cap sentinels). The truncate-breaker
                     # sentinel mirrors Step 2 silent drop on first dispatch.
-                    logger.warning(
-                        "Retry dropped (%s): %s — %s",
+                    # duplicate_order_blocked mirrors reconcile-upgrade / exact-
+                    # duplicate guard when a queued retry outlives adoption.
+                    drop_reason = (
                         "truncate breaker"
                         if result.error == "truncate_breaker_blocked"
-                        else "safety cap",
+                        else "duplicate order"
+                        if result.error == "duplicate_order_blocked"
+                        else "safety cap"
+                    )
+                    logger.warning(
+                        "Retry dropped (%s): %s — %s",
+                        drop_reason,
                         type(item.intent).__name__, result.error,
                     )
                     items_to_remove.append(item)
