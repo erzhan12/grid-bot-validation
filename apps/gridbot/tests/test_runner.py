@@ -3774,9 +3774,15 @@ class TestSameOrderDedupAndAutoRecovery:
         # through normally — that part is a separate, fundamental gap
         # (single-event WS replays without a paired event cannot be
         # detected via SAME ORDER), out of scope for this feature.
+        # Fresh exec_ids: a cached-pair retrigger is NEW executions on the
+        # same order_id pair. Identical-exec_id replays are dropped upstream
+        # by the feature 0083 guard and would never reach the cache-hit
+        # branch this test covers.
         t1 = t0 + timedelta(seconds=10)
-        ev_oa_replay = self._make_exec("oa", t1)
-        ev_ob_replay = self._make_exec("ob", t1 + timedelta(seconds=1))
+        ev_oa_replay = self._make_exec("oa", t1, exec_id="e-oa-retrigger")
+        ev_ob_replay = self._make_exec(
+            "ob", t1 + timedelta(seconds=1), exec_id="e-ob-retrigger"
+        )
         runner._engine.on_event.reset_mock()
         runner.on_execution(ev_oa_replay)
         # Snapshot _execute_intents call count after ev_oa replay so we can
@@ -3874,6 +3880,262 @@ class TestSameOrderDedupAndAutoRecovery:
         assert len(same_order_errors) == 2
         assert notifier.alert.call_count == 2
         assert runner.same_order_error is True
+
+
+class TestExecIdDedup:
+    """Feature 0083: execution-identity idempotency guard for WS resync
+    redelivery bursts (issue #202).
+
+    A private-WS resync can redeliver the same ExecutionEvent (identical
+    exec_id) many times in a tight burst. The guard at the top of
+    `on_execution` drops repeats before they can touch tracked-order state,
+    the SAME ORDER buffers, or the engine. See docs/features/0083_PLAN.md.
+    """
+
+    def _make_exec(self, order_id, t, exec_id=None, price="50000.0", side="Buy"):
+        return ExecutionEvent(
+            event_type=EventType.EXECUTION,
+            symbol="BTCUSDT",
+            exchange_ts=t,
+            local_ts=t,
+            exec_id=exec_id if exec_id is not None else f"e-{order_id}",
+            order_id=order_id,
+            order_link_id=f"link-{order_id}",
+            side=side,
+            price=Decimal(price),
+            qty=Decimal("0.1"),
+            fee=Decimal("0.5"),
+            closed_pnl=Decimal("0"),
+            leaves_qty=Decimal("0"),
+            closed_size=Decimal("0"),
+        )
+
+    def _track_order(self, runner, order_id, price="50000.0"):
+        """Register a resting tracked order matching _make_exec identifiers."""
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT", side="Buy",
+            price=Decimal(price), qty=Decimal("0.1"),
+            grid_level=1, direction="long",
+        )
+        runner._tracked_orders[f"link-{order_id}"] = TrackedOrder(
+            client_order_id=f"link-{order_id}", order_id=order_id,
+            intent=intent, status="placed",
+        )
+
+    def _stub_rest_executions(self, runner, executions=None):
+        """Wire executor._client.get_executions to return executions."""
+        client = MagicMock()
+        client.get_executions.return_value = (executions or [], None)
+        client.get_executions_all.return_value = (executions or [], False)
+        runner._executor._client = client
+        return client
+
+    def _rest_match(self, order_id):
+        return {
+            "orderId": order_id,
+            "execId": f"exec-{order_id}",
+            "execPrice": "50000",
+            "execQty": "0.1",
+            "orderLinkId": f"link-{order_id}",
+            "execType": "Trade",
+        }
+
+    def test_redelivered_execution_deduped_by_exec_id(self, runner, caplog):
+        """Same exec_id redelivered N times: mark_filled/log/engine run once."""
+        import logging
+
+        runner._engine = MagicMock()
+        runner._engine.on_event.return_value = []
+        self._track_order(runner, "oa")
+
+        ev = self._make_exec("oa", datetime.now(UTC))
+        with caplog.at_level(logging.INFO, logger="gridbot.runner"):
+            first = runner.on_execution(ev)
+            repeats = [runner.on_execution(ev) for _ in range(4)]
+
+        filled_logs = [r for r in caplog.records if "Order filled:" in r.message]
+        assert len(filled_logs) == 1, "mark_filled/log must run exactly once"
+        assert runner._engine.on_event.call_count == 1
+        assert first == []
+        assert repeats == [[], [], [], []]
+        assert runner._same_order_error is False
+
+    def test_distinct_exec_ids_not_deduped(self, runner, caplog):
+        """Two genuine fills, same order_id but distinct exec_ids (partial-
+        then-final pattern), both process — guards against over-dedup."""
+        import logging
+
+        runner._engine = MagicMock()
+        runner._engine.on_event.return_value = []
+        self._track_order(runner, "oa")
+
+        t0 = datetime.now(UTC)
+        ev1 = self._make_exec("oa", t0, exec_id="e-oa-1")
+        ev2 = self._make_exec("oa", t0 + timedelta(seconds=1), exec_id="e-oa-2")
+        with caplog.at_level(logging.INFO, logger="gridbot.runner"):
+            runner.on_execution(ev1)
+            runner.on_execution(ev2)
+
+        filled_logs = [r for r in caplog.records if "Order filled:" in r.message]
+        assert len(filled_logs) == 2
+        assert runner._engine.on_event.call_count == 2
+        assert "e-oa-1" in runner._processed_exec_ids
+        assert "e-oa-2" in runner._processed_exec_ids
+
+    def test_exec_dedup_fifo_eviction(self, runner, monkeypatch):
+        """Cache capped at _EXEC_DEDUP_MAX_ENTRIES; oldest evicted first and
+        an evicted exec_id processes again, while residents stay deduped."""
+        monkeypatch.setattr("gridbot.runner._EXEC_DEDUP_MAX_ENTRIES", 3)
+        runner._engine = MagicMock()
+        runner._engine.on_event.return_value = []
+
+        t0 = datetime.now(UTC)
+        # Distinct prices keep SAME ORDER detection out of the picture.
+        for i in range(4):
+            runner.on_execution(
+                self._make_exec(f"o{i}", t0 + timedelta(seconds=i), price=f"5000{i}.0")
+            )
+
+        assert len(runner._processed_exec_ids) == 3
+        assert "e-o0" not in runner._processed_exec_ids, "oldest must be evicted"
+        assert runner._engine.on_event.call_count == 4
+
+        # Evicted oldest re-fed → processes again (not deduped).
+        runner.on_execution(
+            self._make_exec("o0", t0 + timedelta(seconds=10), price="50000.0")
+        )
+        assert runner._engine.on_event.call_count == 5
+
+        # Still-resident exec_id re-fed → deduped.
+        runner.on_execution(
+            self._make_exec("o3", t0 + timedelta(seconds=11), price="50003.0")
+        )
+        assert runner._engine.on_event.call_count == 5
+
+    def test_empty_exec_id_not_deduped(self, runner):
+        """Events with missing exec_id are never deduped and never crash."""
+        runner._engine = MagicMock()
+        runner._engine.on_event.return_value = []
+
+        t0 = datetime.now(UTC)
+        # Different prices so the different-oid pair cannot trip SAME ORDER.
+        runner.on_execution(self._make_exec("oa", t0, exec_id=""))
+        runner.on_execution(
+            self._make_exec("ob", t0 + timedelta(seconds=1), exec_id="", price="50100.0")
+        )
+
+        assert runner._engine.on_event.call_count == 2
+        assert "" not in runner._processed_exec_ids
+
+    def test_exec_dedup_composes_with_0031_phantom_drop(self, runner):
+        """Phantom leg (0031 WS_GLITCH) records its exec_id — harmless; its
+        redelivery stays dropped; a later genuine fill for the still-resting
+        order carries a fresh exec_id and processes normally."""
+        runner._notifier = Mock()
+        # REST matches only oa → ob leg adjudicated WS_GLITCH_SUSPECTED.
+        self._stub_rest_executions(runner, executions=[self._rest_match("oa")])
+        runner._engine = MagicMock()
+        runner._engine.on_event.return_value = []
+
+        t0 = datetime.now(UTC)
+        runner.on_execution(self._make_exec("oa", t0))
+        runner.on_execution(self._make_exec("ob", t0 + timedelta(seconds=1)))
+
+        def engine_exec_ids():
+            return [
+                getattr(c.args[0], "exec_id", None)
+                for c in runner._engine.on_event.call_args_list
+            ]
+
+        assert "e-ob" not in engine_exec_ids(), "phantom dropped by 0031 gate"
+        assert "e-ob" in runner._processed_exec_ids, (
+            "guard records the phantom's exec_id on first sight (harmless)"
+        )
+
+        # Redelivery of the phantom exec_id → dropped by the guard.
+        runner.on_execution(self._make_exec("ob", t0 + timedelta(seconds=2)))
+        assert "e-ob" not in engine_exec_ids()
+
+        # Genuine later fill of the resting order: fresh exec_id, price moved.
+        runner.on_execution(
+            self._make_exec(
+                "ob", t0 + timedelta(seconds=30), exec_id="e-ob-2", price="50100.0"
+            )
+        )
+        assert "e-ob-2" in engine_exec_ids(), "fresh exec_id must process"
+
+    def test_partial_fill_redelivery_deduped(self, runner):
+        """A redelivered partial fill (leaves_qty != 0) shares its original's
+        exec_id and is deduped — the guard applies before any leaves_qty
+        filtering."""
+        runner._engine = MagicMock()
+        runner._engine.on_event.return_value = []
+
+        ev = replace(
+            self._make_exec("oa", datetime.now(UTC)), leaves_qty=Decimal("0.05")
+        )
+        runner.on_execution(ev)
+        runner.on_execution(ev)
+
+        assert runner._engine.on_event.call_count == 1
+
+    def test_exception_after_record_still_dedups_redelivery(self, runner):
+        """Record-first ordering: processing that throws AFTER the guard has
+        recorded the exec_id still dedups a subsequent redelivery — there is
+        no retry path for executions, and re-raising is the documented
+        error-handling discipline."""
+        runner._engine = MagicMock()
+        runner._engine.on_event.side_effect = RuntimeError("engine boom")
+
+        ev = self._make_exec("oa", datetime.now(UTC))
+        with pytest.raises(RuntimeError):
+            runner.on_execution(ev)
+        assert "e-oa" in runner._processed_exec_ids
+
+        # Redelivery after the failed first processing: deduped, engine not
+        # re-invoked (documented record-first trade-off).
+        runner._engine.on_event.side_effect = None
+        runner._engine.on_event.return_value = []
+        assert runner.on_execution(ev) == []
+        assert runner._engine.on_event.call_count == 1
+
+    def test_redelivery_does_not_clear_latched_same_order_error(self, runner, caplog):
+        """P2 regression: a full-fill redelivery burst must not clear a
+        latched SAME ORDER error nor evict the genuine different-oid pair
+        from the maxlen=2 buffers — the guard sits BEFORE _check_same_orders."""
+        import logging
+
+        runner._notifier = Mock()
+        # REST confirms both fills → REAL_DUPLICATE keeps the block latched.
+        self._stub_rest_executions(
+            runner, executions=[self._rest_match("oa"), self._rest_match("ob")]
+        )
+        runner._engine = MagicMock()
+        runner._engine.on_event.return_value = []
+
+        t0 = datetime.now(UTC)
+        ev_b = self._make_exec("ob", t0 + timedelta(seconds=1))
+        runner.on_execution(self._make_exec("oa", t0))
+        runner.on_execution(ev_b)
+        assert runner._same_order_error is True
+        buffer_before = list(runner._recent_executions_long)
+
+        # WS resync: redeliver one leg of the latched pair several times.
+        with caplog.at_level(logging.INFO, logger="gridbot.runner"):
+            for _ in range(3):
+                runner.on_execution(ev_b)
+
+        assert runner._same_order_error is True, (
+            "redelivery burst must not clear the latched SAME ORDER error"
+        )
+        assert list(runner._recent_executions_long) == buffer_before, (
+            "redelivery burst must not touch the SAME ORDER buffers"
+        )
+        assert all(
+            "Same-order error cleared" not in r.message for r in caplog.records
+        )
+        # Engine saw only the two genuine fills, none of the redeliveries.
+        assert runner._engine.on_event.call_count == 2
 
 
 class TestRunnerAuthCooldown:

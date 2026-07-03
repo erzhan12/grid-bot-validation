@@ -11,7 +11,7 @@ The runner is responsible for:
 import logging
 import math
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, UTC, timedelta
 from decimal import Decimal
@@ -112,6 +112,15 @@ _DIRTY_WS_MISMATCH_ALERT_THRESHOLD = 10
 # WARNING to at most one per this many seconds per reason, so a cap held at its
 # threshold (e.g. notional pinned at C1) does not flood the log every tick.
 _SAFETY_CAP_WARN_THROTTLE_SEC = 60.0
+
+# Feature 0083 (issue #202) — cap on the processed-exec_id FIFO dedup cache in
+# `on_execution`. Bybit exec_ids are globally unique, so entries never need
+# time-based expiry (a TTL would let a late WS replay be reprocessed); the cap
+# only bounds memory. 4096 entries ≈ 18 h of fills at the observed ~230
+# fills/h — orders of magnitude beyond the seconds-to-minutes window in which
+# Bybit replays executions after a reconnect. Raise if fill rate grows
+# (~100 bytes/entry incl. dict-node overhead; 4096 ≈ 400 KB per strat).
+_EXEC_DEDUP_MAX_ENTRIES = 4096
 
 
 @dataclass
@@ -491,6 +500,12 @@ class StrategyRunner:
         # as if it had — otherwise downstream ticks/executions re-derive
         # intents from a position view that diverges from reality.
         self._drop_phantom_event_for_current_call: bool = False
+        # Feature 0083 — insertion-ordered set of processed exec_ids (values
+        # unused; OrderedDict gives O(1) FIFO eviction). Guards on_execution
+        # against WS resync redelivery bursts: a repeat exec_id is dropped
+        # before it can touch tracked-order state, the SAME ORDER buffers,
+        # or the engine. Bounded by _EXEC_DEDUP_MAX_ENTRIES, no TTL.
+        self._processed_exec_ids: OrderedDict[str, None] = OrderedDict()
 
     @property
     def strat_id(self) -> str:
@@ -775,6 +790,21 @@ class StrategyRunner:
             # pair; in that case we drop the event before it reaches the
             # engine AND before mutating tracked-order status (see below).
             self._drop_phantom_event_for_current_call = False
+
+            # Feature 0083 — execution-identity idempotency guard. A private
+            # WS resync can redeliver the same execution many times in one
+            # burst (issue #202). Drop repeats here, BEFORE
+            # _check_same_orders: its maxlen=2 buffers and error-flag reset
+            # must only ever see first sightings, or a redelivery burst
+            # would evict a genuine different-oid pair and spuriously clear
+            # a latched SAME ORDER error.
+            if self._seen_exec_id(event.exec_id):
+                logger.debug(
+                    f"{self.strat_id}: dropping redelivered ExecutionEvent "
+                    f"exec_id={event.exec_id} order_id={event.order_id} "
+                    f"(WS resync)"
+                )
+                return []
 
             # Look up tracked order WITHOUT mutating its status yet. The
             # mark_filled() call is deferred until after _check_same_orders
@@ -2717,6 +2747,35 @@ class StrategyRunner:
             if tracked.status in counts:
                 counts[tracked.status] += 1
         return counts
+
+    def _seen_exec_id(self, exec_id: str) -> bool:
+        """Record an execution identity; return True if already processed.
+
+        Feature 0083 (issue #202): dedup guard for WS resync redelivery
+        bursts. Bybit exec_ids are globally unique, so entries never expire
+        by time — memory is bounded by FIFO eviction at
+        ``_EXEC_DEDUP_MAX_ENTRIES``. A repeat lookup does not refresh the
+        entry's position; pure insertion order keeps eviction deterministic.
+        Recording on first sight (before the event is processed) is
+        intentional: if processing throws after recording, a redelivery of
+        the same exec_id is deduped rather than retried — correct for the
+        redelivery-burst failure mode this guard targets.
+
+        Args:
+            exec_id: Exchange execution identity; empty string is never
+                deduped (missing identity falls through to processing).
+
+        Returns:
+            True if this exec_id was seen before (caller should drop).
+        """
+        if not exec_id:
+            return False
+        if exec_id in self._processed_exec_ids:
+            return True
+        self._processed_exec_ids[exec_id] = None
+        while len(self._processed_exec_ids) > _EXEC_DEDUP_MAX_ENTRIES:
+            self._processed_exec_ids.popitem(last=False)
+        return False
 
     def _check_same_orders(self, event: ExecutionEvent) -> None:
         """Check for duplicate orders at same price (bbu2-style safety check).
