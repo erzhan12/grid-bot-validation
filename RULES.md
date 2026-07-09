@@ -563,8 +563,11 @@ builds ONE instance per strat in `_init_strategy` and passes the SAME object
     rejects BOTH open and reduce-only at/above the cap.
   - **C3 `session_loss_limit`** (positive USDT magnitude) + flag
     `session_loss_auto_reset_utc_midnight`. Evaluated in `on_position_update`
-    (where realized PnL lands) off the per-cycle `cur_realized_pnl` sum (the
-    Bybit UI "Realized", NOT the ~80x lifetime `cumRealisedPnl`). On trip it is a
+    (where realized PnL lands) off the per-cycle `curRealisedPnl` sum read
+    directly from the raw long/short WS payloads (`runner._cur_realized_pnl_from_raw`),
+    NOT from `_build_position_state` (which returns `None` at `size == 0` and
+    would miss the closing-fill loss). Uses the Bybit UI "Realized", NOT the ~80x
+    lifetime `cumRealisedPnl`. On trip it is a
     **full circuit breaker**: cancel ALL working orders once (via
     `_execute_cancel_intent` → honors shadow mode + tracked-order state; uses the
     wire `orderId`, not `orderLinkId`) then suppress ALL new places (open AND

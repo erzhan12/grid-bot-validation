@@ -4967,6 +4967,39 @@ class TestSafetyCapsIntegration:
         r._execute_place_intent(self._open(), {"long": [], "short": []})
         mock_executor.execute_place.assert_not_called()
 
+    def test_c3_trip_on_flat_position_cur_realised_pnl(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """C3 must read curRealisedPnl from size=0 payloads (closing fill).
+
+        _build_position_state returns None when size==0, so evaluating C3 only
+        from PositionState would miss the session loss on the flat update.
+        """
+        caps = SafetyCaps(
+            SafetyCapsConfig(session_loss_limit="25"), strat_id="btcusdt_test"
+        )
+        r = self._runner(strategy_config, mock_executor, instrument_info, caps)
+        intent = self._open(price="49000", qty="0.01")
+        tracked = TrackedOrder(
+            client_order_id=intent.client_order_id, intent=intent, status="placed"
+        )
+        tracked.order_id = "wire_1"
+        r._tracked_orders[intent.client_order_id] = tracked
+
+        r.on_position_update(
+            long_position={
+                "size": "0",
+                "avgPrice": "0",
+                "curRealisedPnl": "-30",
+                "leverage": "10",
+            },
+            short_position={"size": "0", "curRealisedPnl": "0"},
+            wallet_balance=10000.0,
+            last_close=50000.0,
+        )
+        assert caps.loss_tripped() is True
+        mock_executor.execute_cancel.assert_called_once()
+
     def test_rate_limit_sentinel_is_dropped_not_enqueued(
         self, strategy_config, mock_executor, instrument_info
     ):
