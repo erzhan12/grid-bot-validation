@@ -14,7 +14,7 @@ import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, UTC, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Optional, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -2492,7 +2492,7 @@ class StrategyRunner:
             return Decimal("0")
         try:
             return Decimal(str(raw))
-        except Exception:
+        except (TypeError, ValueError, InvalidOperation):
             return Decimal("0")
 
     def _evaluate_loss_breaker(

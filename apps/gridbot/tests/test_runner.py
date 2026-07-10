@@ -981,6 +981,33 @@ class TestBuildPositionStateRealizedPnl:
         assert state.cur_realized_pnl == Decimal("0")
 
 
+class TestCurRealizedPnlFromRaw:
+    """_cur_realized_pnl_from_raw reads curRealisedPnl off raw position payloads."""
+
+    def test_positive_value_parsed(self):
+        pos = {"size": "1.0", "curRealisedPnl": "5.50"}
+        assert StrategyRunner._cur_realized_pnl_from_raw(pos) == Decimal("5.50")
+
+    def test_negative_value_parsed(self):
+        pos = {"size": "0", "curRealisedPnl": "-30.25"}
+        assert StrategyRunner._cur_realized_pnl_from_raw(pos) == Decimal("-30.25")
+
+    def test_none_position_data_default_zero(self):
+        assert StrategyRunner._cur_realized_pnl_from_raw(None) == Decimal("0")
+
+    def test_absent_key_default_zero(self):
+        pos = {"size": "1.0", "avgPrice": "50000"}
+        assert StrategyRunner._cur_realized_pnl_from_raw(pos) == Decimal("0")
+
+    def test_empty_string_default_zero(self):
+        pos = {"size": "1.0", "curRealisedPnl": ""}
+        assert StrategyRunner._cur_realized_pnl_from_raw(pos) == Decimal("0")
+
+    def test_malformed_value_default_zero(self):
+        pos = {"size": "1.0", "curRealisedPnl": "not-a-number"}
+        assert StrategyRunner._cur_realized_pnl_from_raw(pos) == Decimal("0")
+
+
 class TestStrategyRunnerOrderUpdate:
     """Tests for order update events."""
     def test_on_order_update_fills_tracked(self, runner, mock_executor):
@@ -4994,6 +5021,44 @@ class TestSafetyCapsIntegration:
                 "leverage": "10",
             },
             short_position={"size": "0", "curRealisedPnl": "0"},
+            wallet_balance=10000.0,
+            last_close=50000.0,
+        )
+        assert caps.loss_tripped() is True
+        mock_executor.execute_cancel.assert_called_once()
+
+    def test_c3_trip_on_combined_long_short_realized_pnl(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """C3 sums realized PnL across both sides: neither leg alone trips.
+
+        long -15 + short -12 = -27 breaches the 25 limit even though each
+        side individually stays under it.
+        """
+        caps = SafetyCaps(
+            SafetyCapsConfig(session_loss_limit="25"), strat_id="btcusdt_test"
+        )
+        r = self._runner(strategy_config, mock_executor, instrument_info, caps)
+        intent = self._open(price="49000", qty="0.01")
+        tracked = TrackedOrder(
+            client_order_id=intent.client_order_id, intent=intent, status="placed"
+        )
+        tracked.order_id = "wire_1"
+        r._tracked_orders[intent.client_order_id] = tracked
+
+        r.on_position_update(
+            long_position={
+                "size": "0.5",
+                "avgPrice": "50000",
+                "curRealisedPnl": "-15",
+                "leverage": "10",
+            },
+            short_position={
+                "size": "0.5",
+                "avgPrice": "50000",
+                "curRealisedPnl": "-12",
+                "leverage": "10",
+            },
             wallet_balance=10000.0,
             last_close=50000.0,
         )
