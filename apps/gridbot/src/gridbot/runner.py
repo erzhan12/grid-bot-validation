@@ -969,7 +969,7 @@ class StrategyRunner:
             self._short_position_value = (
                 short_state.position_value if short_state else Decimal("0")
             )
-            self._evaluate_loss_breaker(long_state, short_state)
+            self._evaluate_loss_breaker(long_position, short_position)
 
             # Update position sizes (used by _is_good_to_place). While a
             # direction is dirty (feature 0064), the size write is gated so a
@@ -2477,14 +2477,32 @@ class StrategyRunner:
                 self.strat_id, reason, intent.side, intent.price,
             )
 
+    @staticmethod
+    def _cur_realized_pnl_from_raw(position_data: Optional[dict]) -> Decimal:
+        """Read Bybit ``curRealisedPnl`` from a raw position payload.
+
+        Used by the C3 loss breaker independently of ``_build_position_state``,
+        which returns ``None`` when ``size == 0``. A closing fill often arrives
+        only on that flat payload, so the breaker must not discard it.
+        """
+        if not position_data:
+            return Decimal("0")
+        raw = position_data.get("curRealisedPnl")
+        if raw in (None, ""):
+            return Decimal("0")
+        try:
+            return Decimal(str(raw))
+        except Exception:
+            return Decimal("0")
+
     def _evaluate_loss_breaker(
         self,
-        long_state: Optional[PositionState],
-        short_state: Optional[PositionState],
+        long_position: Optional[dict],
+        short_position: Optional[dict],
     ) -> None:
         """C3 — evaluate the session realized-loss circuit breaker (feature 0079).
 
-        Uses the per-cycle "Realized" value (``cur_realized_pnl`` — the Bybit UI
+        Uses the per-cycle "Realized" value (``curRealisedPnl`` — the Bybit UI
         Realized column), NOT the ~80x lifetime ``cumRealisedPnl``. On a NEW
         trip: emit one ERROR + alert and cancel ALL working orders for the
         symbol via ``_execute_cancel_intent`` (honors shadow mode + tracked-order
@@ -2494,8 +2512,8 @@ class StrategyRunner:
         if self._safety_caps is None:
             return
         session_realized_pnl = (
-            (long_state.cur_realized_pnl if long_state else Decimal("0"))
-            + (short_state.cur_realized_pnl if short_state else Decimal("0"))
+            self._cur_realized_pnl_from_raw(long_position)
+            + self._cur_realized_pnl_from_raw(short_position)
         )
         newly_tripped = self._safety_caps.check_loss_breaker(
             session_realized_pnl=session_realized_pnl,
