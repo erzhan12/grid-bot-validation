@@ -556,8 +556,11 @@ class PositionFetcher:
         for offset in range(n):
             idx = (start_idx + offset) % n
             account_name, runners = accounts[idx]
-            last = self._last_position_fetch.get(account_name, 0.0)
-            if (now - last) < per_account_floor:
+            # A never-fetched account is always eligible. Defaulting to 0.0
+            # would skip it while time.monotonic() < floor — on Linux that is
+            # seconds since boot, so fresh CI VMs silently no-op'd here.
+            last = self._last_position_fetch.get(account_name)
+            if last is not None and (now - last) < per_account_floor:
                 continue
             try:
                 self._fetch_one_account(account_name, runners)

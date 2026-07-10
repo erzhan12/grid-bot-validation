@@ -1695,6 +1695,28 @@ class TestOrchestratorPositionCheckRotation:
     @patch("gridbot.orchestrator.BybitRestClient")
     @patch("gridbot.orchestrator.PublicWebSocketClient")
     @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_first_fetch_eligible_regardless_of_monotonic_start(
+        self, mock_private_ws, mock_public_ws, mock_rest_client, gridbot_config,
+    ):
+        """Never-fetched account is eligible even when time.monotonic() < floor.
+
+        On Linux time.monotonic() is seconds since boot; fresh CI VMs start
+        near zero, so the old `last = .get(name, 0.0)` default made the first
+        rotation fetch a no-op until uptime exceeded the 60s floor.
+        """
+        orchestrator = self._make_orch_with_accounts(gridbot_config, 1)
+        fetcher = orchestrator._position_fetcher
+        fetcher._fetch_one_account = Mock()
+        assert fetcher._last_position_fetch == {}  # never fetched
+
+        with patch("gridbot.position_fetcher.time.monotonic", return_value=30.0):
+            fetcher._fetch_positions_rotation_tick()
+
+        fetcher._fetch_one_account.assert_called_once()
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
     def test_per_account_floor_skips_recently_fetched(
         self, mock_private_ws, mock_public_ws, mock_rest_client, gridbot_config,
     ):
