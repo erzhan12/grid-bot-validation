@@ -57,9 +57,18 @@ _RETRY_TICK_INTERVAL = 1.0  # seconds between retry-queue drains
 _WS_RECONNECT_SLOW_THRESHOLD = 5.0  # log a warning if a single WS disconnect+connect takes longer
 _MAX_TICK_BACKOFF = 30.0  # cap (s) on main-loop backoff after consecutive _tick() failures
 _UNKNOWN_ORDER_DEBOUNCE_SEC = 2.0  # min interval between WS-triggered fast-track order syncs
+_STARTUP_RECONCILE_BACKOFFS = (2.0, 5.0, 10.0)  # sleeps between startup reconcile attempts (0086)
 
 
 logger = logging.getLogger(__name__)
+
+
+class StartupReconciliationError(Exception):
+    """Raised when startup reconciliation fails after all retries.
+
+    Trading must not start on unconfirmed exchange order state (issue #206).
+    main.py catches startup exceptions and returns exit code 1.
+    """
 
 
 def _ensure_utc_aware(dt: datetime) -> datetime:
@@ -308,6 +317,11 @@ class Orchestrator:
 
         After start() returns, call run() to enter the blocking polling
         loop, or stop() to tear everything down.
+
+        Raises:
+            StartupReconciliationError: startup reconciliation failed after
+                all retries (fail closed, issue #206) — no orders were
+                placed; main.py converts this into exit code 1.
         """
         if self._running:
             return
@@ -330,17 +344,13 @@ class Orchestrator:
             self._pending_executions[strat_id] = deque()
             self._pending_orders[strat_id] = deque()
 
-        # Perform startup reconciliation
+        # Perform startup reconciliation. Fail closed: if open-order state
+        # cannot be confirmed after retries, abort startup (issue #206).
         for runner in self._runners.values():
             account_name = self._get_account_for_strategy(runner.strat_id)
             reconciler = self._reconcilers.get(account_name)
             if reconciler:
-                result = reconciler.reconcile_startup(runner)
-                logger.info(
-                    f"{runner.strat_id}: Reconciliation complete - "
-                    f"fetched={result.orders_fetched}, injected={result.orders_injected}, "
-                    f"untracked={result.untracked_orders_on_exchange}"
-                )
+                self._reconcile_startup_with_retry(runner, reconciler)
 
         # Create database Run records (populates _run_ids)
         self._create_run_records()
@@ -405,6 +415,53 @@ class Orchestrator:
         self._start_time = time.monotonic()
         self._write_health_snapshot(overall=HealthState.STARTING)
         logger.info(f"Orchestrator started with {len(self._runners)} strategies")
+
+    def _reconcile_startup_with_retry(
+        self, runner: StrategyRunner, reconciler: Reconciler
+    ) -> None:
+        """Run startup reconciliation, retrying transient failures in place.
+
+        One initial attempt plus one retry per _STARTUP_RECONCILE_BACKOFFS
+        entry. On exhaustion, alert and raise StartupReconciliationError so
+        start() aborts before any order is placed (issue #206). Sleeping here
+        is safe: the main loop is not running yet and WebSockets are not
+        connected.
+        """
+        attempts = 1 + len(_STARTUP_RECONCILE_BACKOFFS)
+        for attempt in range(1, attempts + 1):
+            result = reconciler.reconcile_startup(runner)
+            if not result.errors:
+                if attempt > 1:
+                    logger.warning(
+                        "%s: Startup reconciliation recovered on attempt %d/%d",
+                        runner.strat_id, attempt, attempts,
+                    )
+                logger.info(
+                    f"{runner.strat_id}: Reconciliation complete - "
+                    f"fetched={result.orders_fetched}, injected={result.orders_injected}, "
+                    f"untracked={result.untracked_orders_on_exchange}"
+                )
+                return
+            if attempt < attempts:
+                backoff = _STARTUP_RECONCILE_BACKOFFS[attempt - 1]
+                logger.warning(
+                    "%s: Startup reconciliation attempt %d/%d failed (%s), "
+                    "retrying in %.0fs",
+                    runner.strat_id, attempt, attempts, result.errors, backoff,
+                )
+                time.sleep(backoff)
+
+        last_error = result.errors[-1]
+        self._notifier.alert(
+            f"Gridbot: startup reconciliation failed for {runner.strat_id} "
+            f"after {attempts} attempts - {last_error}. Aborting startup, "
+            f"no orders placed.",
+            error_key=f"startup_reconcile_{runner.strat_id}",
+        )
+        raise StartupReconciliationError(
+            f"{runner.strat_id}: startup reconciliation failed after "
+            f"{attempts} attempts: {last_error}"
+        )
 
     def run(self) -> None:
         """Main polling loop. Blocks until request_stop() / stop().
@@ -1742,6 +1799,11 @@ class Orchestrator:
                                 "%s: Order sync completed with errors: %s",
                                 runner.strat_id, result.errors,
                             )
+                            self._notifier.alert(
+                                f"Gridbot: order sync failed for "
+                                f"{runner.strat_id} - {result.errors[-1]}",
+                                error_key=f"order_sync_{runner.strat_id}",
+                            )
                         elif result.orders_injected > 0 or result.untracked_orders_on_exchange > 0:
                             logger.info(
                                 "%s: Order sync - fetched=%d, injected=%d, untracked=%d",
@@ -1756,6 +1818,10 @@ class Orchestrator:
 
                     except Exception as e:
                         logger.error("%s: Order sync error: %s", runner.strat_id, e)
+                        self._notifier.alert_exception(
+                            f"order_sync {runner.strat_id}", e,
+                            error_key=f"order_sync_{runner.strat_id}",
+                        )
         except Exception as e:
             logger.error("Order sync sweep error: %s", e)
 

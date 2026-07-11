@@ -912,6 +912,23 @@ Valid: `New`, `PartiallyFilled`, `Filled`, `Cancelled`, `Rejected`, `Untriggered
 - Data flow: `WebSocket → Orchestrator → StrategyRunner → GridEngine.on_event() → Intents → Executor → Bybit REST`
 - Shadow mode: `shadow_mode=True` → intents logged, not executed; returns `shadow_{client_order_id}`
 
+### Startup reconciliation is fail-closed (Feature 0086, issue #206)
+
+`start()` retries a failed startup reconciliation in place (backoffs
+`_STARTUP_RECONCILE_BACKOFFS = (2.0, 5.0, 10.0)`, 4 attempts total per
+strategy). On exhaustion it emits a notifier alert
+(`startup_reconcile_<strat_id>`) and raises `StartupReconciliationError` —
+the process exits 1 with ZERO orders placed; any pre-existing exchange grid
+is left untouched. Rationale: the bot must never trade on an unconfirmed
+open-order book — a startup with empty local state places a duplicate grid
+over live legacy orders, and same-price duplicates are never cancelled by
+the engine (price-keyed dict in `engine.py:_place_grid_orders` collapses
+them; open gap, fix 2 of the #206 analysis). Mid-run order sync keeps
+warn-and-retry semantics (stopping a bot managing a live grid is riskier);
+sync failures now also alert (`order_sync_<strat_id>`, both `result.errors`
+and exception paths). Repro/regression: `test_issue_206_startup_reconcile_race.py`,
+`TestStartupReconcileRetry` in `test_orchestrator.py`.
+
 ### Health status file — check health without tailing logs (Feature 0082, issue #185)
 
 The bot writes a machine-readable JSON snapshot to `status_file_path` (default

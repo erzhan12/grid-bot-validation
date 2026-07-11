@@ -580,6 +580,138 @@ class TestOrchestratorLifecycle:
         orchestrator.stop()
 
 
+class TestStartupReconcileRetry:
+    """Tests for fail-closed startup reconciliation with retry (feature 0086)."""
+
+    @patch("gridbot.orchestrator.time.sleep")
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_startup_reconcile_recovers_after_transient_failure(
+        self, mock_private_ws, mock_public_ws, mock_rest_client, mock_sleep,
+        gridbot_config,
+    ):
+        """A transient get_open_orders failure is retried in place; startup completes."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        mock_rest_client.return_value.get_open_orders = Mock(
+            side_effect=[RuntimeError("transient timeout"), [], [], []]
+        )
+
+        orchestrator.start()
+        try:
+            assert orchestrator.running is True
+            mock_sleep.assert_called_once_with(2.0)
+            notifier.alert.assert_not_called()
+        finally:
+            orchestrator.stop()
+
+    @patch("gridbot.orchestrator.time.sleep")
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_startup_reconcile_success_first_try_no_sleep(
+        self, mock_private_ws, mock_public_ws, mock_rest_client, mock_sleep,
+        gridbot_config,
+    ):
+        """Successful first attempt behaves as before: no sleeps, no alerts."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        mock_rest_client.return_value.get_open_orders = Mock(return_value=[])
+
+        orchestrator.start()
+        try:
+            assert orchestrator.running is True
+            mock_sleep.assert_not_called()
+            notifier.alert.assert_not_called()
+        finally:
+            orchestrator.stop()
+
+    @patch("gridbot.orchestrator.time.sleep")
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_startup_reconcile_exhausted_raises_and_alerts(
+        self, mock_private_ws, mock_public_ws, mock_rest_client, mock_sleep,
+        gridbot_config,
+    ):
+        """All attempts failing raises StartupReconciliationError with one alert."""
+        from gridbot.orchestrator import StartupReconciliationError
+
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        mock_rest_client.return_value.get_open_orders = Mock(
+            side_effect=RuntimeError("persistent failure")
+        )
+
+        try:
+            with pytest.raises(StartupReconciliationError):
+                orchestrator.start()
+
+            assert orchestrator.running is False
+            assert mock_sleep.call_count == 3  # backoffs 2.0, 5.0, 10.0
+            notifier.alert.assert_called_once()
+            assert (
+                notifier.alert.call_args.kwargs["error_key"]
+                == "startup_reconcile_btcusdt_test"
+            )
+            # Abort happens before run records, WS connect, and the main loop.
+            assert orchestrator._run_ids == {}
+            mock_public_ws.return_value.connect.assert_not_called()
+            mock_private_ws.return_value.connect.assert_not_called()
+            mock_rest_client.return_value.place_order.assert_not_called()
+        finally:
+            orchestrator.stop()
+
+    def test_order_sync_errors_emit_throttled_alert(self, gridbot_config):
+        """Periodic order sync errors alert via notifier with a throttle key."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+
+        mock_runner = Mock()
+        mock_runner.strat_id = "btcusdt_test"
+        mock_runner.symbol = "BTCUSDT"
+        orchestrator._account_to_runners = {"test_account": [mock_runner]}
+        orchestrator._reconcilers = {
+            "test_account": Mock(
+                reconcile_reconnect=Mock(
+                    return_value=ReconciliationResult(errors=["REST timeout"])
+                )
+            )
+        }
+
+        orchestrator._order_sync_once()
+
+        notifier.alert.assert_called_once()
+        assert (
+            notifier.alert.call_args.kwargs["error_key"]
+            == "order_sync_btcusdt_test"
+        )
+
+    def test_order_sync_exception_emits_throttled_alert(self, gridbot_config):
+        """A reconcile_reconnect raise mid-sweep alerts and does not kill the sweep."""
+        notifier = Mock(spec=Notifier)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+
+        mock_runner = Mock()
+        mock_runner.strat_id = "btcusdt_test"
+        mock_runner.symbol = "BTCUSDT"
+        orchestrator._account_to_runners = {"test_account": [mock_runner]}
+        orchestrator._reconcilers = {
+            "test_account": Mock(
+                reconcile_reconnect=Mock(side_effect=RuntimeError("inject failed"))
+            )
+        }
+
+        orchestrator._order_sync_once()
+
+        notifier.alert_exception.assert_called_once()
+        assert (
+            notifier.alert_exception.call_args.kwargs["error_key"]
+            == "order_sync_btcusdt_test"
+        )
+
+
 class TestOrchestratorGuardClauses:
     """Tests for guard clauses in start/stop and request_stop."""
 
