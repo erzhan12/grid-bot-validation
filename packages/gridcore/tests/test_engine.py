@@ -1554,3 +1554,275 @@ class TestEngineNoRecenter:
             if isinstance(i, PlaceLimitIntent) and float(i.price) == fill_price
         ]
         assert place_at_fill2 == []
+
+
+class TestDuplicateOrderHealing:
+    """Feature 0087 (issue #220): same-price duplicate orders self-heal."""
+
+    def _engine_with_grid(self):
+        config = GridConfig(grid_count=50, grid_step=0.2)
+        engine = GridEngine(symbol='BTCUSDT', tick_size=Decimal('0.1'), config=config, strat_id='btcusdt_test')
+        event = TickerEvent(
+            event_type=EventType.TICKER,
+            symbol='BTCUSDT',
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            last_price=Decimal('100000.0'),
+            mark_price=Decimal('100000.0'),
+            bid1_price=Decimal('99999.0'),
+            ask1_price=Decimal('100001.0'),
+            funding_rate=Decimal('0.0001'),
+        )
+        engine.on_event(event, {'long': [], 'short': []})
+        return engine, event
+
+    @staticmethod
+    def _order(order_id, price, side, **extra):
+        d = {'orderId': order_id, 'price': str(price), 'side': side, 'qty': '0.001'}
+        d.update(extra)
+        return d
+
+    @staticmethod
+    def _intents_by_order_id(intents):
+        by_id = {}
+        for intent in intents:
+            if isinstance(intent, CancelIntent):
+                by_id.setdefault(intent.order_id, []).append(intent)
+        return by_id
+
+    def test_duplicate_pair_on_grid_one_cancel_one_survivor(self):
+        """Two correct-side orders at one grid price: one duplicate cancel, no re-place."""
+        engine, event = self._engine_with_grid()
+        buy_level = next(g for g in engine.grid.grid if g['side'] == 'Buy')
+        dup = [
+            self._order('dup-1', buy_level['price'], 'Buy'),
+            self._order('dup-2', buy_level['price'], 'Buy'),
+        ]
+
+        intents = engine.on_event(event, {'long': dup, 'short': []})
+
+        cancels = [i for i in intents if isinstance(i, CancelIntent) and i.reason == 'duplicate']
+        assert len(cancels) == 1
+        assert cancels[0].order_id == 'dup-2'
+        # Survivor satisfies the level: no place intent at that price
+        places_at_level = [
+            i for i in intents
+            if isinstance(i, PlaceLimitIntent) and float(i.price) == buy_level['price']
+            and i.direction == 'long'
+        ]
+        assert places_at_level == []
+        # No orderId gets two CancelIntents
+        by_id = self._intents_by_order_id(intents)
+        assert all(len(v) == 1 for v in by_id.values())
+
+    def test_fill_history_order_survives(self):
+        """Same-side duplicate where one order has cumExecQty>0: fill-free one is cancelled."""
+        engine, event = self._engine_with_grid()
+        buy_level = next(g for g in engine.grid.grid if g['side'] == 'Buy')
+        dup = [
+            self._order('fill-free', buy_level['price'], 'Buy'),
+            self._order('part-filled', buy_level['price'], 'Buy', cumExecQty='0.0005'),
+        ]
+
+        intents = engine.on_event(event, {'long': dup, 'short': []})
+
+        cancels = [i for i in intents if isinstance(i, CancelIntent) and i.reason == 'duplicate']
+        assert len(cancels) == 1
+        assert cancels[0].order_id == 'fill-free'
+        # Survivor satisfies the level: no re-place churn
+        places_at_level = [
+            i for i in intents
+            if isinstance(i, PlaceLimitIntent) and float(i.price) == buy_level['price']
+            and i.direction == 'long'
+        ]
+        assert places_at_level == []
+
+    def test_mixed_side_bucket_keeps_grid_side_order(self):
+        """Mixed-side duplicate at a grid level: matching-side order survives, no churn."""
+        engine, event = self._engine_with_grid()
+        buy_level = next(g for g in engine.grid.grid if g['side'] == 'Buy')
+        dup = [
+            self._order('wrong-side', buy_level['price'], 'Sell'),
+            self._order('right-side', buy_level['price'], 'Buy'),
+        ]
+
+        intents = engine.on_event(event, {'long': dup, 'short': []})
+
+        cancels = [i for i in intents if isinstance(i, CancelIntent)]
+        assert len(cancels) == 1
+        assert cancels[0].order_id == 'wrong-side'
+        assert cancels[0].reason == 'duplicate'
+        # No side_mismatch churn, no re-place at the level
+        places_at_level = [
+            i for i in intents
+            if isinstance(i, PlaceLimitIntent) and float(i.price) == buy_level['price']
+            and i.direction == 'long'
+        ]
+        assert places_at_level == []
+
+    def test_side_match_beats_fill_history(self):
+        """Precedence lock: filled wrong-side order loses to fill-free correct-side one."""
+        engine, event = self._engine_with_grid()
+        buy_level = next(g for g in engine.grid.grid if g['side'] == 'Buy')
+        dup = [
+            self._order('wrong-filled', buy_level['price'], 'Sell', cumExecQty='0.0005'),
+            self._order('right-empty', buy_level['price'], 'Buy'),
+        ]
+
+        intents = engine.on_event(event, {'long': dup, 'short': []})
+
+        cancels = [i for i in intents if isinstance(i, CancelIntent)]
+        assert len(cancels) == 1
+        assert cancels[0].order_id == 'wrong-filled'
+        assert cancels[0].reason == 'duplicate'
+        places_at_level = [
+            i for i in intents
+            if isinstance(i, PlaceLimitIntent) and float(i.price) == buy_level['price']
+            and i.direction == 'long'
+        ]
+        assert places_at_level == []
+
+    def test_wait_level_duplicate_heals(self):
+        """Duplicate at a WAIT-level price still collapses to one survivor."""
+        engine, event = self._engine_with_grid()
+        wait_level = next(g for g in engine.grid.grid if g['side'] == 'Wait')
+        dup = [
+            self._order('wait-1', wait_level['price'], 'Buy'),
+            self._order('wait-2', wait_level['price'], 'Buy'),
+        ]
+
+        intents = engine.on_event(event, {'long': dup, 'short': []})
+
+        cancels_for_pair = [
+            i for i in intents
+            if isinstance(i, CancelIntent) and i.order_id in ('wait-1', 'wait-2')
+        ]
+        assert len(cancels_for_pair) == 1
+        assert cancels_for_pair[0].reason == 'duplicate'
+        assert cancels_for_pair[0].order_id == 'wait-2'
+
+    def test_off_grid_duplicate_single_cancel_each(self):
+        """Off-grid duplicate: non-survivor gets 'duplicate', survivor gets 'outside_grid'."""
+        engine, event = self._engine_with_grid()
+        dup = [
+            self._order('off-1', '150000.0', 'Sell'),
+            self._order('off-2', '150000.0', 'Sell'),
+        ]
+
+        intents = engine.on_event(event, {'long': [], 'short': dup})
+
+        by_id = self._intents_by_order_id(intents)
+        assert all(len(v) == 1 for v in by_id.values())
+        assert by_id['off-2'][0].reason == 'duplicate'
+        assert by_id['off-1'][0].reason == 'outside_grid'
+
+    def test_three_order_bucket_two_duplicate_cancels(self):
+        """Bucket of 3 at one price: exactly one survivor, two duplicate cancels."""
+        engine, event = self._engine_with_grid()
+        buy_level = next(g for g in engine.grid.grid if g['side'] == 'Buy')
+        dup = [
+            self._order(f'tri-{n}', buy_level['price'], 'Buy') for n in (1, 2, 3)
+        ]
+
+        intents = engine.on_event(event, {'long': dup, 'short': []})
+
+        cancels = [i for i in intents if isinstance(i, CancelIntent) and i.reason == 'duplicate']
+        assert {c.order_id for c in cancels} == {'tri-2', 'tri-3'}
+        by_id = self._intents_by_order_id(intents)
+        assert all(len(v) == 1 for v in by_id.values())
+
+    def test_all_wrong_side_duplicate_restores_level(self):
+        """All-wrong-side bucket: duplicate cancel + side_mismatch on survivor + replacement."""
+        engine, event = self._engine_with_grid()
+        buy_level = next(g for g in engine.grid.grid if g['side'] == 'Buy')
+        dup = [
+            self._order('ws-1', buy_level['price'], 'Sell'),
+            self._order('ws-2', buy_level['price'], 'Sell'),
+        ]
+
+        intents = engine.on_event(event, {'long': dup, 'short': []})
+
+        by_id = self._intents_by_order_id(intents)
+        assert all(len(v) == 1 for v in by_id.values())
+        assert by_id['ws-2'][0].reason == 'duplicate'
+        assert by_id['ws-1'][0].reason == 'side_mismatch'
+        # Level restored with a correct-side order
+        replacements = [
+            i for i in intents
+            if isinstance(i, PlaceLimitIntent)
+            and float(i.price) == buy_level['price'] and i.side == 'Buy'
+            and i.direction == 'long'
+        ]
+        assert len(replacements) == 1
+
+    def test_near_equal_prices_group_into_one_bucket(self):
+        """Prices differing below the 8th decimal share one bucket (round-8 equality)."""
+        engine, event = self._engine_with_grid()
+        buy_level = next(g for g in engine.grid.grid if g['side'] == 'Buy')
+        near_equal = f"{buy_level['price'] + 4e-9:.10f}"
+        dup = [
+            self._order('exact', buy_level['price'], 'Buy'),
+            self._order('near', near_equal, 'Buy'),
+        ]
+
+        intents = engine.on_event(event, {'long': dup, 'short': []})
+
+        cancels = [i for i in intents if isinstance(i, CancelIntent) and i.reason == 'duplicate']
+        assert len(cancels) == 1
+        assert cancels[0].order_id == 'near'
+
+    def test_near_equal_singleton_occupies_level(self):
+        """Singleton whose price differs below round-8 from the grid price fills the level."""
+        engine, event = self._engine_with_grid()
+        buy_level = next(g for g in engine.grid.grid if g['side'] == 'Buy')
+        near_equal = f"{buy_level['price'] + 4e-9:.10f}"
+        single = [self._order('near-single', near_equal, 'Buy')]
+
+        intents = engine.on_event(event, {'long': single, 'short': []})
+
+        assert not [i for i in intents if isinstance(i, CancelIntent)]
+        places_at_level = [
+            i for i in intents
+            if isinstance(i, PlaceLimitIntent) and float(i.price) == buy_level['price']
+            and i.direction == 'long'
+        ]
+        assert places_at_level == []
+
+    def test_singletons_no_spurious_duplicate_cancels(self):
+        """Single order per price: no 'duplicate' cancels (regression guard)."""
+        engine, event = self._engine_with_grid()
+        buy_level = next(g for g in engine.grid.grid if g['side'] == 'Buy')
+        sell_level = next(g for g in engine.grid.grid if g['side'] == 'Sell')
+        singles_long = [self._order('s-buy', buy_level['price'], 'Buy')]
+        singles_short = [self._order('s-sell', sell_level['price'], 'Sell')]
+
+        intents = engine.on_event(event, {'long': singles_long, 'short': singles_short})
+
+        assert not [
+            i for i in intents
+            if isinstance(i, CancelIntent) and i.reason == 'duplicate'
+        ]
+
+
+class TestHasFillHistory:
+    """Unit cases for GridEngine._has_fill_history."""
+
+    def test_absent_key(self):
+        """No cumExecQty key means no fill history."""
+        assert GridEngine._has_fill_history({'orderId': 'x'}) is False
+
+    def test_zero(self):
+        """cumExecQty '0' means no fill history."""
+        assert GridEngine._has_fill_history({'cumExecQty': '0'}) is False
+
+    def test_nonzero(self):
+        """Nonzero cumExecQty means fill history."""
+        assert GridEngine._has_fill_history({'cumExecQty': '0.001'}) is True
+
+    def test_non_numeric(self):
+        """Unparseable cumExecQty is treated as no fill history."""
+        assert GridEngine._has_fill_history({'cumExecQty': 'abc'}) is False
+
+    def test_empty_string(self):
+        """Empty-string cumExecQty is treated as no fill history."""
+        assert GridEngine._has_fill_history({'cumExecQty': ''}) is False

@@ -10,7 +10,7 @@ Extracted from bbu2-master/strat.py Strat50 class with the following transformat
 
 import logging
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Callable, Optional
 
 from gridcore.config import GridConfig
@@ -260,7 +260,7 @@ class GridEngine:
 
         Args:
             limit: Limit order dict with 'orderId', 'price', 'side'
-            reason: Cancellation reason (e.g., 'rebuild', 'side_mismatch', 'outside_grid')
+            reason: Cancellation reason (e.g., 'rebuild', 'side_mismatch', 'outside_grid', 'duplicate')
 
         Returns:
             CancelIntent for the order
@@ -341,6 +341,12 @@ class GridEngine:
         """
         Generate intents for placing/canceling grid orders.
 
+        Same-price duplicates (two live orders at one price level) are
+        collapsed to a single survivor per price; the shadowed extras are
+        cancelled with reason='duplicate' (feature 0087, issue #220). All
+        price equality uses round(price, 8) — the same definition as the
+        outside-grid membership test.
+
         Reference: bbu2-master/strat.py:124-160
 
         Args:
@@ -355,8 +361,28 @@ class GridEngine:
         # Sort limits by price
         sorted_limits = sorted(limits, key=lambda d: float(d['price']))
 
-        # Create price→limit mapping for O(1) lookup
-        limit_prices = {float(limit['price']): limit for limit in sorted_limits}
+        # Group limits into same-price buckets (stable order within bucket)
+        limits_by_price: dict[float, list[dict]] = {}
+        for limit in sorted_limits:
+            limits_by_price.setdefault(round(float(limit['price']), 8), []).append(limit)
+
+        # Grid side per active (non-WAIT) level, for survivor preference
+        grid_sides = {
+            round(grid_item['price'], 8): grid_item['side']
+            for grid_item in self.grid.grid
+            if grid_item['side'] != GridSideType.WAIT
+        }
+
+        # Keep one survivor per price; cancel the shadowed duplicates.
+        # Later branches read only `survivors`, so a non-survivor can never
+        # collect a second (side_mismatch/outside_grid) CancelIntent.
+        survivors: dict[float, dict] = {}
+        for price, bucket in limits_by_price.items():
+            survivor = self._select_survivor(bucket, grid_sides.get(price))
+            survivors[price] = survivor
+            for extra in bucket:
+                if extra is not survivor:
+                    intents.append(self._cancel_limit(extra, 'duplicate'))
 
         # Find center and create sorted grid items
         center_index = self._get_wait_indices()
@@ -366,8 +392,8 @@ class GridEngine:
 
         # Check each grid level
         for index, grid_item in sorted_grids:
-            # Check if limit exists for this grid price
-            limit = limit_prices.get(grid_item['price'])
+            # Check if a surviving limit exists for this grid price
+            limit = survivors.get(round(grid_item['price'], 8))
 
             if limit:
                 # Cancel if side mismatch
@@ -383,15 +409,50 @@ class GridEngine:
                 if place_intent:
                     intents.append(place_intent)
 
-        # Cancel limits outside grid range
+        # Cancel surviving limits outside grid range
         grid_price_set = {round(grid_item['price'], 8) for grid_item in self.grid.grid}
         outside_limits = [
-            limit for limit in sorted_limits
-            if round(float(limit['price']), 8) not in grid_price_set
+            limit for price, limit in survivors.items()
+            if price not in grid_price_set
         ]
         intents.extend(self._cancel_all_limits(outside_limits, 'outside_grid'))
 
         return intents
+
+    @staticmethod
+    def _has_fill_history(limit: dict) -> bool:
+        """True when the order dict carries a nonzero cumExecQty.
+
+        Live tick-path order dicts do not include cumExecQty, so this
+        returns False there; it is functional only for exchange-shaped
+        dicts.
+        """
+        raw = limit.get('cumExecQty')
+        if raw in (None, ''):
+            return False
+        try:
+            return Decimal(str(raw)) > 0
+        except InvalidOperation:
+            return False
+
+    @staticmethod
+    def _select_survivor(bucket: list[dict], grid_side: Optional[str]) -> dict:
+        """Pick the order to keep from a same-price bucket.
+
+        Preference: (1) orders whose side matches the grid level's side
+        (a wrong-side survivor would be side_mismatch-cancelled anyway),
+        (2) within those, an order with fill history, (3) first in the
+        price-sorted bucket. Pure.
+        """
+        pool = bucket
+        if grid_side is not None:
+            matching = [order for order in bucket if order['side'] == grid_side]
+            if matching:
+                pool = matching
+        for order in pool:
+            if GridEngine._has_fill_history(order):
+                return order
+        return pool[0]
 
     def _create_place_intent(self, grid: dict, direction: str, grid_level: int) -> Optional[PlaceLimitIntent]:
         """

@@ -921,9 +921,12 @@ strategy). On exhaustion it emits a notifier alert
 the process exits 1 with ZERO orders placed; any pre-existing exchange grid
 is left untouched. Rationale: the bot must never trade on an unconfirmed
 open-order book — a startup with empty local state places a duplicate grid
-over live legacy orders, and same-price duplicates are never cancelled by
-the engine (price-keyed dict in `engine.py:_place_grid_orders` collapses
-them; open gap, fix 2 of the #206 analysis). Mid-run order sync keeps
+over live legacy orders. Same-price duplicates now self-heal within one
+ticker (feature 0087, issue #220): `engine.py:_place_grid_orders` groups
+limits into round-8 price buckets, keeps one survivor per price (preference:
+grid-side match > fill history > first-in-list) and cancels the shadowed
+extras with `CancelIntent(reason='duplicate')` — the proactive complement
+to the reactive 0031/0046 post-fill layer. Mid-run order sync keeps
 warn-and-retry semantics (stopping a bot managing a live grid is riskier);
 sync failures now also alert (`order_sync_<strat_id>`, both `result.errors`
 and exception paths). Repro/regression: `test_issue_206_startup_reconcile_race.py`,

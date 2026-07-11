@@ -155,11 +155,12 @@ class CancelIntent:
     Intent to cancel an existing order.
 
     The strategy emits this intent when it wants to cancel an order
-    (e.g., price outside grid range, side mismatch, grid rebuild).
+    (e.g., price outside grid range, side mismatch, grid rebuild,
+    same-price duplicate).
     """
     symbol: str
     order_id: str
-    reason: str  # 'side_mismatch', 'outside_grid', 'rebuild', etc.
+    reason: str  # 'side_mismatch', 'outside_grid', 'rebuild', 'duplicate', etc.
 
     # Optional fields for tracking
     price: Decimal | None = None

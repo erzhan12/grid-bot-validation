@@ -14,16 +14,15 @@ Original fail-open scenario (pre-0086 behavior, mirrors the orchestrator flow):
    exchange orders already sit → live duplicates.
 3. First-tick order sync (``reconcile_reconnect``) then injects the old
    orders — state is repaired, but the damage is not:
-4. On the next ticker the engine indexes limits with a price-keyed dict
-   (engine.py:359 ``limit_prices = {float(limit['price']): limit ...}``)
-   which collapses same-price duplicates — the shadowed order is neither
-   'outside_grid' nor 'side_mismatch', so it is NEVER cancelled. Double
-   exposure persists until filled.
+4. On the next ticker the engine groups same-price limits into buckets,
+   keeps one survivor per price, and cancels the shadowed duplicates with
+   ``CancelIntent(reason='duplicate')`` (feature 0087, issue #220) — the
+   duplicate exposure self-heals within one ticker.
 
 Feature 0086 fixed the fail-open startup (fail-closed + alert); the
-orchestrator-level test below asserts the fixed behavior. The runner-level
-test still documents the engine same-price duplicate-collapse gap (fix 2 of
-the issue #206 analysis), which is tracked separately.
+orchestrator-level test below asserts that behavior. Feature 0087 (issue
+#220, fix 2 of the issue #206 analysis) closed the engine same-price
+duplicate-collapse gap; the runner-level test below asserts the healing.
 """
 
 import logging
@@ -186,12 +185,13 @@ class TestStartupReconcileFailClosed:
 class TestStartupReconcileRaceDuplicates:
     """Runner-level: the full duplicate-order mechanism, step by step."""
 
-    def test_race_places_duplicates_and_sync_cannot_heal_them(
+    def test_race_places_duplicates_and_engine_heals_them(
         self, runner, recording_executor,
     ):
-        """REPRO issue #206: failed startup reconcile → first ticker places a
-        fresh grid over live legacy orders → order sync adopts the legacy
-        orders → next ticker never cancels the same-price duplicates."""
+        """Issue #206 race + feature 0087 healing: failed startup reconcile →
+        first ticker places a fresh grid over live legacy orders → order sync
+        adopts the legacy orders → next ticker cancels the same-price
+        duplicates (reason='duplicate'), one survivor per level."""
         rest = Mock()
         reconciler = Reconciler(rest)
 
@@ -246,32 +246,51 @@ class TestStartupReconcileRaceDuplicates:
             "STEP3: order sync adopted %d legacy orders", sync_result.orders_injected,
         )
 
-        # --- Step 4: next ticker. State is now "repaired", but the engine
-        # indexes limits by price (engine.py:359) — same-price duplicates
-        # collapse and the shadowed order is never cancelled.
+        # --- Step 4: next ticker. State is now "repaired"; the engine's
+        # duplicate pass (feature 0087) groups same-price limits into
+        # buckets, keeps one survivor per price and cancels the shadowed
+        # legacy duplicates with reason='duplicate'.
         recording_executor.cancelled_intents.clear()
+        placed_before_heal = len(recording_executor.placed_intents)
         runner.on_ticker(_ticker("50000"))
 
         cancelled_ids = {
             c.order_id for c in recording_executor.cancelled_intents
         }
-        # BUG: neither legacy duplicate is cancelled.
-        assert "legacy-buy" not in cancelled_ids
-        assert "legacy-sell" not in cancelled_ids
-        logger.warning(
-            "STEP4: cancels issued=%s — legacy duplicates survive", cancelled_ids,
+        # Fixed (0087): both shadowed legacy duplicates are cancelled ...
+        assert "legacy-buy" in cancelled_ids
+        assert "legacy-sell" in cancelled_ids
+        # ... with reason='duplicate' on each legacy cancel.
+        legacy_cancels = [
+            c for c in recording_executor.cancelled_intents
+            if c.order_id in ("legacy-buy", "legacy-sell")
+        ]
+        assert all(c.reason == "duplicate" for c in legacy_cancels)
+        # No order got two CancelIntents in the healing tick.
+        all_cancel_ids = [
+            c.order_id for c in recording_executor.cancelled_intents
+        ]
+        assert len(all_cancel_ids) == len(set(all_cancel_ids))
+        # The healing tick placed nothing at the duplicated prices — the
+        # surviving twin satisfies the level (no cancel-all-then-replace).
+        healing_places = recording_executor.placed_intents[placed_before_heal:]
+        assert not [i for i in healing_places if str(i.price) in dup_prices]
+        logger.info(
+            "STEP4: cancels issued=%s — legacy duplicates healed", cancelled_ids,
         )
 
-        # BUG: both duplicates remain tracked as live → 2x exposure at
-        # those grid levels until one side fills.
+        # Fixed (0087): exactly one live order remains per formerly
+        # duplicated price, and the survivor is the bot's own order (the
+        # legacy twin was cancelled).
         limits = runner.get_limit_orders()
         all_limits = limits["long"] + limits["short"]
         for price in dup_prices:
             at_price = [lim for lim in all_limits if str(lim["price"]) == price]
-            assert len(at_price) == 2, (
-                f"expected duplicate pair at {price}, got {at_price}"
+            assert len(at_price) == 1, (
+                f"expected single survivor at {price}, got {at_price}"
             )
-        logger.warning(
-            "FINAL: %d live orders across %d tracked; duplicate pairs at %s",
+            assert at_price[0]["orderId"].startswith("new-")
+        logger.info(
+            "FINAL: %d live orders across %d tracked; single survivor at %s",
             len(all_limits), runner.get_tracked_order_count()["placed"], dup_prices,
         )
