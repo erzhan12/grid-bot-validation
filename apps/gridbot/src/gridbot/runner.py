@@ -736,7 +736,8 @@ class StrategyRunner:
             limit_orders = self.get_limit_orders()
             intents = self._engine.on_event(event, limit_orders)
 
-            # Only execute intents if no same-order error.
+            # Placement is suppressed while SAME ORDER is latched, but healing
+            # CancelIntents (feature 0087 duplicate cleanup) still execute.
             # WARNING is throttled (feature 0046 / issue #94): loud-first,
             # then suppress within _SAME_ORDER_WARN_THROTTLE_SEC, then a
             # single heartbeat re-emit with `(suppressed N since last)`.
@@ -758,10 +759,8 @@ class StrategyRunner:
                         self._same_order_warn_suppressed = 0
                     else:
                         self._same_order_warn_suppressed += 1
-                return intents
 
-            if intents:
-                self._execute_intents(intents, limit_orders)
+            self._execute_generated_intents(intents, limit_orders)
 
             return intents
         except Exception as e:
@@ -854,10 +853,9 @@ class StrategyRunner:
             # Pass to engine (update grid state regardless of error)
             intents = self._engine.on_event(event)
 
-            # Only execute intents if no same-order error.
-            if intents and not self._same_order_error:
+            if intents:
                 limit_orders = self.get_limit_orders()
-                self._execute_intents(intents, limit_orders)
+                self._execute_generated_intents(intents, limit_orders)
 
             return intents
         except Exception as e:
@@ -905,10 +903,9 @@ class StrategyRunner:
             # Pass to engine (update state regardless of error)
             intents = self._engine.on_event(event)
 
-            # Only execute intents if no same-order error
-            if intents and not self._same_order_error:
+            if intents:
                 limit_orders = self.get_limit_orders()
-                self._execute_intents(intents, limit_orders)
+                self._execute_generated_intents(intents, limit_orders)
 
             return intents
         except Exception as e:
@@ -1211,6 +1208,24 @@ class StrategyRunner:
             cum_realized_pnl=Decimal(str(cum_realized_pnl)),
             cur_realized_pnl=Decimal(str(cur_realized_pnl)),
         )
+
+    def _execute_generated_intents(
+        self,
+        intents: list[PlaceLimitIntent | CancelIntent],
+        limits: dict[str, list[dict]],
+    ) -> None:
+        """Execute engine intents, suppressing only placements when SAME ORDER is latched.
+
+        Feature 0087 duplicate-healing emits CancelIntents on the tick path; those
+        must still reach the exchange while the soft-block is active.
+        """
+        if not intents:
+            return
+        if self._same_order_error:
+            intents = [i for i in intents if isinstance(i, CancelIntent)]
+            if not intents:
+                return
+        self._execute_intents(intents, limits)
 
     def _execute_intents(
         self,
