@@ -1,4 +1,4 @@
-.PHONY: test test-integration lint clear-log
+.PHONY: test test-integration lint clear-log live-check
 
 # Run tests per-directory to avoid conftest ImportPathMismatchError when
 # multiple tests/conftest.py exist. Coverage is appended and reported at the end.
@@ -31,4 +31,15 @@ lint:
 # Truncate /tmp/gridbot.log before a fresh run
 clear-log:
 	: > /tmp/gridbot.log
+
+# Reconcile replay vs live over the rolling window (feature 0088).
+# Read-only against the live recorder DB; exit 0=PASS 1=FAIL 2=SKIP/no-data.
+# Config run_id default is a short prefix — the DB stores the full UUID,
+# and database_url needs the data/ prefix, hence both overrides here.
+live-check:
+	uv run --package live-check live-check \
+		-c apps/live_check/conf/live_check.yaml \
+		--database-url "sqlite:///data/recorder_ltcusdt_phase4.db" \
+		--run-id "580ca395-ce99-42a5-bf30-d8542ddaccb8" \
+		--once
 
