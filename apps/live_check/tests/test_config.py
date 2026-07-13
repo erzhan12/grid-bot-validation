@@ -3,7 +3,17 @@
 import pytest
 from pydantic import ValidationError
 
-from live_check.config import LiveCheckConfig
+from live_check.config import LiveCheckConfig, load_config
+
+
+class TestLoadConfig:
+    def test_empty_yaml_file_raises_value_error(self, tmp_path):
+        """yaml.safe_load returns None on an empty file — clean error, not
+        a TypeError from LiveCheckConfig(**None)."""
+        empty = tmp_path / "live_check.yaml"
+        empty.write_text("")
+        with pytest.raises(ValueError, match="Empty or invalid YAML"):
+            load_config(str(empty))
 
 
 class TestStratsValidation:

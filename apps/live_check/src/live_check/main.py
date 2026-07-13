@@ -275,6 +275,11 @@ def main(args) -> int:
         if args.watch:
             return run_watch(config, args, db)
         return run_single(config, args, db)
+    except KeyboardInterrupt:
+        # Ctrl-C out of the --watch sleep is a normal way to stop the loop —
+        # exit cleanly (conventional SIGINT code) instead of a traceback.
+        logger.info("live_check: interrupted, exiting")
+        return 130
     except ValueError as e:
         # Guard violations (pre-0080 floors, unknown run_id) and config errors.
         logger.error(str(e))

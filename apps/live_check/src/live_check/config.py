@@ -193,4 +193,7 @@ def load_config(config_path: Optional[str] = None) -> LiveCheckConfig:
     with open(path) as f:
         data = yaml.safe_load(f)
 
+    if data is None:
+        raise ValueError(f"Empty or invalid YAML file: {config_path}")
+
     return LiveCheckConfig(**data)
