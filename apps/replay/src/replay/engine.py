@@ -273,6 +273,27 @@ class _BatchPositionSnapshotWriter:
         return self._total_written
 
 
+class _NoopPositionSnapshotWriter:
+    """Discards backtest position snapshots (feature 0088).
+
+    Wired instead of ``_BatchPositionSnapshotWriter`` when the engine is
+    constructed with ``emit_backtest_snapshots=False`` — live_check runs
+    against a READ-ONLY recorder DB where any ``source='backtest'`` insert
+    would raise, and its verdicts never consume ``position_pairs``.
+    """
+
+    def write(self, snapshot: PositionSnapshot) -> None:
+        """Discard the snapshot."""
+
+    def flush(self) -> int:
+        """Nothing buffered; returns 0."""
+        return 0
+
+    @property
+    def total_written(self) -> int:
+        return 0
+
+
 @dataclass
 class ReplayResult:
     """Result of a replay run."""
@@ -305,9 +326,23 @@ class ReplayEngine:
         self,
         config: ReplayConfig,
         db: DatabaseFactory,
+        emit_backtest_snapshots: bool = True,
     ):
+        """Initialize the replay engine.
+
+        Args:
+            config: Replay configuration.
+            db: Recorder database factory (reads; also snapshot writes
+                unless disabled below).
+            emit_backtest_snapshots: When False (feature 0088 live_check),
+                ``source='backtest'`` position snapshots are discarded via a
+                no-op writer instead of being inserted into ``db`` — required
+                when ``db`` is opened read-only. Default True keeps existing
+                callers byte-for-byte unchanged.
+        """
         self._config = config
         self._db = db
+        self._emit_backtest_snapshots = emit_backtest_snapshots
         self._instrument_provider = InstrumentInfoProvider()
 
     def run(
@@ -888,23 +923,29 @@ class ReplayEngine:
         # the recorder DB so the comparator can read both live and backtest
         # rows from the same table (filtered by `source`).
         if run_id is not None:
-            if account_id is None:
-                # Pre-0029 legacy data: Run.account_id is NULL. Don't
-                # silently fall back — surface the issue so the operator
-                # re-records with the current writer. A broken pre-0029
-                # run would otherwise look identical to a healthy empty
-                # data run (comparator would just see zero backtest rows).
-                raise ValueError(
-                    f"Run {run_id} has no account_id; cannot emit backtest "
-                    "position snapshots. Re-record after the 0029+0034 "
-                    "migrations to populate Run.account_id."
+            if not self._emit_backtest_snapshots:
+                # Feature 0088: live_check runs against a read-only recorder
+                # DB and never consumes position_pairs — discard snapshots
+                # instead of writing them.
+                position_writer = _NoopPositionSnapshotWriter()
+            else:
+                if account_id is None:
+                    # Pre-0029 legacy data: Run.account_id is NULL. Don't
+                    # silently fall back — surface the issue so the operator
+                    # re-records with the current writer. A broken pre-0029
+                    # run would otherwise look identical to a healthy empty
+                    # data run (comparator would just see zero backtest rows).
+                    raise ValueError(
+                        f"Run {run_id} has no account_id; cannot emit backtest "
+                        "position snapshots. Re-record after the 0029+0034 "
+                        "migrations to populate Run.account_id."
+                    )
+                position_writer = _BatchPositionSnapshotWriter(
+                    db=self._db,
+                    run_id=run_id,
+                    account_id=account_id,
+                    source="backtest",
                 )
-            position_writer = _BatchPositionSnapshotWriter(
-                db=self._db,
-                run_id=run_id,
-                account_id=account_id,
-                source="backtest",
-            )
             runner.position_snapshot_callback = position_writer.write
             # Stash on runner so the engine can call .flush() at end-of-run.
             runner._position_writer = position_writer  # type: ignore[attr-defined]

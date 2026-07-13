@@ -17,6 +17,7 @@ test:
 	uv run pytest apps/replay/tests --cov=replay --cov-append -q
 	uv run pytest apps/backtest/tests --cov=backtest --cov-append -q
 	uv run pytest apps/pnl_checker/tests --cov=pnl_checker --cov-append -q
+	uv run pytest apps/live_check/tests --cov=live_check --cov-append -q
 	uv run pytest tests/integration/ --cov-append --cov-report=term-missing -v
 
 # Run cross-package integration tests only

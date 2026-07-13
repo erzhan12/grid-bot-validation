@@ -12,6 +12,18 @@ from grid_db.settings import DatabaseSettings
 from grid_db.models import Base
 
 
+def _readonly_sqlite_url(url: str) -> str:
+    """Rewrite a file-backed SQLite URL to a ``mode=ro`` URI open.
+
+    ``sqlite:///path/to.db`` → ``sqlite:///file:path/to.db?mode=ro&uri=true``.
+    SQLAlchemy passes ``uri=true`` through to ``sqlite3.connect``, which then
+    honours ``mode=ro``. ``mode=ro`` ONLY — ``immutable=1`` would freeze the
+    read snapshot and hide rows committed by a live writer after open.
+    """
+    scheme, _, path = url.partition(":///")
+    return f"{scheme}:///file:{path}?mode=ro&uri=true"
+
+
 class DatabaseFactory:
     """Factory for creating database connections supporting SQLite and PostgreSQL.
 
@@ -70,7 +82,12 @@ class DatabaseFactory:
             # Use StaticPool only for in-memory databases
             if ":memory:" in url:
                 poolclass = StaticPool
-            
+            elif self.settings.read_only:
+                # Feature 0088: file-backed SQLite opens read-only via URI.
+                # Skipped for :memory: (nothing to protect; URI form would
+                # create a new empty in-memory DB instead).
+                url = _readonly_sqlite_url(url)
+
             kwargs = {
                 "echo": self.settings.echo_sql,
                 "connect_args": connect_args,
@@ -131,6 +148,23 @@ class DatabaseFactory:
         except Exception:
             session.rollback()
             raise
+        finally:
+            session.close()
+
+    @contextmanager
+    def get_readonly_session(self) -> Generator[Session, None, None]:
+        """Context manager for read-only database sessions (feature 0088).
+
+        Unlike :meth:`get_session`, never calls ``session.commit()`` — there
+        is nothing to commit on a read path, and skipping it avoids any write
+        attempt against a ``mode=ro`` connection.
+
+        Yields:
+            SQLAlchemy Session instance.
+        """
+        session = self.session_factory()
+        try:
+            yield session
         finally:
             session.close()
 

@@ -1,0 +1,40 @@
+# live_check configuration (feature 0088).
+# Two strats mirroring live conf/gridbot_test.yaml geometry+risk.
+# amount x0.0005 matches live — omitting it would fall through to the replay
+# default x0.001 → wrong placed qty → event_follower divergence.
+# max_margin mirrors live and IS passed through to RiskConfig but is not
+# consumed by gridcore's risk-mgmt branches (does not affect reconcile).
+
+database_url: "sqlite:///recorder_ltcusdt_phase4.db"
+run_id: "580ca395"
+
+last: "4h"
+lag: "2m"
+
+strats:
+  - strat_id: solusdt_test
+    symbol: SOLUSDT
+    grid_step: 0.3
+    tick_size: "0.01"
+    grid_count: 30
+    min_total_margin: 2.5
+    amount: "x0.0005"
+    max_margin: 3.0
+    min_liq_ratio: 0.8
+    max_liq_ratio: 1.2
+    increase_same_position_on_low_margin: true
+    leverage: 10
+    enable_risk_multipliers: true
+  - strat_id: ltcusdt_test
+    symbol: LTCUSDT
+    grid_step: 0.4
+    tick_size: "0.1"
+    grid_count: 20
+    min_total_margin: 3
+    amount: "x0.0005"
+    max_margin: 5.0
+    min_liq_ratio: 0.8
+    max_liq_ratio: 1.2
+    increase_same_position_on_low_margin: true
+    leverage: 10
+    enable_risk_multipliers: true

@@ -32,6 +32,12 @@ class DatabaseSettings(BaseSettings):
     pool_timeout: int = 30
     pool_recycle: int = 1800
 
+    # Read-only open (feature 0088). File-backed SQLite only: the engine URL
+    # is rewritten to mode=ro (URI open) so the connection rejects all writes.
+    # mode=ro ONLY — never immutable=1, which would freeze the snapshot and
+    # hide new writer rows from long-lived readers (live_check --watch).
+    read_only: bool = False
+
     # Debug
     echo_sql: bool = False
 
