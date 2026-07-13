@@ -2401,9 +2401,144 @@ class TestSameOrderDetection:
         assert "SAME ORDER ERROR" in call_args[0][0]
         assert "50000.0" in call_args[0][0]
 
-    def test_on_order_update_skips_intents_when_same_order_error(self, runner):
-        """Test on_order_update does not execute intents when same-order error active."""
+    def test_execute_generated_intents_suppresses_places_not_cancels(self, runner):
+        """SAME ORDER latch blocks placements only; duplicate-healing cancels run."""
         runner._same_order_error = True
+        cancel = CancelIntent(
+            symbol="BTCUSDT", order_id="dup-2", reason="duplicate",
+        )
+        place = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            grid_level=5,
+            direction="long",
+            strat_id="btcusdt_test",
+        )
+
+        executed: list[PlaceLimitIntent | CancelIntent] = []
+        runner._execute_intents = lambda intents, limits: executed.extend(intents)
+
+        runner._execute_generated_intents([cancel, place], EMPTY_LIMITS)
+
+        assert executed == [cancel]
+
+    def test_execute_generated_intents_suppresses_non_duplicate_cancels(self, runner):
+        """SAME ORDER latch suppresses cancels with reasons other than 'duplicate'.
+
+        A rebuild/side_mismatch/outside_grid cancel executed without its paired
+        placement would thin the grid while state is suspect.
+        """
+        runner._same_order_error = True
+        rebuild_cancel = CancelIntent(
+            symbol="BTCUSDT", order_id="old-1", reason="rebuild",
+        )
+        duplicate_cancel = CancelIntent(
+            symbol="BTCUSDT", order_id="dup-2", reason="duplicate",
+        )
+
+        executed: list[PlaceLimitIntent | CancelIntent] = []
+        runner._execute_intents = lambda intents, limits: executed.extend(intents)
+
+        runner._execute_generated_intents(
+            [rebuild_cancel, duplicate_cancel], EMPTY_LIMITS,
+        )
+
+        assert executed == [duplicate_cancel]
+
+    def test_execute_generated_intents_no_latch_passes_all(self, runner):
+        """Without the latch, all intents pass through unchanged."""
+        cancel = CancelIntent(
+            symbol="BTCUSDT", order_id="old-1", reason="rebuild",
+        )
+        place = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            grid_level=5,
+            direction="long",
+            strat_id="btcusdt_test",
+        )
+
+        executed: list[PlaceLimitIntent | CancelIntent] = []
+        runner._execute_intents = lambda intents, limits: executed.extend(intents)
+
+        runner._execute_generated_intents([cancel, place], EMPTY_LIMITS)
+
+        assert executed == [cancel, place]
+
+    def test_on_ticker_duplicate_healing_cancels_under_same_order_error(
+        self, runner, mock_executor,
+    ):
+        """Feature 0087 duplicate CancelIntents must execute while SAME ORDER latched."""
+        ticker = TickerEvent(
+            event_type=EventType.TICKER,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            last_price=Decimal("50000.0"),
+            mark_price=Decimal("50000.0"),
+            bid1_price=Decimal("49999.0"),
+            ask1_price=Decimal("50001.0"),
+            funding_rate=Decimal("0.0001"),
+        )
+        runner.on_ticker(ticker)
+        buy_level = next(
+            g for g in runner._engine.grid.grid if g["side"] == "Buy"
+        )
+        runner.inject_open_orders([
+            {
+                "orderId": "dup-survivor",
+                "price": str(buy_level["price"]),
+                "qty": "0.001",
+                "side": "Buy",
+                "reduceOnly": False,
+            },
+            {
+                "orderId": "dup-shadow",
+                "price": str(buy_level["price"]),
+                "qty": "0.001",
+                "side": "Buy",
+                "reduceOnly": False,
+            },
+        ])
+        runner._same_order_error = True
+        mock_executor.execute_cancel.reset_mock()
+        mock_executor.execute_place.reset_mock()
+
+        runner.on_ticker(ticker)
+
+        duplicate_cancels = [
+            c for c in mock_executor.execute_cancel.call_args_list
+            if c.args[0].reason == "duplicate"
+        ]
+        cancelled_ids = {c.args[0].order_id for c in duplicate_cancels}
+        assert "dup-shadow" in cancelled_ids
+        assert mock_executor.execute_place.call_count == 0
+
+    def test_on_order_update_skips_placements_not_cancels_when_same_order_error(
+        self, runner,
+    ):
+        """on_order_update still forwards CancelIntents while SAME ORDER latched."""
+        runner._same_order_error = True
+        cancel = CancelIntent(
+            symbol="BTCUSDT", order_id="dup-2", reason="duplicate",
+        )
+        place = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            grid_level=5,
+            direction="long",
+            strat_id="btcusdt_test",
+        )
+        runner._engine.on_event = Mock(return_value=[cancel, place])
+
+        executed: list[PlaceLimitIntent | CancelIntent] = []
+        runner._execute_intents = lambda intents, limits: executed.extend(intents)
 
         order_event = OrderUpdateEvent(
             event_type=EventType.ORDER_UPDATE,
@@ -2418,21 +2553,10 @@ class TestSameOrderDetection:
             qty=Decimal("0.1"),
             leaves_qty=Decimal("0"),
         )
-
-        execute_called = False
-        original_execute = runner._execute_intents
-
-        def mock_execute(intents, limits):
-            nonlocal execute_called
-            execute_called = True
-            original_execute(intents)
-
-        runner._execute_intents = mock_execute
-
         runner.on_order_update(order_event)
 
         assert runner.same_order_error is True
-        assert execute_called is False
+        assert executed == [cancel]
 
     def test_partial_fill_skipped_from_buffer(self, runner):
         """Test partial fills (leavesQty != 0) are not added to buffer.

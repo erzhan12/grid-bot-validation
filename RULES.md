@@ -927,7 +927,12 @@ ticker (feature 0087, issue #220): `engine.py:_place_grid_orders` groups
 limits into round-8 price buckets, keeps one survivor per price (preference:
 grid-side match > fill history > first-in-list) and cancels the shadowed
 extras with `CancelIntent(reason='duplicate')` — the proactive complement
-to the reactive 0031/0046 post-fill layer. Mid-run order sync keeps
+to the reactive 0031/0046 post-fill layer. While the SAME ORDER soft-block is
+latched (`runner._same_order_error`), only healing `CancelIntent(reason=
+'duplicate')`s still execute via `_execute_generated_intents` (otherwise 0087
+cleanup is a no-op during the latch); placements AND other-reason cancels
+(rebuild/side_mismatch/outside_grid) stay suppressed — cancelling grid orders
+without their paired placements would thin the grid. Mid-run order sync keeps
 warn-and-retry semantics (stopping a bot managing a live grid is riskier);
 sync failures now also alert (`order_sync_<strat_id>`, both `result.errors`
 and exception paths). Repro/regression: `test_issue_206_startup_reconcile_race.py`,
