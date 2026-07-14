@@ -2,13 +2,14 @@
 
 from datetime import datetime, timedelta
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 
-from gridcore import TickerEvent, EventType
+from gridcore import InstrumentInfo, TickerEvent, EventType
 
 from backtest.engine import BacktestEngine, FundingSimulator
-from backtest.config import BacktestConfig, WindDownMode
+from backtest.config import BacktestConfig, BacktestStrategyConfig, WindDownMode
 from backtest.data_provider import InMemoryDataProvider
 
 
@@ -366,3 +367,126 @@ class TestInMemoryDataProvider:
         assert info.start_ts is None
         assert info.end_ts is None
         assert info.total_records == 0
+
+
+def _real_info(tick: Decimal) -> InstrumentInfo:
+    """A real InstrumentInfo so the GridEngine can build a grid."""
+    return InstrumentInfo(
+        symbol="BTCUSDT",
+        qty_step=Decimal("0.001"),
+        tick_size=tick,
+        min_qty=Decimal("0.001"),
+        max_qty=Decimal("1000"),
+    )
+
+
+class TestTickSizeResolution:
+    """Feature 0090: backtest sources tick_size from the exchange provider.
+
+    Mirror of the replay resolution: exchange tick by default, YAML override
+    wins on mismatch (WARNING). Resolution happens in _init_runner before the
+    GridEngine is built (runner.py), reusing the single fetched instance.
+    """
+
+    @pytest.fixture
+    def ticks(self, sample_timestamp):
+        return [
+            TickerEvent(
+                event_type=EventType.TICKER,
+                symbol="BTCUSDT",
+                exchange_ts=sample_timestamp + timedelta(seconds=i),
+                local_ts=sample_timestamp + timedelta(seconds=i),
+                last_price=Decimal("100000"),
+                mark_price=Decimal("100000"),
+                bid1_price=Decimal("99999"),
+                ask1_price=Decimal("100001"),
+                funding_rate=Decimal("0.0001"),
+            )
+            for i in range(3)
+        ]
+
+    def _config_with_tick(self, tick):
+        strat = BacktestStrategyConfig(
+            strat_id="test_btc",
+            symbol="BTCUSDT",
+            tick_size=tick,
+            grid_count=50,
+            grid_step=0.2,
+            amount="x0.001",
+            enable_risk_multipliers=False,
+        )
+        return BacktestConfig(
+            strategies=[strat],
+            database_url="sqlite:///:memory:",
+            initial_balance=Decimal("10000"),
+            enable_funding=False,
+        )
+
+    def _run(self, engine, ticks, sample_timestamp):
+        engine.run(
+            symbol="BTCUSDT",
+            start_ts=sample_timestamp,
+            end_ts=sample_timestamp + timedelta(hours=1),
+            data_provider=InMemoryDataProvider(ticks),
+        )
+
+    @patch("backtest.engine.InstrumentInfoProvider")
+    def test_provider_tick_used_when_yaml_none(
+        self, mock_provider_cls, ticks, sample_timestamp,
+    ):
+        """YAML tick None -> GridEngine gets exchange tick; require_live=True."""
+        mock_get = mock_provider_cls.return_value.get
+        mock_get.return_value = _real_info(Decimal("0.5"))
+
+        engine = BacktestEngine(config=self._config_with_tick(None))
+        self._run(engine, ticks, sample_timestamp)
+
+        assert mock_get.call_args.kwargs["require_live"] is True
+        assert engine._runners["test_btc"].engine.tick_size == Decimal("0.5")
+
+    @patch("backtest.engine.InstrumentInfoProvider")
+    def test_yaml_override_wins_with_warning_on_mismatch(
+        self, mock_provider_cls, ticks, sample_timestamp, caplog,
+    ):
+        """YAML tick set & differs -> WARNING + YAML wins; require_live=False."""
+        mock_get = mock_provider_cls.return_value.get
+        mock_get.return_value = _real_info(Decimal("0.01"))
+
+        engine = BacktestEngine(config=self._config_with_tick(Decimal("0.1")))
+        with caplog.at_level("WARNING"):
+            self._run(engine, ticks, sample_timestamp)
+
+        assert mock_get.call_args.kwargs["require_live"] is False
+        assert engine._runners["test_btc"].engine.tick_size == Decimal("0.1")
+        assert any(
+            "tick_size mismatch" in r.message and r.levelname == "WARNING"
+            for r in caplog.records
+        )
+
+    @patch("backtest.engine.InstrumentInfoProvider")
+    def test_no_warning_when_yaml_matches_exchange(
+        self, mock_provider_cls, ticks, sample_timestamp, caplog,
+    ):
+        """YAML tick equal to exchange -> exchange tick, no WARNING."""
+        mock_get = mock_provider_cls.return_value.get
+        mock_get.return_value = _real_info(Decimal("0.1"))
+
+        engine = BacktestEngine(config=self._config_with_tick(Decimal("0.1")))
+        with caplog.at_level("WARNING"):
+            self._run(engine, ticks, sample_timestamp)
+
+        assert engine._runners["test_btc"].engine.tick_size == Decimal("0.1")
+        assert not any("tick_size mismatch" in r.message for r in caplog.records)
+
+    @patch("backtest.engine.InstrumentInfoProvider")
+    def test_single_get_call_per_runner(
+        self, mock_provider_cls, ticks, sample_timestamp,
+    ):
+        """The already-fetched instance is reused — exactly one .get() call."""
+        mock_get = mock_provider_cls.return_value.get
+        mock_get.return_value = _real_info(Decimal("0.1"))
+
+        engine = BacktestEngine(config=self._config_with_tick(Decimal("0.1")))
+        self._run(engine, ticks, sample_timestamp)
+
+        assert mock_get.call_count == 1

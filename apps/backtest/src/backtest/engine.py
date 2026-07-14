@@ -15,7 +15,11 @@ from gridcore import DirectionType, SideType, create_qty_calculator
 from backtest.config import BacktestConfig, BacktestStrategyConfig, WindDownMode
 from backtest.data_provider import HistoricalDataProvider, InMemoryDataProvider
 from backtest.fill_simulator import TradeThroughFillSimulator
-from backtest.instrument_info import InstrumentInfoProvider, InstrumentInfo
+from backtest.instrument_info import (
+    InstrumentInfo,
+    InstrumentInfoProvider,
+    resolve_tick_size,
+)
 from backtest.order_manager import BacktestOrderManager
 from backtest.executor import BacktestExecutor
 from backtest.position_tracker import BacktestPositionTracker
@@ -240,11 +244,26 @@ class BacktestEngine:
 
     def _init_runner(self, strategy_config: BacktestStrategyConfig) -> None:
         """Initialize a runner for a strategy."""
-        # Fetch instrument info (from API or cache)
-        instrument_info = self._instrument_provider.get(strategy_config.symbol)
+        # Fetch instrument info (from API or cache). Feature 0090: tick_size is
+        # an exchange property — require_live is True only when there is no YAML
+        # override, so a fabricated no-cache-no-network default can never become
+        # the grid tick.
+        yaml_tick = strategy_config.tick_size
+        instrument_info = self._instrument_provider.get(
+            strategy_config.symbol, require_live=yaml_tick is None
+        )
         logger.info(
             f"Instrument {strategy_config.symbol}: "
             f"qty_step={instrument_info.qty_step}, tick_size={instrument_info.tick_size}"
+        )
+
+        # Resolve the grid tick before the GridEngine is built in the runner:
+        # exchange value by default, YAML override wins on mismatch (WARNING).
+        # model_copy so runner.py's GridEngine(tick_size=strategy_config.tick_size)
+        # consumes the resolved value without a runner-side change.
+        resolved_tick = resolve_tick_size(yaml_tick, instrument_info.tick_size)
+        strategy_config = strategy_config.model_copy(
+            update={"tick_size": resolved_tick}
         )
 
         # Create fill simulator and order manager

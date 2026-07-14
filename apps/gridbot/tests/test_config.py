@@ -189,6 +189,37 @@ class TestStrategyConfig:
         )
         assert strategy.tick_size == Decimal("0.01")
 
+    def test_tick_size_absent_defaults_none(self):
+        """Feature 0090: tick_size is optional (sourced from the exchange)."""
+        strategy = StrategyConfig(
+            strat_id="test",
+            account="test",
+            symbol="BTCUSDT",
+        )
+        assert strategy.tick_size is None
+
+    def test_tick_size_from_float_is_exact_decimal(self):
+        """Feature 0090: unquoted YAML float coerces via Decimal(str(v)) —
+        exact-equal to Decimal("0.1"), no binary artifact that would trip the
+        exchange cross-check."""
+        strategy = StrategyConfig(
+            strat_id="test",
+            account="test",
+            symbol="BTCUSDT",
+            tick_size=0.1,
+        )
+        assert strategy.tick_size == Decimal("0.1")
+
+    def test_tick_size_from_int_is_decimal(self):
+        """Feature 0090: an int tick_size coerces to Decimal."""
+        strategy = StrategyConfig(
+            strat_id="test",
+            account="test",
+            symbol="BTCUSDT",
+            tick_size=1,
+        )
+        assert strategy.tick_size == Decimal("1")
+
     def test_custom_grid_params(self):
         """Test strategy with custom grid parameters."""
         strategy = StrategyConfig(

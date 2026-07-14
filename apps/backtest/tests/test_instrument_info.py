@@ -7,7 +7,12 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from backtest.instrument_info import InstrumentInfo, InstrumentInfoProvider, DEFAULT_CACHE_PATH
+from backtest.instrument_info import (
+    DEFAULT_CACHE_PATH,
+    InstrumentInfo,
+    InstrumentInfoProvider,
+    resolve_tick_size,
+)
 
 
 class TestInstrumentInfo:
@@ -131,6 +136,25 @@ class TestInstrumentInfoProvider:
     def test_load_from_cache_corrupted(self, provider, cache_path):
         """Returns None when cache file is corrupted JSON."""
         cache_path.write_text("not valid json{{{")
+
+        assert provider.load_from_cache("BTCUSDT") is None
+
+    def test_load_from_cache_bad_decimal_field(self, provider, cache_path):
+        """Valid JSON with an unparseable decimal field -> None, never raises.
+
+        A corrupt cached ``tick_size`` (InvalidOperation from ``from_dict``)
+        must fall back to refetch, not crash the run.
+        """
+        cache_path.write_text(json.dumps({
+            "BTCUSDT": {
+                "symbol": "BTCUSDT",
+                "qty_step": "0.001",
+                "tick_size": "not-a-number",
+                "min_qty": "0.001",
+                "max_qty": "1000",
+                "cached_at": "2026-01-01T00:00:00+00:00",
+            }
+        }))
 
         assert provider.load_from_cache("BTCUSDT") is None
 
@@ -407,3 +431,44 @@ class TestInstrumentInfoProvider:
 
         # Should try API because no cached_at means stale
         mock_fetch.assert_called_once_with("BTCUSDT")
+
+
+class TestResolveTickSize:
+    """Feature 0090: resolve_tick_size — warn-and-use-YAML for replay/backtest."""
+
+    def test_none_yaml_uses_exchange(self):
+        """YAML None -> exchange tick, no warning."""
+        assert resolve_tick_size(None, Decimal("0.5")) == Decimal("0.5")
+
+    def test_matching_yaml_uses_exchange_no_warning(self, caplog):
+        """YAML equal to exchange -> exchange value, no warning."""
+        with caplog.at_level("WARNING"):
+            resolved = resolve_tick_size(Decimal("0.1"), Decimal("0.1"))
+        assert resolved == Decimal("0.1")
+        assert not caplog.records
+
+    def test_mismatch_yaml_wins_with_warning(self, caplog):
+        """YAML differs -> YAML wins, WARNING logged."""
+        with caplog.at_level("WARNING"):
+            resolved = resolve_tick_size(Decimal("0.5"), Decimal("0.1"))
+        assert resolved == Decimal("0.5")
+        assert any(
+            "tick_size mismatch" in r.message and r.levelname == "WARNING"
+            for r in caplog.records
+        )
+
+    def test_decimal_normalized_equality_no_false_mismatch(self, caplog):
+        """0.10 and 0.1 are Decimal-equal -> no spurious warning."""
+        with caplog.at_level("WARNING"):
+            resolved = resolve_tick_size(Decimal("0.10"), Decimal("0.1"))
+        assert resolved == Decimal("0.1")
+        assert not caplog.records
+
+    def test_matching_yaml_returns_exchange_representation(self):
+        """On a match, the exchange value (not the YAML) is returned (plan step 4).
+
+        Guards the representation: a YAML "0.10" that equals exchange "0.1"
+        must yield the exchange "0.1", so grid rounding uses the exchange tick.
+        """
+        resolved = resolve_tick_size(Decimal("0.10"), Decimal("0.1"))
+        assert str(resolved) == "0.1"

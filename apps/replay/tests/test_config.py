@@ -25,6 +25,17 @@ class TestReplayStrategyConfig:
         config = ReplayStrategyConfig(tick_size="0.01")
         assert config.tick_size == Decimal("0.01")
 
+    def test_tick_size_optional_defaults_none(self):
+        """Feature 0090: tick_size may be omitted (sourced from exchange)."""
+        config = ReplayStrategyConfig()
+        assert config.tick_size is None
+
+    def test_tick_size_from_float_coerces_without_artifact(self):
+        """Unquoted YAML float coerces via _parse_decimal, no float artifact."""
+        config = ReplayStrategyConfig(tick_size=0.1)
+        assert config.tick_size == Decimal("0.1")
+        assert str(config.tick_size) == "0.1"
+
     def test_grid_count_minimum(self):
         with pytest.raises(ValidationError):
             ReplayStrategyConfig(tick_size=Decimal("0.1"), grid_count=2)

@@ -11,7 +11,7 @@ strategies:
   - strat_id: "btcusdt_main"
     account: "main_account"
     symbol: "BTCUSDT"
-    tick_size: "0.1"
+    tick_size: "0.1"  # DEPRECATED (0090): optional cross-check — bot uses exchange tick_size; mismatch aborts startup
     grid_count: 50
     grid_step: 0.2
     amount: "x0.001"  # 0.1% of wallet per order
@@ -37,7 +37,7 @@ strategies:
   - strat_id: "ethusdt_main"
     account: "main_account"
     symbol: "ETHUSDT"
-    tick_size: "0.01"
+    tick_size: "0.01"  # DEPRECATED (0090): optional cross-check — bot uses exchange tick_size; mismatch aborts startup
     grid_count: 50
     grid_step: 0.2
     amount: "x0.001"

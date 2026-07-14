@@ -172,7 +172,7 @@ Maintained code is NOT excluded. When a maintained file has an intentional lint 
 - **Helper methods**: `_cancel_limit(limit, reason)` and `_cancel_all_limits(limits, reason)` for DRY CancelIntent creation
 - **OrderUpdateEvent**: Tracks `pending_orders` dict (client_order_id → order_id). Statuses: 'New'/'PartiallyFilled' (pending), 'Filled'/'Cancelled'/'Rejected' (terminal). Does NOT track 'Active' (V3 legacy, see Bybit V5 note below)
 - **GridEngine emits `qty=0`** — qty is always computed by execution layer's `qty_calculator`
-- **InstrumentInfo** lives in `gridcore/instrument_info.py` (shared by backtest, replay, gridbot). Provider/fetcher stays in each app layer.
+- **InstrumentInfo** lives in `gridcore/instrument_info.py` (shared by backtest, replay, gridbot). **InstrumentInfoProvider** (fetcher) lives in `packages/bybit_adapter/src/bybit_adapter/instrument_info.py` (moved from backtest in 0090); apps import it from there.
 - **Live gridbot qty resolution**: `StrategyRunner._resolve_qty()` composes `_qty_calculator` (from config amount) with `get_amount_multiplier()` (risk). `PlaceLimitIntent` is frozen, so `dataclasses.replace()` creates a new intent with resolved qty.
 - **Wallet balance for qty**: Stored on `StrategyRunner._wallet_balance`, updated each `on_position_update()`. Tests must set `runner._wallet_balance` or orders resolve to qty=0 and get skipped.
 
@@ -1095,7 +1095,7 @@ Two-layer: Runner logs + re-raises → Orchestrator catches + sends Telegram ale
 
 ## backtest — Backtest Engine
 
-**Path**: `apps/backtest/` | **Dependencies**: gridcore, grid-db (NO bybit_adapter)
+**Path**: `apps/backtest/` | **Dependencies**: gridcore, grid-db, bybit-adapter (0090: `InstrumentInfoProvider` home)
 
 ### Architecture
 
@@ -1112,7 +1112,7 @@ Two-layer: Runner logs + re-raises → Orchestrator catches + sends Telegram ale
 - **Two-phase tick**: `process_fills()` → equity update → `execute_tick()` (fills reflected before sizing)
 - **Equity update**: Engine level, not runner level (aggregates all runners' unrealized PnL)
 - **`WindDownMode` StrEnum**: `LEAVE_OPEN`, `CLOSE_ALL`
-- **InstrumentInfoProvider**: Fetches from Bybit API, 24h cache, fallback cascade: fresh cache → API → stale cache → defaults
+- **InstrumentInfoProvider** (`packages/bybit_adapter/src/bybit_adapter/instrument_info.py`): Fetches from Bybit API, 24h cache, fallback cascade: fresh cache → API → stale cache → defaults. `tick_size` is sourced from the exchange (0090); YAML `tick_size` is optional — gridbot uses it as a fail-closed cross-check (mismatch aborts startup), replay/backtest use it as a what-if override (mismatch warns, YAML wins).
 
 ### Risk Multiplier Composition (CRITICAL)
 

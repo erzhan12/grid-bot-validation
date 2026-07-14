@@ -110,7 +110,13 @@ class StrategyConfig(BaseModel):
     strat_id: str = Field(..., description="Unique strategy identifier")
     account: str = Field(..., description="Account name reference")
     symbol: str = Field(..., description="Trading pair (e.g., BTCUSDT)")
-    tick_size: Decimal = Field(..., description="Price tick size for rounding")
+    # Feature 0090: DEPRECATED — tick_size is now sourced from the exchange at
+    # startup (orchestrator._fetch_instrument_info). Kept optional as a
+    # cross-check: if set and it differs from the exchange tick, startup aborts
+    # (config drift = operator error). Omit it in new configs.
+    tick_size: Optional[Decimal] = Field(
+        default=None, description="DEPRECATED price tick (cross-checked vs exchange)"
+    )
 
     # Grid parameters
     grid_count: int = Field(default=50, ge=4, description="Total grid levels")
@@ -393,9 +399,16 @@ class StrategyConfig(BaseModel):
     @field_validator("tick_size", mode="before")
     @classmethod
     def parse_tick_size(cls, v):
-        """Convert string tick_size to Decimal."""
+        """Convert str/int/float tick_size to Decimal; pass None through.
+
+        Coerce numerics via Decimal(str(v)) so an unquoted YAML `tick_size: 0.1`
+        (arriving as a float) becomes exact Decimal("0.1"), not a binary
+        artifact — otherwise the exchange cross-check would spuriously mismatch.
+        """
         if isinstance(v, str):
             return Decimal(v)
+        if isinstance(v, (int, float)):
+            return Decimal(str(v))
         return v
 
     @model_validator(mode="before")

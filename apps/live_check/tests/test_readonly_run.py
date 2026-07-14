@@ -29,6 +29,15 @@ RUN_ID = "test-run-id"
 TS = datetime(2026, 7, 1, 12, 0, 0)
 
 
+def _fake_instrument_info() -> MagicMock:
+    """Return a MagicMock shaped like InstrumentInfo with tick_size=0.1."""
+    mock_info = MagicMock()
+    mock_info.qty_step = Decimal("0.01")
+    mock_info.tick_size = Decimal("0.1")
+    mock_info.round_qty = lambda q: q.quantize(Decimal("0.01"))
+    return mock_info
+
+
 def _tick(price, ts):
     return TickerEvent(
         event_type=EventType.TICKER,
@@ -98,11 +107,7 @@ def _config() -> ReplayConfig:
 @pytest.fixture
 def mock_instrument():
     with patch("replay.engine.InstrumentInfoProvider") as mock_provider_cls:
-        mock_info = MagicMock()
-        mock_info.qty_step = Decimal("0.01")
-        mock_info.tick_size = Decimal("0.1")
-        mock_info.round_qty = lambda q: q.quantize(Decimal("0.01"))
-        mock_provider_cls.return_value.get.return_value = mock_info
+        mock_provider_cls.return_value.get.return_value = _fake_instrument_info()
         yield mock_provider_cls
 
 
@@ -119,6 +124,7 @@ class TestNoopWriterWiring:
                 strat_id="s", symbol="LTCUSDT", tick_size=Decimal("0.1")
             ),
             BacktestSession(initial_balance=Decimal("10000")),
+            instrument_info=_fake_instrument_info(),
             run_id=RUN_ID,
             account_id="acc1",
         )
@@ -137,6 +143,7 @@ class TestNoopWriterWiring:
                 strat_id="s", symbol="LTCUSDT", tick_size=Decimal("0.1")
             ),
             BacktestSession(initial_balance=Decimal("10000")),
+            instrument_info=_fake_instrument_info(),
             run_id=RUN_ID,
             account_id="acc1",
         )

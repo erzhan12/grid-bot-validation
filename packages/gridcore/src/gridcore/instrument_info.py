@@ -1,11 +1,12 @@
 """Instrument trading parameters (qty rounding, tick sizing).
 
 Pure data class with no external dependencies.
-Provider/fetcher logic lives in app layers (backtest, gridbot).
+Provider/fetcher logic lives in ``bybit_adapter.instrument_info``
+(``InstrumentInfoProvider``); gridbot fetches directly via its REST client.
 """
 
 import logging
-from decimal import Decimal, ROUND_HALF_UP, ROUND_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, ROUND_UP
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -74,18 +75,37 @@ class InstrumentInfo:
             instrument: Single instrument dict from response["result"]["list"][0].
 
         Returns:
-            InstrumentInfo if valid, None if params are invalid (zero qty_step/tick_size).
+            InstrumentInfo if valid, None if qtyStep/tickSize is missing,
+            unparseable, non-finite (NaN/Infinity), or non-positive. Since the
+            tick is load-bearing for grid price rounding, no caller may receive
+            a fabricated tick.
         """
-        lot_filter = instrument.get("lotSizeFilter", {})
-        price_filter = instrument.get("priceFilter", {})
+        # `or {}` guards a present-but-null filter (JSON null -> None), which
+        # would otherwise raise AttributeError on the .get() below.
+        lot_filter = instrument.get("lotSizeFilter") or {}
+        price_filter = instrument.get("priceFilter") or {}
 
-        qty_step = Decimal(lot_filter.get("qtyStep", "0.001"))
-        tick_size = Decimal(price_filter.get("tickSize", "0.1"))
+        raw_qty_step = lot_filter.get("qtyStep")
+        raw_tick_size = price_filter.get("tickSize")
 
-        if qty_step <= 0 or tick_size <= 0:
+        try:
+            qty_step = Decimal(raw_qty_step)
+            tick_size = Decimal(raw_tick_size)
+        except (InvalidOperation, TypeError, ValueError):
+            # Missing key (None -> TypeError) or unparseable string ("", "abc").
+            qty_step = tick_size = None
+
+        if (
+            qty_step is None
+            or tick_size is None
+            or not qty_step.is_finite()
+            or not tick_size.is_finite()
+            or qty_step <= 0
+            or tick_size <= 0
+        ):
             logger.warning(
                 f"Invalid instrument params for {symbol}: "
-                f"qty_step={qty_step}, tick_size={tick_size}"
+                f"qtyStep={raw_qty_step!r}, tickSize={raw_tick_size!r}"
             )
             return None
 

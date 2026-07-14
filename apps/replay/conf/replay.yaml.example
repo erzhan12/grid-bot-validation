@@ -13,7 +13,7 @@ symbol: "BTCUSDT"
 # end_ts: "2025-02-23T00:00:00"
 
 strategy:
-  tick_size: 0.1
+  tick_size: 0.1  # DEPRECATED (0090): optional what-if override — provider tick used when absent; mismatch warns, YAML wins
   grid_count: 50
   grid_step: 0.2
   amount: "x0.001"

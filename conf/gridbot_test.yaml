@@ -8,7 +8,7 @@ strategies:
   - strat_id: ltcusdt_test
     account: mainnet_live
     symbol: LTCUSDT
-    tick_size: "0.1"
+    tick_size: "0.1"  # DEPRECATED (0090): optional cross-check — bot uses exchange tick_size; mismatch aborts startup
     grid_count: 20
     grid_step: 0.4
     amount: "x0.0005"
@@ -21,7 +21,7 @@ strategies:
   - strat_id: solusdt_test
     account: mainnet_live
     symbol: SOLUSDT
-    tick_size: "0.01"
+    tick_size: "0.01"  # DEPRECATED (0090): optional cross-check — bot uses exchange tick_size; mismatch aborts startup
     grid_count: 30
     grid_step: 0.3
     amount: "x0.0005"

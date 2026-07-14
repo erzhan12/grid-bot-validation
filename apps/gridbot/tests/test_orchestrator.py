@@ -8,13 +8,34 @@ from unittest.mock import Mock, MagicMock, patch
 
 import pytest
 
-from gridcore import EventType, TickerEvent
+from gridcore import EventType, InstrumentInfo, TickerEvent
 from gridbot.config import GridbotConfig, AccountConfig, StrategyConfig
 from gridbot.notifier import Notifier
 from gridbot.orchestrator import Orchestrator
 from gridbot.position_fetcher import WalletSnapshot
 from gridbot.reconciler import ReconciliationResult
 from grid_db.identity import account_id_for
+
+# Feature 0090: a valid Bybit get_instruments_info payload (tick_size 0.1
+# matches the strategy_config fixture, so the mismatch cross-check passes).
+_VALID_INSTRUMENT_PAYLOAD = {
+    "lotSizeFilter": {"qtyStep": "0.001", "minOrderQty": "0.001", "maxOrderQty": "100"},
+    "priceFilter": {"tickSize": "0.1"},
+}
+
+
+@pytest.fixture(autouse=True)
+def _default_instrument_info(request):
+    """Feature 0090: give every start()/_init_strategy test a valid exchange
+    tick so the fail-closed fetch does not abort them. Fetch-specific tests
+    exercise the real method via @pytest.mark.real_instrument_fetch.
+    """
+    if request.node.get_closest_marker("real_instrument_fetch"):
+        yield
+        return
+    info = InstrumentInfo.from_bybit_response("BTCUSDT", _VALID_INSTRUMENT_PAYLOAD)
+    with patch.object(Orchestrator, "_fetch_instrument_info", return_value=info):
+        yield
 
 
 @pytest.fixture
@@ -322,18 +343,19 @@ class TestOrchestratorMultipleStrategies:
     @pytest.fixture
     def multi_config(self, account_config):
         """Config with multiple strategies."""
+        # Feature 0090: tick_size is now sourced from the exchange (the autouse
+        # _default_instrument_info fixture supplies it), so it is omitted here —
+        # keeping ETHUSDT at 0.01 would trip the mismatch cross-check.
         strategies = [
             StrategyConfig(
                 strat_id="btcusdt_test",
                 account="test_account",
                 symbol="BTCUSDT",
-                tick_size=Decimal("0.1"),
             ),
             StrategyConfig(
                 strat_id="ethusdt_test",
                 account="test_account",
                 symbol="ETHUSDT",
-                tick_size=Decimal("0.01"),
             ),
         ]
         return GridbotConfig(
@@ -3575,8 +3597,9 @@ class TestOrchestratorAuthCooldown:
         assert retry_queue.size == 0
 
 
+@pytest.mark.real_instrument_fetch
 class TestFetchInstrumentInfo:
-    """Tests for _fetch_instrument_info."""
+    """Feature 0090: _fetch_instrument_info is fail-closed with retries."""
 
     @patch("gridbot.orchestrator.BybitRestClient")
     @patch("gridbot.orchestrator.PublicWebSocketClient")
@@ -3585,12 +3608,9 @@ class TestFetchInstrumentInfo:
         self, mock_private_ws, mock_public_ws, mock_rest_client,
         gridbot_config, account_config,
     ):
-        """Successful fetch returns InstrumentInfo."""
+        """Successful first attempt returns InstrumentInfo, no retry."""
         rest_client = mock_rest_client.return_value
-        rest_client.get_instruments_info.return_value = {
-            "lotSizeFilter": {"qtyStep": "0.001", "minOrderQty": "0.001", "maxOrderQty": "100"},
-            "priceFilter": {"tickSize": "0.1"},
-        }
+        rest_client.get_instruments_info.return_value = _VALID_INSTRUMENT_PAYLOAD
 
         orchestrator = Orchestrator(gridbot_config)
         orchestrator._init_account(account_config)
@@ -3601,42 +3621,187 @@ class TestFetchInstrumentInfo:
         assert info.tick_size == Decimal("0.1")
         rest_client.get_instruments_info.assert_called_once_with("BTCUSDT")
 
+    @patch("gridbot.orchestrator.time.sleep")
     @patch("gridbot.orchestrator.BybitRestClient")
     @patch("gridbot.orchestrator.PublicWebSocketClient")
     @patch("gridbot.orchestrator.PrivateWebSocketClient")
-    def test_fetch_api_error_returns_none(
-        self, mock_private_ws, mock_public_ws, mock_rest_client,
+    def test_fetch_api_error_all_retries_raises_and_alerts(
+        self, mock_private_ws, mock_public_ws, mock_rest_client, mock_sleep,
         gridbot_config, account_config,
     ):
-        """API exception returns None gracefully."""
+        """Persistent API exception exhausts retries → raise + one alert."""
+        from gridbot.orchestrator import StartupReconciliationError
+
+        notifier = Mock(spec=Notifier)
         rest_client = mock_rest_client.return_value
         rest_client.get_instruments_info.side_effect = Exception("API error")
 
-        orchestrator = Orchestrator(gridbot_config)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
         orchestrator._init_account(account_config)
 
-        info = orchestrator._fetch_instrument_info("BTCUSDT", "test_account")
-        assert info is None
+        with pytest.raises(StartupReconciliationError):
+            orchestrator._fetch_instrument_info("BTCUSDT", "test_account")
 
+        assert mock_sleep.call_count == 3  # backoffs 2.0, 5.0, 10.0
+        assert rest_client.get_instruments_info.call_count == 4
+        notifier.alert.assert_called_once()
+        assert (
+            notifier.alert.call_args.kwargs["error_key"]
+            == "instrument_fetch_BTCUSDT"
+        )
+
+    @patch("gridbot.orchestrator.time.sleep")
     @patch("gridbot.orchestrator.BybitRestClient")
     @patch("gridbot.orchestrator.PublicWebSocketClient")
     @patch("gridbot.orchestrator.PrivateWebSocketClient")
-    def test_fetch_invalid_params_returns_none(
-        self, mock_private_ws, mock_public_ws, mock_rest_client,
+    def test_fetch_invalid_params_all_retries_raises_and_alerts(
+        self, mock_private_ws, mock_public_ws, mock_rest_client, mock_sleep,
         gridbot_config, account_config,
     ):
-        """Zero qty_step in response returns None."""
+        """A None from_bybit_response (malformed payload) counts as a failed
+        attempt: every attempt None → raise + one alert (not a soft None)."""
+        from gridbot.orchestrator import StartupReconciliationError
+
+        notifier = Mock(spec=Notifier)
         rest_client = mock_rest_client.return_value
         rest_client.get_instruments_info.return_value = {
             "lotSizeFilter": {"qtyStep": "0", "minOrderQty": "0.001", "maxOrderQty": "100"},
             "priceFilter": {"tickSize": "0.1"},
         }
 
-        orchestrator = Orchestrator(gridbot_config)
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
+        orchestrator._init_account(account_config)
+
+        with pytest.raises(StartupReconciliationError):
+            orchestrator._fetch_instrument_info("BTCUSDT", "test_account")
+
+        assert mock_sleep.call_count == 3
+        assert rest_client.get_instruments_info.call_count == 4
+        notifier.alert.assert_called_once()
+
+    @patch("gridbot.orchestrator.time.sleep")
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_fetch_recovers_on_later_retry_no_alert(
+        self, mock_private_ws, mock_public_ws, mock_rest_client, mock_sleep,
+        gridbot_config, account_config,
+    ):
+        """A malformed payload then a valid one → recovery, no alert fires."""
+        notifier = Mock(spec=Notifier)
+        malformed = {
+            "lotSizeFilter": {"qtyStep": "0", "minOrderQty": "0.001", "maxOrderQty": "100"},
+            "priceFilter": {"tickSize": "0.1"},
+        }
+        rest_client = mock_rest_client.return_value
+        rest_client.get_instruments_info.side_effect = [
+            malformed, _VALID_INSTRUMENT_PAYLOAD,
+        ]
+
+        orchestrator = Orchestrator(gridbot_config, notifier=notifier)
         orchestrator._init_account(account_config)
 
         info = orchestrator._fetch_instrument_info("BTCUSDT", "test_account")
-        assert info is None
+        assert info is not None
+        assert info.tick_size == Decimal("0.1")
+        assert mock_sleep.call_count == 1  # one backoff before the good attempt
+        notifier.alert.assert_not_called()
+
+
+@pytest.mark.real_instrument_fetch
+class TestInitStrategyTickSource:
+    """Feature 0090: grid tick comes from the exchange; YAML is a cross-check."""
+
+    @staticmethod
+    def _payload(tick: str) -> dict:
+        return {
+            "lotSizeFilter": {
+                "qtyStep": "0.001", "minOrderQty": "0.001", "maxOrderQty": "100",
+            },
+            "priceFilter": {"tickSize": tick},
+        }
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_engine_gets_exchange_tick_when_yaml_matches(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """YAML tick present & equal → engine gets exchange tick."""
+        mock_rest_client.return_value.get_instruments_info.return_value = (
+            self._payload("0.1")
+        )
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+
+        engine = orchestrator._runners["btcusdt_test"].engine
+        assert engine.tick_size == Decimal("0.1")
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_engine_gets_exchange_tick_over_yaml(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """Exchange tick wins: engine uses instrument_info.tick_size, not YAML.
+
+        strategy_config has no YAML tick_size (cross-check skipped), exchange
+        returns 0.05 → engine gets 0.05, distinct from the fixture's 0.1.
+        """
+        strategy_config.tick_size = None
+        mock_rest_client.return_value.get_instruments_info.return_value = (
+            self._payload("0.05")
+        )
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+
+        engine = orchestrator._runners["btcusdt_test"].engine
+        assert engine.tick_size == Decimal("0.05")
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_yaml_none_uses_exchange_tick_silently(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """YAML tick absent → engine gets exchange tick, no error."""
+        strategy_config.tick_size = None
+        mock_rest_client.return_value.get_instruments_info.return_value = (
+            self._payload("0.1")
+        )
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+
+        engine = orchestrator._runners["btcusdt_test"].engine
+        assert engine.tick_size == Decimal("0.1")
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_yaml_mismatch_raises_before_runner(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        """YAML tick present & differs from exchange → raise, no runner built."""
+        from gridbot.orchestrator import StartupReconciliationError
+
+        # fixture YAML tick is 0.1; exchange returns 0.05 → mismatch.
+        mock_rest_client.return_value.get_instruments_info.return_value = (
+            self._payload("0.05")
+        )
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._init_account(account_config)
+
+        with pytest.raises(StartupReconciliationError):
+            orchestrator._init_strategy(strategy_config)
+
+        assert "btcusdt_test" not in orchestrator._runners
 
 
 class TestOrchestratorRunBackoff:

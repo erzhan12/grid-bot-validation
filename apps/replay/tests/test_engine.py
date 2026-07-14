@@ -521,7 +521,7 @@ class TestPositionTelemetryWriter0034:
         session = BacktestSession(initial_balance=Decimal("10000"))
         with pytest.raises(ValueError, match="has no account_id"):
             engine._init_runner(
-                strategy_config, session,
+                strategy_config, session, instrument_info=mock_info,
                 run_id="test-run-id", account_id=None,
             )
 
@@ -609,3 +609,119 @@ class TestPositionPairsSurviveSessionClose:
         assert pair.backtest.side == "Buy"
         assert pair.live.entry_price == Decimal("100000")
         assert pair.backtest.entry_price == Decimal("100000")
+
+
+def _real_info(tick: Decimal):
+    """A real InstrumentInfo (not a MagicMock) so grids can actually build."""
+    from gridcore import InstrumentInfo
+
+    return InstrumentInfo(
+        symbol="BTCUSDT",
+        qty_step=Decimal("0.001"),
+        tick_size=tick,
+        min_qty=Decimal("0.001"),
+        max_qty=Decimal("1000"),
+    )
+
+
+class TestTickSizeResolution:
+    """Feature 0090: replay sources tick_size from the exchange provider.
+
+    Policy = warn-and-use-YAML: exchange tick by default, YAML override
+    wins on mismatch (with a WARNING). require_live is dynamic: True only
+    when there is no YAML tick, so a fabricated default can never become
+    the grid tick.
+    """
+
+    def _run_capturing(self, engine, ticker_events):
+        """Run the engine, capturing the strategy_config + runner _init_runner uses.
+
+        Wraps the real _init_runner (so the run still builds a real grid)
+        while recording the resolved strategy_config it is handed and the
+        runner it returns.
+        """
+        captured = {}
+        real_init = ReplayEngine._init_runner
+
+        def wrapper(inner_self, strategy_config, *args, **kwargs):
+            captured["strategy_config"] = strategy_config
+            runner = real_init(inner_self, strategy_config, *args, **kwargs)
+            captured["runner"] = runner
+            return runner
+
+        with patch.object(ReplayEngine, "_init_runner", autospec=True,
+                          side_effect=wrapper):
+            engine.run(data_provider=InMemoryDataProvider(list(ticker_events)))
+        return captured
+
+    @patch("replay.engine.InstrumentInfoProvider")
+    def test_provider_tick_used_when_yaml_none(
+        self, mock_provider_cls, db, seeded_run_account, replay_config, ticker_events,
+    ):
+        """YAML tick_size None -> exchange tick feeds the engine; require_live=True."""
+        mock_get = mock_provider_cls.return_value.get
+        mock_get.return_value = _real_info(Decimal("0.5"))
+
+        config = replay_config.model_copy(
+            update={"strategy": replay_config.strategy.model_copy(
+                update={"tick_size": None})}
+        )
+        engine = ReplayEngine(config=config, db=db)
+        captured = self._run_capturing(engine, ticker_events)
+
+        # require_live=True (no YAML tick -> defaults must not masquerade).
+        assert mock_get.call_args.kwargs["require_live"] is True
+        assert captured["strategy_config"].tick_size == Decimal("0.5")
+
+    @patch("replay.engine.InstrumentInfoProvider")
+    def test_yaml_override_wins_with_warning_on_mismatch(
+        self, mock_provider_cls, db, seeded_run_account, replay_config,
+        ticker_events, caplog,
+    ):
+        """YAML tick set & differs -> WARNING + YAML value used; require_live=False."""
+        mock_get = mock_provider_cls.return_value.get
+        mock_get.return_value = _real_info(Decimal("0.01"))
+
+        # replay_config carries YAML tick_size 0.1 (differs from exchange 0.01).
+        engine = ReplayEngine(config=replay_config, db=db)
+        with caplog.at_level("WARNING"):
+            captured = self._run_capturing(engine, ticker_events)
+
+        assert mock_get.call_args.kwargs["require_live"] is False
+        assert captured["strategy_config"].tick_size == Decimal("0.1")
+        assert any(
+            "tick_size mismatch" in r.message and r.levelname == "WARNING"
+            for r in caplog.records
+        )
+
+    @patch("replay.engine.InstrumentInfoProvider")
+    def test_single_get_call_per_run(
+        self, mock_provider_cls, db, seeded_run_account, replay_config, ticker_events,
+    ):
+        """The provider is queried exactly once per run (tick + qty share it)."""
+        mock_get = mock_provider_cls.return_value.get
+        mock_get.return_value = _real_info(Decimal("0.1"))
+
+        engine = ReplayEngine(config=replay_config, db=db)
+        engine.run(data_provider=InMemoryDataProvider(ticker_events))
+
+        assert mock_get.call_count == 1
+
+    @patch("replay.engine.InstrumentInfoProvider")
+    def test_determinism_two_runs_identical_grid_levels(
+        self, mock_provider_cls, db, seeded_run_account, replay_config, ticker_events,
+    ):
+        """Warm-cache determinism (guards live_check 0088): identical grids."""
+        mock_provider_cls.return_value.get.return_value = _real_info(Decimal("0.1"))
+
+        def run_and_capture():
+            engine = ReplayEngine(config=replay_config, db=db)
+            captured = self._run_capturing(engine, ticker_events)
+            grid = captured["runner"].engine.grid.grid
+            return [(lvl["side"], lvl["price"]) for lvl in grid]
+
+        levels_a = run_and_capture()
+        levels_b = run_and_capture()
+
+        assert levels_a == levels_b
+        assert len(levels_a) > 0

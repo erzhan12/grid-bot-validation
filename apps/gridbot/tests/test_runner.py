@@ -1613,6 +1613,50 @@ class TestResolveQtyExtended:
         assert qty_zero_records[0].levelno == logging.DEBUG
 
 
+class TestGridEngineTickSource:
+    """Feature 0090: GridEngine tick resolution (exchange over YAML, fallback)."""
+
+    def test_engine_uses_instrument_info_tick_over_yaml(
+        self, strategy_config, mock_executor,
+    ):
+        """instrument_info present → engine gets its tick, not the YAML tick."""
+        # YAML tick is 0.1; exchange info carries 0.05 → exchange wins.
+        info = InstrumentInfo(
+            symbol="BTCUSDT",
+            qty_step=Decimal("0.001"),
+            tick_size=Decimal("0.05"),
+            min_qty=Decimal("0.001"),
+            max_qty=Decimal("1000"),
+        )
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=info,
+        )
+        assert runner.engine.tick_size == Decimal("0.05")
+
+    def test_engine_falls_back_to_yaml_tick_without_instrument_info(
+        self, strategy_config, mock_executor,
+    ):
+        """No instrument_info → engine falls back to the YAML tick (tests/tools)."""
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=None,
+        )
+        assert runner.engine.tick_size == Decimal("0.1")
+
+    def test_no_tick_source_raises(self, strategy_config, mock_executor):
+        """Both instrument_info and YAML tick None → ValueError (no tick source)."""
+        strategy_config.tick_size = None
+        with pytest.raises(ValueError, match="no tick_size source"):
+            StrategyRunner(
+                strategy_config=strategy_config,
+                executor=mock_executor,
+                instrument_info=None,
+            )
+
+
 class TestEarlyImbalanceMultiplier:
     """Tests for the early-imbalance qty multiplier (bbu2 ref: bybit_api_usdt.py:257-261).
 

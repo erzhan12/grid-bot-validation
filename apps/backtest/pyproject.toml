@@ -5,6 +5,7 @@ description = "Grid trading backtest system with trade-through fill model"
 requires-python = ">=3.11"
 dependencies = [
     "gridcore",
+    "bybit-adapter",
     "grid-db",
     "pyyaml>=6.0",
     "pydantic>=2.0",
@@ -14,6 +15,7 @@ dependencies = [
 
 [tool.uv.sources]
 gridcore = { workspace = true }
+bybit-adapter = { workspace = true }
 grid-db = { workspace = true }
 
 [build-system]

@@ -32,6 +32,7 @@ name = "backtest"
 version = "0.1.0"
 source = { editable = "apps/backtest" }
 dependencies = [
+    { name = "bybit-adapter" },
     { name = "grid-db" },
     { name = "gridcore" },
     { name = "pybit" },
@@ -42,6 +43,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "bybit-adapter", editable = "packages/bybit_adapter" },
     { name = "grid-db", editable = "shared/db" },
     { name = "gridcore", editable = "packages/gridcore" },
     { name = "pybit", specifier = ">=5.8" },

@@ -165,6 +165,14 @@ class TestStartupReconcileFailClosed:
         )
         notifier = Mock(spec=Notifier)
         orchestrator = Orchestrator(config, notifier=notifier)
+        # Feature 0090: instrument fetch (fail-closed) runs before reconcile; a
+        # valid payload lets startup reach the reconcile step under test.
+        mock_rest_client.return_value.get_instruments_info = Mock(return_value={
+            "lotSizeFilter": {
+                "qtyStep": "0.001", "minOrderQty": "0.001", "maxOrderQty": "100",
+            },
+            "priceFilter": {"tickSize": "0.1"},
+        })
         mock_rest_client.return_value.get_open_orders = Mock(
             side_effect=RuntimeError("REST timeout during startup reconcile")
         )

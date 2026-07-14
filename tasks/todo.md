@@ -1,18 +1,12 @@
-# Feature 0088 — live_check app
+# Feature 0090 — Source tick_size from exchange instead of hand-maintained YAML
 
-Plan: docs/features/0088_PLAN.md  |  Branch: feature/0088-live-check
+Plan: docs/features/0090_PLAN.md  |  Branch: feature/0090-exchange-tick-size
 
-- [x] Phase 1: apps/live_check pyproject + root pyproject registration + config.py + conf/live_check.yaml
-- [x] Phase 1B(a): grid_db read-only mode (settings.read_only, mode=ro URL rewrite, get_readonly_session) + tests
-- [x] Phase 1B(b): ReplayEngine disable-snapshot-emission flag + no-op writer + tests
-- [x] Phase 2A: runner.py (build_replay_config, run_strat)
-- [x] Phase 2B: ground_truth.py (sums, net unrealised, exec count, ticker freshness, run start)
-- [x] Phase 2C: verdict.py (Verdict dataclass, evaluate)
-- [x] Phase 2D: render.py (once, watch_line, per_fill, curve)
-- [x] Phase 3: main.py CLI (modes, window, guards, freshness, exit codes)
-- [x] Phase 4: full test suite green (2907 passed, 3 skipped; 75 new live_check tests)
-- [x] Lint clean (ruff)
-- [x] RULES.md live_check section
-- [x] ext-code-review (codex+cursor, 3 rounds): 5 accepted findings fixed — watch --last threading, per-fill rollup/prefix pairing, Makefile CI gate, strats min_length=1, extra tests; trail in docs/features/0088_REVIEW.md
+- [x] Task 1 / Phase 1: move InstrumentInfoProvider → bybit_adapter, require_live flag, backtest re-export + pyproject dep, gridcore from_bybit_response missing-key fix + tests
+- [x] Task 2 / Phase 2: gridbot — optional YAML tick_size, fail-closed _fetch_instrument_info w/ retries, mismatch cross-check (raise), runner tick resolution fallback + tests
+- [x] Task 3 / Phase 3: replay + backtest — optional YAML tick_size, provider-sourced tick w/ dynamic require_live, warn-and-use-YAML mismatch + tests
+- [x] Task 4: conf YAMLs mark tick_size deprecated; RULES.md updates (lines 175, 1115)
+- [x] Full suite green (post-fix: all packages 0 failures) + lint clean
+- [x] Final whole-branch review — READY TO MERGE (0 Critical/Important); 2 test-hygiene nits folded in
 
 ## Not committed — awaiting user review/approval before any commit.

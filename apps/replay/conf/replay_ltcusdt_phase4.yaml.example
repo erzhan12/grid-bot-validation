@@ -19,7 +19,7 @@ start_ts: "<paste $SEED_AT_TS>"
 end_ts:   "<paste $END_TS>"
 
 strategy:
-  tick_size: "0.1"
+  tick_size: "0.1"  # DEPRECATED (0090): optional what-if override — provider tick used when absent; mismatch warns, YAML wins
   grid_count: 20
   grid_step: 0.3
   amount: "x0.001"

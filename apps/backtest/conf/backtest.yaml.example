@@ -4,7 +4,7 @@
 strategies:
   - strat_id: "btcusdt_backtest"
     symbol: "BTCUSDT"
-    tick_size: "0.1"
+    tick_size: "0.1"  # DEPRECATED (0090): optional what-if override — provider tick used when absent; mismatch warns, YAML wins
     grid_count: 50
     grid_step: 0.2
     amount: "x0.001"  # 0.1% of wallet per order

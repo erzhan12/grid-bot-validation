@@ -25,7 +25,11 @@ class BacktestStrategyConfig(BaseModel):
 
     strat_id: str = Field(..., description="Unique strategy identifier")
     symbol: str = Field(..., description="Trading pair (e.g., BTCUSDT)")
-    tick_size: Decimal = Field(..., description="Price tick size for rounding")
+    tick_size: Optional[Decimal] = Field(
+        default=None,
+        description="Price tick size for rounding. None = source from exchange "
+        "(InstrumentInfoProvider); set = what-if override (wins on mismatch).",
+    )
 
     # Grid parameters
     grid_count: int = Field(default=50, ge=4, description="Total grid levels")
@@ -97,9 +101,16 @@ class BacktestStrategyConfig(BaseModel):
     @field_validator("tick_size", mode="before")
     @classmethod
     def parse_tick_size(cls, v):
-        """Convert string tick_size to Decimal."""
+        """Convert string/numeric tick_size to Decimal (None passes through).
+
+        Coerce int/float via ``Decimal(str(v))`` so an unquoted YAML override
+        (e.g. ``tick_size: 0.1``) does not become a float-artifact Decimal that
+        spuriously mismatches the exchange value.
+        """
         if isinstance(v, str):
             return Decimal(v)
+        if isinstance(v, (int, float)):
+            return Decimal(str(v))
         return v
 
     @model_validator(mode="before")

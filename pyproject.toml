@@ -27,6 +27,9 @@ pythonpath = ["packages/gridcore/src", "packages/bybit_adapter/src", "shared/db/
 testpaths = ["packages/gridcore/tests", "packages/bybit_adapter/tests", "shared/db/tests", "apps/event_saver/tests", "apps/gridbot/tests", "apps/backtest/tests", "apps/comparator/tests", "apps/recorder/tests", "apps/replay/tests", "apps/pnl_checker/tests", "apps/live_check/tests", "tests/integration"]
 asyncio_mode = "auto"
 addopts = ["--import-mode=importlib"]
+markers = [
+    "real_instrument_fetch: opt out of the default _fetch_instrument_info patch (feature 0090)",
+]
 
 [tool.ruff]
 # Lint all maintained code; skip intentionally-unmaintained trees (issue #181).

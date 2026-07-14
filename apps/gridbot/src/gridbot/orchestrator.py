@@ -58,16 +58,19 @@ _WS_RECONNECT_SLOW_THRESHOLD = 5.0  # log a warning if a single WS disconnect+co
 _MAX_TICK_BACKOFF = 30.0  # cap (s) on main-loop backoff after consecutive _tick() failures
 _UNKNOWN_ORDER_DEBOUNCE_SEC = 2.0  # min interval between WS-triggered fast-track order syncs
 _STARTUP_RECONCILE_BACKOFFS = (2.0, 5.0, 10.0)  # sleeps between startup reconcile attempts (0086)
+_INSTRUMENT_FETCH_BACKOFFS = (2.0, 5.0, 10.0)  # sleeps between instrument-info fetch attempts (0090)
 
 
 logger = logging.getLogger(__name__)
 
 
 class StartupReconciliationError(Exception):
-    """Raised when startup reconciliation fails after all retries.
+    """Raised when a fail-closed startup step fails after all retries.
 
-    Trading must not start on unconfirmed exchange order state (issue #206).
-    main.py catches startup exceptions and returns exit code 1.
+    Trading must not start on unconfirmed exchange order state (issue #206)
+    or an unresolved instrument tick_size (feature 0090) — a wrong tick
+    corrupts every grid level. main.py catches startup exceptions and
+    returns exit code 1.
     """
 
 
@@ -918,10 +921,30 @@ class Orchestrator:
         )
         self._retry_queues[strat_id] = retry_queue
 
-        # Fetch instrument info for qty rounding
+        # Feature 0090: fetch instrument info (fail-closed) — supplies the grid
+        # tick and qty-rounding params. Guaranteed non-None (raises on failure).
         instrument_info = self._fetch_instrument_info(
             strategy_config.symbol, account_name
         )
+
+        # Feature 0090: cross-check the DEPRECATED YAML tick_size against the
+        # exchange. If set and it differs, that is config drift (operator error)
+        # — abort fail-closed. If None, use the exchange value silently.
+        if (
+            strategy_config.tick_size is not None
+            and strategy_config.tick_size != instrument_info.tick_size
+        ):
+            logger.error(
+                "%s: YAML tick_size %s != exchange tick_size %s for %s "
+                "(config drift). Remove the deprecated YAML tick_size or fix it.",
+                strat_id, strategy_config.tick_size, instrument_info.tick_size,
+                strategy_config.symbol,
+            )
+            raise StartupReconciliationError(
+                f"{strat_id}: YAML tick_size {strategy_config.tick_size} != "
+                f"exchange tick_size {instrument_info.tick_size} for "
+                f"{strategy_config.symbol}"
+            )
 
         # Feature 0066 Phase 4: inject the NON-BLOCKING peek_wallet_snapshot
         # reader as the preflight's real-time free-margin source. Skipped (None)
@@ -1157,39 +1180,76 @@ class Orchestrator:
 
     def _fetch_instrument_info(
         self, symbol: str, account_name: str
-    ) -> Optional[InstrumentInfo]:
-        """Fetch instrument info from Bybit API for qty rounding.
+    ) -> InstrumentInfo:
+        """Fetch instrument info from Bybit, fail-closed with retries.
 
-        Uses the account's REST client public endpoint. Returns None if
-        fetch fails (qty rounding will be skipped). pybit's HTTP() already
-        caps the request at `rest_fetch_timeout` seconds.
+        Feature 0090: the grid tick now comes from the exchange, so a wrong or
+        missing tick corrupts every grid level — this must never fall back to
+        defaults. Mirrors the _reconcile_startup_with_retry pattern (0086): one
+        initial attempt plus one retry per _INSTRUMENT_FETCH_BACKOFFS entry.
+        Both failure modes count as a failed attempt: the REST call raising, and
+        from_bybit_response returning None (invalid/missing params — a malformed
+        payload can be a transient API glitch). On exhaustion, alert and raise
+        StartupReconciliationError so start() aborts before any order is placed.
+        Runs during _init_strategy at startup (main loop not running, WS not
+        connected), so blocking sleeps are safe.
 
         Args:
             symbol: Trading pair (e.g., "BTCUSDT").
             account_name: Account name (for REST client access).
 
         Returns:
-            InstrumentInfo or None if fetch fails.
-        """
-        try:
-            rest_client = self._rest_clients[account_name]
-            raw = rest_client.get_instruments_info(symbol)
-            info = InstrumentInfo.from_bybit_response(symbol, raw)
-            if info is None:
-                logger.warning(
-                    f"Invalid instrument params from API for {symbol}, "
-                    f"will use defaults"
-                )
-                return None
-            logger.info(
-                f"Fetched instrument info for {symbol}: "
-                f"qty_step={info.qty_step}, tick_size={info.tick_size}"
-            )
-            return info
+            A valid InstrumentInfo.
 
-        except Exception as e:
-            logger.warning(f"Failed to fetch instrument info for {symbol}: {e}")
-            return None
+        Raises:
+            StartupReconciliationError: all fetch attempts failed.
+        """
+        rest_client = self._rest_clients[account_name]
+        attempts = 1 + len(_INSTRUMENT_FETCH_BACKOFFS)
+        last_error = ""
+        for attempt in range(1, attempts + 1):
+            try:
+                raw = rest_client.get_instruments_info(symbol)
+                info = InstrumentInfo.from_bybit_response(symbol, raw)
+                if info is not None:
+                    if attempt > 1:
+                        logger.warning(
+                            "%s: Instrument info fetch recovered on attempt %d/%d",
+                            symbol, attempt, attempts,
+                        )
+                    logger.info(
+                        f"Fetched instrument info for {symbol}: "
+                        f"qty_step={info.qty_step}, tick_size={info.tick_size}"
+                    )
+                    return info
+                last_error = "invalid/missing instrument params"
+            except Exception as e:
+                last_error = str(e)
+                if attempt >= attempts:
+                    logger.error(
+                        "%s: Instrument info fetch attempt %d/%d failed: %s",
+                        symbol, attempt, attempts, e, exc_info=True,
+                    )
+
+            if attempt < attempts:
+                backoff = _INSTRUMENT_FETCH_BACKOFFS[attempt - 1]
+                logger.warning(
+                    "%s: Instrument info fetch attempt %d/%d failed (%s), "
+                    "retrying in %.0fs",
+                    symbol, attempt, attempts, last_error, backoff,
+                )
+                time.sleep(backoff)
+
+        self._notifier.alert(
+            f"Gridbot: instrument info fetch failed for {symbol} after "
+            f"{attempts} attempts - {last_error}. Aborting startup, "
+            f"no orders placed.",
+            error_key=f"instrument_fetch_{symbol}",
+        )
+        raise StartupReconciliationError(
+            f"{symbol}: instrument info fetch failed after "
+            f"{attempts} attempts: {last_error}"
+        )
 
     def _health_check_once(self) -> None:
         """Single-shot WebSocket health check + auth-cooldown expiry sweep.

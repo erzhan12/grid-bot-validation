@@ -27,7 +27,11 @@ def _parse_decimal(v):
 class ReplayStrategyConfig(BaseModel):
     """Grid strategy configuration for replay simulation."""
 
-    tick_size: Decimal = Field(..., description="Price tick size for rounding")
+    tick_size: Optional[Decimal] = Field(
+        default=None,
+        description="Price tick size for rounding. None = source from exchange "
+        "(InstrumentInfoProvider); set = what-if override (wins on mismatch).",
+    )
 
     # Feature 0080 (issue #183): the deterministic client_order_id is namespaced
     # by strat_id. To match orders recorded by the LIVE strategy, replay must salt

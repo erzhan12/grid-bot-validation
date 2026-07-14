@@ -227,7 +227,10 @@ class StrategyRunner:
                 ``orchestrator.py:1156-1162`` computes from the account name.
                 Used by the DB grid-state writer (feature 0047) so snapshots
                 FK-match ``runs.account_id``.
-            instrument_info: Instrument info for qty rounding (None uses no rounding).
+            instrument_info: Exchange instrument params. Primary source of the
+                grid engine's tick_size (0090) and qty rounding. When None, the
+                engine falls back to ``strategy_config.tick_size`` and applies no
+                qty rounding — a bare-runner path for tests/tools, not live.
             state_store: Optional grid state store for persistence.
             grid_state_writer: Optional DB writer for ``grid_state_snapshots``
                 (feature 0047). When provided, ``_on_grid_change`` writes a
@@ -440,9 +443,23 @@ class StrategyRunner:
             grid_count=strategy_config.grid_count,
             grid_step=strategy_config.grid_step,
         )
+        # Feature 0090: grid tick comes from the exchange InstrumentInfo (the
+        # orchestrator's fail-closed fetch guarantees a valid one before the
+        # live runner is built). The YAML tick_size branch is only for tests/
+        # tools that construct a bare runner without instrument_info — it is NOT
+        # a live fallback.
+        if self._instrument_info is not None:
+            tick_size = self._instrument_info.tick_size
+        elif strategy_config.tick_size is not None:
+            tick_size = strategy_config.tick_size
+        else:
+            raise ValueError(
+                f"{strategy_config.strat_id}: no tick_size source "
+                "(instrument_info and strategy_config.tick_size are both None)"
+            )
         self._engine = GridEngine(
             symbol=strategy_config.symbol,
-            tick_size=strategy_config.tick_size,
+            tick_size=tick_size,
             config=grid_config,
             strat_id=strategy_config.strat_id,
             restored_grid=restored_grid,

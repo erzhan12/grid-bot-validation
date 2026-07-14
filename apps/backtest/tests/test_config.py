@@ -43,6 +43,29 @@ class TestBacktestStrategyConfig:
 
         assert config.tick_size == Decimal("0.01")
 
+    def test_tick_size_optional_defaults_none(self):
+        """Feature 0090: tick_size may be omitted (sourced from exchange)."""
+        config = BacktestStrategyConfig(strat_id="test", symbol="BTCUSDT")
+
+        assert config.tick_size is None
+
+    def test_tick_size_from_float_coerces_without_artifact(self):
+        """Unquoted YAML float coerces via Decimal(str(v)), no float artifact."""
+        config = BacktestStrategyConfig(
+            strat_id="test", symbol="BTCUSDT", tick_size=0.1,
+        )
+
+        assert config.tick_size == Decimal("0.1")
+        assert str(config.tick_size) == "0.1"
+
+    def test_tick_size_from_int_coerces_to_decimal(self):
+        """Unquoted YAML int coerces to Decimal."""
+        config = BacktestStrategyConfig(
+            strat_id="test", symbol="BTCUSDT", tick_size=1,
+        )
+
+        assert config.tick_size == Decimal("1")
+
     def test_commission_rate_from_string(self):
         """commission_rate can be provided as string."""
         config = BacktestStrategyConfig(

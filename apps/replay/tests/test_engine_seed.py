@@ -291,6 +291,7 @@ class TestReplayEngineSeedingPipeline:
         runner = engine._init_runner(
             strategy_config,
             session,
+            instrument_info=mock_instrument,
             long_seed=long_seed,
             short_seed=short_seed,
             grid_seed=grid_seed,
@@ -369,7 +370,9 @@ class TestReplayEngineSeedingPipeline:
             leverage=config.strategy.leverage,
         )
         session = BacktestSession(initial_balance=Decimal("10000"))
-        runner = engine._init_runner(strategy_config, session)
+        runner = engine._init_runner(
+            strategy_config, session, instrument_info=mock_instrument
+        )
 
         for position in (runner._long_position, runner._short_position):
             assert position is not None

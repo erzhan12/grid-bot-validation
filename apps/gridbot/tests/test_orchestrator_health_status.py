@@ -10,6 +10,9 @@ from datetime import datetime, UTC, timedelta
 from decimal import Decimal
 from unittest.mock import patch
 
+import pytest
+
+from gridcore import InstrumentInfo
 from gridbot.config import (
     AccountConfig,
     GridbotConfig,
@@ -17,6 +20,21 @@ from gridbot.config import (
     StrategyConfig,
 )
 from gridbot.orchestrator import Orchestrator
+
+
+@pytest.fixture(autouse=True)
+def _default_instrument_info():
+    """Feature 0090: supply a valid exchange tick (0.1, matching _config) so the
+    fail-closed instrument fetch does not abort these health-status tests."""
+    info = InstrumentInfo(
+        symbol="BTCUSDT",
+        qty_step=Decimal("0.001"),
+        tick_size=Decimal("0.1"),
+        min_qty=Decimal("0.001"),
+        max_qty=Decimal("1000"),
+    )
+    with patch.object(Orchestrator, "_fetch_instrument_info", return_value=info):
+        yield
 
 
 def _config(tmp_path, shadow=False):

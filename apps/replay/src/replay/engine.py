@@ -43,7 +43,11 @@ from backtest.fill_simulator import (
     RecordedExecution,
     TradeThroughFillSimulator,
 )
-from backtest.instrument_info import InstrumentInfoProvider
+from backtest.instrument_info import (
+    InstrumentInfo,
+    InstrumentInfoProvider,
+    resolve_tick_size,
+)
 from backtest.order_manager import BacktestOrderManager
 from backtest.position_tracker import BacktestPositionTracker
 from backtest.runner import BacktestRunner
@@ -383,10 +387,22 @@ class ReplayEngine:
             strat_id = config.seed.strat_id
         else:
             strat_id = f"replay_{config.symbol.lower()}"
+
+        # Feature 0090: tick_size is an exchange property. Fetch InstrumentInfo
+        # once here (reused for qty wiring in _init_runner) and resolve the
+        # grid tick: exchange value by default, YAML override wins on mismatch
+        # (with a WARNING). require_live is True only when there is no YAML tick,
+        # so a fabricated no-cache-no-network default can never become the tick.
+        yaml_tick = config.strategy.tick_size
+        instrument_info = self._instrument_provider.get(
+            config.symbol, require_live=yaml_tick is None
+        )
+        resolved_tick = resolve_tick_size(yaml_tick, instrument_info.tick_size)
+
         strategy_config = BacktestStrategyConfig(
             strat_id=strat_id,
             symbol=config.symbol,
-            tick_size=config.strategy.tick_size,
+            tick_size=resolved_tick,
             grid_count=config.strategy.grid_count,
             grid_step=config.strategy.grid_step,
             amount=config.strategy.amount,
@@ -496,6 +512,7 @@ class ReplayEngine:
         runner = self._init_runner(
             strategy_config,
             session,
+            instrument_info=instrument_info,
             long_seed=long_seed,
             short_seed=short_seed,
             grid_seed=grid_seed,
@@ -832,6 +849,7 @@ class ReplayEngine:
         self,
         strategy_config: BacktestStrategyConfig,
         session: BacktestSession,
+        instrument_info: InstrumentInfo,
         long_seed: Optional[PositionStateSeed] = None,
         short_seed: Optional[PositionStateSeed] = None,
         grid_seed: Optional[GridStateSeed] = None,
@@ -849,6 +867,9 @@ class ReplayEngine:
             session: Pre-constructed ``BacktestSession`` — when 0042 wallet
                 seed data is present, its ``initial_balance`` is account-level
                 UTA ``total_available_balance``.
+            instrument_info: Exchange ``InstrumentInfo`` fetched once in
+                ``run()`` (feature 0090). Reused here for qty wiring and the
+                runner — no second provider ``.get()`` call.
             long_seed: Optional long-direction position seed; when present
                 AND non-zero, ``BacktestPositionTracker.seed_state`` is
                 called before the runner gets the tracker. Skipping the
@@ -873,7 +894,6 @@ class ReplayEngine:
                 unconditionally below; in event_follower mode it is never
                 consulted because ``process_fills`` skips ``check_fills``.
         """
-        instrument_info = self._instrument_provider.get(strategy_config.symbol)
         logger.info(
             f"Instrument {strategy_config.symbol}: "
             f"qty_step={instrument_info.qty_step}, tick_size={instrument_info.tick_size}"
