@@ -1,5 +1,37 @@
 # Project Rules and Guidelines
 
+## Table of Contents
+Maintenance: when adding a `##` section, add it here; every ~10 features, sweep the file and prune entries that no longer apply.
+
+- Project Overview
+- Constraints (do not)
+- Package Management with uv
+- Running Tests
+- Continuous Integration (`.github/workflows/ci.yml`)
+- Development Workflow
+- gridcore — Pure Strategy Engine
+- Logging Configuration
+- Private WS disconnect handling (event_saver / recorder)
+- Testing
+- PnL Calculation Functions (`packages/gridcore/src/gridcore/pnl.py`) — Added 2026-02-24
+- grid_db — Multi-Tenant Database Layer
+- bybit_adapter — Exchange Interface
+- event_saver — Data Capture
+- gridbot — Live Trading Bot
+- backtest — Backtest Engine
+- comparator — Backtest vs Live Validation
+- recorder — Standalone Data Recorder
+- replay — Replay Engine
+- pnl_checker — Live PnL Validation
+- live_check — Replay-vs-Live Reconciliation (feature 0088)
+- Margin Ratio vs Bybit positionIM — Critical Distinction
+- Common Pitfalls (Cross-Cutting)
+- Dynamic Risk Limit Tiers
+- Reference Code
+- Docs
+- Risk Limit Cache Format Evolution
+- Next Steps (Future Phases)
+
 ## Project Overview
 
 Grid trading bot system with pure strategy engine (gridcore), exchange adapter (bybit_adapter), database layer (grid_db), data capture (event_saver), live bot (gridbot), backtest engine, comparator, recorder, replay engine, and PnL checker.
