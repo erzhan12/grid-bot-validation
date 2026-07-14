@@ -5,8 +5,13 @@
 # max_margin mirrors live and IS passed through to RiskConfig but is not
 # consumed by gridcore's risk-mgmt branches (does not affect reconcile).
 
-database_url: "sqlite:///recorder_ltcusdt_phase4.db"
-run_id: "580ca395"
+# Paths are relative to the project root (run via `make live-check` or
+# `uv run live-check` from the repo root); the recorder DB lives under data/.
+database_url: "sqlite:///data/recorder_ltcusdt_phase4.db"
+# null → auto-discover the latest recording run (survives recorder restarts,
+# which mint a fresh run_id each time). Pin a full 36-char UUID or pass
+# --run-id only to reconcile a specific historical run.
+run_id: null
 
 last: "4h"
 lag: "2m"
