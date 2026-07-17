@@ -1,0 +1,346 @@
+# Feature 0087 — Engine cancels same-price duplicate grid orders
+
+## Context
+
+`GridEngine._place_grid_orders` indexes resting limit orders in a
+**price-keyed dict** (`packages/gridcore/src/gridcore/engine.py:359`):
+
+```python
+limit_prices = {float(limit['price']): limit for limit in sorted_limits}
+```
+
+Two live orders at the same price collapse to a single dict entry — the
+later one wins, the earlier is shadowed and becomes invisible to the
+engine. None of the existing cancel branches fire for the shadow:
+`side_mismatch` doesn't (side is correct), `outside_grid` doesn't (price
+is on-grid), and the over-limit `rebuild` branch's threshold
+(`len(limits) > len(self.grid.grid) + 10`, engine.py:305) is far away.
+The shadowed duplicate rests until filled → **2x size at that grid
+level, invisible to risk logic** in the pre-fill window.
+
+This is **fix 2 of the issue #206 analysis** (fixes 1+3 shipped as
+feature 0086, PR #219). Severity **P3, defense-in-depth**: the main entry
+(dirty startup after failed reconciliation) is closed by 0086's
+fail-closed startup, and the 0080 migration-retry entry was point-fixed
+in commit `5a358d6`. Feature 0031/0046 `same_order_error` bounds damage
+*after* both duplicates fill. What remains uncovered is the pre-fill
+double exposure and the collateral of 0031 latching (whole-strategy
+placement freeze once the duplicates fill). This fix makes any
+two-orders-one-price state **self-heal within one ticker**.
+
+gridcore is pure logic, zero external deps, `Decimal` for price/qty
+(never `float`), 80% coverage gate.
+
+## Files changed
+
+### `packages/gridcore/src/gridcore/engine.py`
+
+`_place_grid_orders` (lines 340–394) — the core change.
+
+Replace the price → single-order dict (line 359) with a price → **list of
+orders** mapping, keep exactly one working order (the survivor) per price,
+and emit a `CancelIntent(reason='duplicate')` for every non-survivor.
+
+**Single-algorithm design (one owner for survivor identity, one
+CancelIntent per order).** The two mechanisms in the previous draft (an
+in-loop survivor selection inside the grid loop AND a separate pass over
+`limits_by_price`) could double-schedule an order — the grid loop might
+`side_mismatch`-cancel an order the separate pass keeps, or two passes
+could each emit a cancel for the same orderId. Collapse to **one** ordered
+algorithm so each order gets **at most one** CancelIntent and survivor
+identity has a single owner:
+
+1. **Build buckets.** Group `sorted_limits` into
+   `limits_by_price: dict[float, list[dict]]`, keyed by
+   `round(float(limit['price']), 8)` — the **same** rounding used by the
+   `grid_price_set` / `outside_grid` test at engine.py:387–390. Using the
+   raw `float(price)` would define price-equality differently from the rest
+   of the function, so two "same price" orders differing below 8 decimals
+   (or float-vs-Decimal-string round skew) could split into two singletons
+   and slip the len>1 test. `sorted_limits` is already price-sorted, so
+   order within a bucket is stable/deterministic.
+
+2. **Pick one survivor per bucket, up front (before the grid loop).** For
+   each bucket, choose exactly one survivor and collect all non-survivors
+   into a duplicate-cancel list:
+   - Survivor rule: `_select_survivor(bucket, grid_side)`. Preference
+     order: (1) an order whose `side` matches the grid level's side at that
+     price, when the bucket's price is an active (non-WAIT) grid level —
+     pass `grid_side=None` for WAIT/off-grid buckets, where no side
+     preference applies; (2) within the side-preferred candidates, an order
+     with fill history (`_has_fill_history`); (3) deterministic tie-break:
+     **first in the already price-sorted list**. Side comes BEFORE fill
+     history: a wrong-side order is cancelled by the existing
+     `side_mismatch` branch regardless of fill state, so keeping a filled
+     wrong-side order as survivor self-defeats — it takes the
+     `side_mismatch` cancel + replace anyway while the correct-side
+     duplicate was already `duplicate`-cancelled, churning the whole level.
+     Consequence for the issue's partial-fill acceptance criterion: the
+     "order with fill history is never cancelled" guarantee holds **within
+     same-side comparisons** only; a wrong-side order (filled or not) is
+     cancelled either way under existing engine semantics — this fix does
+     not change that. Without preference (1) at all, a mixed-side bucket
+     could keep a wrong-side order and `duplicate`-cancel the correct-side
+     one (lost queue position, transient gap). Mixed-side same-price
+     buckets are exotic (known duplicate entries are same-side pairs) but
+     this feature exists precisely for unknown entry states.
+   - **`grid_side` resolution uses the same round-8 keying.** Build the
+     price → side map from `self.grid.grid` keyed by
+     `round(grid_item['price'], 8)` and look up with the bucket's (already
+     rounded) key. Raw-price equality against the rounded bucket key would
+     silently miss whenever `round(p, 8) != p` (grid.py:93 formats to 10
+     decimals), setting `grid_side=None` and disabling the side preference
+     exactly where it should apply.
+   - **Honest scope of the fill-history guard (F-1-1).** On the live tick
+     path the guard is a **no-op**: `_place_grid_orders` is called only
+     from `_check_and_place` (call site engine.py:318; the ticker path
+     reaches `_check_and_place` via engine.py:191–192), where `limits`
+     come from `StrategyRunner.get_limit_orders()`
+     (runner.py:688–716), which emits only
+     `{orderId, orderLinkId, price, qty, side, reduceOnly}` — **no
+     `cumExecQty`**. So `_has_fill_history` returns `False` for every live
+     order and the survivor always falls to the first-in-list tie-break.
+     The exchange-shaped dict that carries `cumExecQty` (from
+     `reconcile_reconnect`) is consumed by the reconciler/`inject_open_orders`,
+     never passed to `_place_grid_orders`. **Decision: accept first-in-list
+     as the live survivor rule.** This is tolerable because (a) the
+     *filled* case is already bounded by the 0031/0046 post-fill
+     `same_order_error` layer — this feature only closes the *pre-fill*
+     double-exposure window, and (b) among two same-price same-side resting
+     orders that have NOT filled, either is an equally valid survivor; the
+     replacement placed for the cancelled one (if the grid still wants that
+     level) restores the intended single order. The `_has_fill_history`
+     guard is kept as **defence for the exchange-shaped path only** (any
+     future caller that does pass `cumExecQty`), not presented as a live
+     safety guarantee. Threading `cumExecQty` through `get_limit_orders`/
+     `TrackedOrder` is explicitly **out of scope** (see Out of scope).
+   - Emit `CancelIntent(reason='duplicate')` for every non-survivor via
+     `self._cancel_limit(extra, 'duplicate')`. Note: the single-CancelIntent
+     guarantee is enforced **structurally** by step 3's re-sourcing (later
+     branches simply never see non-survivors) — no `cancelled_ids`
+     bookkeeping set is needed in the implementation; the "no orderId in
+     two CancelIntents" property is asserted in tests instead.
+
+3. **Rebuild BOTH survivor-derived structures.** Two structures currently
+   read the raw limit set and MUST be re-sourced from survivors, or a
+   non-survivor slips a second CancelIntent:
+   - **The O(1) grid-loop lookup.** Replace line 359's `limit_prices` with a
+     survivor-only map:
+     `limit_prices = {price: survivor for price, survivor in survivors.items()}`
+     (keyed by the rounded price from step 1). The grid loop (line 368) then
+     sees only survivors — a non-survivor is never evaluated by the
+     `side_mismatch`/place logic, so it can never receive a second
+     (side_mismatch) CancelIntent on top of its `duplicate` one.
+     **The lookup side MUST round too:** line 370's
+     `limit_prices.get(grid_item['price'])` currently uses the raw grid
+     price, and grid prices are formatted to 10 decimals
+     (`float(f'{rounded:.10f}')`, grid.py:93) — so a grid price can carry
+     precision beyond 8 decimals. Keying the map by `round(price, 8)` while
+     looking up with the raw price breaks the invariant whenever
+     `round(p, 8) != p`: the lookup misses, the engine emits a spurious
+     `PlaceLimitIntent` while the survivor still rests — creating exactly
+     the duplicate this feature removes. Change the lookup to
+     `limit_prices.get(round(grid_item['price'], 8))` so key and lookup use
+     the same 8-decimal price-equality definition.
+     Assumption (documented, not guarded): no two DISTINCT grid levels
+     share one round-8 key. Grid prices are tick-size multiples
+     (grid.py:93), so distinct levels differ by ≥ tick_size; collision
+     requires tick_size < 1e-8, which no traded symbol has — and the
+     pre-existing round-8 `grid_price_set` convention (engine.py:387)
+     already assumes the same.
+   - **The `outside_grid` sweep source (engine.py:388–389).** This
+     comprehension iterates `sorted_limits` **directly**, NOT `limit_prices`,
+     so rebuilding `limit_prices` alone does NOT protect it. Change its
+     iteration source from `sorted_limits` to the survivor list. Concrete
+     edit — replace:
+
+     ```python
+     outside_limits = [
+         limit for limit in sorted_limits
+         if round(float(limit['price']), 8) not in grid_price_set
+     ]
+     ```
+
+     with iteration over the survivors (e.g. `for limit in survivors.values()`,
+     which are already the rounded-price → survivor entries from step 2). If
+     the sweep is left reading `sorted_limits`, a non-survivor whose price is
+     ALSO off-grid receives BOTH a `duplicate` CancelIntent (step 2) and an
+     `outside_grid` CancelIntent (line 392) — a double-cancel for one
+     orderId, violating the at-most-one-CancelIntent guarantee. (This is not
+     a WAIT-only edge: any duplicate bucket at an off-grid price is affected.)
+
+4. **Run the existing grid loop + outside_grid sweep against survivors
+   only.** With both structures in step 3 re-sourced from survivors, the
+   `side_mismatch` / place-if-missing loop and the `outside_grid` sweep are
+   otherwise unchanged; they operate on the survivor set. This guarantees
+   exactly one CancelIntent per order: `duplicate` for non-survivors, or
+   (mutually exclusive) at most one of `side_mismatch` / `outside_grid` for a
+   survivor.
+
+5. **Single-order-per-price case (overwhelmingly common path).** A bucket
+   of length 1 has that lone order as survivor, no duplicate cancel, and
+   identical output to today.
+
+Interaction notes:
+- **WAIT-level duplicates self-heal via the up-front survivor pass, not a
+  second independent pass (F-1-2/F-1-3).** A duplicate at a WAIT-level
+  price survives both existing branches (WAIT is filtered out of
+  `sorted_grids` at engine.py:363 so the grid loop never visits it; its
+  price IS in `grid_price_set` because WAIT levels are in `self.grid.grid`,
+  so `outside_grid` won't cancel it either). Because the survivor pass in
+  step 2 runs over **every** bucket (independent of which grid levels the
+  loop visits), a WAIT-level bucket with len>1 still collapses to one
+  survivor and emits `duplicate` cancels for the rest. Keying buckets by
+  `round(float(price), 8)` (step 1) keeps this consistent with the
+  `grid_price_set` membership test, so near-equal duplicates are grouped
+  the same way the rest of the function defines "same price".
+- The `outside_grid` sweep (lines 387–392) now iterates the survivor set
+  (per step 3, its comprehension source is changed from `sorted_limits` to
+  `survivors.values()`) — an off-grid survivor is still caught there as
+  before, and a non-survivor is no longer visible to the sweep, so it cannot
+  collect an `outside_grid` cancel on top of its `duplicate` one.
+
+`_has_fill_history(limit: dict) -> bool` — new private helper. Reads
+`limit.get('cumExecQty')`, returns `True` when it parses to a nonzero
+`Decimal`, `False` when absent/zero/unparseable. Pure, no float math on
+the parsed value. On the live tick path this always returns `False` (key
+absent); it is functional only for exchange-shaped dicts.
+
+`_select_survivor(bucket: list[dict], grid_side) -> dict` — new private
+helper. Candidate pool: orders whose `side` matches `grid_side` when
+`grid_side` is not `None` and at least one matches; otherwise the whole
+bucket. Within the pool: first order with `_has_fill_history(...) == True`,
+else the pool's first entry (deterministic first-in-list). Pure.
+
+### `RULES.md`
+
+Lines ~923–926 document same-price duplicates as never cancelled
+(pre-fix behavior). Update to state the engine now self-heals them within
+one ticker via the survivor pass (`CancelIntent(reason='duplicate')`),
+complementing the reactive 0031/0046 post-fill layer.
+
+### `packages/gridcore/src/gridcore/intents.py`
+
+`CancelIntent` (lines 153–166) — extend the `reason` field's inline
+enumeration comment (line 162) to include `'duplicate'`. No structural
+change; `reason` is already a free-form `str`.
+
+## Tests
+
+### `apps/gridbot/tests/test_issue_206_startup_reconcile_race.py`
+
+`TestStartupReconcileRaceDuplicates.test_race_places_duplicates_and_sync_cannot_heal_them`
+currently ASSERTS the buggy behavior with `# BUG:` comments (lines
+258–273). Invert to assert the fix:
+
+- Rename the test to reflect healed behavior (e.g.
+  `test_race_places_duplicates_and_engine_heals_them`) and update the
+  class/method docstrings (the module docstring at lines 17–26 and the
+  STEP4 comment block at 249–251 describe the gap as permanent — update to
+  note it now self-heals).
+- Lines 258–260: assert the shadowed legacy duplicates ARE cancelled —
+  `"legacy-buy" in cancelled_ids` and `"legacy-sell" in cancelled_ids`.
+  (Why the *legacy* ids lose: the bot's own orders enter the tracked set
+  before `inject_open_orders` adds the legacy ones, and Python's stable
+  sort preserves insertion order among equal prices, so first-in-list
+  survivor = the bot's order. If tracked-order iteration order ever
+  changes, which id is cancelled flips — assert "one of the pair is
+  cancelled, one survives" if that coupling becomes a problem.)
+- Verify the emitted cancels carry `reason == 'duplicate'` (inspect
+  `recording_executor.cancelled_intents` — each is a `CancelIntent`).
+- Lines 267–273: assert exactly **one** live order remains per formerly
+  duplicated price (`len(at_price) == 1`), i.e. the pair collapsed to a
+  single survivor — AND that the survivor is the non-legacy twin (the
+  bot's own `new-*` order is still live), AND that the healing tick
+  emitted **no new `PlaceLimitIntent` at the duplicated prices**. Without
+  these, an implementation that `duplicate`-cancels EVERY bucket member
+  and then re-places at the level would still pass the cancelled-ids /
+  reason / len==1 checks while churning the whole level. Test mechanics:
+  the recording executor's `placed_intents` list is append-only and still
+  holds the STEP2 grid placements — snapshot `len(placed_intents)` (or
+  clear the list) right before the STEP4 tick, mirroring the existing
+  `cancelled_intents.clear()` at line 252, and assert only the
+  STEP4-emitted slice; otherwise the no-place assertion false-fails on
+  STEP2 leftovers.
+- Keep the STEP1–STEP3 setup (startup fail → fresh grid → sync injects
+  legacy) untouched; only STEP4's post-tick assertions flip.
+
+### `packages/gridcore/tests/` — engine unit tests
+
+Add focused gridcore-level tests (hermetic, no runner) for
+`_place_grid_orders` duplicate handling, so the 80% gate covers the new
+branch directly:
+
+- Two orders at one on-grid price, both correct side, neither with fill
+  history ⇒ one `CancelIntent(reason='duplicate')`, one survivor, and
+  **no `PlaceLimitIntent` at that price** — the survivor must satisfy the
+  grid level. Without this assertion, a lookup/rounding bug (survivor map
+  keyed rounded, lookup raw) would cancel the duplicate AND re-place at the
+  level — recreating the double exposure — while still passing the
+  cancel-count and single-CancelIntent checks.
+- Mixed-side duplicate at an on-grid price (one order matches the grid
+  level's side, one doesn't) ⇒ the **matching-side** order survives, the
+  mismatched one gets the `duplicate` cancel, and no `side_mismatch`
+  cancel/replace churn is emitted for the level.
+- **Precedence lock (side beats fill history):** mixed-side duplicate
+  where the WRONG-side order has `cumExecQty > 0` ⇒ the correct-side
+  fill-free order still survives; the filled wrong-side order gets the
+  `duplicate` cancel (it would have been `side_mismatch`-cancelled anyway),
+  and no `side_mismatch`/place churn is emitted.
+- **Bucket of ≥3 orders at one price** ⇒ exactly one survivor,
+  `len(bucket) - 1` `duplicate` cancels, no orderId in two CancelIntents.
+- **All-wrong-side duplicate** (both orders' side mismatches the grid
+  level): survivor selection falls back to the whole-bucket pool (no
+  side-match candidate) ⇒ one `duplicate` cancel for the non-survivor,
+  and the survivor still takes the existing `side_mismatch` cancel +
+  replacement in the grid loop (engine.py:372–379) — the level is
+  restored with a correct-side order, not left collapsed to one
+  wrong-side resting order. Still one CancelIntent per order (`duplicate`
+  for non-survivor, `side_mismatch` for survivor).
+- Duplicate where exactly one order has `cumExecQty` > 0 ⇒ the
+  **fill-free** order is cancelled, the partially-filled one survives.
+- Duplicate at a `WAIT`-level price ⇒ still cancelled to one survivor
+  (guards the up-front survivor-pass decision that covers WAIT buckets).
+- **Single-CancelIntent guarantee (on-grid):** a non-survivor at an on-grid
+  price that the grid loop also visits receives exactly ONE CancelIntent
+  (`reason == 'duplicate'`), never both `duplicate` and `side_mismatch` —
+  because the grid loop sees survivors only. Assert the total cancel count
+  and that no orderId appears in two CancelIntents.
+- **Single-CancelIntent guarantee (off-grid):** a duplicate bucket at an
+  OFF-grid price (price NOT in `grid_price_set`) collapses to one survivor;
+  the non-survivor receives exactly ONE CancelIntent (`reason ==
+  'duplicate'`), never both `duplicate` and `outside_grid`. Assert no
+  orderId appears in two CancelIntents and that the sole `outside_grid`
+  cancel (if any) targets the survivor, not the already-`duplicate`-cancelled
+  order. This proves step 3's re-sourcing of the sweep from survivors.
+- **Rounded-bucket grouping:** two orders whose prices differ **below the
+  8th decimal** (e.g. `44.1` vs `44.100000004` — both `round(..., 8)` to
+  `44.1`) are treated as the same bucket (matching `grid_price_set`
+  rounding) ⇒ collapse to one survivor. (Note: `44.10000001` differs AT
+  the 8th decimal and survives `round(..., 8)` as a distinct key — that
+  pair correctly stays two separate singleton buckets.)
+- Single order per price (no duplicates), prices exact grid prices ⇒
+  output byte-for-byte identical to pre-change (regression guard: no
+  spurious `'duplicate'` cancels). Scope note: the claim holds for
+  **exact-price** singletons; a singleton whose price differs from the
+  grid price only below `round(..., 8)` changes behavior BY DESIGN (raw
+  lookup missed it → spurious place; rounded lookup now matches it) — add
+  a separate near-equal singleton case asserting the new (correct)
+  behavior: level treated as occupied, no place intent.
+- `_has_fill_history` unit cases: absent key, `"0"`, `"0.001"`,
+  non-numeric.
+
+## Out of scope
+
+- No change to `TrackedOrder`, `get_limit_orders`, or the reconciler —
+  the fix is engine-local and consumes the existing limit-dict shape.
+  Consequence (accepted, see step 2 F-1-1): on the live tick path no order
+  carries `cumExecQty`, so the fill-history survivor guard is a no-op there
+  and the survivor is chosen by first-in-list. Threading fill state through
+  `get_limit_orders`/`TrackedOrder` to make the guard live-functional is
+  deliberately deferred — the filled-duplicate case is already covered by
+  the 0031/0046 post-fill layer, and this feature only targets the pre-fill
+  window.
+- No new config/flags. No change to the 0031/0046 post-fill
+  `same_order_error` reactive layer (this fix is the complementary
+  proactive layer).

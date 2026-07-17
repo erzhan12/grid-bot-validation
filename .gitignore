@@ -83,6 +83,9 @@ apps/recorder/conf/recorder.yaml
 apps/replay/conf/replay.yaml
 apps/gridbot/conf/gridbot.yaml
 
+# Live trading config (edited in place, drifts from repo)
+conf/gridbot_test.yaml
+
 # Per-recording replay configs (run_id/timestamps change every recorder run).
 # Canonical template lives at apps/replay/conf/replay_ltcusdt_phase4.yaml.example.
 apps/replay/conf/replay_*.yaml
@@ -90,6 +93,8 @@ apps/replay/conf/replay_*.yaml
 # iterative_v10_ltc.yaml) — each run targets a specific recorded window
 # with its own run_id and timestamps; not meant for the repo.
 apps/replay/conf/iterative_*.yaml
+# One-shot local helper scripts (run_id/timestamp-specific)
+apps/replay/conf/_step1_recheck.sh
 
 # Recorded data
 data/
