@@ -24,9 +24,11 @@ test:
 test-integration:
 	uv run pytest tests/integration/ -v
 
-# Run ruff linter
+# Run ruff linter. check_tier_drift.py is passed explicitly: it is an
+# operational script (weekly risk-tier-monitor CI) inside the otherwise
+# ruff-excluded scripts/ dir (issue #215).
 lint:
-	uv run ruff check .
+	uv run ruff check . scripts/check_tier_drift.py
 
 # Truncate /tmp/gridbot.log before a fresh run
 clear-log:

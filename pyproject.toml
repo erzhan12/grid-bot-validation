@@ -37,5 +37,7 @@ markers = [
 exclude = [
     "apps/backtest/debug_walkthrough.py",  # interactive debug walkthrough; not app code
     "bbu_reference",                        # vendored bbu2 reference; not maintained, has its own ruff config
-    "scripts",                              # one-off research/migration scripts; disposable, not imported by apps
+    "scripts",                              # one-off research/migration scripts; disposable, not imported by apps.
+                                            # Exception: scripts/check_tier_drift.py is operational (weekly CI) and
+                                            # linted explicitly via the Makefile lint target (issue #215).
 ]

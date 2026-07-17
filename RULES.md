@@ -127,10 +127,10 @@ Phase-0 rollout while the repo is red:
 
 ### Lint / Ruff (Feature 0078, issue #181)
 
-`make lint` = `uv run ruff check .`. Root config lives in `pyproject.toml` `[tool.ruff]` (ruff defaults; only an additive `exclude` list). Excluded trees, each with a rationale comment in the config:
+`make lint` = `uv run ruff check . scripts/check_tier_drift.py`. Root config lives in `pyproject.toml` `[tool.ruff]` (ruff defaults; only an additive `exclude` list). Excluded trees, each with a rationale comment in the config:
 - `apps/backtest/debug_walkthrough.py` — interactive debug walkthrough; not app code.
 - `bbu_reference` — vendored bbu2 reference; not maintained, has its own nested `ruff.toml` (line-length 140).
-- `scripts` — one-off research/migration tooling; disposable, not imported by apps.
+- `scripts` — one-off research/migration tooling; disposable, not imported by apps. Carve-out: `scripts/check_tier_drift.py` is operational and linted via the explicit path in the `make lint` recipe (issue #215 / feature 0091) — an explicit positional file arg overrides the directory exclude (no `--force-exclude` set).
 
 Maintained code is NOT excluded. When a maintained file has an intentional lint error, prefer a targeted `# noqa: <code>` over excluding it — e.g. `tests/integration/conftest.py:16` carries `# noqa: E402` on the `gridcore.config` import that must follow the `sys.path.insert` block.
 
@@ -1414,7 +1414,7 @@ Per-symbol maintenance-margin tiers are now fetched from Bybit's `/v5/market/ris
 - `packages/bybit_adapter/src/bybit_adapter/rest_client.py` — `get_risk_limit()` API call (`_unwrap_risk_limit_response` raises `ValueError` on unexpected structure)
 - `apps/pnl_checker/src/pnl_checker/calculator.py` — Uses tiers for IM/MM calculation
 - `apps/pnl_checker/src/pnl_checker/fetcher.py` — Fetches risk limits per symbol
-- `scripts/check_tier_drift.py` — Compares hardcoded tiers against live API (weekly CI via `.github/workflows/risk-tier-monitor.yml`)
+- `scripts/check_tier_drift.py` — Compares hardcoded tiers against live API (weekly CI via `.github/workflows/risk-tier-monitor.yml`). Lint-covered via `make lint`'s explicit path despite the `scripts/` ruff exclude (issue #215 / feature 0091).
 
 ### Caching Strategy (3-Tier Fallback)
 1. **Cache** — Local JSON file, default TTL 24 hours. Stale cache is still used when API fails.
