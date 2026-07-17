@@ -5,10 +5,8 @@ Maintenance: when adding a `##` section, add it here; every ~10 features, sweep 
 
 - Project Overview
 - Constraints (do not)
-- Package Management with uv
 - Running Tests
 - Continuous Integration (`.github/workflows/ci.yml`)
-- Development Workflow
 - gridcore — Pure Strategy Engine
 - Logging Configuration
 - Private WS disconnect handling (event_saver / recorder)
@@ -27,10 +25,7 @@ Maintenance: when adding a `##` section, add it here; every ~10 features, sweep 
 - Margin Ratio vs Bybit positionIM — Critical Distinction
 - Common Pitfalls (Cross-Cutting)
 - Dynamic Risk Limit Tiers
-- Reference Code
-- Docs
 - Risk Limit Cache Format Evolution
-- Next Steps (Future Phases)
 
 ## Project Overview
 
@@ -38,37 +33,33 @@ Grid trading bot system with pure strategy engine (gridcore), exchange adapter (
 
 Successfully extracted pure strategy logic from `bbu2-master` into `packages/gridcore/` with zero exchange dependencies.
 
-**Documentation**: See `docs/features/0001_IMPLEMENTATION_SUMMARY.md` for complete implementation summary and usage examples.
-
 ### Legacy bbu2 paths intentionally not ported (gridcore scope)
 
-1. **Legacy bbu2 paths intentionally not ported**
+These bbu2 code paths exist for products we do not target (Bybit
+inverse contracts: BTCUSD, ETHUSD, etc.). gridcore is intentionally
+scoped to Bybit linear USDT-perps. Future audits MUST recognize
+these as legacy carve-outs and not re-flag them as divergences:
 
-   These bbu2 code paths exist for products we do not target (Bybit
-   inverse contracts: BTCUSD, ETHUSD, etc.). gridcore is intentionally
-   scoped to Bybit linear USDT-perps. Future audits MUST recognize
-   these as legacy carve-outs and not re-flag them as divergences:
+- **`"b..." amount mode`** — bbu2 `bybit_api_usdt.py:509-518`. The
+  "b" prefix means "btc-equivalent" with two branches: `BTCUSD` →
+  `btc_amount * price` (inverse), non-BTCUSD → `math.ceil(btc_amount
+  / price)` (legacy linear non-USDT). Removed from `gridcore/qty.py`
+  in Feature 0028. If a config tries to use `b...` it now raises
+  `ValueError: invalid amount string`.
+- **`"x" mode currency derivation by symbol`** — bbu2
+  `bybit_api_usdt.py:496-501`. bbu2 picks `USDT` if `'USDT' in
+  symbol` else `symbol[:3]` (e.g., `BTC` for `BTCUSD`). This handles
+  inverse contracts margined in coin. Our `gridcore/qty.py` always
+  reads `wallet_balance` as USDT — correct for linear USDT-perps,
+  would need a redesign (not a bbu2 port) if USDC or inverse support
+  is ever added.
+- **`BTCUSD`-specific branches anywhere in bbu2** — inverse
+  contract logic. Out of scope.
 
-   - **`"b..." amount mode`** — bbu2 `bybit_api_usdt.py:509-518`. The
-     "b" prefix means "btc-equivalent" with two branches: `BTCUSD` →
-     `btc_amount * price` (inverse), non-BTCUSD → `math.ceil(btc_amount
-     / price)` (legacy linear non-USDT). Removed from `gridcore/qty.py`
-     in Feature 0028. If a config tries to use `b...` it now raises
-     `ValueError: invalid amount string`.
-   - **`"x" mode currency derivation by symbol`** — bbu2
-     `bybit_api_usdt.py:496-501`. bbu2 picks `USDT` if `'USDT' in
-     symbol` else `symbol[:3]` (e.g., `BTC` for `BTCUSD`). This handles
-     inverse contracts margined in coin. Our `gridcore/qty.py` always
-     reads `wallet_balance` as USDT — correct for linear USDT-perps,
-     would need a redesign (not a bbu2 port) if USDC or inverse support
-     is ever added.
-   - **`BTCUSD`-specific branches anywhere in bbu2** — inverse
-     contract logic. Out of scope.
-
-   If you ever consider reintroducing inverse / non-USDT support,
-   start by re-reading the legacy paths in `bbu_reference/`, not by
-   re-porting them blindly: bbu2's `'USDT' in symbol` heuristic does
-   not handle USDC pairs (`BTCPERP`, `BTCUSDC`) correctly either.
+If you ever consider reintroducing inverse / non-USDT support,
+start by re-reading the legacy paths in `bbu_reference/`, not by
+re-porting them blindly: bbu2's `'USDT' in symbol` heuristic does
+not handle USDC pairs (`BTCPERP`, `BTCUSDC`) correctly either.
 
 ## Constraints (do not)
 
@@ -79,17 +70,6 @@ Project-specific "what not to do" — pairs with the universal Constraints in `.
 - **Backward-compat is deliberate, not speculative** — existing compat (`DirectionType`/`SideType` StrEnum aliases, replay `strict_cross` baseline, `extract_client_order_prefix` no-hyphen fallback) is intentional. Don't add new compat shims without a stated reason.
 - **No dead config fields** — don't add YAML fields/flags "for later"; e.g. `max_margin` is declared but never read. (Feature 0079 added a real automatic position cap via the **C1 `safety_caps.max_notional_per_symbol`** notional limit — see "Production safety caps"; `max_margin` itself remains dead/unrevived.)
 - **Don't point tooling at live state without explicit ask** — the account is Bybit **mainnet** (`mainnet_live`); never run against the live gridbot DB or live orders unless told.
-
-## Package Management with uv
-
-This project uses [uv](https://github.com/astral-sh/uv) for package management.
-
-### Installation and Setup
-
-```bash
-uv sync                                    # Sync workspace
-uv pip install -e packages/gridcore        # Install gridcore editable
-```
 
 ## Running Tests
 
@@ -134,20 +114,11 @@ Phase-0 rollout while the repo is red:
 
 Maintained code is NOT excluded. When a maintained file has an intentional lint error, prefer a targeted `# noqa: <code>` over excluding it — e.g. `tests/integration/conftest.py:16` carries `# noqa: E402` on the `gridcore.config` import that must follow the `sys.path.insert` block.
 
-## Development Workflow
-
-1. Define task clearly
-2. Research codebase and RULES.md
-3. Create plan and get confirmation
-4. Implement with testing
-5. Update RULES.md with learnings
-6. Verify and commit
-
 ---
 
 ## gridcore — Pure Strategy Engine
 
-**Path**: `packages/gridcore/` | **Coverage**: 93% | **Dependencies**: ZERO external
+**Path**: `packages/gridcore/` | **Dependencies**: ZERO external
 
 ### Architecture Rules
 
@@ -650,6 +621,7 @@ builds ONE instance per strat in `_init_strategy` and passes the SAME object
 
 ### SAME ORDER detection
 
+- **Mechanics**: duplicate orders at the same price level soft-block ALL new placements (liquidation guard). Separate per-direction buffers (deque maxlen=2, matches bbu2); only fully filled orders (`leaves_qty == 0`) enter; closing trades detected via `closed_size != 0` (not `closed_pnl`). The engine always runs — only `_execute_intents()` is gated by `_same_order_error`; BOTH sides are checked on every execution event; auto-recovers on a clean fill at a different price.
 - `StrategyRunner._check_same_orders_side()` compares tracked orders by `TrackedOrder.placed_ts` when both fills map to tracked orders; use fill `exchange_ts` only as a fallback for untracked/legacy events. Duplicate same-price orders can rest concurrently and fill more than 5s apart in thin markets, so fill-time-only windows silently miss the critical duplicate-placement bug.
 - **Dedup + auto-recovery (feature 0031)**: `_same_order_dedup_cache` is the single dedup mechanism, keyed by `frozenset` of the two exchange order_ids in the SAME ORDER pair. Each entry carries `first_seen_ts`, `last_seen_ts`, and `verdict ∈ {WS_GLITCH_SUSPECTED, REAL_DUPLICATE, UNKNOWN}`. TTL is `_SAME_ORDER_DEDUP_TTL_SEC = 21600` (6 h), sized to comfortably exceed the 3 h 24 min retrigger gap from the 2026-05-09/10 incident. Don't reintroduce a separate rate-limit set — both REST-rechecking and dedup share this key.
 - The dedup gate inside `_check_same_orders_side` is **verdict-aware**: `WS_GLITCH_SUSPECTED` retriggers are silently suppressed (DEBUG log only) **and must also set `_drop_phantom_event_for_current_call = True`** so `on_execution` drops the phantom replay end-to-end (no `mark_filled`, no engine, no place); `REAL_DUPLICATE` retriggers are silenced too but **must explicitly re-set `_same_order_error = True`** because `_check_same_orders` resets the flag at the top of every call — without this re-set the dedup gate would silently lift a legitimately-latched block. Do NOT set the phantom-drop flag for REAL_DUPLICATE: the event is real (REST saw the fill); `mark_filled` and `engine.on_event` must run normally on it. `UNKNOWN` falls through to the full first-trigger path. The first-trigger path inserts an `UNKNOWN` cache entry **before** running REST cross-check, so a same-event burst is suppressed by the gate on events 2..N.
@@ -677,8 +649,6 @@ builds ONE instance per strat in `_init_strategy` and passes the SAME object
   - When adding params: if it affects uniqueness → add to `_IDENTITY_PARAMS`; if not → don't
   - See `docs/features/ORDER_IDENTITY_DESIGN.md`
   - **Feature 0080 (issue #183) — strat_id namespacing**: `create(strat_id=...)` salts the hash by `strat_id` so two strategies on the same `(account, symbol)` get DISTINCT prefixes. `strat_id` is a SALT, NOT in `_IDENTITY_PARAMS`; the `None` default reproduces the pre-0080 hash byte-for-byte (back-compat for callers + historical rows — only the 3 production call sites thread it). Wire form `{hash16}-{millis}` and `extract_client_order_prefix` unchanged; Bybit `orderLinkId` ≤ 36 chars (`gridbot.order_link_id._BYBIT_ORDER_LINK_ID_MAX`; `make_order_link_id` raises if over). **Replay must salt with the live `strat_id`** or the comparator's `client_order_id` join breaks — the recording's strat_id is on NO DB row, so supply it via config; `apps/replay/src/replay/engine.py` resolves precedence `ReplayStrategyConfig.strat_id` → `seed.strat_id` → synthetic `replay_{symbol}`. For blank-start comparison set `strategy.strat_id` to the recording's live id. `validate_no_shared_symbol` still rejects co-location (positionIdx/cancel-on-mismatch sharing remains the blocker, not the prefix).
-
-### PnL Calculations (`pnl.py`)
 
 ### Grid State Persistence (`persistence.py`)
 
@@ -772,17 +742,6 @@ Gridcore uses Python's standard library `logging` module. Loggers are named afte
 - `INFO` - Important events: grid rebuild, position adjustments
 - `DEBUG` - Detailed state info: position calculations
 
-### Configuration Example
-```python
-import logging
-
-# Configure gridcore logging
-logging.getLogger('gridcore').setLevel(logging.INFO)
-handler = logging.StreamHandler()
-handler.setFormatter(logging.Formatter('%(asctime)s %(name)s %(levelname)s: %(message)s'))
-logging.getLogger('gridcore').addHandler(handler)
-```
-
 ### Logged Events
 - **grid.py**: Grid rebuild when price moves out of bounds
 - **engine.py**: Grid build from anchor/market price, rebuild due to too many orders
@@ -840,7 +799,7 @@ Pure PnL calculation functions extracted into gridcore as the single source of t
 **Functions exported from gridcore:**
 - `calc_unrealised_pnl(direction, entry_price, current_price, size)` — Absolute PnL
 - `calc_unrealised_pnl_pct(direction, entry_price, current_price, leverage)` — Standard Bybit ROE %
-- `calc_position_value(size, entry_price)` — Entry-based notional (size * entry_price); feeds this project's local margin/IM/MM helpers. NOT Bybit's reported positionValue (mark-based: |size| * mark_price). Bybit UTA IM uses mark + hedge (RULES.md:2184); local formulas stay entry-based. Snapshot/parity code computes mark at emit time separately (feature 0060).
+- `calc_position_value(size, entry_price)` — Entry-based notional (size * entry_price); feeds this project's local margin/IM/MM helpers. NOT Bybit's reported positionValue (mark-based: |size| * mark_price). Bybit UTA IM uses mark + hedge (see "Margin Ratio vs Bybit positionIM" section); local formulas stay entry-based. Snapshot/parity code computes mark at emit time separately (feature 0060).
 - `calc_initial_margin(position_value, leverage)` — Initial margin
 - `calc_liq_ratio(liq_price, current_price)` — Liquidation ratio
 - `calc_maintenance_margin(position_value, symbol, tiers=None)` — Tier-based MM (supports dynamic tiers)
@@ -1016,16 +975,6 @@ log parsing. Example:
 - **Wallet caching**: `wallet_cache_interval` (300s default), reduces API calls ~79%
 - **Position updates**: WebSocket-first, REST fallback (`_position_ws_data` cache)
 
-### Same-Order Detection & Blocking
-
-Detects duplicate orders at same price level → BLOCKS all new order placement to prevent liquidation.
-- Separate deques per direction (maxlen=2, matches bbu2)
-- Direction: uses `closed_size != 0` (not `closed_pnl`) to detect closing trades
-- Only fully filled orders (`leaves_qty == 0`) enter buffer
-- Engine always runs; only `_execute_intents()` is gated by `not self._same_order_error`
-- Always checks BOTH sides on every execution event
-- Auto-recovers when new fill at different price arrives
-
 ### Exception Handling
 
 Two-layer: Runner logs + re-raises → Orchestrator catches + sends Telegram alert via `Notifier`.
@@ -1051,7 +1000,6 @@ Two-layer: Runner logs + re-raises → Orchestrator catches + sends Telegram ale
 
 ### Key Pitfalls
 
-- `RiskConfig` uses `max_margin` (not `min_margin`)
 - **`PositionState.margin` is a RATIO** (`positionValue / walletBalance`), NOT Bybit's `positionIM` dollar amount
 - `PositionState.direction` is required
 - Retry queue needs `_dispatch_intent()` closure to route Cancel vs Place correctly
@@ -1060,36 +1008,38 @@ Two-layer: Runner logs + re-raises → Orchestrator catches + sends Telegram ale
 
 ### Reconciliation & order-adoption invariants (Phase E)
 
-   - **Inject is NOT durable adoption (bbu2-faithful)**: Injected orders live for exactly one ticker event. On the first `on_ticker` after startup, `GridEngine._place_grid_orders` (`packages/gridcore/src/gridcore/engine.py:319-325`) cancels any injected order whose price is not in the current `grid_price_set` (`'outside_grid'` reason), and `engine.py:305-312` cancels any at a grid price with the wrong side (`'side_mismatch'` reason). Over-limit cases (`engine.py:237-243`) trigger a full rebuild that cancels everything. Direct port of bbu2 `strat.py:154-160`, `:145-149`, `:103-104`. This means: (a) a "silent adoption of manual orders" security review is a false alarm — the bot does not keep manual orders around, it destroys them on the next tick; (b) the **real** operational concern is the opposite — the bot will **cancel** any limit order on the symbol that doesn't match the grid; (c) do NOT add a refuse-to-start check in `reconcile_startup` — it would re-break normal crash-restart (the bot's own prior orders look identical to manual ones) and was already removed in commit `138737a` for that reason.
-   - **(account, symbol) uniqueness is enforced unconditionally at config load**: Even though `orderLinkId` IS sent to Bybit (since feature 0029, with a `-{millis}` suffix added in HOTFIX 2026-05-08), it cannot disambiguate strategies at runtime. The deterministic prefix is a SHA of `(symbol, side, price, direction)`, so two strategies on the same `(account, symbol)` would compute the SAME prefix for the same logical order — the wire-form suffix only differs across re-placements, not across strategies. Two strategies on the same `(account, symbol)` pair would therefore cancel each other's orders every tick via the cancel-on-mismatch pass described above. `GridbotConfig.validate_no_shared_symbol` (`apps/gridbot/src/gridbot/config.py`) rejects any such configuration at load time with **no escape hatch** — there is no flag to disable it. bbu2 enforces the same invariant structurally: its `amounts[].strat` field is a scalar pointing at a single `pair_timeframes[]` entry, and each `pair_timeframe` has a single `symbol`, so the bad configuration is physically unrepresentable in bbu2's config schema. grid-bot's schema is more flexible (independent `accounts` and `strategies` lists, FK goes `strategy.account → account.name`), so the constraint must be reconstructed as a pydantic validator — but it is enforced just as strictly. If you need a second strategy on the same symbol, use a different account.
-   - **Operational consequence (manual orders get cancelled)**: Any limit order on the symbol that is not at a current grid price, or is at a grid price with the wrong side, will be cancelled by the engine on the next ticker event after it is seen (see the "Inject is NOT durable adoption" bullet above for the exact mechanism). This applies to manual orders placed via the Bybit UI while the bot is running, orders from other tools/scripts on the same account, and stale orders left over from a prior run with different grid parameters. **Manual orders and the grid cannot coexist on the same symbol** — the bot treats "not in my grid" as "cancel it." To manually intervene, stop the bot, make your changes, restart, and accept that anything not matching the grid on restart will be cancelled on the first tick.
-   - **Before first start**: Closing existing orders for the symbol before the first start is recommended for operator clarity (otherwise the bot will cancel them within ~1 second of startup, which is surprising but not incorrect). There is no config flag to disable either the cancel-on-mismatch behavior or the `(account, symbol)` uniqueness check — both are unconditional.
+- **Inject is NOT durable adoption (bbu2-faithful)**: Injected orders live for exactly one ticker event. On the first `on_ticker` after startup, `GridEngine._place_grid_orders` (`packages/gridcore/src/gridcore/engine.py:319-325`) cancels any injected order whose price is not in the current `grid_price_set` (`'outside_grid'` reason), and `engine.py:305-312` cancels any at a grid price with the wrong side (`'side_mismatch'` reason). Over-limit cases (`engine.py:237-243`) trigger a full rebuild that cancels everything. Direct port of bbu2 `strat.py:154-160`, `:145-149`, `:103-104`. This means: (a) a "silent adoption of manual orders" security review is a false alarm — the bot does not keep manual orders around, it destroys them on the next tick; (b) the **real** operational concern is the opposite — the bot will **cancel** any limit order on the symbol that doesn't match the grid; (c) do NOT add a refuse-to-start check in `reconcile_startup` — it would re-break normal crash-restart (the bot's own prior orders look identical to manual ones) and was already removed in commit `138737a` for that reason.
+- **(account, symbol) uniqueness is enforced unconditionally at config load**: Even though `orderLinkId` IS sent to Bybit (since feature 0029, with a `-{millis}` suffix added in HOTFIX 2026-05-08), it cannot disambiguate strategies at runtime. The deterministic prefix is a SHA of `(symbol, side, price, direction)`, so two strategies on the same `(account, symbol)` would compute the SAME prefix for the same logical order — the wire-form suffix only differs across re-placements, not across strategies. Two strategies on the same `(account, symbol)` pair would therefore cancel each other's orders every tick via the cancel-on-mismatch pass described above. `GridbotConfig.validate_no_shared_symbol` (`apps/gridbot/src/gridbot/config.py`) rejects any such configuration at load time with **no escape hatch** — there is no flag to disable it. bbu2 enforces the same invariant structurally: its `amounts[].strat` field is a scalar pointing at a single `pair_timeframes[]` entry, and each `pair_timeframe` has a single `symbol`, so the bad configuration is physically unrepresentable in bbu2's config schema. grid-bot's schema is more flexible (independent `accounts` and `strategies` lists, FK goes `strategy.account → account.name`), so the constraint must be reconstructed as a pydantic validator — but it is enforced just as strictly. If you need a second strategy on the same symbol, use a different account.
+- **Operational consequence (manual orders get cancelled)**: Any limit order on the symbol that is not at a current grid price, or is at a grid price with the wrong side, will be cancelled by the engine on the next ticker event after it is seen (see the "Inject is NOT durable adoption" bullet above for the exact mechanism). This applies to manual orders placed via the Bybit UI while the bot is running, orders from other tools/scripts on the same account, and stale orders left over from a prior run with different grid parameters. **Manual orders and the grid cannot coexist on the same symbol** — the bot treats "not in my grid" as "cancel it." To manually intervene, stop the bot, make your changes, restart, and accept that anything not matching the grid on restart will be cancelled on the first tick.
+- **Before first start**: Closing existing orders for the symbol before the first start is recommended for operator clarity (otherwise the bot will cancel them within ~1 second of startup, which is surprising but not incorrect). There is no config flag to disable either the cancel-on-mismatch behavior or the `(account, symbol)` uniqueness check — both are unconditional.
 
 ### orderLinkId wire format & matching
 
-**orderLinkId Wire Format & Matching (HOTFIX 2026-05-08)**: How the deterministic `client_order_id` survives Bybit's id-cache
-   - **Why the suffix exists**: Bybit caches `orderLinkId` for ~1-2h post-cancel/fill. Our `PlaceLimitIntent.client_order_id` is a deterministic 16-char SHA256 hex digest of `(symbol, side, price, direction)`, so re-placing the same logical intent collides with the cached id and triggers ErrCode 110072 "OrderLinkedID is duplicate" in a tight loop. Live-verified: ~12k duplicate-rejected attempts / 0 successful orders across a 2h window before the fix.
-   - **Wire format**: `{16-hex prefix}-{int(datetime.now(UTC).timestamp() * 1000)}`. The prefix is guaranteed not to contain `-` (`hashlib.sha256().hexdigest()[:16]` returns only `0-9a-f`), so splitting at the first `-` always recovers the deterministic prefix.
-   - **Wire-vs-key invariant**: The full suffixed value goes on the wire and is persisted verbatim in `private_executions.order_link_id` and `orders.order_link_id` (forensics). Internal dict keys (`Runner._tracked_orders`, comparator join key, replay seed `client_id`) use only the deterministic prefix.
-   - **Retry idempotency invariant (feature 0032)**: The wire suffix is minted once per `PlaceLimitIntent` placement lifecycle in `StrategyRunner` and stored on `PlaceLimitIntent.order_link_id`; runner reattempts, retry-queue retries, and fresh engine re-emissions after a failed placement reuse that same wire id. Executor-side generation is only a fallback for direct callers that bypass runner assignment.
-   - **Reconcile-upgrade path**: If REST order sync later reports an open order whose normalized prefix matches a pending/failed tracked placement, `Runner.inject_open_orders` upgrades that tracked order to `placed`, patches the tracked intent with the exchange-reported wire `orderLinkId`, and cancels queued retries for that prefix. This closes the ambiguous-failure window where Bybit accepted the first request but the bot only observed a timeout/error. **Feature 0080 migration**: when the exchange wire prefix is pre-salt (`strat_id=None` hash) but the failed tracked placement used the salted `client_order_id`, upgrade by order identity `(price, qty, side, reduce_only)` and re-key to the exchange prefix — otherwise a queued retry can double-place after delayed reconcile (`runner._find_failed_tracked_by_order_identity`). `retry_dispatch_place` also re-checks `_is_good_to_place` and drops `duplicate_order_blocked` retries.
-   - **Helper**: `gridcore.intents.extract_client_order_prefix(order_link_id) -> Optional[str]` splits at the first `-` and returns the prefix. `None` or empty-string input → `None` (so callers using `prefix or fallback_id` cleanly fall back). No-hyphen input → unchanged (pre-hotfix backward compat).
-   - **Three call sites normalize on read**: (a) `gridbot.runner._find_tracked_order` and `inject_open_orders` — strip suffix before lookup/inject; (b) `comparator.loader.LiveTradeLoader.load` — strip before grouping live executions; (c) `replay.snapshot_loader.load_active_orders` — strip before seeding active orders for replay. Tests in `packages/gridcore/tests/test_intents.py`, `apps/gridbot/tests/test_runner.py`, `apps/comparator/tests/test_loader.py`, `apps/replay/tests/test_snapshot_loader.py`.
-   - **Files**: `packages/gridcore/src/gridcore/intents.py` (helper + `PlaceLimitIntent.order_link_id`), `apps/gridbot/src/gridbot/order_link_id.py`, `apps/gridbot/src/gridbot/executor.py` (wire-id fallback), `apps/gridbot/src/gridbot/runner.py` (wire-id assignment/reuse + read-side normalization), `apps/comparator/src/comparator/loader.py`, `apps/replay/src/replay/snapshot_loader.py`.
+How the deterministic `client_order_id` survives Bybit's id-cache (HOTFIX 2026-05-08):
+
+- **Why the suffix exists**: Bybit caches `orderLinkId` for ~1-2h post-cancel/fill. Our `PlaceLimitIntent.client_order_id` is a deterministic 16-char SHA256 hex digest of `(symbol, side, price, direction)`, so re-placing the same logical intent collides with the cached id and triggers ErrCode 110072 "OrderLinkedID is duplicate" in a tight loop. Live-verified: ~12k duplicate-rejected attempts / 0 successful orders across a 2h window before the fix.
+- **Wire format**: `{16-hex prefix}-{int(datetime.now(UTC).timestamp() * 1000)}`. The prefix is guaranteed not to contain `-` (`hashlib.sha256().hexdigest()[:16]` returns only `0-9a-f`), so splitting at the first `-` always recovers the deterministic prefix.
+- **Wire-vs-key invariant**: The full suffixed value goes on the wire and is persisted verbatim in `private_executions.order_link_id` and `orders.order_link_id` (forensics). Internal dict keys (`Runner._tracked_orders`, comparator join key, replay seed `client_id`) use only the deterministic prefix.
+- **Retry idempotency invariant (feature 0032)**: The wire suffix is minted once per `PlaceLimitIntent` placement lifecycle in `StrategyRunner` and stored on `PlaceLimitIntent.order_link_id`; runner reattempts, retry-queue retries, and fresh engine re-emissions after a failed placement reuse that same wire id. Executor-side generation is only a fallback for direct callers that bypass runner assignment.
+- **Reconcile-upgrade path**: If REST order sync later reports an open order whose normalized prefix matches a pending/failed tracked placement, `Runner.inject_open_orders` upgrades that tracked order to `placed`, patches the tracked intent with the exchange-reported wire `orderLinkId`, and cancels queued retries for that prefix. This closes the ambiguous-failure window where Bybit accepted the first request but the bot only observed a timeout/error. **Feature 0080 migration**: when the exchange wire prefix is pre-salt (`strat_id=None` hash) but the failed tracked placement used the salted `client_order_id`, upgrade by order identity `(price, qty, side, reduce_only)` and re-key to the exchange prefix — otherwise a queued retry can double-place after delayed reconcile (`runner._find_failed_tracked_by_order_identity`). `retry_dispatch_place` also re-checks `_is_good_to_place` and drops `duplicate_order_blocked` retries.
+- **Helper**: `gridcore.intents.extract_client_order_prefix(order_link_id) -> Optional[str]` splits at the first `-` and returns the prefix. `None` or empty-string input → `None` (so callers using `prefix or fallback_id` cleanly fall back). No-hyphen input → unchanged (pre-hotfix backward compat).
+- **Three call sites normalize on read**: (a) `gridbot.runner._find_tracked_order` and `inject_open_orders` — strip suffix before lookup/inject; (b) `comparator.loader.LiveTradeLoader.load` — strip before grouping live executions; (c) `replay.snapshot_loader.load_active_orders` — strip before seeding active orders for replay. Tests in `packages/gridcore/tests/test_intents.py`, `apps/gridbot/tests/test_runner.py`, `apps/comparator/tests/test_loader.py`, `apps/replay/tests/test_snapshot_loader.py`.
+- **Files**: `packages/gridcore/src/gridcore/intents.py` (helper + `PlaceLimitIntent.order_link_id`), `apps/gridbot/src/gridbot/order_link_id.py`, `apps/gridbot/src/gridbot/executor.py` (wire-id fallback), `apps/gridbot/src/gridbot/runner.py` (wire-id assignment/reuse + read-side normalization), `apps/comparator/src/comparator/loader.py`, `apps/replay/src/replay/snapshot_loader.py`.
 
 ### Active WS reconnect with TCP-level probe (feature 0024)
 
-**Active WS reconnect with TCP-level probe (2026-05-03, feature 0024)**: bbu2 `_ensure_*_connection` pattern
-   - **Problem**: Wrapper's `is_connected()` is state-flag based — flips False only on explicit `disconnect()`. A dead TCP socket pybit hadn't noticed left it stuck True. Mainnet observed 6–15 min reconnect gaps.
-   - **Two health signals (both call `client.reset()`)**:
-     - **Primary** (TCP-level, every 10s): `Orchestrator._ws_health_check_once()` calls new `client.is_socket_alive()` → pybit's `ws.sock.connected`. Mirrors bbu2 `ENSURE_SOCKET_INTERVAL = 10`.
-     - **Secondary** (message-gap, on heartbeat fire): existing 30s gap detector → `on_disconnect` callback → `Orchestrator._on_ws_disconnect()` → `client.reset()`. Catches "socket alive but server silent" failure mode that TCP check misses.
-   - **`reset()`**: Stop heartbeat → `_disconnect_internal()` → `connect()` (re-subscribes all streams). Idempotent — back-to-back resets are a no-op + a single re-establishment.
-   - **Heartbeat thread sharp edge**: `on_disconnect` callback runs on the heartbeat thread. **Wrapper-level guard**: `_stop_heartbeat_watchdog` skips `Thread.join()` when `threading.current_thread() is self._heartbeat_thread`, so calling `reset()` inline from a callback is safe (no `RuntimeError`). The orchestrator still dispatches reset to a one-shot daemon worker (`WSReset-{account}-{kind}`) to avoid blocking the heartbeat thread on the full TCP teardown / handshake / subscription replay.
-   - **Zombie heartbeat protection**: `_start_heartbeat_watchdog` replaces `self._stop_heartbeat` with a fresh `threading.Event` each start; the old loop holds a reference to the old (still-set) event and exits cleanly. `_heartbeat_loop(stop_event)` takes the event as parameter.
-   - **`retries=0`**: Both `connect()` methods pass `retries=0` to `pybit.unified_trading.WebSocket(...)` → pybit's `infinitely_reconnect=True`. Removes the 10-attempt cliff at which pybit raises `WebSocketTimeoutException` and gives up.
-   - **Orchestrator wiring**: `_init_account` constructs WS clients with `on_disconnect=lambda ts, a=name: self._on_ws_disconnect(a, "public"|"private", ts)`. Periodic gate `_next_ws_health_check` in `_tick()` between `_next_health_check` and `_next_order_sync`.
-   - Files: `packages/bybit_adapter/src/bybit_adapter/ws_client.py`, `apps/gridbot/src/gridbot/orchestrator.py`
+bbu2 `_ensure_*_connection` pattern (2026-05-03):
+
+- **Problem**: Wrapper's `is_connected()` is state-flag based — flips False only on explicit `disconnect()`. A dead TCP socket pybit hadn't noticed left it stuck True. Mainnet observed 6–15 min reconnect gaps.
+- **Two health signals (both call `client.reset()`)**:
+  - **Primary** (TCP-level, every 10s): `Orchestrator._ws_health_check_once()` calls new `client.is_socket_alive()` → pybit's `ws.sock.connected`. Mirrors bbu2 `ENSURE_SOCKET_INTERVAL = 10`.
+  - **Secondary** (message-gap, on heartbeat fire): existing 30s gap detector → `on_disconnect` callback → `Orchestrator._on_ws_disconnect()` → `client.reset()`. Catches "socket alive but server silent" failure mode that TCP check misses.
+- **`reset()`**: Stop heartbeat → `_disconnect_internal()` → `connect()` (re-subscribes all streams). Idempotent — back-to-back resets are a no-op + a single re-establishment.
+- **Heartbeat thread sharp edge**: `on_disconnect` callback runs on the heartbeat thread. **Wrapper-level guard**: `_stop_heartbeat_watchdog` skips `Thread.join()` when `threading.current_thread() is self._heartbeat_thread`, so calling `reset()` inline from a callback is safe (no `RuntimeError`). The orchestrator still dispatches reset to a one-shot daemon worker (`WSReset-{account}-{kind}`) to avoid blocking the heartbeat thread on the full TCP teardown / handshake / subscription replay.
+- **Zombie heartbeat protection**: `_start_heartbeat_watchdog` replaces `self._stop_heartbeat` with a fresh `threading.Event` each start; the old loop holds a reference to the old (still-set) event and exits cleanly. `_heartbeat_loop(stop_event)` takes the event as parameter.
+- **`retries=0`**: Both `connect()` methods pass `retries=0` to `pybit.unified_trading.WebSocket(...)` → pybit's `infinitely_reconnect=True`. Removes the 10-attempt cliff at which pybit raises `WebSocketTimeoutException` and gives up.
+- **Orchestrator wiring**: `_init_account` constructs WS clients with `on_disconnect=lambda ts, a=name: self._on_ws_disconnect(a, "public"|"private", ts)`. Periodic gate `_next_ws_health_check` in `_tick()` between `_next_health_check` and `_next_order_sync`.
+- Files: `packages/bybit_adapter/src/bybit_adapter/ws_client.py`, `apps/gridbot/src/gridbot/orchestrator.py`
 
 ---
 
@@ -1218,10 +1168,9 @@ Records raw Bybit mainnet WebSocket data to SQLite. Reuses `event_saver` collect
 1. **TickerEvent fields**: Does NOT have `index_price` or `next_funding_time` — check `gridcore.events.TickerEvent` dataclass definition before constructing test fixtures.
 2. **Mock collectors need `stop = AsyncMock()`**: When mocking `PublicCollector`/`PrivateCollector`, must set `stop` as `AsyncMock()` since `Recorder.stop()` awaits them.
 3. **`_close_dangling_coro()` pattern**: When testing `cli()` that calls `asyncio.run(main(...))`, the mock creates an unawaited coroutine. Use the helper to close it after assertions (same pattern as gridbot `test_main.py`).
-4. **Testnet default differs**: Recorder defaults to `testnet=False` (mainnet), unlike gridbot which defaults to `testnet=True`.
-5. **Position/wallet test data format**: `PositionWriter` and `WalletWriter` expect Bybit-formatted dicts with `"data"` keys (e.g., `{"data": [{"symbol": "BTCUSDT", ...}]}`). Flat dicts silently produce zero snapshots.
-6. **Test fixture deduplication**: Shared `db` fixture lives in `conftest.py` — do not duplicate in individual test files. Same for `basic_config` and `config_with_account`.
-7. **Mock config completeness**: When using `MagicMock()` for config in tests, set all attributes that `main()` accesses before the code path under test. E.g., `mock_config.database_url = "sqlite:///test.db"` — bare MagicMock attributes break `urlparse()`.
+4. **Position/wallet test data format**: `PositionWriter` and `WalletWriter` expect Bybit-formatted dicts with `"data"` keys (e.g., `{"data": [{"symbol": "BTCUSDT", ...}]}`). Flat dicts silently produce zero snapshots.
+5. **Test fixture deduplication**: Shared `db` fixture lives in `conftest.py` — do not duplicate in individual test files. Same for `basic_config` and `config_with_account`.
+6. **Mock config completeness**: When using `MagicMock()` for config in tests, set all attributes that `main()` accesses before the code path under test. E.g., `mock_config.database_url = "sqlite:///test.db"` — bare MagicMock attributes break `urlparse()`.
 
 ---
 
@@ -1242,7 +1191,7 @@ Reads recorded data, feeds through GridEngine + simulated order book, compares a
 - Config search: `--config` → `REPLAY_CONFIG_PATH` env → `conf/replay.yaml` → `replay.yaml`
 - **Position telemetry parity (feature 0034)**: backtest emits `position_snapshots` rows with `source='backtest'` on every fill (including wind-down close-outs). Comparator pairs them per-side with `source='live'` rows (monotonic two-pointer, 5s tolerance, one-to-one consume invariant) and recomputes unrealized PnL from `live.mark_price` so the delta is apples-to-apples. Twelve metrics added to `ValidationMetrics`; `position_comparison.csv` emitted when at least one pair exists. Un-migrated DBs raise loudly at load time — do NOT silently mask as zero-pair.
 - **UTA wallet balance semantics (feature 0042)**: `wallet_snapshots` stores account-level UTA fields alongside per-coin rows: `total_equity`, `total_available_balance`, `total_margin_balance`, `account_im_rate`, `account_mm_rate`. Account rates are raw Bybit decimal ratios, not percentages. Replay seeds `BacktestSession.initial_balance/current_balance` from `WalletSeed.total_available_balance` when present, not per-coin `wallet_balance`. That `current_balance` flows through more than liquidation: order margin gating, wallet-fraction qty sizing, margin-ratio logging, and risk multiplier state all see the UTA account-level available-balance baseline. Legacy rows with `total_available_balance IS NULL` fall back to config `initial_balance`.
-- **Position-value parity (feature 0059/0060)**: `position_snapshots.position_value` is the fourth USDT field the 0058 log line emits. **Live**: writers store Bybit `positionValue` verbatim (= `|size| × mark_price`; `not in (None, "")` guard unchanged). **Backtest snapshot** (0059 parity / `position_snapshots.position_value`): mark-based `abs(size) * mark_price` computed inline in `BacktestRunner._emit_position_snapshot` (feature 0060) — NOT `tracker.state.position_value`. **Backtest local margin path**: `tracker.state.position_value` stays entry-based (`calc_position_value` via `_update_margin`) for local IM/MM and the risk margin ratio. Bybit UTA IM uses mark + hedge (`RULES.md:2184`); our `calc_initial_margin` uses entry-based notional — known mismatch, out of scope. Flat backtest snapshots use explicit `Decimal("0")` (not a stale read). Comparator adds per-snapshot `upnl_usdt_delta` (stored unrealised 1:1, distinct from the mark-recomputed `unrealised_pnl_delta`) and `pos_value_delta` (≈0 after 0060; was ≈ per-side unrealized PnL). Nine `ValidationMetrics` aggregates (cur/cum `_usdt_*` reuse the existing per-pair deltas via `_agg`). NULL `position_value` is NULL-safe and does NOT trip `has_missing_telemetry` (mirrors the 0056 `cur_realised_pnl` exclusion). Migration: `scripts/migrate_0059_position_value.py --database-url ...` (idempotent); fresh DBs get the column via `create_all()`. Pre-0060 backtest rows keep entry semantics; re-run backtests for parity (no backfill).
+- **Position-value parity (feature 0059/0060)**: `position_snapshots.position_value` is the fourth USDT field the 0058 log line emits. **Live**: writers store Bybit `positionValue` verbatim (= `|size| × mark_price`; `not in (None, "")` guard unchanged). **Backtest snapshot** (0059 parity / `position_snapshots.position_value`): mark-based `abs(size) * mark_price` computed inline in `BacktestRunner._emit_position_snapshot` (feature 0060) — NOT `tracker.state.position_value`. **Backtest local margin path**: `tracker.state.position_value` stays entry-based (`calc_position_value` via `_update_margin`) for local IM/MM and the risk margin ratio. Bybit UTA IM uses mark + hedge (see "Margin Ratio vs Bybit positionIM" section); our `calc_initial_margin` uses entry-based notional — known mismatch, out of scope. Flat backtest snapshots use explicit `Decimal("0")` (not a stale read). Comparator adds per-snapshot `upnl_usdt_delta` (stored unrealised 1:1, distinct from the mark-recomputed `unrealised_pnl_delta`) and `pos_value_delta` (≈0 after 0060; was ≈ per-side unrealized PnL). Nine `ValidationMetrics` aggregates (cur/cum `_usdt_*` reuse the existing per-pair deltas via `_agg`). NULL `position_value` is NULL-safe and does NOT trip `has_missing_telemetry` (mirrors the 0056 `cur_realised_pnl` exclusion). Migration: `scripts/migrate_0059_position_value.py --database-url ...` (idempotent); fresh DBs get the column via `create_all()`. Pre-0060 backtest rows keep entry semantics; re-run backtests for parity (no backfill).
 
 ### Position telemetry repository contract (feature 0034)
 
@@ -1252,17 +1201,16 @@ Reads recorded data, feeds through GridEngine + simulated order book, compares a
 
 ### Fill simulator modes
 
-3. **Replay Fill Simulator Modes**
-   - `strict_cross`: conservative trade-tape model. BUY fills only below limit; SELL fills only above limit. Used as `BacktestEngine` default and as opt-in for replay backward-compat baseline.
-   - `trade_through_at_limit`: last-price model that includes exact limit touches (`<=` / `>=`).
-   - `book_touch`: parity mode using recorded L1 (`ask1 <= limit` for BUY, `bid1 >= limit` for SELL), falling back to `trade_through_at_limit` for legacy bare-price callers. Was the replay default through features 0033–0050; kept as opt-in for legacy L1-touch parity.
-   - `last_cross` (**replay default since feature 0051**): transition-based aggressor detection. BUY fires when `prev_last > limit_price` AND `curr_last <= limit_price`; SELL fires when `prev_last < limit_price` AND `curr_last >= limit_price`. Strict inequality on `prev_last` — `prev_last == limit_price` does **not** count as a cross. Sticky `last_price` (`prev == curr`) never fires. First-ever observation of a symbol returns `False` (no prior tick). Legacy bare-`Decimal` input on `check_fill` returns `False` for `LAST_CROSS` and does not mutate any state slot (no symbol/exchange_ts available to key the per-tick advance). v7 A/B re-validation cut fill-timing `|delta|` from 19.0s (`book_touch`) to 5.1s at match_rate=100%, closing issue #117's +12.6s lag.
-   - `event_follower` (feature 0072, issue #168): fills sourced from recorded live `private_executions` instead of the per-order simulator — recorded `exec_price`/`exec_qty`/`exec_fee`/`closed_pnl` are applied **as-is** (never recomputed; Bybit's `closed_pnl` is authoritative for the wallet, the tracker keeps only size/entry). Dispatched as a pre-tick injection in `BacktestRunner.process_fills` (`self._event_follower is not None` branch) — `TradeThroughFillSimulator.check_fill` raises if ever consulted under this mode. Executions are consumed in `(exchange_ts, exec_id)` order (sorted by `PrivateExecutionRepository.get_by_run_range` — single sort site) via a forward-only monotonic cursor (`EventFollower.drain`); the within-tick drain is iterative to a fixpoint so a reactive close placed mid-window (via a synthetic ticker at the fill's `exchange_ts`) matches the close execution from the same window. Matching is key-faithful on `extract_client_order_prefix(order_link_id) == client_order_id`, with `order_id` then side/closest-price fallbacks for pre-hotfix rows. Partial fills aggregate per `(matcher_key, recorded_order_id)` — one `BacktestTrade` per order lifecycle, mirroring `LiveTradeLoader._aggregate_fills`; in-flight partials live in `session.set_pending_wallet` until a flush trigger fires (1 full-fill intra-loop; 2 last-in-stream post-fixpoint; 3 cancel in `_dispatch_intents` before `execute_cancel`; 4 end-of-replay `finalize_event_follower()` called by `engine.py` before wind-down/finalize). Consequences: `backtest_only` is structurally `0`; `live_only` = intent-set divergence from live (not simulator misses); the mode answers "how would strategy A vs B have dispatched live's exact fills" — it cannot model fills the strategy never placed an order for, new market regimes, or latency. Recorded qty above replay's placed qty is capped (`qty_excess_divergence` counter; fee/pnl pro-rated). Engine materializes ORM rows to `RecordedExecution` dataclasses inside the DB session (DetachedInstanceError, cf. 0038) and skips other-symbol rows (`get_by_run_range` does not filter symbol).
-   - `advance_market(market: TickerEvent)` contract (feature 0051): `BacktestOrderManager.check_fills` calls `self.fill_simulator.advance_market(market)` as the first statement inside the `isinstance(market, TickerEvent)` branch, before the per-order loop. Runs unconditionally on every `TickerEvent` (including orderless ticks) so the `T -> T+1` transition signal is preserved when no order is active for the symbol. The legacy bare-`Decimal` `else`-branch never calls `advance_market`. The simulator owns three per-symbol state dicts: `_prev_last_price` (committed prior-tick value), `_tick_prev_last` (read slot for the in-flight tick), and `_tick_token` (idempotency guard keyed on `(symbol, exchange_ts, local_ts)`). Repeated calls within a tick are no-ops. `_should_fill_last_cross` reads only `_tick_prev_last` and never writes.
-   - **Test fixture timestamp discipline (pitfall, feature 0051)**: every snapshot in a multi-tick `LAST_CROSS` test MUST carry monotonically distinct `(exchange_ts, local_ts)` values. Reusing one timestamp across two snapshots makes the second `advance_market` call token-match the first and silently no-op — the stash never runs, `_tick_prev_last[symbol]` stays `None`, and the test asserts `False` on every cross. The `_ticker` / `_ticker_for` helpers in `apps/backtest/tests/test_fill_simulator.py` accept a `tick_index: int` parameter that offsets both timestamps by `timedelta(milliseconds=tick_index)`. Pass `tick_index=0` for prev and `tick_index=1` for curr. Production replay is protected from this collision by the DB unique constraint on `(symbol, exchange_ts)` at `shared/db/src/grid_db/models.py:265-267`; tests do not go through that path.
-   - Default split: `apps/replay` defaults to `last_cross` (timing-accurate transition detection; v7 A/B vs `book_touch` showed 19.0s → 5.1s fill-timing improvement at 100% match-rate); `BacktestEngine` keeps `strict_cross` because forward backtest data sources may lack the L1/last-price-history required by the parity-oriented modes.
-   - `BacktestOrderManager.check_fills(TickerEvent(...))` is always scoped to the ticker's own symbol; the legacy bare-Decimal path preserves all-symbol scanning when no `symbol` filter is supplied.
-   - Rationale: production backtests keep conservative semantics; replay parity smoke benefits from the richer bid/ask already stored in `ticker_snapshots`.
+- `strict_cross`: conservative trade-tape model. BUY fills only below limit; SELL fills only above limit. Used as `BacktestEngine` default and as opt-in for replay backward-compat baseline.
+- `trade_through_at_limit`: last-price model that includes exact limit touches (`<=` / `>=`).
+- `book_touch`: parity mode using recorded L1 (`ask1 <= limit` for BUY, `bid1 >= limit` for SELL), falling back to `trade_through_at_limit` for legacy bare-price callers. Was the replay default through features 0033–0050; kept as opt-in for legacy L1-touch parity.
+- `last_cross` (**replay default since feature 0051**): transition-based aggressor detection. BUY fires when `prev_last > limit_price` AND `curr_last <= limit_price`; SELL fires when `prev_last < limit_price` AND `curr_last >= limit_price`. Strict inequality on `prev_last` — `prev_last == limit_price` does **not** count as a cross. Sticky `last_price` (`prev == curr`) never fires. First-ever observation of a symbol returns `False` (no prior tick). Legacy bare-`Decimal` input on `check_fill` returns `False` for `LAST_CROSS` and does not mutate any state slot (no symbol/exchange_ts available to key the per-tick advance). v7 A/B re-validation cut fill-timing `|delta|` from 19.0s (`book_touch`) to 5.1s at match_rate=100%, closing issue #117's +12.6s lag.
+- `event_follower` (feature 0072, issue #168): fills sourced from recorded live `private_executions` instead of the per-order simulator — recorded `exec_price`/`exec_qty`/`exec_fee`/`closed_pnl` are applied **as-is** (never recomputed; Bybit's `closed_pnl` is authoritative for the wallet, the tracker keeps only size/entry). Dispatched as a pre-tick injection in `BacktestRunner.process_fills` (`self._event_follower is not None` branch) — `TradeThroughFillSimulator.check_fill` raises if ever consulted under this mode. Executions are consumed in `(exchange_ts, exec_id)` order (sorted by `PrivateExecutionRepository.get_by_run_range` — single sort site) via a forward-only monotonic cursor (`EventFollower.drain`); the within-tick drain is iterative to a fixpoint so a reactive close placed mid-window (via a synthetic ticker at the fill's `exchange_ts`) matches the close execution from the same window. Matching is key-faithful on `extract_client_order_prefix(order_link_id) == client_order_id`, with `order_id` then side/closest-price fallbacks for pre-hotfix rows. Partial fills aggregate per `(matcher_key, recorded_order_id)` — one `BacktestTrade` per order lifecycle, mirroring `LiveTradeLoader._aggregate_fills`; in-flight partials live in `session.set_pending_wallet` until a flush trigger fires (1 full-fill intra-loop; 2 last-in-stream post-fixpoint; 3 cancel in `_dispatch_intents` before `execute_cancel`; 4 end-of-replay `finalize_event_follower()` called by `engine.py` before wind-down/finalize). Consequences: `backtest_only` is structurally `0`; `live_only` = intent-set divergence from live (not simulator misses); the mode answers "how would strategy A vs B have dispatched live's exact fills" — it cannot model fills the strategy never placed an order for, new market regimes, or latency. Recorded qty above replay's placed qty is capped (`qty_excess_divergence` counter; fee/pnl pro-rated). Engine materializes ORM rows to `RecordedExecution` dataclasses inside the DB session (DetachedInstanceError, cf. 0038) and skips other-symbol rows (`get_by_run_range` does not filter symbol).
+- `advance_market(market: TickerEvent)` contract (feature 0051): `BacktestOrderManager.check_fills` calls `self.fill_simulator.advance_market(market)` as the first statement inside the `isinstance(market, TickerEvent)` branch, before the per-order loop. Runs unconditionally on every `TickerEvent` (including orderless ticks) so the `T -> T+1` transition signal is preserved when no order is active for the symbol. The legacy bare-`Decimal` `else`-branch never calls `advance_market`. The simulator owns three per-symbol state dicts: `_prev_last_price` (committed prior-tick value), `_tick_prev_last` (read slot for the in-flight tick), and `_tick_token` (idempotency guard keyed on `(symbol, exchange_ts, local_ts)`). Repeated calls within a tick are no-ops. `_should_fill_last_cross` reads only `_tick_prev_last` and never writes.
+- **Test fixture timestamp discipline (pitfall, feature 0051)**: every snapshot in a multi-tick `LAST_CROSS` test MUST carry monotonically distinct `(exchange_ts, local_ts)` values. Reusing one timestamp across two snapshots makes the second `advance_market` call token-match the first and silently no-op — the stash never runs, `_tick_prev_last[symbol]` stays `None`, and the test asserts `False` on every cross. The `_ticker` / `_ticker_for` helpers in `apps/backtest/tests/test_fill_simulator.py` accept a `tick_index: int` parameter that offsets both timestamps by `timedelta(milliseconds=tick_index)`. Pass `tick_index=0` for prev and `tick_index=1` for curr. Production replay is protected from this collision by the DB unique constraint on `(symbol, exchange_ts)` at `shared/db/src/grid_db/models.py:265-267`; tests do not go through that path.
+- Default split: `apps/replay` defaults to `last_cross` (timing-accurate transition detection; v7 A/B vs `book_touch` showed 19.0s → 5.1s fill-timing improvement at 100% match-rate); `BacktestEngine` keeps `strict_cross` because forward backtest data sources may lack the L1/last-price-history required by the parity-oriented modes.
+- `BacktestOrderManager.check_fills(TickerEvent(...))` is always scoped to the ticker's own symbol; the legacy bare-Decimal path preserves all-symbol scanning when no `symbol` filter is supplied.
+- Rationale: production backtests keep conservative semantics; replay parity smoke benefits from the richer bid/ask already stored in `ticker_snapshots`.
 
 ### Replay-specific test pitfalls
 
@@ -1293,7 +1241,6 @@ Read-only tool comparing our PnL/margin calculations against Bybit exchange valu
 - **`get_transaction_log_all()` return type**: Returns `tuple[list[dict], bool]` — the bool indicates whether data was truncated at `max_pages`. Callers must handle the truncation flag.
 - **Config redaction**: `_redact_config()` in `reporter.py` replaces API credentials with `[REDACTED]` before writing to JSON output. Never serialize raw `AccountConfig` to files.
 - **Tolerance scaling for percentages**: PnL % values are 100x USDT values. Use `PERCENTAGE_TOLERANCE_MULTIPLIER = 100` in `comparator.py` to scale tolerance for ROE comparisons.
-- **Test coverage**: Currently at 92%. Run: `uv run pytest apps/pnl_checker/tests --cov=pnl_checker --cov-report=term-missing -v`
 - **Workspace dependency**: `pnl-checker` must be in root `pyproject.toml` dev deps AND `tool.uv.sources` for test discovery to work.
 
 ---
@@ -1322,45 +1269,33 @@ Wraps `ReplayEngine` (seeded `event_follower`, never `last_cross`) per strat ove
 
 **`PositionState.margin` = `positionValue / walletBalance`** (a ratio, e.g., 0.26) — bbu2 pattern.
 
-All risk config thresholds (`max_margin=8`, `min_total_margin=0.15`) are ratios. **Bybit's `positionIM`** is a dollar amount — completely different. Do NOT use `positionIM` as `margin`.
-
-| Consumer | Margin calculation | Correct? |
-|----------|-------------------|----------|
-| gridbot (live) | `positionValue / walletBalance` | Yes |
-| pnl_checker | `positionValue / walletBalance` | Yes (fixed) |
-| backtest | `positionValue / walletBalance` | Yes |
+All risk config thresholds (`max_margin=8`, `min_total_margin=0.15`) are ratios. **Bybit's `positionIM`** is a dollar amount — completely different. Do NOT use `positionIM` as `margin`. All consumers (gridbot, pnl_checker, backtest) compute `positionValue / walletBalance`.
 
 ---
 
 ## Common Pitfalls (Cross-Cutting)
 
-1. **DO NOT** import exchange libraries in gridcore
-2. **DO NOT** make network/DB calls in gridcore modules
-3. **DO NOT** use raw strings for enums — use `GridSideType`, `DirectionType`, `SideType`, `RunType`
-4. **ALWAYS** pass `tick_size` as Decimal to Grid
-5. **ALWAYS** run tests before committing (`make test`)
-6. **ALWAYS** use `redact_db_url()` when logging database URLs
-7. **ALWAYS** use `asyncio.run_coroutine_threadsafe()` for WS thread → event loop routing
-8. **Grid rebuild**: `build_greed()` clears grid first — prevents doubling
-9. **Duplicate orders**: Deterministic `client_order_id` (SHA256) for dedup
-10. **Event dataclasses**: All fields must have defaults (Python inheritance requirement)
-11. **CancelIntent**: Use `_cancel_limit()`/`_cancel_all_limits()` helpers, not direct construction
-12. **Test anchor/grid state**: Verify against actual grid structure, not just input values
-13. **conftest conflicts**: Run test suites per-directory (or use `make test`)
-14. **SQLite strips timezone**: Use naive UTC timestamps in test data
-15. **Blocking I/O in async**: Wrap with `asyncio.to_thread()` (Python 3.9+)
-16. **Dict iteration in async**: Snapshot with `list(d.items())` before iterating
-17. **`asyncio.CancelledError`**: Is `BaseException`, passes through `except Exception`
-18. **Logging style**: Use `%s`-style in hot-path loops; f-strings elsewhere acceptable
-19. **PlaceLimitIntent constructor**: Requires `qty` and `grid_level` positional args
-20. **`Decimal("")` raises `decimal.InvalidOperation`**: Bybit may send empty strings for unused/dust numeric fields on mainnet UTA (e.g. `walletBalance`, `availableToWithdraw`). `d.get(key, "0")` only handles *missing* keys, not present-but-empty. For non-nullable Decimal columns use a `_decimal_or_zero(value)` helper (predicate `value in (None, "")`, fallback `Decimal("0")`); for nullable columns use the 0034 recorder pattern `Decimal(str(v)) if v not in (None, "") else None`. See `apps/event_saver/src/event_saver/writers/wallet_writer.py:17-34` and `apps/recorder/src/recorder/recorder.py:450-453`. Truthiness checks (`if v:`) are wrong here because they conflate legitimate `"0"` with empty.
-21. **Bybit V5 wallet WS frame puts the exchange timestamp at `msg["creationTime"]` (ms, frame top), not inside `data[i]["updateTime"]`**. Pre-V5 / V3 fixtures still set the inner `updateTime`. `wallet_writer._resolve_exchange_ts` tries `updateTime` first, then frame `creationTime`, then `local_ts` as a guard — never falls to epoch. Don't read `wallet_data["updateTime"]` directly on real V5 traffic; it is missing and `int(None or 0) = 0` silently produces 1970-01-01, which then sorts below the single REST snapshot in `WalletSnapshotRepository.get_latest_before` and freezes 0042 seed lookups on the recorder-start balance.
-22. **Hedge-mode liquidation (feature 0043) is computed pair-shaped, not per-leg.** **TL;DR:** call `BacktestRunner._estimate_pair_liq_prices(long_state, short_state, total_equity) -> (liq_long, liq_short)`. Pool input is `BacktestSession.total_equity` (NOT `current_balance`). MM is `calc_maintenance_margin(L_pv + S_pv, symbol, tiers)` (full tier-MMR on combined notional, NOT the sum of per-leg `positionMM`). The over-hedged smaller leg is `0` by construction. Three non-obvious choices (derived from 13 mainnet validation snapshots, see `docs/features/0043_PLAN.md` Phase 2): (a) pool input is `BacktestSession.total_equity` (UTA `totalEquity`), **not** `current_balance` / `totalAvailableBalance` — `total_available_balance` undershoots live by 30-45 USDT in net configurations; (b) MM term is `calc_maintenance_margin(L_pv + S_pv, symbol, tiers)` — **full** tier-MMR on the combined notional, not the sum of per-leg `position_mm` from Bybit's WS payload (Bybit publishes the smaller leg's MM with a hedge discount but reverts to full MMR internally for liq calc); (c) `_process_fill` calls `session.refresh_balances(post_fill_unrealized)` so the emitted parity snapshot, risk multipliers, and log all see synchronous post-fill equity instead of the previous tick's value. Don't reintroduce a per-leg `_estimate_liquidation_price` — the pair function is the only liq formula in the codebase.
-23. **PositionComparator state-consistency filter (feature 0044).** Pairs matched by exchange_ts but where backtest state has drifted from live (size delta > `state_size_tolerance` default 0.001, or relative entry drift > `state_entry_rel_tolerance` default 0.001 = 0.1%) are flagged `state_diverged=True` on the `PositionComparisonPair`, counted in `ValidationMetrics.position_pairs_state_diverged`, and **excluded** from `liq_price_*` / `position_im_*` / `position_mm_*` / `unrealised_pnl_*` aggregates. They still appear in `position_comparison.csv` (with the `state_diverged` column = `1`) for diagnostic inspection. Why: operator manual fills, missed grid orders, and other state-divergence artefacts otherwise pollute the headline `liq_price_max_abs_delta` metric. Re-validating 0043 on the original noisy DB dropped the metric from 17.77 USDT (dominated by 2 manual-intervention outliers) to 0 USDT. Tolerances are constructor kwargs — relax via `PositionComparator(state_size_tolerance=Decimal("2.0"), ...)` for runs where you want to compare states that drifted by more than a step. See `docs/features/0044_PLAN.md`.
+1. **DO NOT** use raw strings for enums — use `GridSideType`, `DirectionType`, `SideType`, `RunType`
+2. **ALWAYS** run tests before committing (`make test`)
+3. **ALWAYS** use `redact_db_url()` when logging database URLs
+4. **ALWAYS** use `asyncio.run_coroutine_threadsafe()` for WS thread → event loop routing
+5. **Duplicate orders**: Deterministic `client_order_id` (SHA256) for dedup
+6. **Test anchor/grid state**: Verify against actual grid structure, not just input values
+7. **conftest conflicts**: Run test suites per-directory (or use `make test`)
+8. **SQLite strips timezone**: Use naive UTC timestamps in test data
+9. **Blocking I/O in async**: Wrap with `asyncio.to_thread()` (Python 3.9+)
+10. **Dict iteration in async**: Snapshot with `list(d.items())` before iterating
+11. **`asyncio.CancelledError`**: Is `BaseException`, passes through `except Exception`
+12. **Logging style**: Use `%s`-style in hot-path loops; f-strings elsewhere acceptable
+13. **PlaceLimitIntent constructor**: Requires `qty` and `grid_level` positional args
+14. **`Decimal("")` raises `decimal.InvalidOperation`**: Bybit may send empty strings for unused/dust numeric fields on mainnet UTA (e.g. `walletBalance`, `availableToWithdraw`). `d.get(key, "0")` only handles *missing* keys, not present-but-empty. For non-nullable Decimal columns use a `_decimal_or_zero(value)` helper (predicate `value in (None, "")`, fallback `Decimal("0")`); for nullable columns use the 0034 recorder pattern `Decimal(str(v)) if v not in (None, "") else None`. See `apps/event_saver/src/event_saver/writers/wallet_writer.py:17-34` and `apps/recorder/src/recorder/recorder.py:450-453`. Truthiness checks (`if v:`) are wrong here because they conflate legitimate `"0"` with empty.
+15. **Bybit V5 wallet WS frame puts the exchange timestamp at `msg["creationTime"]` (ms, frame top), not inside `data[i]["updateTime"]`**. Pre-V5 / V3 fixtures still set the inner `updateTime`. `wallet_writer._resolve_exchange_ts` tries `updateTime` first, then frame `creationTime`, then `local_ts` as a guard — never falls to epoch. Don't read `wallet_data["updateTime"]` directly on real V5 traffic; it is missing and `int(None or 0) = 0` silently produces 1970-01-01, which then sorts below the single REST snapshot in `WalletSnapshotRepository.get_latest_before` and freezes 0042 seed lookups on the recorder-start balance.
+16. **Hedge-mode liquidation (feature 0043) is computed pair-shaped, not per-leg.** **TL;DR:** call `BacktestRunner._estimate_pair_liq_prices(long_state, short_state, total_equity) -> (liq_long, liq_short)`. Pool input is `BacktestSession.total_equity` (NOT `current_balance`). MM is `calc_maintenance_margin(L_pv + S_pv, symbol, tiers)` (full tier-MMR on combined notional, NOT the sum of per-leg `positionMM`). The over-hedged smaller leg is `0` by construction. Three non-obvious choices (derived from 13 mainnet validation snapshots, see `docs/features/0043_PLAN.md` Phase 2): (a) pool input is `BacktestSession.total_equity` (UTA `totalEquity`), **not** `current_balance` / `totalAvailableBalance` — `total_available_balance` undershoots live by 30-45 USDT in net configurations; (b) MM term is `calc_maintenance_margin(L_pv + S_pv, symbol, tiers)` — **full** tier-MMR on the combined notional, not the sum of per-leg `position_mm` from Bybit's WS payload (Bybit publishes the smaller leg's MM with a hedge discount but reverts to full MMR internally for liq calc); (c) `_process_fill` calls `session.refresh_balances(post_fill_unrealized)` so the emitted parity snapshot, risk multipliers, and log all see synchronous post-fill equity instead of the previous tick's value. Don't reintroduce a per-leg `_estimate_liquidation_price` — the pair function is the only liq formula in the codebase.
+17. **PositionComparator state-consistency filter (feature 0044).** Pairs matched by exchange_ts but where backtest state has drifted from live (size delta > `state_size_tolerance` default 0.001, or relative entry drift > `state_entry_rel_tolerance` default 0.001 = 0.1%) are flagged `state_diverged=True` on the `PositionComparisonPair`, counted in `ValidationMetrics.position_pairs_state_diverged`, and **excluded** from `liq_price_*` / `position_im_*` / `position_mm_*` / `unrealised_pnl_*` aggregates. They still appear in `position_comparison.csv` (with the `state_diverged` column = `1`) for diagnostic inspection. Why: operator manual fills, missed grid orders, and other state-divergence artefacts otherwise pollute the headline `liq_price_max_abs_delta` metric. Re-validating 0043 on the original noisy DB dropped the metric from 17.77 USDT (dominated by 2 manual-intervention outliers) to 0 USDT. Tolerances are constructor kwargs — relax via `PositionComparator(state_size_tolerance=Decimal("2.0"), ...)` for runs where you want to compare states that drifted by more than a step. See `docs/features/0044_PLAN.md`.
 
-24. **Hedge-aware `positionIM` / `positionMM` on `PositionSnapshot` (feature 0045) — inline pair helper, no per-leg primitives on the emission path.** **TL;DR:** in `BacktestRunner._emit_position_snapshot`, call `self._estimate_pair_im_mm(long_state, short_state, mark_price) -> (im_long, mm_long, im_short, mm_short)` inline and pick the leg matching the snapshot direction. Do **not** reintroduce `calc_initial_margin(L_pv, ...)` / `calc_maintenance_margin(L_pv, ...)` on the snapshot path — those primitives omit Bybit's fee-to-close component (a ~0.23 USDT single-leg gap) AND the hedge cross-credit (a ~1 USDT paired-hedge gap). They stay in `gridcore.pnl` for non-snapshot callers (`pnl_checker` and other pure single-leg sites). Three non-obvious choices, derived from 10 paired LTCUSDT mainnet snapshots + Bybit help-center docs (see `docs/features/0045_PLAN.md` Phase 1 and `docs/features/0045_REVIEW.md`): (a) `positionIM` / `positionMM` returned by Bybit's `/v5/position/list` **include the estimated fee-to-close** — `fee_long = L_size × L_entry × (1 − 1/leverage) × taker_rate`, `fee_short = L_size × L_entry × (1 + 1/leverage) × taker_rate`; (b) the dominant leg's MM uses **only the unhedged portion** at the leg's full-pv tier (`max((L − S) × mark × MMR_tier − deduction_tier, 0)`) — the hedged portion contributes zero to the dominant leg's published MM because Bybit cross-credits it to the smaller leg; the `deduction_tier` term carries through to keep the per-tier MM formula continuous at tier boundaries (matters once any leg crosses tier 1, e.g. LTCUSDT pv ≥ 200k); (c) the smaller (fully hedged) leg has **no `pv × MMR` baseline term** — it publishes `fee_to_close_smaller + MMR_tier × hedged_size × |L_entry − S_entry| × C`, where `C ≈ 5.657` is an empirical Bybit hedge buffer factor whose closed form is not yet documented and needs per-symbol calibration. Config inputs live on `BacktestStrategyConfig.taker_fee_rate` (default 0.00075) and `BacktestStrategyConfig.hedge_smaller_buffer_factor` (default 5.657, LTCUSDT @ 10x). The pre-0045 `calc_initial_margin` / `calc_maintenance_margin` on the snapshot path was wrong even for single-leg cases (missed fee-to-close); the new helper closes the gap for both single-leg and paired-hedge configurations. Single consumer per emit — call inline, no precompute / kwargs threading (contrast with 0043 liq, where two consumers in `_process_fill` justify a precomputed pair).
+18. **Hedge-aware `positionIM` / `positionMM` on `PositionSnapshot` (feature 0045) — inline pair helper, no per-leg primitives on the emission path.** **TL;DR:** in `BacktestRunner._emit_position_snapshot`, call `self._estimate_pair_im_mm(long_state, short_state, mark_price) -> (im_long, mm_long, im_short, mm_short)` inline and pick the leg matching the snapshot direction. Do **not** reintroduce `calc_initial_margin(L_pv, ...)` / `calc_maintenance_margin(L_pv, ...)` on the snapshot path — those primitives omit Bybit's fee-to-close component (a ~0.23 USDT single-leg gap) AND the hedge cross-credit (a ~1 USDT paired-hedge gap). They stay in `gridcore.pnl` for non-snapshot callers (`pnl_checker` and other pure single-leg sites). Three non-obvious choices, derived from 10 paired LTCUSDT mainnet snapshots + Bybit help-center docs (see `docs/features/0045_PLAN.md` Phase 1 and `docs/features/0045_REVIEW.md`): (a) `positionIM` / `positionMM` returned by Bybit's `/v5/position/list` **include the estimated fee-to-close** — `fee_long = L_size × L_entry × (1 − 1/leverage) × taker_rate`, `fee_short = L_size × L_entry × (1 + 1/leverage) × taker_rate`; (b) the dominant leg's MM uses **only the unhedged portion** at the leg's full-pv tier (`max((L − S) × mark × MMR_tier − deduction_tier, 0)`) — the hedged portion contributes zero to the dominant leg's published MM because Bybit cross-credits it to the smaller leg; the `deduction_tier` term carries through to keep the per-tier MM formula continuous at tier boundaries (matters once any leg crosses tier 1, e.g. LTCUSDT pv ≥ 200k); (c) the smaller (fully hedged) leg has **no `pv × MMR` baseline term** — it publishes `fee_to_close_smaller + MMR_tier × hedged_size × |L_entry − S_entry| × C`, where `C ≈ 5.657` is an empirical Bybit hedge buffer factor whose closed form is not yet documented and needs per-symbol calibration. Config inputs live on `BacktestStrategyConfig.taker_fee_rate` (default 0.00075) and `BacktestStrategyConfig.hedge_smaller_buffer_factor` (default 5.657, LTCUSDT @ 10x). The pre-0045 `calc_initial_margin` / `calc_maintenance_margin` on the snapshot path was wrong even for single-leg cases (missed fee-to-close); the new helper closes the gap for both single-leg and paired-hedge configurations. Single consumer per emit — call inline, no precompute / kwargs threading (contrast with 0043 liq, where two consumers in `_process_fill` justify a precomputed pair).
 
-25. **Non-USDT collateral re-marking on backtest `total_equity` (feature 0065).** When the trader holds non-USDT spot (e.g. SOL) as UTA collateral, live `totalEquity` floats with that coin's mark while a pre-0065 backtest stayed anchored to the seed snapshot — surfacing as `liq_price_*`/`position_im_*`/`position_mm_*` parity drift (those metrics read `BacktestSession.total_equity`, see entry 22). 0065 adds a collateral re-mark **delta** to `total_equity` ONLY. Non-obvious points:
+19. **Non-USDT collateral re-marking on backtest `total_equity` (feature 0065).** When the trader holds non-USDT spot (e.g. SOL) as UTA collateral, live `totalEquity` floats with that coin's mark while a pre-0065 backtest stayed anchored to the seed snapshot — surfacing as `liq_price_*`/`position_im_*`/`position_mm_*` parity drift (those metrics read `BacktestSession.total_equity`, see entry 16). 0065 adds a collateral re-mark **delta** to `total_equity` ONLY. Non-obvious points:
     - **Bybit `totalEquity` excludes the collateral value ratio** — the re-mark term is the FULL asset USD value `Σ balance × mark` (anchored: `+ (collateral_now − Σ balance × seed_mark)`), with **no** ratio/haircut. The ratio applies to *margin balance*, not `totalEquity`. `SeedConfig.collateral_value_ratios` is stored for a FUTURE margin-parity feature and is **not** applied here.
     - **Term moves `total_equity` only.** `current_balance`, `equity_curve`, and `finalize().final_balance` stay available-based (`initial_balance + pnl_delta`) so executor sizing/qty/PnL/fee parity is byte-identical. Applied in BOTH `BacktestSession.update_equity` AND `refresh_balances` (the latter is what `process_fills` calls before reading `total_equity` for the emitted pair-liq snapshot — omitting it there lags the metric one collateral step on fill rows).
     - **Mark feed runs at the TOP of the engine tick loop**, before `process_fills` (`engine.py` `CollateralMarkFeed.mark_at(coin, tick.exchange_ts)` → `session.update_collateral_mark`). The traded-symbol provider does not carry collateral ticks; the feed streams each coin's `*USDT` `ticker_snapshots` with carry-forward at-or-before semantics and a monotonic per-coin cursor (assumes non-decreasing tick ts).
@@ -1372,14 +1307,14 @@ All risk config thresholds (`max_margin=8`, `min_total_margin=0.15`) are ratios.
     - **#3a integration tests MUST use `wind_down_mode: leave_open`** — `_wind_down` (close_all) does not call `refresh_balances`/`update_equity` and `finalize()` does not rewrite `total_equity`, so read `session.total_equity` after the tick loop, NOT post-`finalize()`. Static-balance limitation: `coin_balances` are frozen at seed; live deposits/withdrawals/spot-trades of the coin during the window are un-modelled (#3a WARN). Empty `collateral_coins` → term is identically zero (USDT-only no-op, acceptance #4).
     - Real-data attribution: `scripts/verify_0065_collateral.py` shows `balance × (mark_end − mark_seed)` against live `totalEquity` drift on a recorder DB. See `docs/features/0065_PLAN.md`.
 
-26. **`claude-code-action` workflow file must match default branch** — The `.github/workflows/claude-code-review.yml` on a PR branch must be identical to the version on `main`. Modify it on `main` first, then all future PRs pick it up. If you change it on a feature branch, the OIDC token validation fails with "Workflow validation failed."
-27. **`_margin_ratio` in calculator.py** — Distinguishes `pos is None` (no position, returns 0 silently) from `wallet_balance <= 0` (logs warning then returns 0). This aids debugging when wallet data is missing.
-28. **`grid.py __center_grid` rebalancing** — `lowest_buy_price` must be tracked in the loop (not just initialized from `grid[0]`). After `update_grid` changes sides, grid[0] may be WAIT, not BUY. Fixed 2026-04-11.
-29. **f-string division in `runner.py _process_fill`** — Decimal division by `session.current_balance` inside f-strings crashes even when debug logging is disabled. Always guard balance divisions with `> 0` check outside the f-string. Fixed 2026-04-11.
-30. **`reconciler.py` public trade reconciliation** — Bybit's `/v5/market/recent-trade` only returns the most recent trades; it does NOT support time-range queries. The reconciler logs a warning when fetched data doesn't cover the gap. Execution reconciliation (`get_executions_all`) correctly passes `start_time`/`end_time`. **`reconcile_public_trades` must floor `reconcile_start` at `gap_start`** when `last_persisted_ts >= gap_start` (mirrors execution path) — otherwise post-gap live WS writes advance `get_last_trade_ts` past the outage and the local filter silently skips the entire gap. Path: `apps/event_saver/src/event_saver/reconciler.py`. Fixed 2026-06-30.
-31. **`runner.py _execute_intents` stale limits snapshot** — `_execute_intents()` must refresh the `limits` snapshot after each successful `_execute_place_intent()` call. Without this, multiple reduce-only intents in the same batch all check against the same stale snapshot, over-covering the position and causing Bybit 110017 reduce-only rejections. Path: `apps/gridbot/src/gridbot/runner.py`. Fixed 2026-04-11.
-32. **Backtest `_should_place_close` must resolve intent qty** — Engine emits `qty=0`; the gate must resolve it via `executor.qty_calculator` before checking `pos_size > (pending + intent_qty)`. Without this, the backtest gate is weaker than live `_is_good_to_place()` and allows over-closing positions. Path: `apps/backtest/src/backtest/runner.py`. Fixed 2026-04-11.
-33. **Backtest `_apply_risk_to_qty` must re-round after multiplier** — Base qty is rounded to `qty_step`, but multiplying by the risk multiplier can produce sub-step values (e.g., 0.001 * 0.5 = 0.0005). Must call `instrument_info.round_qty()` after multiplying, matching live `_resolve_qty`. Path: `apps/backtest/src/backtest/runner.py`. Fixed 2026-04-11.
+20. **`claude-code-action` workflow file must match default branch** — The `.github/workflows/claude-code-review.yml` on a PR branch must be identical to the version on `main`. Modify it on `main` first, then all future PRs pick it up. If you change it on a feature branch, the OIDC token validation fails with "Workflow validation failed."
+21. **`_margin_ratio` in calculator.py** — Distinguishes `pos is None` (no position, returns 0 silently) from `wallet_balance <= 0` (logs warning then returns 0). This aids debugging when wallet data is missing.
+22. **`grid.py __center_grid` rebalancing** — `lowest_buy_price` must be tracked in the loop (not just initialized from `grid[0]`). After `update_grid` changes sides, grid[0] may be WAIT, not BUY. Fixed 2026-04-11.
+23. **f-string division in `runner.py _process_fill`** — Decimal division by `session.current_balance` inside f-strings crashes even when debug logging is disabled. Always guard balance divisions with `> 0` check outside the f-string. Fixed 2026-04-11.
+24. **`reconciler.py` public trade reconciliation** — Bybit's `/v5/market/recent-trade` only returns the most recent trades; it does NOT support time-range queries. The reconciler logs a warning when fetched data doesn't cover the gap. Execution reconciliation (`get_executions_all`) correctly passes `start_time`/`end_time`. **`reconcile_public_trades` must floor `reconcile_start` at `gap_start`** when `last_persisted_ts >= gap_start` (mirrors execution path) — otherwise post-gap live WS writes advance `get_last_trade_ts` past the outage and the local filter silently skips the entire gap. Path: `apps/event_saver/src/event_saver/reconciler.py`. Fixed 2026-06-30.
+25. **`runner.py _execute_intents` stale limits snapshot** — `_execute_intents()` must refresh the `limits` snapshot after each successful `_execute_place_intent()` call. Without this, multiple reduce-only intents in the same batch all check against the same stale snapshot, over-covering the position and causing Bybit 110017 reduce-only rejections. Path: `apps/gridbot/src/gridbot/runner.py`. Fixed 2026-04-11.
+26. **Backtest `_should_place_close` must resolve intent qty** — Engine emits `qty=0`; the gate must resolve it via `executor.qty_calculator` before checking `pos_size > (pending + intent_qty)`. Without this, the backtest gate is weaker than live `_is_good_to_place()` and allows over-closing positions. Path: `apps/backtest/src/backtest/runner.py`. Fixed 2026-04-11.
+27. **Backtest `_apply_risk_to_qty` must re-round after multiplier** — Base qty is rounded to `qty_step`, but multiplying by the risk multiplier can produce sub-step values (e.g., 0.001 * 0.5 = 0.0005). Must call `instrument_info.round_qty()` after multiplying, matching live `_resolve_qty`. Path: `apps/backtest/src/backtest/runner.py`. Fixed 2026-04-11.
 
 ## Dynamic Risk Limit Tiers
 
@@ -1448,16 +1383,6 @@ Per-symbol maintenance-margin tiers are now fetched from Bybit's `/v5/market/ris
 15. **Negative position_value**: `calc_initial_margin` logs a warning and returns zero for negative `position_value` (likely a data error).
 16. **In-process lock registry location**: `_IN_PROCESS_LOCKS` and `acquire_in_process_lock` / `release_in_process_lock` live in `cache_lock.py`, not `risk_limit_info.py`. Integration tests that assert ref-counts must import `backtest.cache_lock`; oversized-cache warnings log `CacheSizeExceededError` text (`"Cache file size"` … `"exceeds"`), not the legacy `"Cache file exceeds"` substring.
 
-## Reference Code
-
-- Location: `bbu_reference/bbu2-master/`
-- Keep for comparison tests; never modify
-- **WARNING**: Contains bugs (e.g., short position liq risk logic)
-
-## Docs
-
-Feature documentation lives in `docs/features/` — see `0001_IMPLEMENTATION_SUMMARY.md`, `ORDER_IDENTITY_DESIGN.md`, `0003_FIXES.md`, `0008_PLAN.md`, `0009_PLAN.md`, etc.
-
 ## Risk Limit Cache Format Evolution
 
 **Cache format versions** (apps/backtest/conf/risk_limits_cache.json):
@@ -1472,7 +1397,3 @@ Feature documentation lives in `docs/features/` — see `0001_IMPLEMENTATION_SUM
 1. Open with `O_NOFOLLOW` to atomically reject symlinks
 2. Post-open `fstat` vs `lstat` inode/device comparison detects symlink swaps
 This pattern should be used for all security-sensitive file operations.
-
-## Next Steps (Future Phases)
-
-- Phase I: Deployment & Monitoring
