@@ -11,7 +11,7 @@ Pure grid trading strategy logic with **zero exchange dependencies**.
 - **Zero Exchange Dependencies**: No imports from `pybit`, `bybit`, or any exchange-specific libraries
 - **Event-Driven Architecture**: Strategy processes events and returns intents (no side effects)
 - **Deterministic Behavior**: Produces identical results to original `bbu2-master` code
-- **Well-Tested**: 88% test coverage with comprehensive unit tests
+- **Well-Tested**: 94.7% test coverage with comprehensive unit tests
 - **Type-Safe**: Uses dataclasses and type hints throughout
 
 ## Installation
@@ -143,7 +143,7 @@ From `packages/gridcore` directory:
 PYTHONPATH=./src pytest tests/ --cov=gridcore --cov-report=term-missing --cov-fail-under=80
 ```
 
-Current coverage: **89%**
+Current coverage: **94.7%**
 
 ### Test Suites
 
@@ -174,7 +174,7 @@ The comparison tests in `test_comparison.py` verify that `gridcore` produces ide
 2. ✅ `Grid.build_greed()` produces identical price/side lists as original `Greed.build_greed()`
 3. ✅ `Grid.update_grid()` produces identical results as original
 4. ✅ `Grid.center_greed()` produces identical results as original `__center_greed()`
-5. ✅ All unit tests pass with 88% coverage (exceeds 80% requirement)
+5. ✅ All unit tests pass with 94.7% coverage (exceeds 80% requirement)
 6. ✅ CI validation confirms no `pybit` or `BybitApi` imports in gridcore
 
 ## License

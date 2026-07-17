@@ -1,13 +1,15 @@
 .PHONY: test test-integration lint clear-log live-check
 
 # Run tests per-directory to avoid conftest ImportPathMismatchError when
-# multiple tests/conftest.py exist. Coverage is appended and reported at the end.
-# Note: --cov-fail-under is not used on the merged run; total coverage is ~73%
-# (event_saver, bybit_adapter/rest_client, gridbot/main are low). To enforce
-# 80% on one package: uv run pytest <testpath> --cov=<pkg> --cov-fail-under=80
+# multiple tests/conftest.py exist. Coverage gates (issue #214): total >= 88
+# via the trailing `coverage report --fail-under=88` step (real total 91% as of
+# 2026-07-17); gridcore >= 80 via --cov-fail-under=80 on its invocation, which
+# must stay first and non-append (fresh data file scoped by --cov=gridcore).
+# The integration run's --cov-append/--cov-report flags are inert (no --cov=
+# source, pytest-cov not registered) — the trailing step is the gate site.
 test:
-	rm -f .coverage
-	uv run pytest packages/gridcore/tests --cov=gridcore -q
+	rm -f .coverage .coverage.*
+	uv run pytest packages/gridcore/tests --cov=gridcore --cov-fail-under=80 -q
 	uv run pytest packages/bybit_adapter/tests --cov=bybit_adapter --cov-append -q
 	uv run pytest shared/db/tests --cov=grid_db --cov-append -q
 	uv run pytest apps/event_saver/tests --cov=event_saver --cov-append -q
@@ -19,6 +21,7 @@ test:
 	uv run pytest apps/pnl_checker/tests --cov=pnl_checker --cov-append -q
 	uv run pytest apps/live_check/tests --cov=live_check --cov-append -q
 	uv run pytest tests/integration/ --cov-append --cov-report=term-missing -v
+	uv run coverage report --fail-under=88
 
 # Run cross-package integration tests only
 test-integration:

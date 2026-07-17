@@ -92,7 +92,7 @@ uv run pytest apps/live_check/tests -v
 make test-integration
 ```
 
-**`make test` note**: Runs pytest separately per package to avoid `conftest` ImportPathMismatchError. Coverage is appended; final run prints `term-missing`. `--cov-fail-under` not applied to merged total (~73%). Covers every `pyproject.toml` `testpaths` entry, including `apps/backtest/tests` (added for issue #178 — its prior omission was an oversight with no documented justification).
+**`make test` note**: Runs pytest separately per package to avoid `conftest` ImportPathMismatchError. Coverage accumulates across the 11 package runs into one `.coverage`; a trailing `coverage report --fail-under=88` step gates the merged total (real ≈91% as of 2026-07-17). Covers every `pyproject.toml` `testpaths` entry, including `apps/backtest/tests` (added for issue #178 — its prior omission was an oversight with no documented justification).
 
 ## Continuous Integration (`.github/workflows/ci.yml`)
 
@@ -113,6 +113,14 @@ Phase-0 rollout while the repo is red:
 - `scripts` — one-off research/migration tooling; disposable, not imported by apps. Carve-out: `scripts/check_tier_drift.py` is operational and linted via the explicit path in the `make lint` recipe (issue #215 / feature 0091) — an explicit positional file arg overrides the directory exclude (no `--force-exclude` set).
 
 Maintained code is NOT excluded. When a maintained file has an intentional lint error, prefer a targeted `# noqa: <code>` over excluding it — e.g. `tests/integration/conftest.py:16` carries `# noqa: E402` on the `gridcore.config` import that must follow the `sys.path.insert` block.
+
+### Coverage gate (Feature 0092, issue #214)
+
+Two gates in `make test`, both enforced by CI because it runs `make test`:
+- **Total ≥ 88** — trailing `uv run coverage report --fail-under=88` step, evaluated on the merged `.coverage` accumulated by the 11 per-package pytest runs (real total ≈91% as of 2026-07-17).
+- **gridcore ≥ 80** — `--cov-fail-under=80` on gridcore's own pytest invocation. Valid only because that invocation is scoped by `--cov=gridcore` and writes a fresh data file (first in sequence, no `--cov-append`, right after `rm -f .coverage .coverage.*`). It must stay first AND non-append — moved later without adding `--cov-append`, it erases the accumulated data feeding the total gate.
+
+The integration run's `--cov-append`/`--cov-report` flags are inert (no `--cov=` source, so pytest-cov never registers) — the merged total covers the 11 package runs only. Other packages are intentionally ungated; both thresholds sit below real coverage for churn headroom.
 
 ---
 
