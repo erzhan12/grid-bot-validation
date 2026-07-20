@@ -1,0 +1,24 @@
+# Smoke-replay template for the importer's --validate check (feature 0093).
+# validate.py renders this to a temp file, overriding database_url, symbol,
+# start_ts/end_ts (one 4h window) and strategy.tick_size (pinned per-symbol
+# EXCHANGE tick — without it replay's instrument-info path would require a
+# live exchange fetch and the smoke check would fail offline).
+database_url: "OVERRIDDEN"
+run_id: null  # auto-discover the synthetic recording run
+symbol: "OVERRIDDEN"
+start_ts: "OVERRIDDEN"
+end_ts: "OVERRIDDEN"
+
+strategy:
+  tick_size: "OVERRIDDEN"
+  grid_count: 50
+  grid_step: 0.5
+  amount: "x0.001"
+
+seed:
+  enabled: false  # fresh grid from market price
+
+fill_simulator:
+  mode: last_cross
+
+output_dir: "OVERRIDDEN"
