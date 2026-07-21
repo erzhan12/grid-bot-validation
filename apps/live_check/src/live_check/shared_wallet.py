@@ -88,17 +88,23 @@ def reconcile_wallet_curve(
 
     Recorded NULL fields are skipped per field, never coerced to zero. Replayed
     values are sampled nearest at-or-before the recorded timestamp.
+
+    Both timestamp streams are normalized to naive UTC before comparison so a
+    mixed tz-aware/tz-naive pair cannot raise a TypeError mid-walk (the prod
+    SQLite path is naive on both sides; this guards injected/aware inputs).
     """
-    replay = sorted(replay_curve, key=lambda p: p.exchange_ts)
+    replay = sorted(replay_curve, key=lambda p: to_naive_utc(p.exchange_ts))
+    replay_ts = [to_naive_utc(p.exchange_ts) for p in replay]
     equity_deltas: list[Decimal] = []
     margin_deltas: list[Decimal] = []
     mm_rate_deltas: list[Decimal] = []
     final_equity_delta = Decimal("0")
     idx = -1
     for point in recorded_curve:
+        point_ts = to_naive_utc(point.exchange_ts)
         while (
             idx + 1 < len(replay)
-            and replay[idx + 1].exchange_ts <= point.exchange_ts
+            and replay_ts[idx + 1] <= point_ts
         ):
             idx += 1
         if idx < 0:

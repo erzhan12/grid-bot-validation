@@ -137,6 +137,37 @@ class TestSharedSessionCoordinator:
         assert seen_wallet == Decimal("103")
         assert session.total_equity == Decimal("103")
 
+    def test_in_method_place_reads_account_wide_wallet_balance(self):
+        """C2 (review): the wallet_balance an in-method execute_place consumes
+        during execute_tick reflects the account-wide Σ unrealized (idle book
+        folded in), NOT the own-symbol value — the exact anti-pattern a
+        trailing refresh would leave stale."""
+        session = BacktestSession(initial_balance=Decimal("100"))
+        runners = {
+            "SOLUSDT": _Runner("5", "0"),   # active book: +5 own unrealized
+            "LTCUSDT": _Runner("-2", "0"),  # idle book: -2, must be folded in
+        }
+        coord = _SharedSessionCoordinator(
+            session,
+            runners,
+            {"SOLUSDT": Decimal("100"), "LTCUSDT": Decimal("80")},
+        )
+        captured = {}
+
+        def fake_execute_place():
+            # Mirrors runner.execute_place(wallet_balance=session.current_balance)
+            captured["wallet_balance"] = session.current_balance
+
+        # Simulate execute_tick internals: own-symbol refresh, then a place
+        # that reads session.current_balance in-method.
+        with coord.active("SOLUSDT"):
+            session.refresh_balances(Decimal("5"))
+            fake_execute_place()
+
+        # Σ = 100 + 5 + (-2) = 103, NOT the own-symbol 100 + 5 = 105.
+        assert captured["wallet_balance"] == Decimal("103")
+        assert captured["wallet_balance"] != Decimal("105")
+
     def test_account_margin_series_units(self):
         """C3/C4: emitted sample has equity, margin balance and ratio units."""
         session = BacktestSession(initial_balance=Decimal("100"))

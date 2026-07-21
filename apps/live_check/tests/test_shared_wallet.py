@@ -1,6 +1,6 @@
 """Tests for shared-wallet reconciliation helpers."""
 
-from datetime import timedelta
+from datetime import timedelta, timezone
 from decimal import Decimal
 
 from grid_db import WalletSnapshot
@@ -138,3 +138,28 @@ def test_reconcile_wallet_curve_skips_nulls_per_field(ts):
     assert diff.margin_balance_points == 1
     assert diff.max_account_mm_rate_delta == Decimal("0.001")
     assert diff.account_mm_rate_points == 1
+
+
+def test_reconcile_wallet_curve_mixed_tz_awareness(ts):
+    """Review P2: mixed tz-aware/naive timestamps normalize to naive UTC and
+    do not raise a TypeError mid-walk (recorded aware, replay naive here)."""
+    aware = ts.replace(tzinfo=timezone.utc)
+    recorded = [
+        WalletCurvePoint(
+            exchange_ts=aware,
+            total_equity=Decimal("100"),
+            total_margin_balance=None,
+            account_mm_rate=None,
+        )
+    ]
+    replay = [
+        AccountCurveSample(
+            exchange_ts=ts,  # naive — opposite awareness from recorded
+            total_equity=Decimal("100.4"),
+            total_margin_balance=Decimal("100.4"),
+            account_mm_rate=Decimal("0.01"),
+        )
+    ]
+    diff = reconcile_wallet_curve(replay, recorded)
+    assert diff.equity_points == 1
+    assert diff.max_equity_delta == Decimal("0.4")
