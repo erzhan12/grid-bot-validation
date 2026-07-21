@@ -8,6 +8,7 @@ from decimal import Decimal
 
 from live_check.config import VerdictThresholds
 from live_check.ground_truth import GroundTruth
+from live_check.shared_wallet import SharedWalletDiff
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,18 @@ class Verdict:
     realized_ok: bool
     commission_ok: bool
     unrealised_ok: bool
+    passed: bool
+
+
+@dataclass(frozen=True)
+class SharedWalletVerdict:
+    """Outcome of the account-level shared-wallet gates."""
+
+    per_strat: dict[str, Verdict]
+    wallet_diff: SharedWalletDiff
+    equity_ok: bool
+    total_margin_balance_ok: bool
+    account_mm_rate_ok: bool
     passed: bool
 
 
@@ -95,4 +108,74 @@ def evaluate(
         commission_ok=commission_ok,
         unrealised_ok=unrealised_ok,
         passed=matched_ok and realized_ok and commission_ok and unrealised_ok,
+    )
+
+
+def evaluate_multi_strategy(
+    strategy_result,
+    ground_truth: GroundTruth,
+    thresholds: VerdictThresholds,
+) -> Verdict:
+    """Evaluate one symbol from a shared-session replay using per-symbol metrics."""
+    match_result = strategy_result.match_result
+    live_only_count = len(match_result.live_only)
+    backtest_only_count = len(match_result.backtest_only)
+    matched_ok = live_only_count == 0 and backtest_only_count == 0
+    metrics = strategy_result.metrics
+
+    d_realized = metrics.total_backtest_pnl - ground_truth.sum_realized
+    d_commission = metrics.total_backtest_fees - ground_truth.sum_commission
+    d_unrealised = strategy_result.final_unrealized - ground_truth.net_unrealised
+
+    realized_ok = abs(d_realized) < thresholds.realized
+    commission_ok = abs(d_commission) < thresholds.commission
+    unrealised_ok = abs(d_unrealised) < thresholds.unrealised
+
+    return Verdict(
+        live_only_count=live_only_count,
+        backtest_only_count=backtest_only_count,
+        matched_count=len(match_result.matched),
+        live_exec_count=ground_truth.live_exec_count,
+        d_realized=d_realized,
+        d_commission=d_commission,
+        d_unrealised=d_unrealised,
+        matched_ok=matched_ok,
+        realized_ok=realized_ok,
+        commission_ok=commission_ok,
+        unrealised_ok=unrealised_ok,
+        passed=matched_ok and realized_ok and commission_ok and unrealised_ok,
+    )
+
+
+def evaluate_shared_wallet(
+    per_strat: dict[str, Verdict],
+    wallet_diff: SharedWalletDiff,
+    thresholds: VerdictThresholds,
+) -> SharedWalletVerdict:
+    """AND per-strat event-follower checks with account wallet gates."""
+    equity_ok = (
+        wallet_diff.equity_points > 0
+        and wallet_diff.max_equity_delta < thresholds.equity
+    )
+    total_margin_balance_ok = (
+        wallet_diff.margin_balance_points > 0
+        and wallet_diff.max_margin_balance_delta < thresholds.total_margin_balance
+    )
+    account_mm_rate_ok = (
+        wallet_diff.account_mm_rate_points > 0
+        and wallet_diff.max_account_mm_rate_delta < thresholds.account_mm_rate
+    )
+    passed = (
+        all(v.passed for v in per_strat.values())
+        and equity_ok
+        and total_margin_balance_ok
+        and account_mm_rate_ok
+    )
+    return SharedWalletVerdict(
+        per_strat=per_strat,
+        wallet_diff=wallet_diff,
+        equity_ok=equity_ok,
+        total_margin_balance_ok=total_margin_balance_ok,
+        account_mm_rate_ok=account_mm_rate_ok,
+        passed=passed,
     )

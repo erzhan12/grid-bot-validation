@@ -50,7 +50,28 @@ class VerdictThresholds(BaseModel):
         ),
     )
 
-    @field_validator("realized", "commission", "unrealised", mode="before")
+    equity: Decimal = Field(
+        default=Decimal("0.50"),
+        description="Max replayed-vs-recorded account total_equity delta.",
+    )
+    total_margin_balance: Decimal = Field(
+        default=Decimal("5.00"),
+        description="Max replayed-vs-recorded account total_margin_balance delta.",
+    )
+    account_mm_rate: Decimal = Field(
+        default=Decimal("0.01"),
+        description="Max replayed-vs-recorded account_mm_rate ratio delta.",
+    )
+
+    @field_validator(
+        "realized",
+        "commission",
+        "unrealised",
+        "equity",
+        "total_margin_balance",
+        "account_mm_rate",
+        mode="before",
+    )
     @classmethod
     def parse_decimal_fields(cls, v):
         """Convert string/numeric to Decimal."""

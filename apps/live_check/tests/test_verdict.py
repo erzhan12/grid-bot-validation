@@ -7,7 +7,12 @@ import pytest
 
 from live_check.config import VerdictThresholds
 from live_check.ground_truth import GroundTruth
-from live_check.verdict import evaluate
+from live_check.shared_wallet import SharedWalletDiff
+from live_check.verdict import (
+    evaluate,
+    evaluate_multi_strategy,
+    evaluate_shared_wallet,
+)
 
 _ZERO = Decimal("0")
 
@@ -124,3 +129,56 @@ class TestUnrealisedSource:
         """session.metrics None → explicit ValueError, not AttributeError."""
         with pytest.raises(ValueError, match="not.*finalized|finalize"):
             evaluate(_rr(metrics_none=True), _truth(), VerdictThresholds())
+
+
+class TestSharedWalletVerdict:
+    def test_multi_strategy_uses_per_symbol_metrics_not_session_totals(self):
+        """C5: per-strat verdict fails even if shared session totals would pass."""
+        result = SimpleNamespace(
+            metrics=SimpleNamespace(
+                total_backtest_pnl=Decimal("10"),
+                total_backtest_fees=Decimal("1"),
+            ),
+            final_unrealized=Decimal("0"),
+            match_result=SimpleNamespace(matched=[], live_only=[], backtest_only=[]),
+        )
+        verdict = evaluate_multi_strategy(
+            result,
+            _truth(realized="0", commission="1", unrealised="0"),
+            VerdictThresholds(),
+        )
+        assert not verdict.realized_ok
+        assert not verdict.passed
+
+    def test_shared_wallet_ands_all_gate_groups(self):
+        """Shared verdict requires per-strat, equity and margin gates."""
+        per = {
+            "sol": evaluate(_rr(), _truth(), VerdictThresholds()),
+            "ltc": evaluate(_rr(), _truth(), VerdictThresholds()),
+        }
+        diff = SharedWalletDiff(
+            max_equity_delta=Decimal("0.1"),
+            final_equity_delta=Decimal("0.1"),
+            max_margin_balance_delta=Decimal("0.1"),
+            max_account_mm_rate_delta=Decimal("0.001"),
+            equity_points=2,
+            margin_balance_points=2,
+            account_mm_rate_points=2,
+        )
+        verdict = evaluate_shared_wallet(per, diff, VerdictThresholds())
+        assert verdict.passed
+
+    def test_shared_wallet_zero_points_fail(self):
+        """Zero wallet data is not a PASS."""
+        per = {"sol": evaluate(_rr(), _truth(), VerdictThresholds())}
+        diff = SharedWalletDiff(
+            max_equity_delta=Decimal("0"),
+            final_equity_delta=Decimal("0"),
+            max_margin_balance_delta=Decimal("0"),
+            max_account_mm_rate_delta=Decimal("0"),
+            equity_points=0,
+            margin_balance_points=0,
+            account_mm_rate_points=0,
+        )
+        verdict = evaluate_shared_wallet(per, diff, VerdictThresholds())
+        assert not verdict.passed

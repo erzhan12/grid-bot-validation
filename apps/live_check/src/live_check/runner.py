@@ -6,6 +6,8 @@ from grid_db import DatabaseFactory
 
 from replay.config import FillSimulatorConfig, ReplayConfig, SeedConfig
 from replay.engine import ReplayEngine, ReplayResult
+from replay.multi_config import MultiReplayConfig, MultiSeedConfig
+from replay.multi_engine import MultiReplayEngine, MultiReplayResult
 
 from live_check.config import StratCheckConfig
 from live_check.window import Window
@@ -78,5 +80,57 @@ def run_strat(
     logger.info(
         "%s: replaying %s window %s → %s (event_follower, seeded)",
         strat.strat_id, strat.symbol, window.start, window.end,
+    )
+    return engine.run()
+
+
+def build_multi_replay_config(
+    strats: list[StratCheckConfig],
+    window: Window,
+    run_id: str,
+    database_url: str,
+    account_id: str,
+) -> MultiReplayConfig:
+    """Compose one shared-wallet event_follower replay config."""
+    return MultiReplayConfig(
+        database_url=database_url,
+        run_id=run_id,
+        start_ts=window.start,
+        end_ts=window.end,
+        seed=MultiSeedConfig(
+            enabled=True,
+            at_ts=window.start,
+            account_id=account_id,
+        ),
+        fill_simulator=FillSimulatorConfig(mode="event_follower"),
+        strategies=[
+            strat.to_replay_strategy_config().model_dump() | {
+                "symbol": strat.symbol,
+                "strat_id": strat.strat_id,
+            }
+            for strat in strats
+        ],
+    )
+
+
+def run_shared(
+    strats: list[StratCheckConfig],
+    window: Window,
+    run_id: str,
+    account_id: str,
+    db: DatabaseFactory,
+) -> MultiReplayResult:
+    """Run one seeded shared-wallet replay for all configured strats."""
+    config = build_multi_replay_config(
+        strats=strats,
+        window=window,
+        run_id=run_id,
+        database_url=db.settings.get_database_url(),
+        account_id=account_id,
+    )
+    engine = MultiReplayEngine(config, db=db, emit_backtest_snapshots=False)
+    logger.info(
+        "shared: replaying %d strats window %s → %s (event_follower, seeded)",
+        len(strats), window.start, window.end,
     )
     return engine.run()

@@ -7,6 +7,12 @@ simulated trades against real recorded executions.
 
 from replay.config import ReplayConfig, ReplayStrategyConfig, load_config
 from replay.engine import ReplayEngine, ReplayResult
+from replay.multi_config import (
+    MultiReplayConfig,
+    MultiReplayStrategyConfig,
+    load_multi_config,
+)
+from replay.multi_engine import MultiReplayEngine, MultiReplayResult
 
 __all__ = [
     "ReplayConfig",
@@ -14,4 +20,9 @@ __all__ = [
     "load_config",
     "ReplayEngine",
     "ReplayResult",
+    "MultiReplayConfig",
+    "MultiReplayStrategyConfig",
+    "load_multi_config",
+    "MultiReplayEngine",
+    "MultiReplayResult",
 ]

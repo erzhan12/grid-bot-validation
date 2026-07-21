@@ -24,9 +24,13 @@ from typing import Optional
 from grid_db import DatabaseFactory, DatabaseSettings, Run, RunRepository, redact_db_url
 from replay.snapshot_loader import SeedDataQualityError
 
-from live_check import ground_truth, render, runner
+from live_check import ground_truth, render, runner, shared_wallet
 from live_check.config import LiveCheckConfig, StratCheckConfig, load_config
-from live_check.verdict import evaluate
+from live_check.verdict import (
+    evaluate,
+    evaluate_multi_strategy,
+    evaluate_shared_wallet,
+)
 from live_check.window import (
     Window,
     check_post_0080_floors,
@@ -178,6 +182,67 @@ def run_single(config: LiveCheckConfig, args, db: DatabaseFactory) -> int:
     return _exit_code(outcomes)
 
 
+def run_shared_single(config: LiveCheckConfig, args, db: DatabaseFactory) -> int:
+    """Run one shared-wallet replay and account-level reconciliation."""
+    run_id, account_id, run_start = _resolve_run(db, config.run_id)
+    window = compute_window(parse_duration(args.last), parse_duration(args.lag))
+    check_post_0080_floors(window.start, run_start)
+
+    with db.get_readonly_session() as session:
+        exec_counts = {
+            strat.symbol: ground_truth.live_exec_count(
+                session, run_id, strat.symbol, window.start, window.end
+            )
+            for strat in config.strats
+        }
+        missing_ticker = [
+            strat for strat in config.strats
+            if ground_truth.latest_ticker_ts(session, strat.symbol) is None
+        ]
+    if any(count == 0 for count in exec_counts.values()):
+        for strat in config.strats:
+            if exec_counts[strat.symbol] == 0:
+                print(f"{strat.strat_id} ({strat.symbol}) — SKIP: no data in window")
+        return EXIT_SKIP
+    if missing_ticker:
+        for strat in missing_ticker:
+            print(f"{strat.strat_id} ({strat.symbol}) — SKIP: no ticker data")
+        return EXIT_SKIP
+
+    result = runner.run_shared(config.strats, window, run_id, account_id, db)
+    per_strat = {}
+    rendered = []
+    with db.get_readonly_session() as session:
+        for strat in config.strats:
+            truth = ground_truth.collect(
+                session, run_id, account_id, strat.symbol, window
+            )
+            strategy_result = result.strategies[strat.symbol]
+            verdict = evaluate_multi_strategy(
+                strategy_result, truth, config.thresholds
+            )
+            per_strat[strat.strat_id] = verdict
+            rendered.append((strat, verdict, strategy_result))
+        recorded_curve = shared_wallet.load_wallet_curve(
+            session,
+            run_id,
+            account_id,
+            "USDT",
+            window,
+        )
+    wallet_diff = shared_wallet.reconcile_wallet_curve(
+        result.account_curve,
+        recorded_curve,
+    )
+    shared_verdict = evaluate_shared_wallet(
+        per_strat,
+        wallet_diff,
+        config.thresholds,
+    )
+    print(render.render_shared_wallet(rendered, shared_verdict))
+    return EXIT_PASS if shared_verdict.passed else EXIT_FAIL
+
+
 def watch_tick(
     config: LiveCheckConfig,
     db: DatabaseFactory,
@@ -274,6 +339,8 @@ def main(args) -> int:
     try:
         if args.watch:
             return run_watch(config, args, db)
+        if args.shared:
+            return run_shared_single(config, args, db)
         return run_single(config, args, db)
     except KeyboardInterrupt:
         # Ctrl-C out of the --watch sleep is a normal way to stop the loop —
@@ -314,6 +381,10 @@ def cli() -> None:
     mode.add_argument(
         "--curve", action="store_true",
         help="Cumulative realized sparklines + CSV export",
+    )
+    mode.add_argument(
+        "--shared", action="store_true",
+        help="Shared-wallet multi-strategy reconciliation",
     )
     parser.add_argument(
         "--last", type=str, default=None,

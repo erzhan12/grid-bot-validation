@@ -58,6 +58,31 @@ def render_once(results) -> str:
     return "\n\n".join(blocks)
 
 
+def render_shared_wallet(strat_results, shared_verdict) -> str:
+    """Render per-strat rows plus shared account-level wallet gates."""
+    blocks = [render_once(strat_results)]
+    status = "PASS" if shared_verdict.passed else "FAIL"
+    diff = shared_verdict.wallet_diff
+    blocks.append(
+        "\n".join(
+            [
+                f"=== shared wallet — {status} ===",
+                f"  max Δequity          {_fmt(diff.max_equity_delta)} "
+                f"{_flag(shared_verdict.equity_ok)} "
+                f"({diff.equity_points} points)",
+                f"  final Δequity        {_fmt(diff.final_equity_delta)}",
+                f"  max Δmargin_balance  {_fmt(diff.max_margin_balance_delta)} "
+                f"{_flag(shared_verdict.total_margin_balance_ok)} "
+                f"({diff.margin_balance_points} points)",
+                f"  max Δaccount_mm_rate {_fmt(diff.max_account_mm_rate_delta)} "
+                f"{_flag(shared_verdict.account_mm_rate_ok)} "
+                f"({diff.account_mm_rate_points} points)",
+            ]
+        )
+    )
+    return "\n\n".join(blocks)
+
+
 def render_watch_line(results, tick_ts=None) -> str:
     """One-line traffic-light per strat for a watch tick.
 
