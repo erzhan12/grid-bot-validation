@@ -1,9 +1,10 @@
 """Shared-wallet ground-truth reads and replayed-curve reconciliation."""
 
+import json
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
-from typing import Iterable, Optional
+from decimal import Decimal, InvalidOperation
+from typing import Any, Iterable, Optional
 
 from sqlalchemy.orm import Session
 
@@ -14,12 +15,58 @@ from live_check.window import Window, to_naive_utc
 
 @dataclass(frozen=True)
 class WalletCurvePoint:
-    """Materialized account-level wallet snapshot fields."""
+    """Materialized futures-basis wallet snapshot fields."""
 
     exchange_ts: datetime
     total_equity: Optional[Decimal]
     total_margin_balance: Optional[Decimal]
     account_mm_rate: Optional[Decimal]
+
+
+def _decoded_raw_json(raw_json: Any) -> Optional[dict[str, Any]]:
+    """Return a wallet raw_json dict, including one double-encoded layer."""
+    if raw_json is None:
+        return None
+    raw = raw_json
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(raw, dict):
+        return None
+    return raw
+
+
+def _futures_equity(row, coin: str) -> Optional[Decimal]:
+    """Return USDT futures equity from per-coin raw_json, not account total."""
+    raw = _decoded_raw_json(row.raw_json)
+    if raw is None or raw.get("coin") != coin:
+        return None
+    if row.wallet_balance is None or "unrealisedPnl" not in raw:
+        return None
+    try:
+        result = row.wallet_balance + Decimal(str(raw["unrealisedPnl"]))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    # Decimal("NaN")/("Infinity") parse WITHOUT raising — reject non-finite
+    # so a malformed value can never poison the reconcile max-diff.
+    return result if result.is_finite() else None
+
+
+def _futures_mm_rate(row, coin: str) -> Optional[Decimal]:
+    """Return top-level position MM divided by futures equity, if available."""
+    futures_equity = _futures_equity(row, coin)
+    raw = _decoded_raw_json(row.raw_json)
+    if futures_equity is None or futures_equity == 0 or raw is None:
+        return None
+    if "totalPositionMM" not in raw:
+        return None
+    try:
+        result = Decimal(str(raw["totalPositionMM"])) / futures_equity
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return result if result.is_finite() else None
 
 
 @dataclass(frozen=True)
@@ -72,9 +119,9 @@ def load_wallet_curve(
     return [
         WalletCurvePoint(
             exchange_ts=row.exchange_ts,
-            total_equity=row.total_equity,
-            total_margin_balance=row.total_margin_balance,
-            account_mm_rate=row.account_mm_rate,
+            total_equity=_futures_equity(row, coin),
+            total_margin_balance=_futures_equity(row, coin),
+            account_mm_rate=_futures_mm_rate(row, coin),
         )
         for row in sorted(by_ts.values(), key=lambda r: r.exchange_ts)
     ]

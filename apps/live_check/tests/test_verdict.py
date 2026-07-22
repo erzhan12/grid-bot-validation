@@ -150,8 +150,8 @@ class TestSharedWalletVerdict:
         assert not verdict.realized_ok
         assert not verdict.passed
 
-    def test_shared_wallet_ands_all_gate_groups(self):
-        """Shared verdict requires per-strat, equity and margin gates."""
+    def test_shared_wallet_fallback_gates_on_equity_only(self):
+        """0095 fallback: margin/mm-rate remain metrics but do not gate PASS."""
         per = {
             "sol": evaluate(_rr(), _truth(), VerdictThresholds()),
             "ltc": evaluate(_rr(), _truth(), VerdictThresholds()),
@@ -159,14 +159,18 @@ class TestSharedWalletVerdict:
         diff = SharedWalletDiff(
             max_equity_delta=Decimal("0.1"),
             final_equity_delta=Decimal("0.1"),
-            max_margin_balance_delta=Decimal("0.1"),
-            max_account_mm_rate_delta=Decimal("0.001"),
+            max_margin_balance_delta=Decimal("500"),
+            max_account_mm_rate_delta=Decimal("0.5"),
             equity_points=2,
             margin_balance_points=2,
             account_mm_rate_points=2,
         )
         verdict = evaluate_shared_wallet(per, diff, VerdictThresholds())
         assert verdict.passed
+        assert not verdict.total_margin_balance_ok
+        assert not verdict.account_mm_rate_ok
+        assert verdict.wallet_diff.margin_balance_points == 2
+        assert verdict.wallet_diff.account_mm_rate_points == 2
 
     def test_shared_wallet_zero_points_fail(self):
         """Zero wallet data is not a PASS."""

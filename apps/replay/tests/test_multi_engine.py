@@ -18,6 +18,7 @@ from replay.multi_engine import (
     MultiReplayEngine,
     _SharedSessionCoordinator,
 )
+from replay.snapshot_loader import WalletSeed
 
 
 TS = datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -187,6 +188,46 @@ class TestSharedSessionCoordinator:
 
 
 class TestSharedWalletCoupling:
+    def test_build_shared_session_seeds_equity_from_coin_balance(self):
+        """0095: shared replay initial_equity uses futures cash."""
+        config = MultiReplayConfig(
+            initial_balance=Decimal("1000"),
+            strategies=[
+                {"symbol": "SOLUSDT", "strat_id": "sol", "tick_size": "0.01"},
+            ],
+        )
+        wallet_seed = WalletSeed(
+            coin_balance=Decimal("314.02"),
+            total_available_balance=Decimal("280.00"),
+            total_equity=Decimal("324.70"),
+            total_margin_balance=Decimal("324.70"),
+            account_im_rate=Decimal("0.02"),
+            account_mm_rate=Decimal("0.01"),
+        )
+        session = MultiReplayEngine._build_shared_session(config, wallet_seed)
+        assert session.initial_equity == Decimal("314.02")
+        assert session.initial_balance == Decimal("280.00")
+
+    def test_cash_baseline_contract_applies_unrealized_once(self):
+        """0095: total_equity after update is futures cash plus one U."""
+        config = MultiReplayConfig(
+            initial_balance=Decimal("1000"),
+            strategies=[
+                {"symbol": "SOLUSDT", "strat_id": "sol", "tick_size": "0.01"},
+            ],
+        )
+        wallet_seed = WalletSeed(
+            coin_balance=Decimal("314.02"),
+            total_available_balance=Decimal("280.00"),
+            total_equity=Decimal("324.70"),
+            total_margin_balance=Decimal("324.70"),
+            account_im_rate=Decimal("0.02"),
+            account_mm_rate=Decimal("0.01"),
+        )
+        session = MultiReplayEngine._build_shared_session(config, wallet_seed)
+        session.update_equity(TS, Decimal("-8.51"))
+        assert session.total_equity == Decimal("305.51")
+
     def test_record_trade_accumulates_shared_wallet(self):
         """One shared session accumulates realized PnL and fees across symbols."""
         session = BacktestSession(initial_balance=Decimal("100"))

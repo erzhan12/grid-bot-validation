@@ -9,8 +9,11 @@ from live_check.render import (
     render_curve,
     render_once,
     render_per_fill,
+    render_shared_wallet,
     render_watch_line,
 )
+from live_check.shared_wallet import SharedWalletDiff
+from live_check.verdict import SharedWalletVerdict
 from live_check.verdict import Verdict
 
 
@@ -79,6 +82,30 @@ class TestRenderOnce:
         """FAIL verdict labelled FAIL."""
         out = render_once([(_strat(), _verdict(False), _result())])
         assert "FAIL" in out
+
+    def test_shared_wallet_margin_lines_are_informational(self):
+        """0095 fallback render labels demoted margin gates as INFO."""
+        diff = SharedWalletDiff(
+            max_equity_delta=Decimal("0"),
+            final_equity_delta=Decimal("0"),
+            max_margin_balance_delta=Decimal("500"),
+            max_account_mm_rate_delta=Decimal("0.5"),
+            equity_points=1,
+            margin_balance_points=1,
+            account_mm_rate_points=1,
+        )
+        verdict = SharedWalletVerdict(
+            per_strat={"ltcusdt_test": _verdict(True)},
+            wallet_diff=diff,
+            equity_ok=True,
+            total_margin_balance_ok=False,
+            account_mm_rate_ok=False,
+            passed=True,
+        )
+        out = render_shared_wallet([(_strat(), _verdict(True), _result())], verdict)
+        assert "max Δmargin_balance" in out
+        assert "max Δaccount_mm_rate" in out
+        assert out.count("INFO") == 2
 
 
 class TestRenderWatchLine:

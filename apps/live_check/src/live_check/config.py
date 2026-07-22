@@ -51,16 +51,31 @@ class VerdictThresholds(BaseModel):
     )
 
     equity: Decimal = Field(
-        default=Decimal("0.50"),
-        description="Max replayed-vs-recorded account total_equity delta.",
+        default=Decimal("1.00"),
+        description=(
+            "Max replayed-vs-recorded futures total_equity delta. Two books' "
+            "last-vs-mark basis jitter sums, so the two-strategy shared-wallet "
+            "floor is ~2x the single-book 0.50 band (feature 0095: after the "
+            "futures-only fix the systematic ~$8.5 offset collapsed to ~0.54 "
+            "transient max with ~0 final delta on run 580ca395)."
+        ),
     )
     total_margin_balance: Decimal = Field(
         default=Decimal("5.00"),
-        description="Max replayed-vs-recorded account total_margin_balance delta.",
+        description=(
+            "Max replayed-vs-recorded FUTURES margin-balance delta. Feature "
+            "0095 made shared-wallet margin/mm-rate INFORMATIONAL (not gated): "
+            "the recorded side is futures-equity based, not the spot-contaminated "
+            "account total_margin_balance column."
+        ),
     )
     account_mm_rate: Decimal = Field(
         default=Decimal("0.01"),
-        description="Max replayed-vs-recorded account_mm_rate ratio delta.",
+        description=(
+            "Max replayed-vs-recorded FUTURES mm-rate ratio delta. Informational "
+            "for shared-wallet (feature 0095): recorded = totalPositionMM / "
+            "futures_equity, not the spot-contaminated account_mm_rate column."
+        ),
     )
 
     @field_validator(

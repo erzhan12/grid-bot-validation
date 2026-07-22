@@ -1,5 +1,6 @@
 """Tests for shared-wallet reconciliation helpers."""
 
+import json
 from datetime import timedelta, timezone
 from decimal import Decimal
 
@@ -27,8 +28,20 @@ def _insert_wallet(
     equity=None,
     margin=None,
     mm_rate=None,
+    wallet_balance="100",
+    raw_json="auto",
     coin="USDT",
 ):
+    if raw_json == "auto":
+        raw_json = {
+            "coin": coin,
+            "walletBalance": wallet_balance,
+            "unrealisedPnl": (
+                str(Decimal(equity) - Decimal(wallet_balance))
+                if equity is not None else "0"
+            ),
+            "totalPositionMM": "1",
+        }
     with db.get_session() as session:
         session.add(
             WalletSnapshot(
@@ -37,7 +50,7 @@ def _insert_wallet(
                 exchange_ts=ts,
                 local_ts=ts,
                 coin=coin,
-                wallet_balance=Decimal("100"),
+                wallet_balance=Decimal(wallet_balance),
                 available_balance=Decimal("90"),
                 total_available_balance=Decimal("90"),
                 total_equity=Decimal(equity) if equity is not None else None,
@@ -45,6 +58,7 @@ def _insert_wallet(
                     Decimal(margin) if margin is not None else None
                 ),
                 account_mm_rate=Decimal(mm_rate) if mm_rate is not None else None,
+                raw_json=raw_json,
             )
         )
 
@@ -99,6 +113,109 @@ def test_load_wallet_curve_run_filters_and_dedups_end_anchor(
         Decimal("100.00000000"),
         Decimal("101.00000000"),
     ]
+
+
+def test_load_wallet_curve_uses_futures_equity_not_account_column(
+    db, seeded_run_account, ts
+):
+    """Recorded equity comes from coin cash plus unrealised, not account total."""
+    acc = seeded_run_account.account_id
+    _insert_wallet(
+        db,
+        acc,
+        ts=ts,
+        equity="324.70",
+        wallet_balance="314.02",
+        raw_json={
+            "coin": "USDT",
+            "walletBalance": "314.02",
+            "unrealisedPnl": "-8.51",
+            "totalPositionMM": "5.00",
+        },
+    )
+    window = Window(start=ts, end=ts)
+    with db.get_readonly_session() as session:
+        rows = load_wallet_curve(session, RUN_ID, acc, "USDT", window)
+    assert rows[0].total_equity == Decimal("305.51000000")
+    assert rows[0].total_equity != Decimal("324.70000000")
+    assert rows[0].total_margin_balance == Decimal("305.51000000")
+    assert rows[0].account_mm_rate == (
+        Decimal("5.00") / Decimal("305.51000000")
+    )
+
+
+def test_load_wallet_curve_parses_double_encoded_raw_json(
+    db, seeded_run_account, ts
+):
+    """JSON stored as a JSON string is decoded once before futures parsing."""
+    acc = seeded_run_account.account_id
+    _insert_wallet(
+        db,
+        acc,
+        ts=ts,
+        equity="999",
+        wallet_balance="200",
+        raw_json=json.dumps({
+            "coin": "USDT",
+            "walletBalance": "200",
+            "unrealisedPnl": "3.25",
+            "totalPositionMM": "2.5",
+        }),
+    )
+    window = Window(start=ts, end=ts)
+    with db.get_readonly_session() as session:
+        rows = load_wallet_curve(session, RUN_ID, acc, "USDT", window)
+    assert rows[0].total_equity == Decimal("203.25000000")
+
+
+def test_load_wallet_curve_skips_rows_without_raw_futures_equity(
+    db, seeded_run_account, ts
+):
+    """Missing raw USDT futures fields produce NULL-equivalent curve fields."""
+    acc = seeded_run_account.account_id
+    _insert_wallet(db, acc, ts=ts, equity="999", raw_json=None)
+    _insert_wallet(
+        db,
+        acc,
+        ts=ts + timedelta(seconds=1),
+        equity="999",
+        raw_json={"coin": "USDC", "unrealisedPnl": "1"},
+    )
+    _insert_wallet(
+        db,
+        acc,
+        ts=ts + timedelta(seconds=2),
+        equity="999",
+        raw_json={"coin": "USDT", "walletBalance": "100"},
+    )
+    window = Window(start=ts, end=ts + timedelta(seconds=2))
+    with db.get_readonly_session() as session:
+        rows = load_wallet_curve(session, RUN_ID, acc, "USDT", window)
+    assert [row.total_equity for row in rows] == [None, None, None]
+    assert [row.total_margin_balance for row in rows] == [None, None, None]
+
+
+def test_load_wallet_curve_skips_malformed_raw_json_without_crash(
+    db, seeded_run_account, ts
+):
+    """A non-decodable JSON string and a non-numeric unrealisedPnl both skip
+    the row (total_equity=None), never crash and never fall back to the account
+    total_equity column (would reintroduce spot contamination)."""
+    acc = seeded_run_account.account_id
+    # raw_json stored as a string that is NOT valid JSON.
+    _insert_wallet(db, acc, ts=ts, equity="999", wallet_balance="100",
+                   raw_json="{not valid json")
+    # unrealisedPnl present but non-numeric → Decimal(str(...)) InvalidOperation.
+    _insert_wallet(
+        db, acc, ts=ts + timedelta(seconds=1), equity="999",
+        wallet_balance="100",
+        raw_json={"coin": "USDT", "walletBalance": "100",
+                  "unrealisedPnl": "NaN"},
+    )
+    window = Window(start=ts, end=ts + timedelta(seconds=1))
+    with db.get_readonly_session() as session:
+        rows = load_wallet_curve(session, RUN_ID, acc, "USDT", window)
+    assert [row.total_equity for row in rows] == [None, None]  # not 999.0
 
 
 def test_reconcile_wallet_curve_skips_nulls_per_field(ts):

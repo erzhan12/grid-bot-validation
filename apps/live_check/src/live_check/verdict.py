@@ -165,12 +165,12 @@ def evaluate_shared_wallet(
         wallet_diff.account_mm_rate_points > 0
         and wallet_diff.max_account_mm_rate_delta < thresholds.account_mm_rate
     )
-    passed = (
-        all(v.passed for v in per_strat.values())
-        and equity_ok
-        and total_margin_balance_ok
-        and account_mm_rate_ok
-    )
+    # Feature 0095 fallback: the seeded acceptance DB is not available in this
+    # checkout, so numerator comparability between replay ``session.total_mm``
+    # and recorded top-level ``totalPositionMM`` could not be confirmed. Keep
+    # margin/mm-rate metrics informational and gate shared-wallet on futures
+    # equity only.
+    passed = all(v.passed for v in per_strat.values()) and equity_ok
     return SharedWalletVerdict(
         per_strat=per_strat,
         wallet_diff=wallet_diff,

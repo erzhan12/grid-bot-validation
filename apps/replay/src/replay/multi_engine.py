@@ -575,7 +575,7 @@ class MultiReplayEngine(ReplayEngine):
             if wallet_seed is not None else config.initial_balance
         )
         initial_equity = (
-            wallet_seed.total_equity if wallet_seed is not None else initial_balance
+            wallet_seed.coin_balance if wallet_seed is not None else initial_balance
         )
         return BacktestSession(
             initial_balance=initial_balance,

@@ -72,10 +72,10 @@ def render_shared_wallet(strat_results, shared_verdict) -> str:
                 f"({diff.equity_points} points)",
                 f"  final Δequity        {_fmt(diff.final_equity_delta)}",
                 f"  max Δmargin_balance  {_fmt(diff.max_margin_balance_delta)} "
-                f"{_flag(shared_verdict.total_margin_balance_ok)} "
+                f"INFO "
                 f"({diff.margin_balance_points} points)",
                 f"  max Δaccount_mm_rate {_fmt(diff.max_account_mm_rate_delta)} "
-                f"{_flag(shared_verdict.account_mm_rate_ok)} "
+                f"INFO "
                 f"({diff.account_mm_rate_points} points)",
             ]
         )
