@@ -212,10 +212,18 @@ def test_load_wallet_curve_skips_malformed_raw_json_without_crash(
         raw_json={"coin": "USDT", "walletBalance": "100",
                   "unrealisedPnl": "NaN"},
     )
-    window = Window(start=ts, end=ts + timedelta(seconds=1))
+    # "Infinity"/"NaN" parse to valid Decimal specials WITHOUT raising — the
+    # is_finite() guard must reject BOTH so they never poison the max-diff.
+    _insert_wallet(
+        db, acc, ts=ts + timedelta(seconds=2), equity="999",
+        wallet_balance="100",
+        raw_json={"coin": "USDT", "walletBalance": "100",
+                  "unrealisedPnl": "Infinity"},
+    )
+    window = Window(start=ts, end=ts + timedelta(seconds=2))
     with db.get_readonly_session() as session:
         rows = load_wallet_curve(session, RUN_ID, acc, "USDT", window)
-    assert [row.total_equity for row in rows] == [None, None]  # not 999.0
+    assert [row.total_equity for row in rows] == [None, None, None]  # not 999.0
 
 
 def test_reconcile_wallet_curve_skips_nulls_per_field(ts):

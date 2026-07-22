@@ -8,7 +8,7 @@ from typing import Any, Iterable, Optional
 
 from sqlalchemy.orm import Session
 
-from grid_db import WalletSnapshotRepository
+from grid_db import WalletSnapshot, WalletSnapshotRepository
 
 from live_check.window import Window, to_naive_utc
 
@@ -38,7 +38,7 @@ def _decoded_raw_json(raw_json: Any) -> Optional[dict[str, Any]]:
     return raw
 
 
-def _futures_equity(row, coin: str) -> Optional[Decimal]:
+def _futures_equity(row: WalletSnapshot, coin: str) -> Optional[Decimal]:
     """Return USDT futures equity from per-coin raw_json, not account total."""
     raw = _decoded_raw_json(row.raw_json)
     if raw is None or raw.get("coin") != coin:
@@ -54,7 +54,7 @@ def _futures_equity(row, coin: str) -> Optional[Decimal]:
     return result if result.is_finite() else None
 
 
-def _futures_mm_rate(row, coin: str) -> Optional[Decimal]:
+def _futures_mm_rate(row: WalletSnapshot, coin: str) -> Optional[Decimal]:
     """Return top-level position MM divided by futures equity, if available."""
     futures_equity = _futures_equity(row, coin)
     raw = _decoded_raw_json(row.raw_json)
