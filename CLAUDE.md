@@ -21,4 +21,4 @@ Monorepo to run, record, and validate a Bybit USDT-perp **grid trading bot** —
 
 # Coding principles
 - See `.claude/rules/code-style.md` for coding principles (simplicity first, surgical changes, plan-first, goal-driven execution) and safety rules.
-- Project rules live in `.claude/rules/` (feature 0096): component rules are path-scoped and auto-load when matching files are read; `RULES.md` is only the index. Workflow step "update RULES.md" = edit the relevant `.claude/rules/*.md` + keep the index in sync.
+- Project rules live in `.claude/rules/` (feature 0096): `code-style.md` and `core-invariants.md` are unscoped and load every session; component rules are path-scoped and load on the first Read of a file matching their `paths:` globs; all loaded rules re-inject after context compaction. `RULES.md` is only the index. Workflow step "update RULES.md" = edit the relevant `.claude/rules/*.md` + keep the index in sync.

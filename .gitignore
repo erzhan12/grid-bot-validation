@@ -39,6 +39,8 @@ env/
 # IDE
 .vscode/
 .idea/
+# .claude/* (not .claude/) is required: git cannot re-include files inside an
+# excluded directory, so the dir-level pattern would defeat the !rules/ negation
 .claude/*
 !.claude/rules/
 # Session tooling (vendored caveman-plugin skills + lockfile, same as .claude/)
