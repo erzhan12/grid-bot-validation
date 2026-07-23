@@ -69,6 +69,13 @@ make test-integration
 
 The merge gate (feature 0073, issue #176). Two parallel jobs — `test` (`make test`) and `lint` (`make lint`) — run on every PR and on push to `main`; both fail the workflow on any non-zero exit. **CI green is the source of truth for repo health.**
 
+### Dependency / lockfile discipline (Feature 0097, issue #212)
+
+- **Local install:** plain `uv sync` is the day-to-day command (resolves freely).
+- **After editing any workspace `pyproject.toml`** (root or member under `packages/`, `shared/`, `apps/`) or dependency metadata: run `uv lock` at repo root and commit the manifest change together with the updated `uv.lock`.
+- **CI / scheduled / release workflows:** must use `uv sync --locked` (not plain `uv sync`). Any new workflow that installs deps must follow this — today: `.github/workflows/ci.yml` and `.github/workflows/risk-tier-monitor.yml`.
+- **Pre-commit:** `uv lock --check` runs via the local `uv-lock-check` hook in `.pre-commit-config.yaml` when a matching workspace manifest changes. Install hooks once per clone (or after pulling this change): `uv run pre-commit install`. (`bbu_reference/**` is out of scope.)
+
 Phase-0 rollout while the repo is red:
 - **Step A (current)** — real failing jobs, no `continue-on-error`; the check is NOT required in branch protection, so it doesn't block the fix PRs for #177–#180.
 - **Step A′** — advisory green via `continue-on-error: true` on `lint` ONLY (never `test`); opt-in scaffolding, avoid unless explicitly requested.

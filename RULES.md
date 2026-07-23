@@ -16,7 +16,7 @@ every ~10 features, sweep the rule files and prune entries that no longer apply.
 | Rule file | Loads | Contents |
 |---|---|---|
 | `.claude/rules/code-style.md` | always | Coding principles, conventions, safety rules |
-| `.claude/rules/core-invariants.md` | always | Project overview, Constraints (do-not), running tests, CI, logging levels, cross-package testing + pitfalls, margin-ratio vs positionIM distinction, Common Pitfalls (cross-cutting) |
+| `.claude/rules/core-invariants.md` | always | Project overview, Constraints (do-not), running tests, CI, Dependency / lockfile (`uv sync` local vs `uv sync --locked` in CI, `uv lock` after manifest edits, pre-commit `uv lock --check`), logging levels, cross-package testing + pitfalls, margin-ratio vs positionIM distinction, Common Pitfalls (cross-cutting) |
 | `.claude/rules/gridcore.md` | `packages/gridcore/**` | Strategy engine: grid/engine/position modules, 110017 self-heal (0064), state-divergence detector (0069), 110007 preflight + chase-close (0066), safety caps (0079), SAME ORDER, enums, events/intents, persistence, DB snapshots (0047), PnL functions |
 | `.claude/rules/grid-db.md` | `shared/db/**` | Multi-tenant DB layer rules, enums, env vars |
 | `.claude/rules/bybit-adapter.md` | `packages/bybit_adapter/**` | REST/WS components, event normalization, V5 API status |

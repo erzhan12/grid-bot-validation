@@ -1,0 +1,11 @@
+# Feature 0097 / issue #212 — lockfile consistency gate.
+# Install once per clone: uv run pre-commit install
+repos:
+  - repo: local
+    hooks:
+      - id: uv-lock-check
+        name: check uv.lock is up to date
+        entry: uv lock --check
+        language: system
+        pass_filenames: false
+        files: ^(pyproject\.toml|(packages|shared|apps)/[^/]+/pyproject\.toml)$
