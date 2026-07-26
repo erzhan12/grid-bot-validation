@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
@@ -38,15 +39,41 @@ class ImportLockHeldError(Exception):
     """The ``.importlock`` sidecar is held (or unreadable) — do not write."""
 
 
-def output_db_path(out_dir: str, symbol: str, tag: Optional[str] = None) -> Path:
+class SourceFingerprintMismatchError(Exception):
+    """An HTTP output DB belongs to a different canonical API deployment."""
+
+
+def _sha256(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def output_db_path(
+    out_dir: str,
+    symbol: str,
+    tag: Optional[str] = None,
+    *,
+    source_kind: str = "db",
+    canonical_base_url: str | None = None,
+) -> Path:
     """``{out_dir}/imported_<symbol>[_<tag>].db`` — stable default path.
 
     The filename deliberately does NOT embed start/end: the default
     ``--end`` resolves to a live MAX(timestamp) probe, so a range-encoded
     name would defeat incremental resume.
     """
-    suffix = f"_{tag}" if tag else ""
-    return Path(out_dir) / f"imported_{symbol}{suffix}.db"
+    if source_kind == "db":
+        suffix = f"_{tag}" if tag else ""
+        return Path(out_dir) / f"imported_{symbol}{suffix}.db"
+    if source_kind != "http" or canonical_base_url is None:
+        raise ValueError("HTTP output paths require a canonical base URL")
+    symbol_digest = _sha256(symbol.encode("utf-8"))
+    base_digest = _sha256(canonical_base_url.encode("utf-8"))
+    tag_bytes = b"none" if tag is None else b"value\0" + tag.encode("utf-8")
+    tag_digest = _sha256(tag_bytes)
+    return (
+        Path(out_dir)
+        / f"imported_http_{symbol_digest}_{base_digest}_{tag_digest}.db"
+    )
 
 
 def lock_path(db_path: Path) -> Path:
@@ -195,8 +222,30 @@ def insert_batch(db: DatabaseFactory, snapshots: List[TickerSnapshot]) -> int:
         return TickerSnapshotRepository(session).bulk_insert(snapshots)
 
 
+def verify_source_fingerprint(
+    db: DatabaseFactory, source_fingerprint: str | None
+) -> None:
+    """Reject an existing HTTP run whose stored source identity differs."""
+    if source_fingerprint is None:
+        return
+    with db.get_session() as session:
+        run = RunRepository(session).get_latest_by_type("recording")
+        if run is None:
+            return
+        snapshot = run.config_snapshot or {}
+        stored = snapshot.get("source_fingerprint")
+        if stored is not None and stored != source_fingerprint:
+            raise SourceFingerprintMismatchError(
+                "stored HTTP source fingerprint does not match this output "
+                "path; restart into a fresh --tag"
+            )
+
+
 def ensure_run_row(
-    db: DatabaseFactory, symbol: str, source_desc: str
+    db: DatabaseFactory,
+    symbol: str,
+    source_desc: str,
+    source_fingerprint: str | None = None,
 ) -> Optional[str]:
     """Create-or-update the single synthetic ``recording`` run row.
 
@@ -226,17 +275,20 @@ def ensure_run_row(
         # replay auto-discovery nondeterministic.
         run = RunRepository(session).get_latest_by_type("recording")
         if run is None:
+            config_snapshot = {
+                "note": "imported from trad_save_history",
+                "symbol": symbol,
+                "source": source_desc,
+            }
+            if source_fingerprint is not None:
+                config_snapshot["source_fingerprint"] = source_fingerprint
             run = Run(
                 run_id=str(uuid4()),
                 user_id=IMPORTER_USER_ID,
                 account_id=IMPORTER_ACCOUNT_ID,
                 strategy_id=strategy_id_for(f"{_IMPORTER_NAME}_{symbol.lower()}"),
                 run_type="recording",
-                config_snapshot={
-                    "note": "imported from trad_save_history",
-                    "symbol": symbol,
-                    "source": source_desc,
-                },
+                config_snapshot=config_snapshot,
                 start_ts=min_ts,
                 end_ts=max_ts,
                 status="completed",

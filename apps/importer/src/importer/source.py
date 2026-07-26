@@ -1,4 +1,4 @@
-"""Source transport protocol + factory (feature 0093)."""
+"""Source transport protocols and factory."""
 
 from __future__ import annotations
 
@@ -9,14 +9,11 @@ from typing import Iterator, Optional, Protocol
 class SourceTransport(Protocol):
     """Read-only access to the trad_save_history ``ticker_data`` stream.
 
-    ``fetch_batches`` yields bounded batches of row dicts with keys
-    ``id, symbol, timestamp, last_price, mark_price, bid1_price,
-    ask1_price, funding_rate``. Row ``timestamp`` values are ALREADY naive
-    UTC — normalization happens at the transport boundary because the
-    resume skip compares them against a naive SQLite cursor BEFORE the
-    mapping layer runs. ``start``/``end`` bounds are both inclusive
-    (replay's window filter is inclusive, and the default ``--end``
-    resolves to the source MAX probe).
+    ``fetch_batches`` yields bounded row dicts containing ``symbol``,
+    ``timestamp``, and the five market fields. HTTP rows need no ``id``;
+    market values are nullable and unknown response fields are ignored.
+    Row ``timestamp`` values are already naive UTC. ``start``/``end`` are
+    inclusive.
     """
 
     def fetch_batches(
@@ -35,7 +32,22 @@ class SourceTransport(Protocol):
         ...
 
 
-def make_source(kind: str, url: str, batch_size: int = 10000) -> SourceTransport:
+class HttpKlineSource(Protocol):
+    """Narrow, already-validated HTTP kline contract used by validation."""
+
+    def fetch_klines(
+        self, symbol: str, start: datetime, end: datetime
+    ) -> list[dict]:
+        """Return ordered 1m rows with naive-UTC ``start_time`` values."""
+        ...
+
+
+def make_source(
+    kind: str,
+    url: str,
+    batch_size: int = 10000,
+    api_key: str | None = None,
+) -> SourceTransport:
     """Construct the transport named by ``--source``."""
     if kind == "db":
         from importer.fetch_source_db import DbSource
@@ -44,5 +56,5 @@ def make_source(kind: str, url: str, batch_size: int = 10000) -> SourceTransport
     if kind == "http":
         from importer.fetch_source_http import HttpSource
 
-        return HttpSource(url, batch_size=batch_size)
+        return HttpSource(url, batch_size=batch_size, api_key=api_key)
     raise ValueError(f"unknown source kind: {kind!r}")

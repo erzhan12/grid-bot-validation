@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import re
 import subprocess
 import sys
@@ -37,7 +38,7 @@ from grid_db.settings import DatabaseSettings
 
 from importer.config import to_naive_utc
 from importer.fetch_source_db import aware_utc
-from importer.fetch_source_http import iso_utc
+from importer.source import HttpKlineSource
 
 logger = logging.getLogger(__name__)
 
@@ -211,27 +212,12 @@ def _fetch_klines_db(
 
 
 def _fetch_klines_http(
-    base_url: str, symbol: str, start: datetime, end: datetime
+    source: HttpKlineSource, symbol: str, start: datetime, end: datetime
 ) -> dict[int, OhlcBucket]:
-    """Fetch 1m klines via ``GET {base}/klines?symbol&start&end`` (transport B)."""
-    import requests
-
-    response = requests.get(
-        f"{base_url.rstrip('/')}/klines",
-        params={
-            # Same Z-suffixed ISO format the ticker transport sends.
-            "symbol": symbol,
-            "start": iso_utc(start),
-            "end": iso_utc(end),
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
+    """Convert transport-validated HTTP 1m rows into validation buckets."""
     result: dict[int, OhlcBucket] = {}
-    for row in response.json().get("rows") or []:
-        ts = _coerce_kline_ts(row["start_time"])
-        if not (start <= ts <= end):
-            continue
+    for row in source.fetch_klines(symbol, start, end):
+        ts = row["start_time"]
         result[_epoch_minute(ts)] = OhlcBucket(
             open=Decimal(str(row["open"])).quantize(_EIGHT_DP),
             high=Decimal(str(row["high"])).quantize(_EIGHT_DP),
@@ -290,6 +276,7 @@ def check_ohlc(
     source_url: str,
     bounds: tuple[datetime, datetime],
     threshold: float,
+    http_source: HttpKlineSource | None = None,
 ) -> bool:
     """OHLC cross-check on a sampled day (the middle day of the import)."""
     tick_size = TICK_SIZE.get(symbol)
@@ -319,7 +306,16 @@ def check_ohlc(
         if source_kind == "db":
             klines = _fetch_klines_db(source_url, symbol, day_start, day_end)
         else:
-            klines = _fetch_klines_http(source_url, symbol, day_start, day_end)
+            if http_source is None:
+                raise ValueError(
+                    "HTTP OHLC validation requires the active HTTP source"
+                )
+            klines = _fetch_klines_http(
+                http_source,
+                symbol,
+                day_start,
+                day_start + timedelta(days=1),
+            )
     except Exception as e:
         logger.error("OHLC check: failed to fetch source klines: %s", e)
         return False
@@ -385,6 +381,11 @@ def smoke_replay(
             [sys.executable, "-m", "replay.main", "--config", str(rendered)],
             capture_output=True,
             text=True,
+            env={
+                key: value
+                for key, value in os.environ.copy().items()
+                if key != "MARKET_DATA_API_KEY"
+            },
         )
     if proc.returncode != 0:
         logger.error(
@@ -514,6 +515,7 @@ def run_validation(
     bounds: tuple[datetime, datetime],
     ohlc_threshold: float,
     recorder_db: Optional[str],
+    http_source: HttpKlineSource | None = None,
 ) -> bool:
     """Run the three ``--validate`` checks for one imported symbol.
 
@@ -524,7 +526,13 @@ def run_validation(
         True only when both gating checks pass.
     """
     ohlc_ok = check_ohlc(
-        db, symbol, source_kind, source_url, bounds, ohlc_threshold
+        db,
+        symbol,
+        source_kind,
+        source_url,
+        bounds,
+        ohlc_threshold,
+        http_source=http_source,
     )
     smoke_ok = smoke_replay(db_path, symbol, bounds)
     recorder_overlap_probe(db, symbol, bounds, recorder_db)

@@ -19,6 +19,7 @@ grid-bot-validation/
 │   ├── gridbot/             # Live multi-tenant grid trading bot
 │   ├── backtest/            # Historical backtest engine
 │   ├── recorder/            # Captures live Bybit market + private data to SQLite
+│   ├── importer/            # Imports remote market data into replay SQLite DBs
 │   ├── replay/              # Replays recorded data through the strategy engine
 │   ├── comparator/          # Diffs backtest vs live trade outcomes
 │   ├── event_saver/         # Streaming event persistence used by gridbot
@@ -54,6 +55,11 @@ Holds grid-level math (`greed.py`), the event-driven strategy engine (`strat.py`
 
 **`recorder`** — A standalone process that subscribes to Bybit mainnet WebSocket streams and writes them to SQLite for later replay. Captures L1 ticker snapshots, public trades (optional), and — when API keys are provided — private orders, executions, positions, and wallet snapshots. Tracks gaps and reconciles via REST.
 
+**`importer`** — Reads ticker history from either a read-only database or the
+remote market-data protocol 1.0 API and builds replay-compatible per-symbol
+SQLite databases. HTTP imports are bounded, cursor-paginated, resumable, and
+optionally validate their reconstructed OHLC against the API's 1-minute klines.
+
 **`replay`** — Reads a recorder database for a given `run_id` and time window, then feeds it through the same `gridcore` engine the live bot uses. The point is *shadow validation*: did our strategy, given the exact market it saw live, produce the same orders, fills, and PnL? Hands its output to `comparator`.
 
 **`comparator`** — Compares a replay/backtest run against the corresponding live run from the same database. Surfaces order divergences, fill mismatches, and PnL deltas with configurable price/quantity tolerances.
@@ -88,6 +94,8 @@ Holds grid-level math (`greed.py`), the event-driven strategy engine (`strat.py`
    ┌────┴────────┐
    │ pnl_checker │  (sanity-checks live PnL math vs Bybit)
    └─────────────┘
+
+ remote market API ──▶ importer ──▶ per-symbol SQLite ──▶ replay
 ```
 
 `gridcore` is the strategy engine shared by **gridbot**, **backtest**, and **replay** — that is the entire point of the architecture. The same code that trades live also runs against recorded history and against synthetic backtest data, so divergences are bugs in I/O wrappers or in the data, not in two parallel strategy implementations.
@@ -134,6 +142,18 @@ uv run python -m backtest --config apps/backtest/conf/backtest.yaml
 # Recorder (standalone process — keep running to capture data)
 uv run python -m recorder.main --config apps/recorder/conf/recorder.yaml
 
+# Import a bounded range from the remote market-data API
+IFS= read -rsp 'Market-data API key: ' MARKET_DATA_API_KEY
+printf '\n'
+export MARKET_DATA_API_KEY
+uv run python -m importer.main \
+  --source http \
+  --source-url https://market-api.example.com/deployment \
+  --symbols BTCUSDT \
+  --start 2026-07-01T00:00:00Z \
+  --end 2026-07-02T00:00:00Z
+unset MARKET_DATA_API_KEY
+
 # Replay recorded data through the strategy engine
 uv run python -m replay.main --config apps/replay/conf/replay.yaml
 
@@ -143,6 +163,21 @@ uv run python -m comparator --config apps/replay/conf/replay.yaml
 # Validate live PnL against Bybit
 uv run python -m pnl_checker --config apps/pnl_checker/conf/pnl_checker.yaml
 ```
+
+HTTP importer bounds are mandatory because protocol 1.0 has no MIN/MAX
+endpoint. The API key is read only from `MARKET_DATA_API_KEY`; inject it from a
+secret manager or use a hidden prompt as above, and never commit it or put its
+literal value in a command. `--source-url` is the deployment base URL: it may
+include a base path, but not credentials, a query, or a fragment. Use HTTPS in
+production. Plain HTTP is limited to localhost or a trusted private
+network/tunnel.
+
+Protocol 1.0 HTTP files use a source-scoped `imported_http_<digests>.db`
+namespace derived from the exact symbol, normalized full base URL, and optional
+tag. Draft Feature 0093 HTTP files named
+`imported_<symbol>[_<tag>].db` are intentionally left untouched and are not
+auto-resumed; perform a one-time fresh HTTP import. DB-source filenames and
+their existing resume behavior are unchanged.
 
 ## Configuration Cheat Sheet
 
@@ -178,6 +213,9 @@ make test-integration
 
 # Single package
 uv run pytest packages/gridcore/tests --cov=gridcore -v
+
+# Importer only
+uv run pytest apps/importer/tests -q
 
 # Single file
 uv run pytest apps/backtest/tests/test_runner.py -v

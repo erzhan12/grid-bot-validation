@@ -231,6 +231,56 @@ class TestCheckOhlc:
             db, "BTCUSDT", "db", f"sqlite:///{source}", bounds, 0.99
         )
 
+    def test_http_uses_active_source_and_exact_24_hour_window(self, tmp_path):
+        ticks = _ticks_two_minutes()
+        db, _ = _seed_output_ticks(tmp_path, ticks)
+        buckets = rebuild_ohlc(ticks)
+
+        class FakeHttpSource:
+            def __init__(self):
+                self.call = None
+
+            def fetch_klines(self, symbol, start, end):
+                self.call = (symbol, start, end)
+                return [
+                    {
+                        "start_time": datetime.fromtimestamp(
+                            key * 60, tz=timezone.utc
+                        ).replace(tzinfo=None),
+                        "open": float(bucket.open),
+                        "high": float(bucket.high),
+                        "low": float(bucket.low),
+                        "close": float(bucket.close),
+                    }
+                    for key, bucket in buckets.items()
+                ]
+
+        source = FakeHttpSource()
+        assert check_ohlc(
+            db,
+            "BTCUSDT",
+            "http",
+            "must-not-be-used",
+            (ticks[0][0], ticks[-1][0]),
+            0.99,
+            http_source=source,
+        )
+        _, start, end = source.call
+        assert start == datetime(2026, 7, 1)
+        assert end == datetime(2026, 7, 2)
+
+    def test_http_without_active_source_fails_closed(self, tmp_path):
+        ticks = _ticks_two_minutes()
+        db, _ = _seed_output_ticks(tmp_path, ticks)
+        assert not check_ohlc(
+            db,
+            "BTCUSDT",
+            "http",
+            "https://example.test",
+            (ticks[0][0], ticks[-1][0]),
+            0.99,
+        )
+
 
 class TestSmokeReplayGuards:
     def test_unknown_symbol_fails_without_subprocess(self, tmp_path):
@@ -246,8 +296,9 @@ class TestSmokeReplayMocked:
     def _fake_run(captured, returncode=0, stdout="Net PnL:    1.23"):
         import yaml
 
-        def fake_run(cmd, capture_output, text):
+        def fake_run(cmd, capture_output, text, env):
             captured["cmd"] = cmd
+            captured["env"] = env
             with open(cmd[-1]) as f:
                 captured["config"] = yaml.safe_load(f)
             return SimpleNamespace(
@@ -276,6 +327,21 @@ class TestSmokeReplayMocked:
         assert config["start_ts"] == (_T0 + timedelta(hours=2)).isoformat()
         assert config["end_ts"] == (_T0 + timedelta(hours=6)).isoformat()
         assert captured["cmd"][1:3] == ["-m", "replay.main"]
+
+    def test_market_api_key_removed_only_from_child_env(
+        self, tmp_path, monkeypatch
+    ):
+        captured = {}
+        monkeypatch.setenv("MARKET_DATA_API_KEY", "secret")
+        monkeypatch.setenv("IMPORTER_TEST_KEEP", "yes")
+        monkeypatch.setattr(
+            "importer.validate.subprocess.run", self._fake_run(captured)
+        )
+        bounds = (_T0, _T0 + timedelta(hours=6))
+        assert smoke_replay(tmp_path / "x.db", "BTCUSDT", bounds)
+        assert "MARKET_DATA_API_KEY" not in captured["env"]
+        assert captured["env"]["IMPORTER_TEST_KEEP"] == "yes"
+        assert __import__("os").environ["MARKET_DATA_API_KEY"] == "secret"
 
     def test_nan_metric_fails(self, tmp_path, monkeypatch):
         """A NaN in the replay summary fails the smoke check."""

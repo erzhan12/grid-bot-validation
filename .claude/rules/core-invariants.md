@@ -1,6 +1,6 @@
 ## Project Overview
 
-Grid trading bot system with pure strategy engine (gridcore), exchange adapter (bybit_adapter), database layer (grid_db), data capture (event_saver), live bot (gridbot), backtest engine, comparator, recorder, replay engine, and PnL checker.
+Grid trading bot system with pure strategy engine (gridcore), exchange adapter (bybit_adapter), database layer (grid_db), data capture (event_saver), live bot (gridbot), backtest engine, comparator, recorder, remote market-data importer, replay engine, and PnL checker.
 
 Successfully extracted pure strategy logic from `bbu2-master` into `packages/gridcore/` with zero exchange dependencies.
 
@@ -58,12 +58,13 @@ uv run pytest apps/backtest/tests -v
 uv run pytest apps/comparator/tests --cov=comparator --cov-report=term-missing -v
 uv run pytest apps/pnl_checker/tests --cov=pnl_checker --cov-report=term-missing -v
 uv run pytest apps/live_check/tests -v
+uv run pytest apps/importer/tests -q
 
 # Integration tests only
 make test-integration
 ```
 
-**`make test` note**: Runs pytest separately per package to avoid `conftest` ImportPathMismatchError. Coverage accumulates across the 11 package runs into one `.coverage`; a trailing `coverage report --fail-under=88` step gates the merged total (real ≈91% as of 2026-07-17). Covers every `pyproject.toml` `testpaths` entry, including `apps/backtest/tests` (added for issue #178 — its prior omission was an oversight with no documented justification).
+**`make test` note**: Runs pytest separately per package to avoid `conftest` ImportPathMismatchError. Coverage accumulates across the 12 package runs into one `.coverage`; a trailing `coverage report --fail-under=88` step gates the merged total (real ≈91% as of 2026-07-17). Covers every `pyproject.toml` `testpaths` entry, including `apps/backtest/tests` (added for issue #178 — its prior omission was an oversight with no documented justification).
 
 ## Continuous Integration (`.github/workflows/ci.yml`)
 
@@ -95,10 +96,10 @@ Maintained code is NOT excluded. When a maintained file has an intentional lint 
 ### Coverage gate (Feature 0092, issue #214)
 
 Two gates in `make test`, both enforced by CI because it runs `make test`:
-- **Total ≥ 88** — trailing `uv run coverage report --fail-under=88` step, evaluated on the merged `.coverage` accumulated by the 11 per-package pytest runs (real total ≈91% as of 2026-07-17).
+- **Total ≥ 88** — trailing `uv run coverage report --fail-under=88` step, evaluated on the merged `.coverage` accumulated by the 12 per-package pytest runs (real total ≈91% as of 2026-07-17).
 - **gridcore ≥ 80** — `--cov-fail-under=80` on gridcore's own pytest invocation. Valid only because that invocation is scoped by `--cov=gridcore` and writes a fresh data file (first in sequence, no `--cov-append`, right after `rm -f .coverage .coverage.*`). It must stay first AND non-append — moved later without adding `--cov-append`, it erases the accumulated data feeding the total gate.
 
-The integration run's `--cov-append`/`--cov-report` flags are inert (no `--cov=` source, so pytest-cov never registers) — the merged total covers the 11 package runs only. Other packages are intentionally ungated; both thresholds sit below real coverage for churn headroom.
+The integration run's `--cov-append`/`--cov-report` flags are inert (no `--cov=` source, so pytest-cov never registers) — the merged total covers the 12 package runs only. Other packages are intentionally ungated; both thresholds sit below real coverage for churn headroom.
 
 ---
 
@@ -192,4 +193,3 @@ All risk config thresholds (`max_margin=8`, `min_total_margin=0.15`) are ratios.
 25. **`runner.py _execute_intents` stale limits snapshot** — `_execute_intents()` must refresh the `limits` snapshot after each successful `_execute_place_intent()` call. Without this, multiple reduce-only intents in the same batch all check against the same stale snapshot, over-covering the position and causing Bybit 110017 reduce-only rejections. Path: `apps/gridbot/src/gridbot/runner.py`. Fixed 2026-04-11.
 26. **Backtest `_should_place_close` must resolve intent qty** — Engine emits `qty=0`; the gate must resolve it via `executor.qty_calculator` before checking `pos_size > (pending + intent_qty)`. Without this, the backtest gate is weaker than live `_is_good_to_place()` and allows over-closing positions. Path: `apps/backtest/src/backtest/runner.py`. Fixed 2026-04-11.
 27. **Backtest `_apply_risk_to_qty` must re-round after multiplier** — Base qty is rounded to `qty_step`, but multiplying by the risk multiplier can produce sub-step values (e.g., 0.001 * 0.5 = 0.0005). Must call `instrument_info.round_qty()` after multiplying, matching live `_resolve_qty`. Path: `apps/backtest/src/backtest/runner.py`. Fixed 2026-04-11.
-

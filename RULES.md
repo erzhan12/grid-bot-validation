@@ -28,4 +28,5 @@ every ~10 features, sweep the rule files and prune entries that no longer apply.
 | `.claude/rules/replay.md` | `apps/replay/**` | Replay engine, telemetry parity (0034), UTA wallet semantics (0042), fill simulator modes incl. `last_cross` + `event_follower` (0072), test pitfalls |
 | `.claude/rules/pnl-checker.md` | `apps/pnl_checker/**` | Live PnL validation rules |
 | `.claude/rules/live-check.md` | `apps/live_check/**` | Replay-vs-live reconciliation (0088): read-only DB, verdict gates, freshness |
+| `.claude/rules/importer.md` | `apps/importer/**` | Remote importer: environment-only auth, request isolation, opaque cursor commits, source-scoped HTTP outputs |
 | `.claude/rules/risk-tiers.md` | tier-related files (see its `paths:`) | Dynamic risk limit tiers: architecture, consumers, caching, drift monitoring, cache format evolution |

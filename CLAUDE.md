@@ -7,7 +7,7 @@ Monorepo to run, record, and validate a Bybit USDT-perp **grid trading bot** —
 - `packages/gridcore` — grid strategy engine, zero external deps (core logic)
 - `packages/bybit_adapter` — Bybit REST + WS client wrappers
 - `shared/db` — `grid-db`, SQLAlchemy multi-tenant models
-- `apps/*` — runnable CLIs: `gridbot` (live), `backtest`, `recorder`, `replay`, `comparator`, `event_saver`, `pnl_checker`
+- `apps/*` — runnable CLIs: `gridbot` (live), `backtest`, `recorder`, `importer`, `replay`, `comparator`, `event_saver`, `pnl_checker`
 
 **Entry points:** each app at `apps/<name>/src/<name>/main.py`; run via `uv run <name>`.
 
@@ -17,6 +17,7 @@ Monorepo to run, record, and validate a Bybit USDT-perp **grid trading bot** —
 - `make lint` — ruff (line-length 88)
 - `make live-check` — replay-vs-live reconciliation
 - `uv run pytest packages/<name>` — single package; always via `uv run`, never bare `pytest` / `python -m pytest`
+- `uv run pytest apps/importer/tests -q` — importer-only suite
 - `uv run <app>` — run an app (e.g. `uv run gridbot`)
 
 # Coding principles

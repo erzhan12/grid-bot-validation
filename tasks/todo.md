@@ -33,8 +33,8 @@ Plan: docs/features/0093_PLAN.md  |  Branch: feature/0093-importer
 
 Plan: docs/features/0098_PLAN.md
 
-- [ ] Phase 1: source-aware config preflight, secret loading, auth/session lifecycle
-- [ ] Phase 2: shared JSON request path, retries, Retry-After, redaction
-- [ ] Phase 3: bulk-page schema, damaged-row filtering, cursor/order invariants
-- [ ] Phase 4: authenticated kline fetch, strict minute/window validation
-- [ ] Phase 5: tests, CLIENT/README/rules updates, full verification
+- [x] Phase 1: source-aware config preflight, secret loading, auth/session lifecycle
+- [x] Phase 2: shared JSON request path, retries, Retry-After, redaction
+- [x] Phase 3: bulk-page schema, damaged-row filtering, cursor/order invariants
+- [x] Phase 4: authenticated kline fetch, strict minute/window validation
+- [x] Phase 5: tests, CLIENT/README/rules updates, full verification

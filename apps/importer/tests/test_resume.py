@@ -2,11 +2,13 @@
 
 from datetime import datetime, timedelta
 
+import pytest
 from sqlalchemy import create_engine, text
 
 from grid_db.models import Run, TickerSnapshot
 
 import importer.main as importer_main
+from importer.config import preflight_http
 from importer.output_db import open_output_db, output_db_path
 
 _T0 = datetime(2026, 7, 1, 0, 0, 0)
@@ -180,15 +182,18 @@ class TestResume:
         assert str(by_ts[dup_ts]) == "101.00000000"  # first by id survived
 
     def test_http_source_requires_explicit_bounds(self, tmp_path, capsys):
-        """--source http without --start/--end fails per symbol (no probe)."""
+        """HTTP bounds fail globally before output paths are created."""
         argv = [
             "--source", "http",
             "--source-url", "http://unreachable.invalid",
             "--symbols", "BTCUSDT",
             "--out-dir", str(tmp_path / "out"),
         ]
-        assert importer_main.main(argv) == 1  # fails before any HTTP call
-        assert "pass explicit bounds" in capsys.readouterr().out
+        with pytest.raises(SystemExit) as caught:
+            importer_main.main(argv)
+        assert caught.value.code == 2
+        assert "requires both" in capsys.readouterr().err
+        assert not (tmp_path / "out").exists()
 
     def test_tagged_import_is_isolated(self, tmp_path, seed_source_db, src_row):
         """--tag writes a distinct file, leaving the default DB untouched."""
@@ -208,3 +213,201 @@ class TestResume:
             ).scalar()
         engine.dispose()
         assert count == 1
+
+
+class FakeHttpSource:
+    def __init__(self, rows, batch_size=2, failure=None):
+        self.rows = rows
+        self.batch_size = batch_size
+        self.failure = failure
+        self.close_calls = 0
+        self.fetch_calls = []
+
+    def probe_range(self, symbol):
+        return None
+
+    def fetch_batches(self, symbol, start, end):
+        self.fetch_calls.append((symbol, start, end))
+        if self.failure is not None:
+            raise self.failure
+        eligible = [
+            row
+            for row in self.rows
+            if row["symbol"] == symbol and start <= row["timestamp"] <= end
+        ]
+        for offset in range(0, len(eligible), self.batch_size):
+            yield eligible[offset : offset + self.batch_size]
+
+    def close(self):
+        self.close_calls += 1
+
+
+def _http_rows(symbol="BtC", count=5):
+    return [
+        {
+            "symbol": symbol,
+            "timestamp": _T0 + timedelta(minutes=index),
+            "last_price": 100 + index,
+            "mark_price": 100 + index,
+            "bid1_price": 99 + index,
+            "ask1_price": 101 + index,
+            "funding_rate": 0.001,
+        }
+        for index in range(count)
+    ]
+
+
+def _http_argv(out_dir, extra=None):
+    return [
+        "--source",
+        "http",
+        "--source-url",
+        "HTTPS://EXAMPLE.test:443/deploy/",
+        "--symbols",
+        "BtC",
+        "--start",
+        _T0.isoformat() + "Z",
+        "--end",
+        (_T0 + timedelta(minutes=4)).isoformat() + "Z",
+        "--batch-size",
+        "2",
+        "--out-dir",
+        str(out_dir),
+        "--tag",
+        "CaseTag",
+        *(extra or []),
+    ]
+
+
+class TestHttpMain:
+    def test_secret_source_validation_and_close_share_one_instance(
+        self, tmp_path, monkeypatch
+    ):
+        source = FakeHttpSource(_http_rows())
+        calls = {"load": 0}
+        made = {}
+        validated = {}
+
+        def load_key():
+            calls["load"] += 1
+            return "opaque-token"
+
+        def make_source(kind, url, batch_size, api_key=None):
+            made.update(
+                kind=kind, url=url, batch_size=batch_size, api_key=api_key
+            )
+            return source
+
+        def validate(*args, http_source=None, **kwargs):
+            validated["source"] = http_source
+            return True
+
+        monkeypatch.setattr(importer_main, "load_market_data_api_key", load_key)
+        monkeypatch.setattr(importer_main, "make_source", make_source)
+        monkeypatch.setattr(importer_main, "run_validation", validate)
+        assert importer_main.main(_http_argv(tmp_path, ["--validate"])) == 0
+        assert calls["load"] == 1
+        assert made == {
+            "kind": "http",
+            "url": "https://example.test/deploy",
+            "batch_size": 2,
+            "api_key": "opaque-token",
+        }
+        assert validated["source"] is source
+        assert source.close_calls == 1
+
+        identity = preflight_http("https://example.test/deploy")
+        path = output_db_path(
+            str(tmp_path),
+            "BtC",
+            "CaseTag",
+            source_kind="http",
+            canonical_base_url=identity.canonical_base_url,
+        )
+        db = open_output_db(path)
+        with db.get_session() as session:
+            run = session.query(Run).filter(Run.run_type == "recording").one()
+            snapshot = run.config_snapshot
+            assert snapshot["source"] == "http:https://example.test"
+            assert snapshot["source_fingerprint"] == identity.source_fingerprint
+            rendered = str(snapshot)
+            assert "opaque-token" not in rendered
+            assert "/deploy" not in rendered
+
+    @pytest.mark.parametrize(
+        "failure,expected_exception",
+        [(RuntimeError("boom"), None), (KeyboardInterrupt(), KeyboardInterrupt)],
+    )
+    def test_session_closed_on_symbol_failure_and_interruption(
+        self, tmp_path, monkeypatch, failure, expected_exception
+    ):
+        source = FakeHttpSource([], failure=failure)
+        monkeypatch.setattr(importer_main, "make_source", lambda *a, **k: source)
+        monkeypatch.setattr(
+            importer_main, "load_market_data_api_key", lambda: None
+        )
+        if expected_exception is None:
+            assert importer_main.main(_http_argv(tmp_path)) == 1
+        else:
+            with pytest.raises(expected_exception):
+                importer_main.main(_http_argv(tmp_path))
+        assert source.close_calls == 1
+
+    def test_http_crash_resume_reuses_path_and_heals_metadata(
+        self, tmp_path, monkeypatch
+    ):
+        rows = _http_rows()
+        sources = []
+
+        def factory(kind, url, batch_size, api_key=None):
+            source = FakeHttpSource(rows, batch_size=batch_size)
+            sources.append(source)
+            return source
+
+        monkeypatch.setattr(importer_main, "make_source", factory)
+        monkeypatch.setattr(
+            importer_main, "load_market_data_api_key", lambda: None
+        )
+        real_insert = importer_main.insert_batch
+        insert_calls = {"count": 0}
+
+        def crash_after_first_commit(db, snapshots):
+            insert_calls["count"] += 1
+            if insert_calls["count"] == 2:
+                raise RuntimeError("crash before run metadata")
+            return real_insert(db, snapshots)
+
+        monkeypatch.setattr(importer_main, "insert_batch", crash_after_first_commit)
+        assert importer_main.main(_http_argv(tmp_path)) == 1
+        monkeypatch.setattr(importer_main, "insert_batch", real_insert)
+
+        identity = preflight_http("https://example.test/deploy")
+        path = output_db_path(
+            str(tmp_path),
+            "BtC",
+            "CaseTag",
+            source_kind="http",
+            canonical_base_url=identity.canonical_base_url,
+        )
+        db = open_output_db(path)
+        with db.get_session() as session:
+            assert session.query(TickerSnapshot).count() == 2
+            assert session.query(Run).count() == 0
+
+        assert importer_main.main(_http_argv(tmp_path)) == 0
+        with db.get_session() as session:
+            ticks = (
+                session.query(TickerSnapshot)
+                .filter(TickerSnapshot.symbol == "BtC")
+                .order_by(TickerSnapshot.exchange_ts)
+                .all()
+            )
+            run = session.query(Run).filter(Run.run_type == "recording").one()
+            assert len(ticks) == 5
+            assert len({tick.exchange_ts for tick in ticks}) == 5
+            assert (
+                run.config_snapshot["source_fingerprint"]
+                == identity.source_fingerprint
+            )
+        assert sources[1].fetch_calls[0][1] == _T0 + timedelta(minutes=1)
+        assert [source.close_calls for source in sources] == [1, 1]

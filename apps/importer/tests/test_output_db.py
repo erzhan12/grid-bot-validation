@@ -20,6 +20,8 @@ from importer.output_db import (
     open_output_db,
     output_db_path,
     release_lock,
+    SourceFingerprintMismatchError,
+    verify_source_fingerprint,
 )
 
 _T0 = datetime(2026, 7, 1, 0, 0, 0)
@@ -47,6 +49,42 @@ class TestOutputDbPath:
             output_db_path(str(tmp_path), "BTCUSDT", "fresh").name
             == "imported_BTCUSDT_fresh.db"
         )
+
+    def test_http_paths_hash_exact_symbol_base_and_tag(self, tmp_path):
+        def path(symbol, base, tag=None):
+            return output_db_path(
+                str(tmp_path),
+                symbol,
+                tag,
+                source_kind="http",
+                canonical_base_url=base,
+            )
+
+        baseline = path("BtC", "https://example.test/api", "tag")
+        assert baseline == path("BtC", "https://example.test/api", "tag")
+        assert baseline != path("btc", "https://example.test/api", "tag")
+        assert baseline != path("BtC", "https://example.test/other", "tag")
+        assert baseline != path("BtC", "https://example.test/api", "TAG")
+        assert baseline.name.startswith("imported_http_")
+        assert all(
+            raw not in baseline.name
+            for raw in ("BtC", "example", "api", "tag")
+        )
+
+    def test_http_unicode_normalization_remains_distinct(self, tmp_path):
+        composed = output_db_path(
+            str(tmp_path),
+            "É",
+            source_kind="http",
+            canonical_base_url="https://example.test",
+        )
+        decomposed = output_db_path(
+            str(tmp_path),
+            "E\u0301",
+            source_kind="http",
+            canonical_base_url="https://example.test",
+        )
+        assert composed != decomposed
 
 
 class TestOutputDb:
@@ -95,6 +133,24 @@ class TestOutputDb:
             assert len(runs) == 1
             assert runs[0].start_ts == _T0  # unchanged on append
             assert runs[0].end_ts == _T0 + timedelta(hours=1)
+
+    def test_http_run_metadata_and_fingerprint_guard(self, tmp_path):
+        db = open_output_db(tmp_path / "out.db")
+        ensure_parents(db, "BtC")
+        insert_batch(db, [_snapshot(_T0, symbol="BtC")])
+        ensure_run_row(
+            db,
+            "BtC",
+            "http:https://example.test",
+            source_fingerprint="a" * 64,
+        )
+        verify_source_fingerprint(db, "a" * 64)
+        with pytest.raises(SourceFingerprintMismatchError, match="fresh --tag"):
+            verify_source_fingerprint(db, "b" * 64)
+        with db.get_session() as session:
+            run = RunRepository(session).get_latest_by_type("recording")
+            assert run.config_snapshot["source"] == "http:https://example.test"
+            assert run.config_snapshot["source_fingerprint"] == "a" * 64
 
     def test_parents_idempotent(self, tmp_path):
         """ensure_parents reruns session.get the same pinned rows."""

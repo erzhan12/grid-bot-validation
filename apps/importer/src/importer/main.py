@@ -19,7 +19,7 @@ import sys
 from datetime import datetime
 from typing import Optional
 
-from importer.config import build_parser
+from importer.config import ConfigurationError, build_parser, load_market_data_api_key
 from importer.density import compute_density, log_density_report
 from importer.mapping import FallbackCounters, map_row
 from importer.output_db import (
@@ -33,6 +33,7 @@ from importer.output_db import (
     open_output_db,
     output_db_path,
     release_lock,
+    verify_source_fingerprint,
 )
 from importer.source import SourceTransport, make_source
 from importer.validate import run_validation
@@ -88,11 +89,18 @@ def import_symbol(
     args: argparse.Namespace, source: SourceTransport, symbol: str
 ) -> bool:
     """Import one symbol into its output DB; returns success."""
-    db_path = output_db_path(args.out_dir, symbol, args.tag)
+    db_path = output_db_path(
+        args.out_dir,
+        symbol,
+        args.tag,
+        source_kind=args.source,
+        canonical_base_url=args.http_base_url,
+    )
     lock = acquire_lock(db_path)
     try:
         db = open_output_db(db_path)
         ensure_parents(db, symbol)
+        verify_source_fingerprint(db, args.http_source_fingerprint)
 
         window = _resolve_window(args, source, symbol)
         if window is None:
@@ -148,8 +156,16 @@ def import_symbol(
         if any(fallback_counts.values()):
             logger.warning("%s NULL-fallback/skip counts: %s", symbol, fallback_counts)
 
+        source_desc = (
+            f"db:{args.source_url}"
+            if args.source == "db"
+            else args.http_origin_label
+        )
         run_id = ensure_run_row(
-            db, symbol, source_desc=f"{args.source}:{args.source_url}"
+            db,
+            symbol,
+            source_desc=source_desc,
+            source_fingerprint=args.http_source_fingerprint,
         )
         if run_id is None:
             # Zero-row rule: empty range or every row skipped for NULL
@@ -181,6 +197,7 @@ def import_symbol(
                 bounds,
                 args.ohlc_threshold,
                 args.recorder_db,
+                http_source=source if args.source == "http" else None,
             )
         return True
     finally:
@@ -189,28 +206,42 @@ def import_symbol(
 
 def main(argv: Optional[list[str]] = None) -> int:
     """Entry point; returns non-zero when ANY symbol failed."""
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        api_key = load_market_data_api_key() if args.source == "http" else None
+    except ConfigurationError as exc:
+        parser.error(str(exc))
     setup_logging(debug=args.debug)
 
-    source = make_source(args.source, args.source_url, args.batch_size)
+    source_url = (
+        args.http_base_url if args.source == "http" else args.source_url
+    )
+    source = make_source(
+        args.source, source_url, args.batch_size, api_key=api_key
+    )
 
     failed: list[str] = []
-    for symbol in args.symbols:
-        try:
-            ok = import_symbol(args, source, symbol)
-        except ImportLockHeldError as e:
-            logger.error("%s: %s", symbol, e)
-            ok = False
-        except Exception:
-            logger.error("%s: import failed", symbol, exc_info=True)
-            ok = False
-        if not ok:
-            failed.append(symbol)
+    try:
+        for symbol in args.symbols:
+            try:
+                ok = import_symbol(args, source, symbol)
+            except ImportLockHeldError as e:
+                logger.error("%s: %s", symbol, e)
+                ok = False
+            except Exception:
+                logger.error("%s: import failed", symbol, exc_info=True)
+                ok = False
+            if not ok:
+                failed.append(symbol)
 
-    if failed:
-        logger.error("FAILED symbols: %s", ", ".join(failed))
-        return 1
-    return 0
+        if failed:
+            logger.error("FAILED symbols: %s", ", ".join(failed))
+            return 1
+        return 0
+    finally:
+        if args.source == "http":
+            source.close()
 
 
 if __name__ == "__main__":  # pragma: no cover
