@@ -46,3 +46,8 @@ Plan: docs/features/0098_PLAN.md
   large cursor pagination memory bounds (cycle set stays unbounded by design).
 - 0098 review P3: consumer-side MARKET_DATA_API_KEY handling notes belong in
   importer README/ops docs, not the protocol `docs/CLIENT.md` contract.
+- 0098 review round-2 P1/P2 deferred: `_safe_hostname` split refactor; hot-path
+  timestamp filter micro-opts; live HTTP integration server test; cached
+  `_headers()` dict; truncated output digests; preflight redirect note;
+  `_validate_bulk_shape` module-level move; extra preflight_http comments;
+  CLIENT.md ops rate-limit section.
