@@ -87,6 +87,12 @@ class HttpSource:
         session: Optional[requests.Session] = None,
         api_key: str | None = None,
     ):
+        if batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
+        if batch_size > 10000:
+            raise ValueError(
+                f"batch_size exceeds protocol limit of 10000, got {batch_size}"
+            )
         self._base_url = base_url
         self._batch_size = batch_size
         self._api_key = api_key

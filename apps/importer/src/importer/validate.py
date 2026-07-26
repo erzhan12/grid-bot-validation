@@ -59,7 +59,13 @@ _EIGHT_DP = Decimal("0.00000001")
 
 def _epoch_minute(ts: datetime) -> int:
     """Absolute UTC minute key for a naive-UTC timestamp."""
-    return int(ts.replace(tzinfo=timezone.utc).timestamp()) // 60
+    try:
+        epoch = int(ts.replace(tzinfo=timezone.utc).timestamp())
+    except (ValueError, OverflowError):
+        raise ValueError(
+            f"timestamp {ts} cannot be converted to epoch seconds"
+        ) from None
+    return epoch // 60
 
 
 @dataclass
@@ -381,6 +387,7 @@ def smoke_replay(
             [sys.executable, "-m", "replay.main", "--config", str(rendered)],
             capture_output=True,
             text=True,
+            timeout=300,
             env={
                 key: value
                 for key, value in os.environ.copy().items()

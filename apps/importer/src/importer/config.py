@@ -20,7 +20,7 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 import requests
 
 _ASCII_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
-_TOKEN68_RE = re.compile(r"^[A-Za-z0-9\-._~+/]+={0,}$")
+_TOKEN68_RE = re.compile(r"^[A-Za-z0-9\-._~+/]+={0,2}$")
 
 
 class ConfigurationError(ValueError):
@@ -93,8 +93,8 @@ def _safe_hostname(parts: SplitResult) -> tuple[str, int | None]:
     try:
         hostname = parts.hostname
         port = parts.port
-    except ValueError as exc:
-        raise ConfigurationError("--source-url has an invalid host or port") from exc
+    except ValueError:
+        raise ConfigurationError("--source-url has an invalid host or port") from None
     if not hostname:
         raise ConfigurationError("--source-url must include a host")
     try:
@@ -121,8 +121,8 @@ def _safe_hostname(parts: SplitResult) -> tuple[str, int | None]:
                 raise ValueError
             if all(ch.isdigit() or ch == "." for ch in ascii_host):
                 ipaddress.IPv4Address(ascii_host)
-    except (UnicodeError, ValueError) as exc:
-        raise ConfigurationError("--source-url has an invalid host") from exc
+    except (UnicodeError, ValueError):
+        raise ConfigurationError("--source-url has an invalid host") from None
     return hostname, port
 
 
@@ -145,8 +145,8 @@ def preflight_http(source_url: str) -> HttpPreflight:
         raise ConfigurationError("--source-url contains unsafe whitespace or controls")
     try:
         parts = urlsplit(source_url)
-    except ValueError as exc:
-        raise ConfigurationError("--source-url is malformed") from exc
+    except ValueError:
+        raise ConfigurationError("--source-url is malformed") from None
     if parts.scheme.lower() not in {"http", "https"}:
         raise ConfigurationError("--source-url must use http or https")
     if parts.username is not None or parts.password is not None:
@@ -163,8 +163,10 @@ def preflight_http(source_url: str) -> HttpPreflight:
     try:
         prepared = requests.Request("GET", candidate).prepare()
         canonical_with_slash = prepared.url
-    except (requests.RequestException, UnicodeError, ValueError) as exc:
-        raise ConfigurationError("--source-url cannot be prepared as an HTTP URL") from exc
+    except (requests.RequestException, UnicodeError, ValueError):
+        raise ConfigurationError(
+            "--source-url cannot be prepared as an HTTP URL"
+        ) from None
     if canonical_with_slash is None:  # defensive: PreparedRequest.url is optional
         raise ConfigurationError("--source-url cannot be prepared as an HTTP URL")
 
@@ -175,8 +177,10 @@ def preflight_http(source_url: str) -> HttpPreflight:
         endpoint = requests.Request(
             "GET", canonical_base + "/ticker_data"
         ).prepare().url
-    except (requests.RequestException, UnicodeError, ValueError) as exc:
-        raise ConfigurationError("--source-url cannot form protocol endpoints") from exc
+    except (requests.RequestException, UnicodeError, ValueError):
+        raise ConfigurationError(
+            "--source-url cannot form protocol endpoints"
+        ) from None
     if (
         stable != canonical_base + "/"
         or endpoint != canonical_base + "/ticker_data"
@@ -239,10 +243,11 @@ def load_market_data_api_key() -> str | None:
             "https://market-data.invalid/ticker_data",
             headers={"Authorization": f"Bearer {key}"},
         ).prepare()
-    except (UnicodeError, requests.RequestException, ValueError) as exc:
+    except (UnicodeError, requests.RequestException, ValueError):
+        # Drop the cause chain: prepare() may embed the Authorization header.
         raise ConfigurationError(
             "MARKET_DATA_API_KEY cannot be used as an HTTP header"
-        ) from exc
+        ) from None
     if prepared.headers.get("Authorization") != f"Bearer {key}":
         raise ConfigurationError(
             "MARKET_DATA_API_KEY cannot be used as an HTTP header"

@@ -296,9 +296,10 @@ class TestSmokeReplayMocked:
     def _fake_run(captured, returncode=0, stdout="Net PnL:    1.23"):
         import yaml
 
-        def fake_run(cmd, capture_output, text, env):
+        def fake_run(cmd, capture_output, text, env, timeout=None):
             captured["cmd"] = cmd
             captured["env"] = env
+            captured["timeout"] = timeout
             with open(cmd[-1]) as f:
                 captured["config"] = yaml.safe_load(f)
             return SimpleNamespace(
@@ -327,6 +328,7 @@ class TestSmokeReplayMocked:
         assert config["start_ts"] == (_T0 + timedelta(hours=2)).isoformat()
         assert config["end_ts"] == (_T0 + timedelta(hours=6)).isoformat()
         assert captured["cmd"][1:3] == ["-m", "replay.main"]
+        assert captured["timeout"] == 300
 
     def test_market_api_key_removed_only_from_child_env(
         self, tmp_path, monkeypatch

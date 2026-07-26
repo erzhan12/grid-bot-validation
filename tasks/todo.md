@@ -38,3 +38,11 @@ Plan: docs/features/0098_PLAN.md
 - [x] Phase 3: bulk-page schema, damaged-row filtering, cursor/order invariants
 - [x] Phase 4: authenticated kline fetch, strict minute/window validation
 - [x] Phase 5: tests, CLIENT/README/rules updates, full verification
+
+## Follow-ups
+- 0098 review P2: optional charset warning in `_is_json_content_type` (warn on
+  non-utf-8 charset parameters without rejecting otherwise-valid JSON).
+- 0098 review P2: extra stress tests for concurrent lock acquisition and very
+  large cursor pagination memory bounds (cycle set stays unbounded by design).
+- 0098 review P3: consumer-side MARKET_DATA_API_KEY handling notes belong in
+  importer README/ops docs, not the protocol `docs/CLIENT.md` contract.

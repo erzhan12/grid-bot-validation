@@ -178,6 +178,12 @@ class TestRequests:
         source.close()
         assert session.close_calls == 1
 
+    def test_batch_size_bounds_are_enforced(self):
+        with pytest.raises(ValueError, match="positive"):
+            HttpSource("https://example.test", batch_size=0)
+        with pytest.raises(ValueError, match="10000"):
+            HttpSource("https://example.test", batch_size=10001)
+
 
 class TestBulkPages:
     def test_pagination_and_naive_timestamps_without_id(self):

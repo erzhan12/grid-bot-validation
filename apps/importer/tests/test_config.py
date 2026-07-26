@@ -194,6 +194,7 @@ class TestConfig:
         with pytest.raises(ConfigurationError) as caught:
             load_market_data_api_key()
         assert key not in str(caught.value)
+        assert caught.value.__cause__ is None
 
     @pytest.mark.parametrize("value", [None, ""])
     def test_missing_or_empty_bearer_disables_auth(self, value, monkeypatch):
@@ -206,6 +207,13 @@ class TestConfig:
     def test_valid_bearer_is_preserved_exactly(self, monkeypatch):
         monkeypatch.setenv("MARKET_DATA_API_KEY", "opaque-token/+=")
         assert load_market_data_api_key() == "opaque-token/+="
+
+    def test_bearer_rejects_excessive_padding(self, monkeypatch):
+        monkeypatch.setenv("MARKET_DATA_API_KEY", "opaque-token/+===")
+        with pytest.raises(ConfigurationError) as caught:
+            load_market_data_api_key()
+        assert caught.value.__cause__ is None
+        assert "opaque-token" not in str(caught.value)
 
     def test_ohlc_threshold_must_be_unit_fraction(self):
         """--ohlc-threshold outside (0, 1] is rejected."""
