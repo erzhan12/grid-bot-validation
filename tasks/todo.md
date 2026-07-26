@@ -28,3 +28,13 @@ Plan: docs/features/0093_PLAN.md  |  Branch: feature/0093-importer
   Missing kline minutes are legitimate source sparsity.
 
 ## Not committed — awaiting user review/approval before any commit.
+
+# Feature 0098 — remote market-data API client protocol 1.0
+
+Plan: docs/features/0098_PLAN.md
+
+- [ ] Phase 1: source-aware config preflight, secret loading, auth/session lifecycle
+- [ ] Phase 2: shared JSON request path, retries, Retry-After, redaction
+- [ ] Phase 3: bulk-page schema, damaged-row filtering, cursor/order invariants
+- [ ] Phase 4: authenticated kline fetch, strict minute/window validation
+- [ ] Phase 5: tests, CLIENT/README/rules updates, full verification
