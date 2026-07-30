@@ -2562,6 +2562,52 @@ class TestSameOrderDetection:
         assert "dup-shadow" in cancelled_ids
         assert mock_executor.execute_place.call_count == 0
 
+    def test_duplicate_healing_cancel_drains_queued_retry(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """0087 healing must not leave a queued retry that resurrects the shadow."""
+        retry_queue = RetryQueue(executor_func=mock_executor.execute_place)
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+            on_retry_cancel_for_prefix=lambda prefix: retry_queue.cancel_for_prefix(
+                prefix
+            ),
+        )
+        intent = PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("49000.0"),
+            qty=Decimal("0.001"),
+            grid_level=5,
+            direction="long",
+        )
+        wired = replace(intent, order_link_id=f"{intent.client_order_id}-123")
+        runner._tracked_orders[intent.client_order_id] = TrackedOrder(
+            client_order_id=intent.client_order_id,
+            order_id="dup-shadow",
+            intent=wired,
+            status="placed",
+        )
+        retry_queue.add(wired, "Connection timeout")
+        assert retry_queue.size == 1
+
+        runner._execute_cancel_intent(
+            CancelIntent(
+                symbol="BTCUSDT",
+                order_id="dup-shadow",
+                reason="duplicate",
+                price=Decimal("49000.0"),
+                side="Buy",
+            )
+        )
+
+        assert retry_queue.size == 0
+        assert (
+            runner._tracked_orders[intent.client_order_id].status == "cancelled"
+        )
+
     def test_on_order_update_skips_placements_not_cancels_when_same_order_error(
         self, runner,
     ):
@@ -5339,6 +5385,18 @@ class TestSafetyCapsIntegration:
         )
         assert caps.loss_tripped() is True
         assert retry_queue.size == 0
+
+    def test_retry_dispatch_place_blocks_when_same_order_latched(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """Queued retries must honor the SAME ORDER soft-block."""
+        r = self._runner(strategy_config, mock_executor, instrument_info, None)
+        r._same_order_error = True
+        intent = self._assign_wire(self._open())
+        result = r.retry_dispatch_place(intent)
+        assert result.success is False
+        assert result.error == "same_order_blocked"
+        mock_executor.execute_place.assert_not_called()
 
     def test_retry_dispatch_place_blocks_when_truncate_breaker_tripped(
         self, strategy_config, mock_executor, instrument_info
