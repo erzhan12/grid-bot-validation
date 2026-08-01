@@ -240,7 +240,9 @@ class StrategyRunner:
                 (for fast-tracking the next order-sync sweep).
             notifier: Alert notifier for same-order error Telegram alerts.
             on_retry_cancel_for_prefix: Optional callback to cancel queued
-                placement retries after reconcile proves the order was accepted.
+                placement retries — after reconcile proves the order was
+                accepted, or after a feature-0087 duplicate-healing cancel
+                removes a same-price shadow.
             on_retry_queue_clear: Optional callback to drain the retry queue
                 on C3 session-loss trip (mirrors auth-cooldown queue clear).
             rest_client: Optional Bybit REST client for the dirty-mirror
@@ -2436,7 +2438,24 @@ class StrategyRunner:
         queued place can outlive a breaker trip on the same ``(side, price)``
         scope, so retries must honor the cooldown or they partially bypass the
         0064 storm backstop.
+
+        Also honors the SAME ORDER soft-block (feature 0031): tick-path
+        placements are suppressed while latched, so retries must not bypass it.
         """
+        if self._same_order_error:
+            logger.debug(
+                "%s: SAME ORDER latched — dropping retry %s %s @ %s",
+                self.strat_id,
+                intent.direction,
+                intent.side,
+                intent.price,
+            )
+            return OrderResult(
+                success=False,
+                order_link_id=intent.order_link_id,
+                error="same_order_blocked",
+            )
+
         now = self._clock()
         if self._truncate_breaker.is_blocked(intent.side, intent.price, now):
             logger.debug(
@@ -2486,6 +2505,19 @@ class StrategyRunner:
         tracked = self._find_tracked_order(None, intent.order_id)
         if tracked and result.success:
             tracked.mark_cancelled()
+            if (
+                intent.reason == "duplicate"
+                and self._on_retry_cancel_for_prefix is not None
+            ):
+                removed = self._on_retry_cancel_for_prefix(tracked.client_order_id)
+                if removed:
+                    logger.info(
+                        "%s: duplicate-healing cancel drained %d queued retry(ies) "
+                        "for prefix=%s",
+                        self.strat_id,
+                        removed,
+                        tracked.client_order_id,
+                    )
 
         if not result.success and self._on_intent_failed:
             self._on_intent_failed(intent, result.error)

@@ -232,6 +232,7 @@ class RetryQueue:
                     result.error.startswith("safety_cap")
                     or result.error == "truncate_breaker_blocked"
                     or result.error == "duplicate_order_blocked"
+                    or result.error == "same_order_blocked"
                 ):
                     # Feature 0079 — cap-blocked retries are dropped, not
                     # re-backed-off (mirrors runner drop-not-enqueue on first
@@ -239,11 +240,17 @@ class RetryQueue:
                     # sentinel mirrors Step 2 silent drop on first dispatch.
                     # duplicate_order_blocked mirrors reconcile-upgrade / exact-
                     # duplicate guard when a queued retry outlives adoption.
+                    # same_order_blocked mirrors the feature-0031 SAME ORDER
+                    # soft-block: a queued place-retry must be dropped (not
+                    # re-backed-off) while the latch is active, matching the
+                    # tick-path placement suppression.
                     drop_reason = (
                         "truncate breaker"
                         if result.error == "truncate_breaker_blocked"
                         else "duplicate order"
                         if result.error == "duplicate_order_blocked"
+                        else "same order latch"
+                        if result.error == "same_order_blocked"
                         else "safety cap"
                     )
                     logger.warning(
