@@ -1,4 +1,4 @@
-"""Verdict evaluation for live_check — the four threshold checks.
+"""Verdict evaluation for live_check — the five threshold checks.
 
 Pure functions over already-loaded data; no DB access.
 """
