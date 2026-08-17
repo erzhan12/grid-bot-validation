@@ -53,6 +53,10 @@ def build_replay_config(
             strat_id=strat.strat_id,
         ),
         fill_simulator=FillSimulatorConfig(mode="event_follower"),
+        # 0100: never simulate funding in a reconcile run — the inherited
+        # default (enabled, canned 0.0001 rate) is NOT Bybit's recorded
+        # rate and drifts current_balance/sizing away from live.
+        enable_funding=False,
     )
 
 
@@ -103,6 +107,8 @@ def build_multi_replay_config(
             account_id=account_id,
         ),
         fill_simulator=FillSimulatorConfig(mode="event_follower"),
+        # 0100: same rationale as build_replay_config — no synthetic funding.
+        enable_funding=False,
         strategies=[
             strat.to_replay_strategy_config().model_dump() | {
                 "symbol": strat.symbol,

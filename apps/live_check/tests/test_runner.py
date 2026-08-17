@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-from live_check.runner import build_replay_config
+from live_check.runner import build_multi_replay_config, build_replay_config
 from live_check.window import Window
 
 
@@ -30,6 +30,23 @@ class TestBuildReplayConfig:
         assert config.seed.at_ts == window.start
         assert config.seed.strat_id == "ltcusdt_test"
         assert config.seed.account_id == "acc-uuid"
+        # 0100: never simulate funding in a reconcile run — the inherited
+        # default (True, canned 0.0001) is not Bybit's recorded rate.
+        assert config.enable_funding is False
+
+    def test_multi_config_funding_disabled(self, strat):
+        """0100: shared-wallet config also disables synthetic funding."""
+        start = datetime(2026, 7, 1, 8, 0, 0)
+        window = Window(start=start, end=start + timedelta(hours=4))
+        config = build_multi_replay_config(
+            strats=[strat],
+            window=window,
+            run_id="test-run-id",
+            database_url="sqlite:///recorder.db",
+            account_id="acc-uuid",
+        )
+        assert config.fill_simulator.mode == "event_follower"
+        assert config.enable_funding is False
 
     def test_geometry_and_risk_mirror(self, strat):
         """All five risk fields + geometry project into the strategy config."""

@@ -13,16 +13,18 @@ from live_check.shared_wallet import SharedWalletDiff
 
 @dataclass(frozen=True)
 class Verdict:
-    """Outcome of the four reconcile checks for one strat/window."""
+    """Outcome of the five reconcile checks for one strat/window."""
 
     live_only_count: int
     backtest_only_count: int
     matched_count: int
     live_exec_count: int  # informational display only (raw exec rows)
+    qty_mismatch_count: int
     d_realized: Decimal
     d_commission: Decimal
     d_unrealised: Decimal
     matched_ok: bool
+    qty_ok: bool
     realized_ok: bool
     commission_ok: bool
     unrealised_ok: bool
@@ -41,18 +43,34 @@ class SharedWalletVerdict:
     passed: bool
 
 
+def _count_qty_mismatches(matched) -> int:
+    """Count matched pairs whose live and backtest qty differ.
+
+    Feature 0100: identity matching alone is blind to quantity fidelity —
+    the qty-excess cap (``order_manager.py``) pro-rates fee/pnl on a capped
+    fill and emits it under the SAME matching key, so a materially
+    undersized reproduced fill still lands in ``matched``. The same holds
+    for trailing partial executions left undrained after the window's last
+    ticker tick: the live aggregate carries more qty than the replay
+    rollup. Exact equality (no tolerance): event_follower applies recorded
+    ``exec_qty`` as-is, so any mismatch is a real divergence, not noise.
+    """
+    return sum(1 for p in matched if p.live.qty != p.backtest.qty)
+
+
 def evaluate(
     replay_result,
     ground_truth: GroundTruth,
     thresholds: VerdictThresholds,
 ) -> Verdict:
-    """Apply the four verdict checks to one strat's replay vs ground truth.
+    """Apply the five verdict checks to one strat's replay vs ground truth.
 
     The matched check is structural: ``match_result.live_only == [] AND
     match_result.backtest_only == []``. It is NOT ``matched_count ==
     live_exec_count`` — ``matched`` counts aggregated NormalizedTrades while
     ``live_exec_count`` counts RAW execution rows; partial fills make them
-    legitimately differ on a correct run.
+    legitimately differ on a correct run. The qty check (0100) closes the
+    identity-only blind spot: matched pairs must also agree on quantity.
 
     Replay unrealised is read from
     ``replay_result.session.metrics.total_unrealized_pnl`` (the finalized
@@ -84,6 +102,8 @@ def evaluate(
     live_only_count = len(match_result.live_only)
     backtest_only_count = len(match_result.backtest_only)
     matched_ok = live_only_count == 0 and backtest_only_count == 0
+    qty_mismatch_count = _count_qty_mismatches(match_result.matched)
+    qty_ok = qty_mismatch_count == 0
 
     d_realized = session_metrics.total_realized_pnl - ground_truth.sum_realized
     d_commission = session_metrics.total_commission - ground_truth.sum_commission
@@ -100,14 +120,20 @@ def evaluate(
         backtest_only_count=backtest_only_count,
         matched_count=len(match_result.matched),
         live_exec_count=ground_truth.live_exec_count,
+        qty_mismatch_count=qty_mismatch_count,
         d_realized=d_realized,
         d_commission=d_commission,
         d_unrealised=d_unrealised,
         matched_ok=matched_ok,
+        qty_ok=qty_ok,
         realized_ok=realized_ok,
         commission_ok=commission_ok,
         unrealised_ok=unrealised_ok,
-        passed=matched_ok and realized_ok and commission_ok and unrealised_ok,
+        passed=matched_ok
+        and qty_ok
+        and realized_ok
+        and commission_ok
+        and unrealised_ok,
     )
 
 
@@ -121,6 +147,8 @@ def evaluate_multi_strategy(
     live_only_count = len(match_result.live_only)
     backtest_only_count = len(match_result.backtest_only)
     matched_ok = live_only_count == 0 and backtest_only_count == 0
+    qty_mismatch_count = _count_qty_mismatches(match_result.matched)
+    qty_ok = qty_mismatch_count == 0
     metrics = strategy_result.metrics
 
     d_realized = metrics.total_backtest_pnl - ground_truth.sum_realized
@@ -136,14 +164,20 @@ def evaluate_multi_strategy(
         backtest_only_count=backtest_only_count,
         matched_count=len(match_result.matched),
         live_exec_count=ground_truth.live_exec_count,
+        qty_mismatch_count=qty_mismatch_count,
         d_realized=d_realized,
         d_commission=d_commission,
         d_unrealised=d_unrealised,
         matched_ok=matched_ok,
+        qty_ok=qty_ok,
         realized_ok=realized_ok,
         commission_ok=commission_ok,
         unrealised_ok=unrealised_ok,
-        passed=matched_ok and realized_ok and commission_ok and unrealised_ok,
+        passed=matched_ok
+        and qty_ok
+        and realized_ok
+        and commission_ok
+        and unrealised_ok,
     )
 
 

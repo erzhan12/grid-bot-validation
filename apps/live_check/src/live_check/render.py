@@ -46,6 +46,8 @@ def render_once(results) -> str:
                     f"live_only={verdict.live_only_count} "
                     f"backtest_only={verdict.backtest_only_count} "
                     f"{_flag(verdict.matched_ok)}",
+                    f"  qty mismatch {verdict.qty_mismatch_count} "
+                    f"{_flag(verdict.qty_ok)}",
                     f"  Δrealized    {_fmt(verdict.d_realized)} "
                     f"{_flag(verdict.realized_ok)}",
                     f"  Δcommission  {_fmt(verdict.d_commission)} "

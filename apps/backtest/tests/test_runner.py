@@ -2378,6 +2378,12 @@ class TestEstimatePairImMm:
         assert mm_L == expected_mm
         assert im_S == Decimal("0")
         assert mm_S == Decimal("0")
+        # 0100: literal lock, hand-derived — guards the FORMULA itself, not
+        # just implementation == test-side recomputation of the same formula.
+        # fee = 6.2*55.91368848*0.9*0.00075 = 0.2339987862888;
+        # im = 6.2*53.70/10 + fee; mm = 6.2*53.70*0.01 + fee.
+        assert im_L == Decimal("33.5279987862888")
+        assert mm_L == Decimal("3.5633987862888")
 
     def test_short_only_matches_one_way_with_fee(self, runner):
         """Test #2: Short-only symmetric to long-only with (1+1/lev) fee."""
@@ -2396,6 +2402,11 @@ class TestEstimatePairImMm:
         assert mm_L == Decimal("0")
         assert im_S == expected_im
         assert mm_S == expected_mm
+        # 0100: literal lock, hand-derived (see long-only twin).
+        # fee = 2.2*55.53059536*1.1*0.00075 = 0.1007880305784;
+        # im = 2.2*53.70/10 + fee; mm = 2.2*53.70*0.01 + fee.
+        assert im_S == Decimal("11.9147880305784")
+        assert mm_S == Decimal("1.2821880305784")
 
     def test_zero_positions(self, runner):
         """Test #6: both legs zero returns all zeros — no DivisionByZero."""

@@ -15,6 +15,7 @@ Reads recorded data, feeds through GridEngine + simulated order book, compares a
 - Config: root-level `initial_balance`/`enable_funding`/`wind_down_mode` (not nested under strategy)
 - Run resolution: auto-discovers latest recording run, or explicit `--run-id`
 - Active runs (`end_ts=None`): falls back to `datetime.now(UTC)` instead of failing
+- **Resolved bounds are naive UTC (0100)**: `_resolve_run` (both engines) converts aware bounds via `_to_naive_utc` (aware → `astimezone(utc)` → strip) BEFORE they reach query binds — SQLAlchemy's SQLite DateTime bind keeps WALL time and silently drops a non-UTC offset (empirically verified), so an un-normalized `+05:00` config shifts the whole queried window. `_strip_tz` (snapshot_loader) keeps wall time — do NOT use it for query bounds; `ReplayResult.start_ts/end_ts` are therefore naive UTC.
 - `RunRepository.get_latest_by_type()` has `statuses` filter (default: completed + running)
 - `datetime.fromisoformat()` requires Python 3.11+ for full timezone support
 - Config search: `--config` → `REPLAY_CONFIG_PATH` env → `conf/replay.yaml` → `replay.yaml`

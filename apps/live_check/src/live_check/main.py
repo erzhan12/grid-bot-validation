@@ -145,12 +145,29 @@ def _exit_code(outcomes: list[str]) -> int:
 def run_single(config: LiveCheckConfig, args, db: DatabaseFactory) -> int:
     """--once / --per-fill / --curve: one window, one report, exit."""
     run_id, account_id, run_start = _resolve_run(db, config.run_id)
-    window = compute_window(parse_duration(args.last), parse_duration(args.lag))
+    last = parse_duration(args.last)
+    lag = parse_duration(args.lag)
+    window = compute_window(last, lag)
     check_post_0080_floors(window.start, run_start)
+    # 0100: --once previously had NO freshness gate (watch-only) — a stopped
+    # recorder's self-consistent prefix could PASS. Mirror the watch probe.
+    override = (
+        parse_duration(config.staleness_threshold)
+        if config.staleness_threshold is not None
+        else None
+    )
+    threshold = staleness_threshold(lag, override)
 
     outcomes: list[str] = []
     results = []
     for strat in config.strats:
+        with db.get_readonly_session() as session:
+            ticker_ts = ground_truth.latest_ticker_ts(session, strat.symbol)
+        reason = freshness_skip_reason(ticker_ts, lag, threshold)
+        if reason is not None:
+            outcomes.append("skip")
+            print(f"{strat.strat_id} ({strat.symbol}) — SKIP: {reason}")
+            continue
         outcome = check_strat(strat, window, run_id, account_id, db, config)
         outcomes.append(outcome[0])
         if outcome[0] == "skip":
@@ -185,8 +202,18 @@ def run_single(config: LiveCheckConfig, args, db: DatabaseFactory) -> int:
 def run_shared_single(config: LiveCheckConfig, args, db: DatabaseFactory) -> int:
     """Run one shared-wallet replay and account-level reconciliation."""
     run_id, account_id, run_start = _resolve_run(db, config.run_id)
-    window = compute_window(parse_duration(args.last), parse_duration(args.lag))
+    last = parse_duration(args.last)
+    lag = parse_duration(args.lag)
+    window = compute_window(last, lag)
     check_post_0080_floors(window.start, run_start)
+    # 0100: freshness gate (see run_single). freshness_skip_reason(None, ...)
+    # returns "no ticker data", so this subsumes the old missing-ticker probe.
+    override = (
+        parse_duration(config.staleness_threshold)
+        if config.staleness_threshold is not None
+        else None
+    )
+    threshold = staleness_threshold(lag, override)
 
     with db.get_readonly_session() as session:
         exec_counts = {
@@ -195,18 +222,24 @@ def run_shared_single(config: LiveCheckConfig, args, db: DatabaseFactory) -> int
             )
             for strat in config.strats
         }
-        missing_ticker = [
-            strat for strat in config.strats
-            if ground_truth.latest_ticker_ts(session, strat.symbol) is None
-        ]
+        stale_reasons = {
+            strat.strat_id: freshness_skip_reason(
+                ground_truth.latest_ticker_ts(session, strat.symbol),
+                lag,
+                threshold,
+            )
+            for strat in config.strats
+        }
     if any(count == 0 for count in exec_counts.values()):
         for strat in config.strats:
             if exec_counts[strat.symbol] == 0:
                 print(f"{strat.strat_id} ({strat.symbol}) — SKIP: no data in window")
         return EXIT_SKIP
-    if missing_ticker:
-        for strat in missing_ticker:
-            print(f"{strat.strat_id} ({strat.symbol}) — SKIP: no ticker data")
+    if any(reason is not None for reason in stale_reasons.values()):
+        for strat in config.strats:
+            reason = stale_reasons[strat.strat_id]
+            if reason is not None:
+                print(f"{strat.strat_id} ({strat.symbol}) — SKIP: {reason}")
         return EXIT_SKIP
 
     result = runner.run_shared(config.strats, window, run_id, account_id, db)

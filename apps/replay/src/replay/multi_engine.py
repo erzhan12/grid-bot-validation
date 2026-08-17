@@ -41,6 +41,7 @@ from replay.engine import (
     CollateralMarkFeed,
     ReplayEngine,
     _NoopPositionSnapshotWriter,
+    _to_naive_utc,
 )
 from replay.multi_config import MultiReplayConfig, MultiReplayStrategyConfig
 from replay.snapshot_loader import (
@@ -444,7 +445,11 @@ class MultiReplayEngine(ReplayEngine):
             end_ts = datetime.now(timezone.utc)
         if start_ts is None:
             raise ValueError("start_ts could not be resolved")
-        if start_ts.replace(tzinfo=None) >= end_ts.replace(tzinfo=None):
+        # 0100: normalize to naive UTC before the bounds reach query binds
+        # (SQLite binds keep wall time, dropping a non-UTC offset silently).
+        start_ts = _to_naive_utc(start_ts)
+        end_ts = _to_naive_utc(end_ts)
+        if start_ts >= end_ts:
             raise ValueError(
                 f"Invalid time range: start_ts ({start_ts}) must be before "
                 f"end_ts ({end_ts})"

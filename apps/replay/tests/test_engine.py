@@ -93,8 +93,11 @@ class TestReplayEngine:
         assert result.match_result is not None
         assert result.run_id == "test-run-id"
         assert result.symbol == "BTCUSDT"
-        assert result.start_ts == replay_config.start_ts
-        assert result.end_ts == replay_config.end_ts
+        # 0100: bounds are normalized to naive UTC (same instant) before
+        # reaching query binds — compare tz-stripped.
+        assert result.start_ts == replay_config.start_ts.replace(tzinfo=None)
+        assert result.end_ts == replay_config.end_ts.replace(tzinfo=None)
+        assert result.start_ts.tzinfo is None
         assert result.fill_mode == FillMode.LAST_CROSS
 
     @patch("replay.engine.InstrumentInfoProvider")
@@ -317,6 +320,56 @@ class TestResolveRun:
 
         # Should resolve timestamps from DB without error
         assert result is not None
+
+    def test_resolve_run_normalizes_non_utc_aware_bounds(self, db, ts):
+        """0100: aware non-UTC bounds → naive UTC before any query bind.
+
+        SQLAlchemy's SQLite DateTime bind keeps wall time and silently drops
+        a non-UTC offset (empirically verified), so an un-normalized
+        ``+05:00`` config would shift the whole queried window by 5 hours.
+        """
+        with db.get_session() as session:
+            user = User(user_id="user-tz", username="tz")
+            account = BybitAccount(
+                account_id="acc-tz", user_id="user-tz",
+                account_name="tz", environment="testnet",
+            )
+            strategy = Strategy(
+                strategy_id="strat-tz", account_id="acc-tz",
+                strategy_type="recorder", symbol="BTCUSDT",
+                config_json={},
+            )
+            run = Run(
+                run_id="tz-run",
+                user_id="user-tz",
+                account_id="acc-tz",
+                strategy_id="strat-tz",
+                run_type="recording",
+                status="completed",
+                start_ts=ts,
+                end_ts=ts + timedelta(days=1),
+            )
+            session.add_all([user, account, strategy, run])
+            session.commit()
+
+        tz5 = timezone(timedelta(hours=5))
+        config = ReplayConfig(
+            database_url="sqlite:///:memory:",
+            run_id="tz-run",
+            symbol="BTCUSDT",
+            start_ts=datetime(2025, 2, 20, 12, 0, 0, tzinfo=tz5),
+            end_ts=datetime(2025, 2, 20, 18, 0, 0, tzinfo=tz5),
+            strategy=ReplayStrategyConfig(tick_size=Decimal("0.1")),
+            enable_funding=False,
+        )
+        engine = ReplayEngine(config=config, db=db)
+
+        _, _, start_ts, end_ts = engine._resolve_run(config)
+
+        assert start_ts == datetime(2025, 2, 20, 7, 0, 0)
+        assert start_ts.tzinfo is None
+        assert end_ts == datetime(2025, 2, 20, 13, 0, 0)
+        assert end_ts.tzinfo is None
 
     @patch("replay.engine.InstrumentInfoProvider")
     def test_active_run_uses_utcnow_for_end_ts(self, mock_provider_cls, db, ts):

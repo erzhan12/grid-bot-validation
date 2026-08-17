@@ -7,7 +7,7 @@ paths:
 
 **Path**: `apps/live_check/` — CLI `uv run live-check` (`--once` default, `--watch <interval>`, `--per-fill`, `--curve`; window `--last 4h` / `--lag 2m`).
 
-Wraps `ReplayEngine` (seeded `event_follower`, never `last_cross`) per strat over a rolling window and compares against RECORDED ground truth only (never live Bybit REST). Verdict: `live_only==[] AND backtest_only==[]`, |Δrealized|<0.01, |Δcommission|<0.01, |Δunrealised|<0.50 (net per pair). Exit codes: 0 all-PASS, 1 FAIL/config error, 2 SKIP/no-data (zero-data window is NEVER a PASS).
+Wraps `ReplayEngine` (seeded `event_follower`, never `last_cross`) per strat over a rolling window and compares against RECORDED ground truth only (never live Bybit REST). Verdict (five checks since 0100): `live_only==[] AND backtest_only==[]`, **qty exact-equality on every matched pair** (`qty_mismatch_count==0`), |Δrealized|<0.01, |Δcommission|<0.01, |Δunrealised|<0.50 (net per pair). Exit codes: 0 all-PASS, 1 FAIL/config error, 2 SKIP/no-data (zero-data window is NEVER a PASS).
 
 ### Key Rules
 
@@ -16,7 +16,9 @@ Wraps `ReplayEngine` (seeded `event_follower`, never `last_cross`) per strat ove
 - **Symbol scoping is mandatory**: both strats share one run_id; `get_by_run_range` has NO symbol filter — ground-truth sums use direct `func.coalesce(func.sum(...), 0)` queries filtered by run_id + symbol + window.
 - **Matched gate ≠ raw exec count**: partial fills aggregate several `private_executions` rows into one `NormalizedTrade`; `live_exec_count` is display-only.
 - **Pre-0080 guard (two floors)**: `window.start >= run.start_ts` AND `>= 2026-06-17T23:07:00Z` (`window.POST_0080_CUTOFF`) — pre-0080 data collapses link_id matching (954→44).
-- **Freshness gate (`--watch`)**: probes `MAX(TickerSnapshot.exchange_ts)` per symbol (no run_id column; `PrivateExecution` would false-trip on quiet periods); threshold `max(2*lag, 5m)`; `None` ticker ts → SKIP line, never crash. Seed miss (`SeedDataQualityError`) → SKIP line, watch loop continues.
+- **Freshness gate (ALL modes since 0100, was watch-only)**: probes `MAX(TickerSnapshot.exchange_ts)` per symbol (no run_id column; `PrivateExecution` would false-trip on quiet periods); threshold `max(2*lag, 5m)`; `None` ticker ts → SKIP line, never crash. Seed miss (`SeedDataQualityError`) → SKIP line, watch loop continues. `--once`/`--shared` skip BEFORE any replay runs — a stopped recorder's self-consistent prefix must never PASS.
+- **Qty gate (0100)**: identity matching alone is blind to quantity — the qty-excess cap pro-rates fee/pnl and emits under the SAME matching key, and trailing partials left undrained after the window's last ticker tick shrink the replay rollup. `_count_qty_mismatches` uses exact equality (no tolerance): event_follower applies recorded `exec_qty` as-is, so any mismatch is real divergence.
+- **`enable_funding=False` in BOTH `build_replay_config` and `build_multi_replay_config` (0100)** — the inherited replay default (True, canned 0.0001 rate) is not Bybit's recorded rate; simulated funding drifts `current_balance`/sizing away from live. Never re-enable in a reconcile run.
 - **`account_id` must be pre-queried** from the `Run` row before building `ReplayConfig` — `SeedConfig` requires it at construction time.
 - All query/comparison datetimes normalized to naive UTC (`window.to_naive_utc`) — SQLite stores tz-stripped; aware-vs-naive math raises `TypeError`.
 - Replay unrealised source: `ReplayResult.session.metrics.total_unrealized_pnl` (finalized `BacktestMetrics`) — NOT `ReplayResult.metrics` (comparator `ValidationMetrics`, no such field).

@@ -26,24 +26,38 @@ def _truth(realized="0", commission="0", unrealised="0", count=3):
     )
 
 
+def _pair(live_qty="0.2", backtest_qty="0.2"):
+    """Matched-pair stub carrying qty on both legs (0100 qty gate reads them)."""
+    return SimpleNamespace(
+        live=SimpleNamespace(qty=Decimal(live_qty)),
+        backtest=SimpleNamespace(qty=Decimal(backtest_qty)),
+    )
+
+
 def _rr(realized="0", commission="0", unrealised="0",
-        matched=3, live_only=0, backtest_only=0, metrics_none=False):
+        matched=3, live_only=0, backtest_only=0, metrics_none=False,
+        qty_mismatched=0):
     """Synthetic ReplayResult stub.
 
     ``replay_result.metrics`` (the comparator ValidationMetrics) deliberately
     has NO total_unrealized_pnl attribute — evaluate must never read it.
     ``session`` likewise has no top-level total_unrealized_pnl.
+    ``qty_mismatched`` of the ``matched`` pairs carry a live qty differing
+    from the backtest qty (0100 qty gate).
     """
     session_metrics = None if metrics_none else SimpleNamespace(
         total_realized_pnl=Decimal(realized),
         total_commission=Decimal(commission),
         total_unrealized_pnl=Decimal(unrealised),
     )
+    matched_pairs = [_pair() for _ in range(matched - qty_mismatched)] + [
+        _pair(live_qty="0.3") for _ in range(qty_mismatched)
+    ]
     return SimpleNamespace(
         session=SimpleNamespace(metrics=session_metrics),
         metrics=SimpleNamespace(),  # ValidationMetrics stand-in, no pnl fields
         match_result=SimpleNamespace(
-            matched=[object()] * matched,
+            matched=matched_pairs,
             live_only=[object()] * live_only,
             backtest_only=[object()] * backtest_only,
         ),
@@ -89,6 +103,47 @@ class TestVerdictThresholds:
         v = evaluate(_rr(backtest_only=2), _truth(), VerdictThresholds())
         assert not v.matched_ok
         assert v.backtest_only_count == 2
+
+
+class TestQtyGate:
+    def test_qty_mismatch_fails_even_when_identity_and_sums_match(self):
+        """0100: a capped/under-drained fill matches by identity but must FAIL.
+
+        Reproduces the audit blind spot: qty-excess capping pro-rates fee/pnl
+        and emits the fill under the same matching key, so identity + sum
+        gates alone stay green while the reproduced qty is wrong.
+        """
+        v = evaluate(_rr(qty_mismatched=1), _truth(), VerdictThresholds())
+        assert v.matched_ok  # identity gate alone would have passed
+        assert v.qty_mismatch_count == 1
+        assert not v.qty_ok
+        assert not v.passed
+
+    def test_equal_qty_passes(self):
+        """All matched pairs agree on qty → qty gate green."""
+        v = evaluate(_rr(), _truth(), VerdictThresholds())
+        assert v.qty_mismatch_count == 0
+        assert v.qty_ok
+        assert v.passed
+
+    def test_multi_strategy_qty_gate(self):
+        """Shared-wallet per-symbol path applies the same qty gate."""
+        result = SimpleNamespace(
+            metrics=SimpleNamespace(
+                total_backtest_pnl=Decimal("0"),
+                total_backtest_fees=Decimal("0"),
+            ),
+            final_unrealized=Decimal("0"),
+            match_result=SimpleNamespace(
+                matched=[_pair(live_qty="0.4", backtest_qty="0.2")],
+                live_only=[],
+                backtest_only=[],
+            ),
+        )
+        v = evaluate_multi_strategy(result, _truth(), VerdictThresholds())
+        assert v.matched_ok
+        assert not v.qty_ok
+        assert not v.passed
 
 
 class TestMatchedGrain:

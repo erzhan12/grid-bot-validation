@@ -87,6 +87,20 @@ from replay.snapshot_loader import (
 logger = logging.getLogger(__name__)
 
 
+def _to_naive_utc(dt: datetime) -> datetime:
+    """Aware → UTC → naive; naive passes through.
+
+    0100: SQLAlchemy's SQLite DateTime bind DROPS a non-UTC offset while
+    keeping the wall time (empirically verified), so an aware non-UTC bound
+    silently shifts the whole queried window. Unlike ``_strip_tz`` (which
+    keeps wall time), this converts to UTC first — use it for anything that
+    reaches a query bind.
+    """
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
 class CollateralMarkFeed:
     """Per-coin collateral mark stream over the replay window (feature 0065).
 
@@ -837,8 +851,12 @@ class ReplayEngine:
         if start_ts is None:
             raise ValueError("start_ts could not be resolved")
 
-        # Compare without tz info — SQLite may strip timezone from stored timestamps
-        if start_ts.replace(tzinfo=None) >= end_ts.replace(tzinfo=None):
+        # 0100: normalize to naive UTC BEFORE the bounds reach query binds —
+        # SQLite binds keep wall time and drop a non-UTC offset silently.
+        start_ts = _to_naive_utc(start_ts)
+        end_ts = _to_naive_utc(end_ts)
+
+        if start_ts >= end_ts:
             raise ValueError(
                 f"Invalid time range: start_ts ({start_ts}) must be before end_ts ({end_ts})"
             )
