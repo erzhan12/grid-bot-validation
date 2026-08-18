@@ -39,6 +39,7 @@ side, reduce_only             direction
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -147,6 +148,14 @@ class PositionStateSeed:
     liquidation_price: Decimal
     cum_realised_pnl: Decimal = Decimal("0")
     cur_realised_pnl: Decimal = Decimal("0")
+    # 0101: Bybit's recorded ``unrealisedPnl`` / ``markPrice`` for the row, used
+    # to derive the seed-time U0 subtracted from the UPL-bearing session
+    # baselines. Both columns are nullable in the DB, so these default to
+    # ``None`` (NOT ``Decimal('0')`` — a genuine NULL must stay distinguishable
+    # from a recorded zero); the default keeps every existing constructor/test
+    # valid, like the optional ``cum_realised_pnl`` above.
+    unrealised_pnl: Decimal | None = None
+    mark_price: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -539,6 +548,8 @@ def load_position_snapshots(
         cur_realised_pnl=(
             buy_snap.cur_realised_pnl if buy_snap.cur_realised_pnl is not None else Decimal("0")
         ),
+        unrealised_pnl=buy_snap.unrealised_pnl,
+        mark_price=buy_snap.mark_price,
     )
     short_seed = PositionStateSeed(
         direction="short",
@@ -551,8 +562,84 @@ def load_position_snapshots(
         cur_realised_pnl=(
             sell_snap.cur_realised_pnl if sell_snap.cur_realised_pnl is not None else Decimal("0")
         ),
+        unrealised_pnl=sell_snap.unrealised_pnl,
+        mark_price=sell_snap.mark_price,
     )
     return long_seed, short_seed
+
+
+def compute_seed_upl(legs: Iterable[PositionStateSeed | None]) -> Decimal:
+    """Sum the seed-time unrealized PnL (``U0``) across seeded position legs.
+
+    Bybit UTA ``totalEquity`` / ``totalAvailableBalance`` already embed the
+    unrealized PnL of positions open at ``seed.at_ts``. The seeded backtest
+    session then re-adds the FULL current unrealized every tick, so any
+    baseline seeded from a UPL-bearing field is overstated by this constant
+    ``U0`` for the whole run (understated when ``U0 < 0``). Callers subtract
+    the returned value from ONLY the UPL-bearing baselines before
+    constructing the session: single engine → both ``initial_balance`` (TAB)
+    and ``initial_equity`` (total_equity); multi engine → ``initial_balance``
+    (TAB) ONLY, since its ``initial_equity`` is ``coin_balance`` cash with no
+    embedded UPL (see docs/features/0101_PLAN.md). This helper only computes
+    the sum; where to subtract it is the caller's decision.
+
+    Per leg, in precedence order:
+
+    * ``None`` or ``size == 0`` → contributes ``Decimal('0')``.
+    * ``size > 0`` with ``entry_price <= 0`` → :class:`SeedDataQualityError`
+      (corrupt non-flat seed; the tracker would recompute ``U(t)`` from this
+      entry every tick regardless of the recorded UPL).
+    * ``unrealised_pnl is not None`` → contributes it verbatim (Bybit's own
+      mark-based value; **takes precedence** over the mark formula).
+    * else ``mark_price is not None`` → row-local mark formula:
+      ``long → (mark_price - entry_price) * size``,
+      ``short → (entry_price - mark_price) * size``.
+    * else (``size > 0``, both fields ``None``) → :class:`SeedDataQualityError`
+      (pre-0059 recording without UPL telemetry cannot be seeded correctly;
+      silently contributing 0 would preserve the double-count).
+
+    Args:
+        legs: Seeded position legs (typically ``[long_seed, short_seed]``,
+            or all strategies' legs flattened for the shared multi session).
+
+    Returns:
+        The Decimal sum of every non-flat leg's seed-time unrealized PnL.
+
+    Raises:
+        SeedDataQualityError: A non-flat leg has a corrupt entry price, or
+            has neither a recorded ``unrealised_pnl`` nor a ``mark_price``.
+    """
+    total = Decimal("0")
+    for leg in legs:
+        if leg is None or leg.size == 0:
+            continue
+        if leg.entry_price <= 0:
+            raise SeedDataQualityError(
+                f"seed-time U0: {leg.direction} leg has size={leg.size} but "
+                f"entry_price={leg.entry_price} (<= 0); corrupt seed, refusing "
+                "to seed"
+            )
+        if leg.unrealised_pnl is not None:
+            contribution = leg.unrealised_pnl
+            source = "recorded_unrealised_pnl"
+        elif leg.mark_price is not None:
+            if leg.direction == "long":
+                contribution = (leg.mark_price - leg.entry_price) * leg.size
+            else:
+                contribution = (leg.entry_price - leg.mark_price) * leg.size
+            source = "mark_price_formula"
+        else:
+            raise SeedDataQualityError(
+                f"seed-time U0: {leg.direction} leg has size={leg.size} but "
+                "neither unrealised_pnl nor mark_price recorded (pre-0059 "
+                "recording); cannot seed without preserving the U0 double-count"
+            )
+        logger.info(
+            "seed-time U0: %s leg size=%s source=%s contribution=%s",
+            leg.direction, leg.size, source, contribution,
+        )
+        total += contribution
+    return total
 
 
 def load_wallet_snapshot(
@@ -909,6 +996,7 @@ __all__ = [
     "load_grid_state",
     "load_grid_state_from_snapshots",
     "load_position_snapshots",
+    "compute_seed_upl",
     "load_wallet_seed_full",
     "load_wallet_snapshot",
     "load_active_orders",

@@ -22,6 +22,7 @@ Wraps `ReplayEngine` (seeded `event_follower`, never `last_cross`) per strat ove
 - **`account_id` must be pre-queried** from the `Run` row before building `ReplayConfig` — `SeedConfig` requires it at construction time.
 - All query/comparison datetimes normalized to naive UTC (`window.to_naive_utc`) — SQLite stores tz-stripped; aware-vs-naive math raises `TypeError`.
 - Replay unrealised source: `ReplayResult.session.metrics.total_unrealized_pnl` (finalized `BacktestMetrics`) — NOT `ReplayResult.metrics` (comparator `ValidationMetrics`, no such field).
+- **Seed-time U0 correction (feature 0101)**: seeded replay now subtracts seed-time `U0` from the UPL-bearing baselines (single-strat: `initial_balance`+`initial_equity`; `--shared`: `initial_balance` only — see `replay.md`). The single-strat verdict formula compares realized/commission/unrealised sums + qty (NO balances) so it is UNCHANGED; the `--shared` `equity_ok` gate (`verdict.py:207`) reads the multi `total_equity` axis, which is `coin_balance` cash and was never overstated, so it is also unchanged. BUT the corrected `current_balance` feeds wallet-fraction qty sizing / margin gating inside the replay, so post-0101 seeded runs can place slightly different orders — trade-level verdicts must be re-confirmed empirically on fixed code, not assumed from pre-0101 PASS history.
 
 ---
 

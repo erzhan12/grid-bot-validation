@@ -25,7 +25,7 @@ every ~10 features, sweep the rule files and prune entries that no longer apply.
 | `.claude/rules/backtest.md` | `apps/backtest/**` | Backtest engine architecture, risk multiplier composition, CLI, metrics |
 | `.claude/rules/comparator.md` | `apps/comparator/**` | Validation concepts, NormalizedTrade, spike-vs-drift stats (0070) |
 | `.claude/rules/recorder.md` | `apps/recorder/**` | Standalone recorder rules + test pitfalls |
-| `.claude/rules/replay.md` | `apps/replay/**` | Replay engine, telemetry parity (0034), UTA wallet semantics (0042), fill simulator modes incl. `last_cross` + `event_follower` (0072), test pitfalls |
+| `.claude/rules/replay.md` | `apps/replay/**` | Replay engine, telemetry parity (0034), UTA wallet semantics (0042), fill simulator modes incl. `last_cross` + `event_follower` (0072), seed-time U0 subtraction (0101), test pitfalls |
 | `.claude/rules/pnl-checker.md` | `apps/pnl_checker/**` | Live PnL validation rules |
 | `.claude/rules/live-check.md` | `apps/live_check/**` | Replay-vs-live reconciliation (0088): read-only DB, verdict gates, freshness |
 | `.claude/rules/importer.md` | `apps/importer/**` | Remote importer: environment-only auth, request isolation, opaque cursor commits, source-scoped HTTP outputs |

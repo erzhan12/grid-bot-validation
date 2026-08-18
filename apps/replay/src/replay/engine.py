@@ -74,6 +74,7 @@ from replay.snapshot_loader import (
     SeedDataQualityError,
     WalletSeed,
     _strip_tz,
+    compute_seed_upl,
     load_active_orders,
     load_collateral_seed,
     load_grid_state,
@@ -327,6 +328,10 @@ class ReplayResult:
     # 0034: paired live/backtest position snapshots for the CSV export.
     # Empty list when no pairs found OR comparator not run.
     position_pairs: list = field(default_factory=list)
+    # 0101: the finalized runner, so tests can assert tracker flatness after a
+    # production run() (aligns with MultiStrategyReplayResult.runner). Defaulted
+    # to keep existing ReplayResult(...) call sites and tests valid.
+    runner: "BacktestRunner | None" = None
 
 
 class ReplayEngine:
@@ -458,6 +463,22 @@ class ReplayEngine:
             if wallet_seed is not None
             else initial_balance
         )
+        # 0101: Bybit UTA totalEquity / totalAvailableBalance already embed the
+        # unrealized PnL of positions open at seed.at_ts (U0). The seeded session
+        # re-adds the FULL current unrealized every tick, so BOTH baselines are
+        # overstated by the constant U0. Subtract it once, before the session is
+        # built (single-engine path — both baselines carry UPL). Only when a
+        # wallet seed is present; the config.initial_balance fallback has no
+        # embedded UPL to remove.
+        if wallet_seed is not None:
+            u0 = compute_seed_upl([long_seed, short_seed])
+            initial_balance -= u0
+            initial_equity -= u0
+            logger.info(
+                "0101 seed-time U0 correction: U0=%s -> "
+                "initial_balance=%s, initial_equity=%s",
+                u0, initial_balance, initial_equity,
+            )
         # 0065: seed non-USDT collateral re-mark state onto the session
         # (empty when no seed / no collateral → identical to pre-0065).
         collateral_balances = (
@@ -794,6 +815,7 @@ class ReplayEngine:
             end_ts=end_ts,
             fill_mode=fill_mode,
             position_pairs=position_pairs,
+            runner=runner,
         )
 
     def _resolve_run(self, config: ReplayConfig):

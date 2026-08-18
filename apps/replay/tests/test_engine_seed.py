@@ -3,9 +3,12 @@
 These tests construct a ``ReplayEngine`` with ``seed.enabled=True`` against
 an in-memory recorder DB pre-populated with one of each snapshot dimension
 (positions long+short, wallet, active order) plus a ``GridStateStore`` JSON
-file. They stop short of running ticks — the seed payload is verified
-directly on the constructed ``BacktestRunner``, ``BacktestSession`` and
-``BacktestOrderManager`` to keep the test focused on the wiring.
+file. The original Phase-3 classes stop short of running ticks — the seed
+payload is verified directly on the constructed ``BacktestRunner``,
+``BacktestSession`` and ``BacktestOrderManager`` to keep the test focused
+on the wiring. The feature-0101 ``TestSeedUplCorrection`` class instead
+drives production ``ReplayEngine.run()`` end-to-end (the U0 correction is
+load-bearing on that path).
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from grid_db import (
     OrderRepository,
     PositionSnapshot,
     PositionSnapshotRepository,
+    PrivateExecution,
     Run,
     Strategy,
     User,
@@ -31,9 +35,17 @@ from grid_db import (
 )
 from grid_db.repositories import GridStateSnapshotRepository
 
+from gridcore import EventType, TickerEvent
 from gridcore.persistence import GridStateStore, grid_fingerprint_hash
 
-from replay.config import ReplayConfig, ReplayStrategyConfig, SeedConfig
+from backtest.data_provider import InMemoryDataProvider
+
+from replay.config import (
+    FillSimulatorConfig,
+    ReplayConfig,
+    ReplayStrategyConfig,
+    SeedConfig,
+)
 from replay.engine import ReplayEngine
 from replay.snapshot_loader import SeedDataQualityError
 
@@ -1211,3 +1223,308 @@ class TestReplayEngineSeedCollateral:
         assert wallet_seed.collateral_excluded_coins == []
         assert wallet_seed.collateral_missing_mark_coins == []
         assert wallet_seed.collateral_switch_off_coins == []
+
+
+# ---------------------------------------------------------------------------
+# F. Seed-time unrealized PnL (U0) subtraction (feature 0101, issue #244)
+# ---------------------------------------------------------------------------
+
+
+def _btc_tick(price: Decimal, ts: datetime) -> TickerEvent:
+    """Minimal BTCUSDT ticker for driving production ``run()``."""
+    return TickerEvent(
+        event_type=EventType.TICKER,
+        symbol=SYMBOL,
+        exchange_ts=ts,
+        local_ts=ts,
+        last_price=price,
+        mark_price=price,
+        bid1_price=price - Decimal("1"),
+        ask1_price=price + Decimal("1"),
+        funding_rate=Decimal("0"),
+    )
+
+
+class TestSeedUplCorrection:
+    """Seeded replay subtracts seed-time ``U0`` from the UPL-bearing
+    baselines so ``total_equity``/``current_balance`` follow Bybit UTA
+    semantics (``E0 = walletBalance + U0``) instead of double-counting."""
+
+    def test_seed_upl_corrects_both_single_engine_baselines(
+        self, seeded_db, replay_config, seed_ts, mock_instrument,
+    ):
+        """Long-only recorded ``unrealised_pnl`` is subtracted from BOTH
+        single-engine baselines before the session is built.
+
+        Seed layout (from ``seeded_db``): long size=1.5, entry=100000;
+        wallet total_available_balance=14000.25, total_equity=15000.50.
+        We stamp the long snapshot's recorded ``unrealised_pnl`` = 500.
+
+        Hand-computed U0 (long-only) = 500.
+          initial_balance = 14000.25 - 500 = 13500.25
+          initial_equity  = 15000.50 - 500 = 14500.50
+        """
+        with seeded_db.get_session() as session:
+            buy = (
+                session.query(PositionSnapshot)
+                .filter_by(run_id="seed-run", side="Buy")
+                .one()
+            )
+            buy.unrealised_pnl = Decimal("500")
+            session.commit()
+
+        engine = ReplayEngine(config=replay_config, db=seeded_db)
+        provider = InMemoryDataProvider(
+            [_btc_tick(Decimal("100000"), seed_ts + timedelta(minutes=i))
+             for i in range(3)]
+        )
+        result = engine.run(data_provider=provider)
+
+        assert result.session.initial_balance == Decimal("13500.25")
+        assert result.session.initial_equity == Decimal("14500.50")
+
+    def _seed_hedge(self, seeded_db, long_upl: Decimal, short_upl: Decimal):
+        """Stamp both legs non-flat with recorded per-leg unrealised_pnl."""
+        with seeded_db.get_session() as session:
+            buy = (
+                session.query(PositionSnapshot)
+                .filter_by(run_id="seed-run", side="Buy")
+                .one()
+            )
+            buy.unrealised_pnl = long_upl
+            sell = (
+                session.query(PositionSnapshot)
+                .filter_by(run_id="seed-run", side="Sell")
+                .one()
+            )
+            sell.size = Decimal("2.0")
+            sell.entry_price = Decimal("101000")
+            sell.unrealised_pnl = short_upl
+            session.commit()
+
+    def _run(self, engine, seed_ts):
+        provider = InMemoryDataProvider(
+            [_btc_tick(Decimal("100000"), seed_ts + timedelta(minutes=i))
+             for i in range(3)]
+        )
+        return engine.run(data_provider=provider)
+
+    def test_seed_upl_hedge_both_legs(
+        self, seeded_db, replay_config, seed_ts, mock_instrument,
+    ):
+        """Both legs seeded → baselines reduced by the summed net U0.
+
+        long unrealised_pnl = +500, short unrealised_pnl = -300.
+          net U0 = 500 + (-300) = 200
+          initial_balance = 14000.25 - 200 = 13800.25
+          initial_equity  = 15000.50 - 200 = 14800.50
+        """
+        self._seed_hedge(seeded_db, Decimal("500"), Decimal("-300"))
+        engine = ReplayEngine(config=replay_config, db=seeded_db)
+        result = self._run(engine, seed_ts)
+
+        assert result.session.initial_balance == Decimal("13800.25")
+        assert result.session.initial_equity == Decimal("14800.50")
+
+    def test_seed_upl_negative_net_increases_baselines(
+        self, seeded_db, replay_config, seed_ts, mock_instrument,
+    ):
+        """Losing seed (negative net U0) → subtraction INCREASES baselines.
+
+        long unrealised_pnl = -800, short unrealised_pnl = +100.
+          net U0 = -800 + 100 = -700
+          initial_balance = 14000.25 - (-700) = 14700.25
+          initial_equity  = 15000.50 - (-700) = 15700.50
+        """
+        self._seed_hedge(seeded_db, Decimal("-800"), Decimal("100"))
+        engine = ReplayEngine(config=replay_config, db=seeded_db)
+        result = self._run(engine, seed_ts)
+
+        assert result.session.initial_balance == Decimal("14700.25")
+        assert result.session.initial_equity == Decimal("15700.50")
+
+    def _stamp_long_upl(self, seeded_db, u0: Decimal):
+        with seeded_db.get_session() as session:
+            buy = (
+                session.query(PositionSnapshot)
+                .filter_by(run_id="seed-run", side="Buy")
+                .one()
+            )
+            buy.unrealised_pnl = u0
+            # Seed NO working orders (plan Cycle 3): drop the fixture's open
+            # Buy@99000 so a grid fill can never contaminate the equity literal.
+            session.query(Order).filter_by(run_id="seed-run").delete()
+            session.commit()
+
+    def test_seed_upl_evolution_open_position(
+        self, seeded_db, replay_config, seed_ts, mock_instrument,
+    ):
+        """Split-window run ending with the seeded position STILL OPEN
+        (U(end) ≠ 0) → total_equity follows E0 − U0 + realized + U(end).
+
+        This is the evolution-term test the 0043 same-instant calibration
+        could not catch: the constant U0 offset AND the live U(end) both
+        appear, and only the corrected baseline yields the Bybit literal.
+
+        Seed: long size=1.5 @ entry=100000, recorded unrealised_pnl (U0)=500.
+        Flat tick series at last_price=100300 (no crosses → no fills →
+        realized=0, fees=0; enable_funding=False).
+          U(end) = (100300 - 100000) * 1.5 = 450   (last_price-based)
+          total_equity = 15000.50 - 500 + 0 + 450 - 0 = 14950.50
+        """
+        self._stamp_long_upl(seeded_db, Decimal("500"))
+        engine = ReplayEngine(config=replay_config, db=seeded_db)
+        provider = InMemoryDataProvider(
+            [_btc_tick(Decimal("100300"), seed_ts + timedelta(minutes=i))
+             for i in range(4)]
+        )
+        result = engine.run(data_provider=provider)
+
+        # Flatness guard: the position is genuinely still open (no fill closed
+        # it) and no opposite leg was opened by a stray grid fill.
+        assert result.runner is not None
+        assert result.runner.long_tracker.state.size == Decimal("1.5")
+        assert result.runner.short_tracker.state.size == Decimal("0")
+        assert result.session.total_realized_pnl == Decimal("0")
+
+        assert result.session.total_equity == Decimal("14950.50")
+
+    def test_seed_upl_evolution_marked_to_entry(
+        self, seeded_db, replay_config, seed_ts, mock_instrument,
+    ):
+        """Position marked back to entry (U(end)=0) → total_equity collapses
+        to the corrected baseline E0 − U0 (no double-count residue).
+
+        Seed: long 1.5 @ 100000, U0=500. Flat ticks at last_price=100000.
+          U(end) = 0, realized=0, fees=0
+          total_equity = 15000.50 - 500 + 0 + 0 - 0 = 14500.50
+        """
+        self._stamp_long_upl(seeded_db, Decimal("500"))
+        engine = ReplayEngine(config=replay_config, db=seeded_db)
+        provider = InMemoryDataProvider(
+            [_btc_tick(Decimal("100000"), seed_ts + timedelta(minutes=i))
+             for i in range(4)]
+        )
+        result = engine.run(data_provider=provider)
+
+        assert result.runner is not None
+        assert result.runner.long_tracker.state.size == Decimal("1.5")
+        assert result.runner.short_tracker.state.size == Decimal("0")
+        assert result.session.total_realized_pnl == Decimal("0")
+
+        assert result.session.total_equity == Decimal("14500.50")
+
+    def test_seed_upl_evolution_full_close_with_realized(
+        self, seeded_db, replay_config, seed_ts, snapshot_ts, mock_instrument,
+    ):
+        """Seeded long fully closed via one recorded execution (realized ≠ 0),
+        ending FLAT (U(end)=0) → total_equity = E0 − U0 + realized − fees.
+
+        event_follower mode: the simulator is disabled, so the ONLY fill is
+        the recorded Sell execution we insert — deterministic realized/fee.
+        We seed a tiny long (size=0.001) plus a matching reduce-only Sell
+        close order so the recorded exec routes to the long tracker.
+
+        Seed: long size=0.001 @ entry=100000, recorded unrealised_pnl (U0)=5.
+        Recorded close: closed_pnl=3, exec_fee=0.02, qty=0.001.
+          initial_equity = 15000.50 - 5 = 14995.50
+          U(end) = 0 (flat), realized = 3, fees = 0.02, funding = 0
+          total_equity = 14995.50 + 3 - 0.02 = 14998.48
+          current_balance = (14000.25 - 5) + 3 - 0.02 = 13998.23
+        """
+        close_link = "closelink0000000"
+        with seeded_db.get_session() as session:
+            buy = (
+                session.query(PositionSnapshot)
+                .filter_by(run_id="seed-run", side="Buy")
+                .one()
+            )
+            buy.size = Decimal("0.001")
+            buy.unrealised_pnl = Decimal("5")
+            # Drop the fixture's open Buy@99000; the only working order this
+            # test wants is the reduce-only close below.
+            session.query(Order).filter_by(run_id="seed-run").delete()
+            session.commit()
+            OrderRepository(session).bulk_insert([
+                Order(
+                    run_id="seed-run",
+                    account_id="acc-1",
+                    order_id="ORD-CLOSE-1",
+                    order_link_id=f"{close_link}-1715170800001",
+                    symbol=SYMBOL,
+                    exchange_ts=snapshot_ts,
+                    local_ts=snapshot_ts,
+                    status="New",
+                    side="Sell",
+                    price=Decimal("100200"),
+                    qty=Decimal("0.001"),
+                    leaves_qty=Decimal("0.001"),
+                    reduce_only=True,  # Sell + reduce_only → long close
+                ),
+            ])
+            session.add(PrivateExecution(
+                run_id="seed-run",
+                account_id="acc-1",
+                symbol=SYMBOL,
+                exec_id="close-exec-1",
+                order_id="ORD-CLOSE-1",
+                order_link_id=f"{close_link}-1004",
+                exchange_ts=seed_ts + timedelta(seconds=70),
+                side="Sell",
+                exec_price=Decimal("100200"),
+                exec_qty=Decimal("0.001"),
+                exec_fee=Decimal("0.02"),
+                closed_pnl=Decimal("3"),
+            ))
+            session.commit()
+
+        cfg = replay_config.model_copy(
+            update={"fill_simulator": FillSimulatorConfig(mode="event_follower")}
+        )
+        engine = ReplayEngine(config=cfg, db=seeded_db)
+        provider = InMemoryDataProvider(
+            [_btc_tick(Decimal("100000"), seed_ts + timedelta(minutes=i))
+             for i in range(4)]
+        )
+        result = engine.run(data_provider=provider)
+
+        # Long fully closed by the recorded exec; no opposite leg opened.
+        assert result.runner is not None
+        assert result.runner.long_tracker.state.size == Decimal("0")
+        assert result.runner.short_tracker.state.size == Decimal("0")
+        assert result.session.total_realized_pnl == Decimal("3")
+        assert result.session.total_commission == Decimal("0.02")
+
+        assert result.session.total_equity == Decimal("14998.48")
+        assert result.session.current_balance == Decimal("13998.23")
+
+    def test_seed_upl_flat_is_noop(
+        self, seeded_db, replay_config, seed_ts, mock_instrument,
+    ):
+        """Flat seed (no open position) → U0=0 → baselines byte-identical to
+        the recorded wallet fields (verbatim, no correction applied).
+
+        Zero out the seeded long so both legs are flat; even a non-NULL
+        recorded unrealised_pnl must NOT be subtracted when size==0.
+        """
+        with seeded_db.get_session() as session:
+            buy = (
+                session.query(PositionSnapshot)
+                .filter_by(run_id="seed-run", side="Buy")
+                .one()
+            )
+            buy.size = Decimal("0")
+            buy.entry_price = Decimal("0")
+            buy.unrealised_pnl = Decimal("500")  # present but must be ignored
+            session.commit()
+
+        engine = ReplayEngine(config=replay_config, db=seeded_db)
+        provider = InMemoryDataProvider(
+            [_btc_tick(Decimal("100000"), seed_ts + timedelta(minutes=i))
+             for i in range(3)]
+        )
+        result = engine.run(data_provider=provider)
+
+        # Byte-identical to the recorded wallet baselines (no U0 correction).
+        assert result.session.initial_balance == Decimal("14000.25")
+        assert result.session.initial_equity == Decimal("15000.50")

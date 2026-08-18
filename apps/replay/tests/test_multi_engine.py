@@ -18,7 +18,11 @@ from replay.multi_engine import (
     MultiReplayEngine,
     _SharedSessionCoordinator,
 )
-from replay.snapshot_loader import WalletSeed
+from replay.snapshot_loader import (
+    GridStateSeed,
+    PositionStateSeed,
+    WalletSeed,
+)
 
 
 TS = datetime(2026, 7, 1, 12, 0, 0, tzinfo=timezone.utc)
@@ -350,3 +354,109 @@ class TestMultiReplayRunEndToEnd:
         # Samples are ascending by the merged timeline.
         stamps = [ts for ts, _ in result.total_equity_curve]
         assert stamps == sorted(stamps)
+
+    @patch("backtest.instrument_info.InstrumentInfoProvider")
+    def test_run_subtracts_summed_u0_from_balance_only(
+        self, mock_provider_cls, db, seeded_run_account
+    ):
+        """0101 multi-engine asymmetry: seeded shared session subtracts the
+        SUMMED per-strategy U0 from ``initial_balance`` (TAB) ONLY;
+        ``initial_equity`` (``coin_balance`` — cash, no embedded UPL) is
+        UNCHANGED. Subtracting there would invert the bug on the equity axis.
+
+        Driven through production ``run()`` so the flatten→compute→thread
+        wiring (multi_engine.py run() → _build_shared_session) is exercised;
+        a hand-built _build_shared_session(config, wallet_seed, u0) call would
+        pass even if run() never flattened the legs.
+
+        SOL long U0=10, LTC long U0=25 → summed U0 = 35.
+          initial_balance = 280.00 - 35 = 245.00
+          initial_equity  = 314.02          (coin_balance, UNCHANGED)
+        """
+        mock_info = MagicMock()
+        mock_info.qty_step = Decimal("0.001")
+        mock_info.tick_size = Decimal("0.01")
+        mock_info.round_qty = lambda q: max(
+            Decimal("0.001"), q.quantize(Decimal("0.001"))
+        )
+        mock_provider_cls.return_value.get.return_value = mock_info
+
+        config = MultiReplayConfig(
+            run_id="test-run-id",
+            start_ts=TS,
+            end_ts=TS + timedelta(seconds=1),
+            initial_balance=Decimal("1000"),
+            enable_funding=False,
+            fill_simulator={"mode": "last_cross"},
+            strategies=[
+                {"symbol": "SOLUSDT", "strat_id": "solusdt_test",
+                 "tick_size": "0.01", "grid_count": 4, "grid_step": 0.5},
+                {"symbol": "LTCUSDT", "strat_id": "ltcusdt_test",
+                 "tick_size": "0.01", "grid_count": 4, "grid_step": 0.5},
+            ],
+        )
+        wallet_seed = WalletSeed(
+            coin_balance=Decimal("314.02"),
+            total_available_balance=Decimal("280.00"),
+            total_equity=Decimal("324.70"),
+            total_margin_balance=Decimal("324.70"),
+            account_im_rate=Decimal("0.02"),
+            account_mm_rate=Decimal("0.01"),
+        )
+        zero_short = PositionStateSeed(
+            direction="short", size=Decimal("0"),
+            entry_price=Decimal("0"), liquidation_price=Decimal("0"),
+        )
+        seed_data = {
+            "SOLUSDT": (
+                PositionStateSeed(
+                    direction="long", size=Decimal("2"),
+                    entry_price=Decimal("95"), liquidation_price=Decimal("0"),
+                    unrealised_pnl=Decimal("10"),
+                ),
+                zero_short,
+                GridStateSeed(
+                    strat_id="solusdt_test",
+                    grid=[
+                        {"side": "Buy", "price": 99.0},
+                        {"side": "Buy", "price": 99.5},
+                        {"side": "Sell", "price": 100.5},
+                        {"side": "Sell", "price": 101.0},
+                    ],
+                    grid_step=0.5, grid_count=4,
+                ),
+                [],
+            ),
+            "LTCUSDT": (
+                PositionStateSeed(
+                    direction="long", size=Decimal("3"),
+                    entry_price=Decimal("75"), liquidation_price=Decimal("0"),
+                    unrealised_pnl=Decimal("25"),
+                ),
+                zero_short,
+                GridStateSeed(
+                    strat_id="ltcusdt_test",
+                    grid=[
+                        {"side": "Buy", "price": 79.2},
+                        {"side": "Buy", "price": 79.6},
+                        {"side": "Sell", "price": 80.4},
+                        {"side": "Sell", "price": 80.8},
+                    ],
+                    grid_step=0.5, grid_count=4,
+                ),
+                [],
+            ),
+        }
+        providers = {
+            "SOLUSDT": InMemoryDataProvider([_tick("SOLUSDT", "100", 0)]),
+            "LTCUSDT": InMemoryDataProvider([_tick("LTCUSDT", "80", 100)]),
+        }
+        engine = MultiReplayEngine(config=config, db=db)
+        with patch.object(
+            MultiReplayEngine, "_load_multi_seed",
+            return_value=(wallet_seed, seed_data),
+        ):
+            result = engine.run(data_providers=providers)
+
+        assert result.session.initial_balance == Decimal("245.00")
+        assert result.session.initial_equity == Decimal("314.02")

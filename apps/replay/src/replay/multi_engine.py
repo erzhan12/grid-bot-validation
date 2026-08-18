@@ -51,6 +51,7 @@ from replay.snapshot_loader import (
     SeedDataQualityError,
     WalletSeed,
     _strip_tz,
+    compute_seed_upl,
     load_active_orders,
     load_collateral_seed,
     load_grid_state_from_active_snapshots,
@@ -248,7 +249,23 @@ class MultiReplayEngine(ReplayEngine):
         run_id, account_id, start_ts, end_ts = self._resolve_run_multi(config)
         fill_mode = FillMode(config.fill_simulator.mode)
         wallet_seed, seed_data = self._load_multi_seed(config, run_id)
-        session = self._build_shared_session(config, wallet_seed)
+        # 0101: sum seed-time U0 across ALL strategies' legs (they share one
+        # session, so the double-count is the summed embedded UPL). Subtracted
+        # from initial_balance ONLY inside _build_shared_session.
+        u0 = Decimal("0")
+        if wallet_seed is not None:
+            all_legs = [
+                leg
+                for long_seed, short_seed, _grid, _orders in seed_data.values()
+                for leg in (long_seed, short_seed)
+            ]
+            u0 = compute_seed_upl(all_legs)
+            logger.info(
+                "0101 shared-session seed-time U0 correction: summed U0=%s "
+                "(subtracted from initial_balance only)",
+                u0,
+            )
+        session = self._build_shared_session(config, wallet_seed, u0)
 
         bundles: dict[str, _RunnerBundle] = {}
         last_prices = self._startup_mark_cache(config, start_ts, data_providers)
@@ -573,12 +590,25 @@ class MultiReplayEngine(ReplayEngine):
     def _build_shared_session(
         config: MultiReplayConfig,
         wallet_seed: Optional[WalletSeed],
+        u0: Decimal = Decimal("0"),
     ) -> BacktestSession:
-        """Build the one account-level BacktestSession."""
+        """Build the one account-level BacktestSession.
+
+        0101: ``u0`` is the summed seed-time unrealized PnL across all
+        strategies' seeded legs. It is subtracted from ``initial_balance``
+        (TAB — which embeds UPL) ONLY. ``initial_equity`` is ``coin_balance``
+        (per-coin USDT cash, which does NOT include perp UPL — see
+        docs/features/0101_PLAN.md), so subtracting U0 there would invert the
+        bug and understate equity. Defaults to ``0`` so the non-seeded path
+        and the 0095 unit tests calling ``_build_shared_session(config,
+        wallet_seed)`` stay byte-identical.
+        """
         initial_balance = (
             wallet_seed.total_available_balance
             if wallet_seed is not None else config.initial_balance
         )
+        if wallet_seed is not None:
+            initial_balance -= u0
         initial_equity = (
             wallet_seed.coin_balance if wallet_seed is not None else initial_balance
         )

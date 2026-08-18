@@ -34,6 +34,7 @@ from replay.snapshot_loader import (
     SeedDataQualityError,
     SeedSchemaError,
     WalletSeed,
+    compute_seed_upl,
     load_active_orders,
     load_collateral_seed,
     load_grid_state,
@@ -731,6 +732,52 @@ class TestLoadPositionSnapshots:
         assert short_seed.size == Decimal("0.5")
         assert short_seed.entry_price == Decimal("51000")
         assert short_seed.liquidation_price == Decimal("55000")
+
+    def test_upl_and_mark_fields_pass_through(
+        self, session, sample_account, sample_run, base_ts
+    ):
+        """0101: load_position_snapshots forwards unrealised_pnl/mark_price
+        from the rows (and leaves them None when the columns are NULL)."""
+        repo = PositionSnapshotRepository(session)
+        repo.bulk_insert([
+            PositionSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                symbol="BTCUSDT",
+                exchange_ts=base_ts, local_ts=base_ts,
+                side="Buy",
+                size=Decimal("1.5"),
+                entry_price=Decimal("50000"),
+                liq_price=Decimal("45000"),
+                unrealised_pnl=Decimal("123.45"),
+                mark_price=Decimal("50082.30"),
+            ),
+            PositionSnapshot(
+                run_id=sample_run.run_id,
+                account_id=str(sample_account.account_id),
+                symbol="BTCUSDT",
+                exchange_ts=base_ts, local_ts=base_ts,
+                side="Sell",
+                size=Decimal("0.5"),
+                entry_price=Decimal("51000"),
+                liq_price=Decimal("55000"),
+                unrealised_pnl=None,  # NULL → seed field stays None
+                mark_price=None,
+            ),
+        ])
+
+        long_seed, short_seed = load_position_snapshots(
+            session,
+            sample_run.run_id,
+            str(sample_account.account_id),
+            "BTCUSDT",
+            base_ts + timedelta(seconds=1),
+        )
+
+        assert long_seed.unrealised_pnl == Decimal("123.45")
+        assert long_seed.mark_price == Decimal("50082.30")
+        assert short_seed.unrealised_pnl is None
+        assert short_seed.mark_price is None
 
     def test_both_sides_absent_returns_zero_pair(
         self, session, sample_account, sample_run, base_ts
@@ -1568,3 +1615,74 @@ class TestLoadCollateralSeed:
         )
         assert bal["SOL"] == Decimal("0.2473524")
         assert marks["SOL"] == Decimal("19.95071637") / Decimal("0.2473524")
+
+
+# ---------------------------------------------------------------------------
+# compute_seed_upl (feature 0101)
+# ---------------------------------------------------------------------------
+
+
+def _leg(direction, size, entry="100", upl=None, mark=None):
+    return PositionStateSeed(
+        direction=direction,
+        size=Decimal(size),
+        entry_price=Decimal(entry),
+        liquidation_price=Decimal("0"),
+        unrealised_pnl=None if upl is None else Decimal(upl),
+        mark_price=None if mark is None else Decimal(mark),
+    )
+
+
+class TestComputeSeedUpl:
+    """U0 arithmetic — hand-computed literals per the source hierarchy."""
+
+    def test_long_only_recorded_upl(self):
+        assert compute_seed_upl([_leg("long", "2", upl="10")]) == Decimal("10")
+
+    def test_short_only_recorded_upl(self):
+        assert compute_seed_upl([_leg("short", "1.5", upl="-4")]) == Decimal("-4")
+
+    def test_both_legs_sum(self):
+        legs = [_leg("long", "2", upl="10"), _leg("short", "1", upl="-3")]
+        assert compute_seed_upl(legs) == Decimal("7")
+
+    def test_negative_net(self):
+        legs = [_leg("long", "2", upl="-8"), _leg("short", "1", upl="1")]
+        assert compute_seed_upl(legs) == Decimal("-7")
+
+    def test_none_and_zero_size_skipped(self):
+        legs = [None, _leg("long", "0", upl="999"), _leg("short", "2", upl="5")]
+        assert compute_seed_upl(legs) == Decimal("5")
+
+    def test_mark_price_fallback_long(self):
+        # (mark - entry) * size = (105 - 100) * 2 = 10
+        leg = _leg("long", "2", entry="100", upl=None, mark="105")
+        assert compute_seed_upl([leg]) == Decimal("10")
+
+    def test_mark_price_fallback_short(self):
+        # (entry - mark) * size = (100 - 97) * 3 = 9
+        leg = _leg("short", "3", entry="100", upl=None, mark="97")
+        assert compute_seed_upl([leg]) == Decimal("9")
+
+    def test_recorded_upl_takes_precedence_over_mark(self):
+        # Both present and deliberately disagreeing: recorded UPL wins.
+        # mark formula would give (110-100)*2 = 20; recorded says 3.
+        leg = _leg("long", "2", entry="100", upl="3", mark="110")
+        assert compute_seed_upl([leg]) == Decimal("3")
+
+    def test_both_fields_none_nonflat_raises(self):
+        with pytest.raises(SeedDataQualityError, match="neither"):
+            compute_seed_upl([_leg("long", "2", entry="100", upl=None, mark=None)])
+
+    def test_corrupt_entry_with_recorded_upl_raises(self):
+        # entry_price <= 0 on a non-flat leg is corrupt on BOTH source paths
+        # (checked even when a recorded UPL is present).
+        with pytest.raises(SeedDataQualityError, match="<= 0"):
+            compute_seed_upl([_leg("long", "2", entry="0", upl="5")])
+
+    def test_corrupt_entry_with_mark_raises(self):
+        with pytest.raises(SeedDataQualityError, match="<= 0"):
+            compute_seed_upl([_leg("short", "2", entry="0", upl=None, mark="97")])
+
+    def test_empty_is_zero(self):
+        assert compute_seed_upl([]) == Decimal("0")
