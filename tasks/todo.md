@@ -51,3 +51,10 @@ Plan: docs/features/0098_PLAN.md
   `_headers()` dict; truncated output digests; preflight redirect note;
   `_validate_bulk_shape` module-level move; extra preflight_http comments;
   CLIENT.md ops rate-limit section.
+
+# Feature 0102 — Account-wide liquidation halt
+
+Plan: docs/features/0102_PLAN.md | Issue: #246
+
+- [x] Phases 1–4: result fields, shared-pool observer, engine gate, docs.
+- [x] Phase 5: required replay/gridcore/live-check tests, `make test`, and lint.

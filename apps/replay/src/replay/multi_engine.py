@@ -87,7 +87,12 @@ class MultiStrategyReplayResult:
 
 @dataclass(frozen=True)
 class MultiReplayResult:
-    """Result of a shared-wallet multi-strategy replay."""
+    """Result of a shared-wallet multi-strategy replay.
+
+    ``Decimal("Infinity")`` for ``min_account_pool`` means no marked combined
+    position existed; drivers must render that sentinel specially (for example,
+    as ``n/a``) rather than emit bare ``Infinity``.
+    """
 
     session: BacktestSession
     strategies: dict[str, MultiStrategyReplayResult]
@@ -97,6 +102,9 @@ class MultiReplayResult:
     end_ts: datetime
     fill_mode: FillMode
     account_curve: list[AccountCurveSample] = field(default_factory=list)
+    liquidated: bool = False
+    liq_ts: Optional[datetime] = None
+    min_account_pool: Decimal = Decimal("Infinity")
 
     @property
     def total_equity_curve(self) -> list[tuple[datetime, Decimal]]:
@@ -138,6 +146,9 @@ class _SharedSessionCoordinator:
         self._pending: dict[str, tuple[Decimal, Decimal]] = {
             symbol: (Decimal("0"), Decimal("0")) for symbol in runners
         }
+        self.account_halted = False
+        self.liq_ts: Optional[datetime] = None
+        self.min_account_pool = Decimal("Infinity")
         self._active_symbol: Optional[str] = None
         self._orig_set_pending = session.set_pending_wallet
         self._orig_clear_pending = session.clear_pending_wallet
@@ -210,6 +221,46 @@ class _SharedSessionCoordinator:
             total_im += im_long + im_short
             total_mm += mm_long + mm_short
         return total_im, total_mm
+
+    def total_position_value(self) -> Decimal:
+        """Return gross marked position value across runners with known marks."""
+        total = Decimal("0")
+        for symbol, runner in self._runners.items():
+            price = self._last_prices.get(symbol, Decimal("0"))
+            if price <= 0:
+                continue
+            total += (
+                runner.long_tracker.state.size + runner.short_tracker.state.size
+            ) * price
+        return total
+
+    def observe_account_risk(
+        self,
+        exchange_ts: datetime,
+        total_equity: Decimal,
+        total_mm: Decimal,
+        combined_pv: Decimal,
+    ) -> None:
+        """Track account pool and latch the one-way shared liquidation halt."""
+        if combined_pv <= Decimal("0"):
+            return
+
+        pool = total_equity - total_mm
+        self.min_account_pool = min(self.min_account_pool, pool)
+        if pool > Decimal("0") or self.account_halted:
+            return
+
+        self.account_halted = True
+        self.liq_ts = exchange_ts
+        for runner in self._runners.values():
+            runner.engine.halt_new_opens()
+        logger.warning(
+            "Account-wide liquidation halt at %s: equity=%s mm=%s pool=%s",
+            exchange_ts,
+            total_equity,
+            total_mm,
+            pool,
+        )
 
     def _publish_pending(self) -> None:
         pending_realized = sum((v[0] for v in self._pending.values()), Decimal("0"))
@@ -347,6 +398,15 @@ class MultiReplayEngine(ReplayEngine):
                     logger.debug("%s funding payment: %s", symbol, funding)
                 bundle.funding.mark_funding_applied(tick.exchange_ts)
 
+            session.refresh_balances(Decimal("0"))
+            _, pre_total_mm = coordinator.total_im_mm()
+            coordinator.observe_account_risk(
+                tick.exchange_ts,
+                session.total_equity,
+                pre_total_mm,
+                coordinator.total_position_value(),
+            )
+
             with coordinator.active(symbol):
                 bundle.runner.process_fills(tick)
 
@@ -355,6 +415,12 @@ class MultiReplayEngine(ReplayEngine):
             session.update_equity(tick.exchange_ts, unrealized, total_im, total_mm)
             account_curve.append(
                 self._account_sample(tick.exchange_ts, session, total_mm)
+            )
+            coordinator.observe_account_risk(
+                tick.exchange_ts,
+                session.total_equity,
+                total_mm,
+                coordinator.total_position_value(),
             )
 
             with coordinator.active(symbol):
@@ -413,6 +479,9 @@ class MultiReplayEngine(ReplayEngine):
             end_ts=end_ts,
             fill_mode=fill_mode,
             account_curve=account_curve,
+            liquidated=coordinator.account_halted,
+            liq_ts=coordinator.liq_ts,
+            min_account_pool=coordinator.min_account_pool,
         )
 
     @staticmethod

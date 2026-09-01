@@ -6,10 +6,12 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from gridcore import EventType, TickerEvent
+from gridcore import EventType, GridEngine, TickerEvent
 from grid_db.models import PrivateExecution
 
 from backtest.data_provider import InMemoryDataProvider
+from backtest.executor import BacktestExecutor
+from backtest.config import WindDownMode
 from backtest.fill_simulator import FillMode
 from backtest.session import BacktestSession, BacktestTrade
 
@@ -19,6 +21,7 @@ from replay.multi_engine import (
     _SharedSessionCoordinator,
 )
 from replay.snapshot_loader import (
+    ActiveOrderSeed,
     GridStateSeed,
     PositionStateSeed,
     WalletSeed,
@@ -47,23 +50,109 @@ def _tick(symbol: str, price: str, offset_ms: int) -> TickerEvent:
 @dataclass
 class _Tracker:
     unrealized: Decimal
+    size: Decimal = Decimal("1")
+    avg_entry_price: Decimal = Decimal("1")
 
     @property
     def state(self):
-        return SimpleNamespace(size=Decimal("1"), avg_entry_price=Decimal("1"))
+        return SimpleNamespace(size=self.size, avg_entry_price=self.avg_entry_price)
 
     def calculate_unrealized_pnl(self, price: Decimal) -> Decimal:
         return self.unrealized + (price * Decimal("0"))
 
 
 class _Runner:
-    def __init__(self, long_upnl: str, short_upnl: str, mm: str = "0"):
-        self.long_tracker = _Tracker(Decimal(long_upnl))
-        self.short_tracker = _Tracker(Decimal(short_upnl))
+    def __init__(
+        self,
+        long_upnl: str,
+        short_upnl: str,
+        mm: str = "0",
+        *,
+        long_size: str = "1",
+        short_size: str = "1",
+        long_entry: str = "1",
+        short_entry: str = "1",
+    ):
+        self.long_tracker = _Tracker(
+            Decimal(long_upnl), Decimal(long_size), Decimal(long_entry)
+        )
+        self.short_tracker = _Tracker(
+            Decimal(short_upnl), Decimal(short_size), Decimal(short_entry)
+        )
         self._mm = Decimal(mm)
+        self.engine = MagicMock()
 
     def _estimate_pair_im_mm(self, _long, _short, _price):
         return Decimal("1"), self._mm, Decimal("2"), self._mm
+
+
+@dataclass
+class _LoopTracker:
+    size: Decimal
+    avg_entry_price: Decimal
+    pnl_sign: Decimal = Decimal("1")
+
+    @property
+    def state(self):
+        return SimpleNamespace(size=self.size, avg_entry_price=self.avg_entry_price)
+
+    def calculate_unrealized_pnl(self, price: Decimal) -> Decimal:
+        return (price - self.avg_entry_price) * self.size * self.pnl_sign
+
+
+class _LoopRunner:
+    def __init__(self, calls: list[str], fill_size: Decimal | None = None):
+        self.long_tracker = _LoopTracker(Decimal("1"), Decimal("100"))
+        self.short_tracker = _LoopTracker(Decimal("0"), Decimal("0"), Decimal("-1"))
+        self.engine = MagicMock()
+        self.engine.halt_new_opens.side_effect = lambda: calls.append("halt")
+        self._calls = calls
+        self._fill_size = fill_size
+
+    def _estimate_pair_im_mm(self, long, _short, _price):
+        mm = long.size * Decimal("50")
+        return Decimal("0"), mm, Decimal("0"), Decimal("0")
+
+    def process_fills(self, _tick):
+        self._calls.append("process_fills")
+        if self._fill_size is not None:
+            self.long_tracker.size = self._fill_size
+
+    def execute_tick(self, _tick):
+        self._calls.append("execute_tick")
+
+    def finalize_event_follower(self):
+        return None
+
+
+def _loop_engine(session: BacktestSession, runner: _LoopRunner) -> MultiReplayEngine:
+    """Build a hermetic merged-loop harness with one controllable runner."""
+    strategy = SimpleNamespace(symbol="SOLUSDT", tick_size=Decimal("0.01"))
+    config = SimpleNamespace(
+        strategies=[strategy],
+        fill_simulator=SimpleNamespace(mode="last_cross"),
+        enable_funding=False,
+        funding_rate=Decimal("0"),
+        wind_down_mode=WindDownMode.LEAVE_OPEN,
+    )
+    engine = MultiReplayEngine.__new__(MultiReplayEngine)
+    engine._multi_config = config
+    engine._emit_backtest_snapshots = False
+    engine._instrument_provider = MagicMock()
+    engine._resolve_run_multi = MagicMock(return_value=("run", None, TS, TS))
+    engine._load_multi_seed = MagicMock(
+        return_value=(None, {"SOLUSDT": (None, None, None, [])})
+    )
+    engine._build_shared_session = MagicMock(return_value=session)
+    engine._startup_mark_cache = MagicMock(return_value={"SOLUSDT": Decimal("100")})
+    engine._strategy_config = MagicMock(return_value=SimpleNamespace())
+    engine._event_follower = MagicMock(return_value=None)
+    engine._init_runner = MagicMock(return_value=runner)
+    engine._collateral_feed = MagicMock(return_value=None)
+    engine._warn_unmarked_collateral = MagicMock()
+    engine._runner_unrealized = MagicMock(return_value=Decimal("0"))
+    engine._compare_symbol = MagicMock(return_value=MagicMock())
+    return engine
 
 
 def _trade(symbol: str, pnl: str, fee: str) -> BacktestTrade:
@@ -190,6 +279,72 @@ class TestSharedSessionCoordinator:
         assert metrics.total_unrealized_pnl == Decimal("7")
         assert metrics.net_pnl == Decimal("7.9")
 
+    def test_total_position_value_uses_gross_own_symbol_marks(self):
+        """Marked combined PV uses gross legs and skips symbols without a mark."""
+        session = BacktestSession(initial_balance=Decimal("100"))
+        runners = {
+            "SOLUSDT": _Runner(
+                "0", "0", long_size="2", short_size="3"
+            ),
+            "LTCUSDT": _Runner(
+                "0", "0", long_size="7", short_size="11"
+            ),
+        }
+        coord = _SharedSessionCoordinator(
+            session,
+            runners,
+            {"SOLUSDT": Decimal("10"), "LTCUSDT": Decimal("0")},
+        )
+
+        assert coord.total_position_value() == Decimal("50")
+
+    def test_observe_account_risk_latches_once_and_tracks_active_minimum(self):
+        """Exact Decimal pool samples latch once and retain later troughs."""
+        session = BacktestSession(initial_balance=Decimal("100"))
+        runner = _Runner("0", "0")
+        idle_runner = _Runner("0", "0")
+        coord = _SharedSessionCoordinator(
+            session,
+            {"SOLUSDT": runner, "LTCUSDT": idle_runner},
+            {"SOLUSDT": Decimal("10"), "LTCUSDT": Decimal("10")},
+        )
+        first_breach = TS + timedelta(milliseconds=1)
+        later_breach = TS + timedelta(milliseconds=2)
+
+        with patch("replay.multi_engine.logger.warning") as warning:
+            coord.observe_account_risk(TS, Decimal("100"), Decimal("30"), Decimal("10"))
+            coord.observe_account_risk(
+                first_breach, Decimal("25"), Decimal("30"), Decimal("10")
+            )
+            coord.observe_account_risk(
+                later_breach, Decimal("5"), Decimal("30"), Decimal("10")
+            )
+
+        assert coord.min_account_pool == Decimal("-25")
+        assert coord.account_halted is True
+        assert coord.liq_ts == first_breach
+        runner.engine.halt_new_opens.assert_called_once_with()
+        idle_runner.engine.halt_new_opens.assert_called_once_with()
+        warning.assert_called_once()
+
+    def test_observe_account_risk_ignores_flat_samples_and_flat_breaches(self):
+        """Flat accounts retain the Infinity sentinel and never false-latch."""
+        session = BacktestSession(initial_balance=Decimal("100"))
+        runner = _Runner("0", "0")
+        coord = _SharedSessionCoordinator(
+            session, {"SOLUSDT": runner}, {"SOLUSDT": Decimal("10")}
+        )
+
+        coord.observe_account_risk(TS, Decimal("-1"), Decimal("5"), Decimal("0"))
+        coord.observe_account_risk(
+            TS + timedelta(milliseconds=1), Decimal("9"), Decimal("2"), Decimal("0")
+        )
+
+        assert coord.min_account_pool == Decimal("Infinity")
+        assert coord.account_halted is False
+        assert coord.liq_ts is None
+        runner.engine.halt_new_opens.assert_not_called()
+
 
 class TestSharedWalletCoupling:
     def test_build_shared_session_seeds_equity_from_coin_balance(self):
@@ -259,6 +414,67 @@ class TestSharedWalletCoupling:
         assert cache == {"SOLUSDT": Decimal("100"), "LTCUSDT": Decimal("80")}
 
 
+class TestAccountHaltMergedLoop:
+    def test_no_breach_retains_active_pool_minimum_and_executes_tick(self):
+        """An active but solvent account neither latches nor skips execution."""
+        calls: list[str] = []
+        runner = _LoopRunner(calls)
+        session = BacktestSession(initial_balance=Decimal("100"))
+        engine = _loop_engine(session, runner)
+
+        result = engine.run(
+            data_providers={"SOLUSDT": InMemoryDataProvider([_tick("SOLUSDT", "100", 0)])}
+        )
+
+        assert calls == ["process_fills", "execute_tick"]
+        assert result.liquidated is False
+        assert result.liq_ts is None
+        assert result.min_account_pool == Decimal("50")
+
+    def test_mtm_only_breach_halts_before_process_fills(self):
+        """A fresh-price loss breaches at the pre-fill observer sample."""
+        calls: list[str] = []
+        runner = _LoopRunner(calls)
+        session = BacktestSession(initial_balance=Decimal("100"))
+        engine = _loop_engine(session, runner)
+
+        result = engine.run(
+            data_providers={
+                "SOLUSDT": InMemoryDataProvider(
+                    [_tick("SOLUSDT", "100", 0), _tick("SOLUSDT", "20", 1)]
+                )
+            }
+        )
+
+        assert calls == [
+            "process_fills",
+            "execute_tick",
+            "halt",
+            "process_fills",
+            "execute_tick",
+        ]
+        assert result.liquidated is True
+        assert result.liq_ts == TS + timedelta(milliseconds=1)
+        assert result.min_account_pool == Decimal("-30")
+
+    def test_fill_driven_breach_halts_at_post_fill_sample(self):
+        """A fill that raises MM breaches and halts before execute_tick."""
+        calls: list[str] = []
+        runner = _LoopRunner(calls, fill_size=Decimal("3"))
+        session = BacktestSession(initial_balance=Decimal("100"))
+        engine = _loop_engine(session, runner)
+
+        result = engine.run(
+            data_providers={"SOLUSDT": InMemoryDataProvider([_tick("SOLUSDT", "100", 0)])}
+        )
+
+        assert calls == ["process_fills", "halt", "execute_tick"]
+        assert result.liquidated is True
+        assert result.liq_ts == TS
+        assert result.min_account_pool == Decimal("-50")
+        assert result.min_account_pool <= 0
+
+
 class TestEventFollowerLoading:
     def test_event_follower_is_per_symbol(self, db, seeded_run_account):
         """Synthetic RecordedExecution stream is scoped to one strategy symbol."""
@@ -292,6 +508,184 @@ class TestEventFollowerLoading:
         rows = follower.drain(TS - timedelta(seconds=1), TS)
         assert [row.exec_id for row in rows] == ["SOLUSDT-exec"]
         assert rows[0].order_id == "SOLUSDT-oid"
+
+
+class TestAccountHaltEventFollowerIntegration:
+    """0102's real event-follower path, with two real GridEngines."""
+
+    @patch("backtest.instrument_info.InstrumentInfoProvider")
+    def test_breach_halts_idle_engine_blocks_reactive_opens_and_keeps_closes(
+        self, mock_provider_cls, db, seeded_run_account
+    ):
+        """A real shared-pool breach freezes both engines before the recorded
+        SOL fill's synthetic ticker. The organic 100 -> 1 mark move on a
+        seeded long deterministically drives the pool below zero; no risk/MM
+        helper is patched.
+
+        The seeded open is deliberately pre-halt. It is filled from a real
+        ``PrivateExecution`` row, which makes ``process_fills`` dispatch the
+        real GridEngine synthetic-ticker reactive path at ``fill_ts``. The
+        seeded long is larger than the fixed-USDT close quantity, so the
+        runner's real ``_should_place_close`` gate admits a reduce-only close.
+        """
+        mock_info = MagicMock()
+        mock_info.qty_step = Decimal("0.001")
+        mock_info.tick_size = Decimal("0.01")
+        mock_info.round_qty = lambda q: max(
+            Decimal("0.001"), q.quantize(Decimal("0.001"))
+        )
+        mock_provider_cls.return_value.get.return_value = mock_info
+
+        breach_tick_ts = TS + timedelta(milliseconds=200)
+        fill_ts = TS + timedelta(milliseconds=150)
+        with db.get_session() as session:
+            session.add(
+                PrivateExecution(
+                    run_id="test-run-id",
+                    account_id=seeded_run_account.account_id,
+                    symbol="SOLUSDT",
+                    exec_id="sol-prehalt-open-fill",
+                    order_id="sol-prehalt-open",
+                    order_link_id=None,
+                    exchange_ts=fill_ts,
+                    side="Buy",
+                    exec_price=Decimal("99"),
+                    exec_qty=Decimal("1"),
+                    exec_fee=Decimal("0"),
+                    closed_pnl=Decimal("0"),
+                )
+            )
+            session.commit()
+
+        config = MultiReplayConfig(
+            run_id="test-run-id",
+            start_ts=TS,
+            end_ts=TS + timedelta(seconds=1),
+            initial_balance=Decimal("100"),
+            enable_funding=False,
+            fill_simulator={"mode": "event_follower"},
+            strategies=[
+                {"symbol": "SOLUSDT", "strat_id": "solusdt_halt",
+                 "tick_size": "0.01", "grid_count": 4, "grid_step": 1,
+                 "amount": "5", "enable_risk_multipliers": False},
+                {"symbol": "LTCUSDT", "strat_id": "ltcusdt_halt",
+                 "tick_size": "0.01", "grid_count": 4, "grid_step": 1,
+                 "amount": "5", "enable_risk_multipliers": False},
+            ],
+        )
+        zero_short = PositionStateSeed(
+            direction="short", size=Decimal("0"),
+            entry_price=Decimal("0"), liquidation_price=Decimal("0"),
+        )
+        sol_long = PositionStateSeed(
+            direction="long", size=Decimal("20"),
+            entry_price=Decimal("100"), liquidation_price=Decimal("0"),
+        )
+        restored_grid = GridStateSeed(
+            strat_id="solusdt_halt",
+            grid=[
+                {"side": "Buy", "price": Decimal("98")},
+                {"side": "Buy", "price": Decimal("99")},
+                {"side": "Wait", "price": Decimal("100")},
+                {"side": "Sell", "price": Decimal("101")},
+                {"side": "Sell", "price": Decimal("102")},
+            ],
+            grid_step=Decimal("1"),
+            grid_count=4,
+        )
+        seed_data = {
+            "SOLUSDT": (
+                sol_long,
+                zero_short,
+                restored_grid,
+                [
+                    ActiveOrderSeed(
+                        client_id="sol-prehalt-open",
+                        exchange_order_id="sol-prehalt-open",
+                        symbol="SOLUSDT",
+                        side="Buy",
+                        direction="long",
+                        price=Decimal("99"),
+                        remaining_qty=Decimal("1"),
+                        reduce_only=False,
+                        exchange_ts=TS,
+                    )
+                ],
+            ),
+            "LTCUSDT": (None, zero_short, None, []),
+        }
+        providers = {
+            "SOLUSDT": InMemoryDataProvider([
+                _tick("SOLUSDT", "100", 0),
+                _tick("SOLUSDT", "1", 200),
+            ]),
+            # LTC has an initial mark/build tick but is idle on the SOL breach.
+            "LTCUSDT": InMemoryDataProvider([_tick("LTCUSDT", "80", 0)]),
+        }
+        call_order: list[tuple] = []
+        original_halt = GridEngine.halt_new_opens
+        original_execute_place = BacktestExecutor.execute_place
+
+        def halt_spy(grid_engine):
+            call_order.append(("halt", grid_engine.symbol))
+            return original_halt(grid_engine)
+
+        def execute_place_spy(executor, intent, timestamp, wallet_balance):
+            result = original_execute_place(
+                executor, intent, timestamp, wallet_balance
+            )
+            call_order.append(
+                ("place", intent.symbol, intent.reduce_only, timestamp, result.success)
+            )
+            return result
+
+        engine = MultiReplayEngine(config=config, db=db)
+        with (
+            patch.object(MultiReplayEngine, "_load_multi_seed",
+                         return_value=(None, seed_data)),
+            patch.object(GridEngine, "halt_new_opens", autospec=True,
+                         side_effect=halt_spy),
+            patch.object(BacktestExecutor, "execute_place", autospec=True,
+                         side_effect=execute_place_spy),
+        ):
+            result = engine.run(data_providers=providers)
+
+        runners = {
+            symbol: strategy_result.runner
+            for symbol, strategy_result in result.strategies.items()
+        }
+        assert result.fill_mode == FillMode.EVENT_FOLLOWER
+        assert result.liquidated is True
+        assert result.liq_ts == breach_tick_ts
+        assert runners["SOLUSDT"].engine._new_opens_halted is True
+        assert runners["LTCUSDT"].engine._new_opens_halted is True
+        assert [entry for entry in call_order if entry[0] == "halt"] == [
+            ("halt", "SOLUSDT"),
+            ("halt", "LTCUSDT"),
+        ]
+
+        first_halt = next(
+            index for index, entry in enumerate(call_order) if entry[0] == "halt"
+        )
+        pre_halt_places = [
+            entry for entry in call_order[:first_halt] if entry[0] == "place"
+        ]
+        post_halt_places = [
+            entry for entry in call_order[first_halt:] if entry[0] == "place"
+        ]
+        # Pre-halt grid opens are a baseline, not post-halt opens.
+        assert any(not entry[2] and entry[4] for entry in pre_halt_places)
+        assert all(entry[2] for entry in post_halt_places)
+        # The timestamp is the recorded fill's exchange time, proving this
+        # success came from process_fills' synthetic reactive ticker, not the
+        # outer breach tick's later execute_tick call.
+        assert any(
+            entry[1] == "SOLUSDT"
+            and entry[2]
+            and entry[3] == fill_ts.replace(tzinfo=None)
+            and entry[4]
+            for entry in post_halt_places
+        )
 
 
 class TestMultiReplayRunEndToEnd:
@@ -337,8 +731,24 @@ class TestMultiReplayRunEndToEnd:
                 [_tick("LTCUSDT", "80", 100), _tick("LTCUSDT", "81", 300)]
             ),
         }
+        executed_places = []
+        original_execute_place = BacktestExecutor.execute_place
+
+        def execute_place_spy(executor, intent, timestamp, wallet_balance):
+            result = original_execute_place(
+                executor, intent, timestamp, wallet_balance
+            )
+            executed_places.append((intent, result))
+            return result
+
         engine = MultiReplayEngine(config=config, db=db)
-        result = engine.run(data_providers=providers)
+        with patch.object(
+            BacktestExecutor,
+            "execute_place",
+            autospec=True,
+            side_effect=execute_place_spy,
+        ):
+            result = engine.run(data_providers=providers)
 
         # Both symbols ran against ONE shared session.
         assert set(result.strategies) == {"SOLUSDT", "LTCUSDT"}
@@ -354,6 +764,18 @@ class TestMultiReplayRunEndToEnd:
         # Samples are ascending by the merged timeline.
         stamps = [ts for ts, _ in result.total_equity_curve]
         assert stamps == sorted(stamps)
+        # 0102: result exposes direct non-breach account-halt fields.
+        assert result.liquidated is False
+        assert result.liq_ts is None
+        assert any(
+            not intent.reduce_only and place_result.success
+            for intent, place_result in executed_places
+        )
+        # The run opens a real position, so this must be an observed pool
+        # sample rather than the no-position Infinity sentinel.
+        assert result.min_account_pool != Decimal("Infinity")
+        assert result.min_account_pool > 0
+        assert isinstance(result.min_account_pool, Decimal)
 
     @patch("backtest.instrument_info.InstrumentInfoProvider")
     def test_run_subtracts_summed_u0_from_balance_only(

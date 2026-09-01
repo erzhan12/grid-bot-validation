@@ -89,9 +89,16 @@ class GridEngine:
         # the fill permanently.
         self._fill_pending: bool = False
 
+        # 0102: one-way account-wide halt for non-reduce-only placements.
+        self._new_opens_halted = False
+
         # Track pending orders to avoid duplicates
         # client_order_id → order_id mapping
         self.pending_orders: dict[str, str] = {}
+
+    def halt_new_opens(self) -> None:
+        """Latch the one-way halt for future non-reduce-only placements."""
+        self._new_opens_halted = True
 
     def on_event(self, event: Event, limit_orders: dict[str, list[dict]] | None = None) -> list[PlaceLimitIntent | CancelIntent]:
         """
@@ -123,6 +130,12 @@ class GridEngine:
         elif isinstance(event, OrderUpdateEvent):
             intents.extend(self._handle_order_update_event(event))
 
+        if self._new_opens_halted:
+            return [
+                intent
+                for intent in intents
+                if not isinstance(intent, PlaceLimitIntent) or intent.reduce_only
+            ]
         return intents
 
     def _handle_ticker_event(self, event: TickerEvent, limit_orders: dict[str, list[dict]]) -> list[PlaceLimitIntent | CancelIntent]:

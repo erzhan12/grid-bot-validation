@@ -125,6 +125,78 @@ class TestGridEngineBasic:
         assert len(intents) == 0
 
 
+class TestGridEngineAccountHalt:
+    """One-way account halt preserves cancellation and de-risking flow."""
+
+    @staticmethod
+    def _ticker(price: str) -> TickerEvent:
+        now = datetime.now(UTC)
+        return TickerEvent(
+            event_type=EventType.TICKER,
+            symbol="BTCUSDT",
+            exchange_ts=now,
+            local_ts=now,
+            last_price=Decimal(price),
+            mark_price=Decimal(price),
+            bid1_price=Decimal(price) - Decimal("1"),
+            ask1_price=Decimal(price) + Decimal("1"),
+            funding_rate=Decimal("0"),
+        )
+
+    def test_halt_filters_opens_but_preserves_reduces_and_rebuild_cancels(self):
+        """Halted ticker flow retains closes/cancels and stays one-way."""
+        engine = GridEngine(
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+            config=GridConfig(grid_count=6, grid_step=1),
+            strat_id="btcusdt_test",
+        )
+        engine.on_event(self._ticker("100"), {"long": [], "short": []})
+
+        engine.halt_new_opens()
+        engine.halt_new_opens()
+        assert engine._new_opens_halted is True
+
+        halted = engine.on_event(self._ticker("100"), {"long": [], "short": []})
+        placements = [item for item in halted if isinstance(item, PlaceLimitIntent)]
+        assert placements
+        assert all(intent.reduce_only for intent in placements)
+
+        rebuild_limits = [
+            {
+                "orderId": f"long-{index}",
+                "price": str(90 + index),
+                "side": "Buy",
+                "qty": "1",
+            }
+            for index in range(len(engine.grid.grid) + 11)
+        ]
+        rebuild = engine.on_event(
+            self._ticker("100"), {"long": rebuild_limits, "short": []}
+        )
+        rebuild_cancels = [
+            item
+            for item in rebuild
+            if isinstance(item, CancelIntent) and item.reason == "rebuild"
+        ]
+        assert len(rebuild_cancels) == len(rebuild_limits)
+        assert not [
+            item
+            for item in rebuild
+            if isinstance(item, PlaceLimitIntent) and item.direction == "long"
+        ]
+
+        following = engine.on_event(
+            self._ticker("100"), {"long": [], "short": []}
+        )
+        assert any(
+            isinstance(item, PlaceLimitIntent)
+            and item.direction == "long"
+            and item.reduce_only
+            for item in following
+        )
+
+
 class TestGridEngineOrderPlacement:
     """Order placement intent generation tests."""
 
