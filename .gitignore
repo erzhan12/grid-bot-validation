@@ -115,3 +115,5 @@ conf/risk_limits_cache.json
 # Incident captures: full per-incident bundles (raw .jsonl 0.9–36 MB, .gz
 # archives, .summary.md post-mortems) live on disk but are kept out of the repo.
 docs/incidents/
+# Local Quantumbot read-only SSH key.
+.quantumbot_ro_keys
