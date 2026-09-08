@@ -229,7 +229,7 @@ class Reconciler:
         self,
         runner: StrategyRunner,
         open_orders: list[dict],
-        missing_in_memory: set,
+        missing_in_memory: set[str],
         result: ReconciliationResult,
     ) -> None:
         """Adopt exchange orders that are not yet tracked in memory.
