@@ -246,7 +246,7 @@ class TestStartupReconcileRaceDuplicates:
             )
             for n, intent in enumerate(new_intents, start=1)
         ]
-        rest.get_open_orders = Mock(return_value=legacy_orders + new_order_dicts)
+        rest.get_open_orders = Mock(return_value=(legacy_orders + new_order_dicts, False))
         sync_result = reconciler.reconcile_reconnect(runner)
         assert sync_result.untracked_orders_on_exchange == 2
         assert sync_result.orders_injected == 2

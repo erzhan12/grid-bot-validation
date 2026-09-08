@@ -1646,7 +1646,9 @@ class Orchestrator:
             )
         if reconciler is not None:
             try:
-                reconciler.reconcile_reconnect(runner)
+                result = reconciler.reconcile_reconnect(runner)
+                if result.truncated:
+                    self._report_reconcile_truncation(strat_id, result.orders_fetched)
             except Exception as e:
                 self._notifier.alert_exception(
                     f"forced reconcile orders {strat_id}", e,
@@ -1670,6 +1672,15 @@ class Orchestrator:
                     error_key=f"force_reconcile_pos_{strat_id}_{d}",
                 )
         return True
+
+    def _report_reconcile_truncation(self, strat_id: str, orders_fetched: int) -> None:
+        """Record and alert on an incomplete open-order reconciliation sweep."""
+        self._health_metrics.record_reconcile_truncation(strat_id)
+        self._notifier.alert(
+            f"Gridbot: order reconciliation truncated for {strat_id} after "
+            f"{orders_fetched} orders",
+            error_key=f"reconcile_truncated_{strat_id}",
+        )
 
     def _trigger_divergence_reconcile(
         self,
@@ -1854,6 +1865,14 @@ class Orchestrator:
                     try:
                         result = reconciler.reconcile_reconnect(runner)
 
+                        # Report truncation first (an incomplete sweep must never
+                        # be logged as "in sync"); a truncated result may ALSO
+                        # carry errors, so the errors alert below still fires.
+                        if result.truncated:
+                            self._report_reconcile_truncation(
+                                runner.strat_id, result.orders_fetched
+                            )
+
                         if result.errors:
                             logger.warning(
                                 "%s: Order sync completed with errors: %s",
@@ -1864,6 +1883,10 @@ class Orchestrator:
                                 f"{runner.strat_id} - {result.errors[-1]}",
                                 error_key=f"order_sync_{runner.strat_id}",
                             )
+                        elif result.truncated:
+                            # Already reported above; do not fall through to the
+                            # injected / "in sync" logging for a partial snapshot.
+                            pass
                         elif result.orders_injected > 0 or result.untracked_orders_on_exchange > 0:
                             logger.info(
                                 "%s: Order sync - fetched=%d, injected=%d, untracked=%d",

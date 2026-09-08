@@ -79,6 +79,7 @@ class HealthMetrics:
         self.cancels_failed = 0
         self.rest_errors_by_code: dict[str, int] = defaultdict(int)
         self.ws_reconnects: dict[str, int] = defaultdict(int)  # 'public' / 'private'
+        self.reconcile_truncations: dict[str, int] = defaultdict(int)
 
     def record_place(self, *, shadow: bool) -> None:
         if shadow:
@@ -101,6 +102,9 @@ class HealthMetrics:
     def record_ws_reconnect(self, kind: str) -> None:
         self.ws_reconnects[kind] += 1
 
+    def record_reconcile_truncation(self, strat_id: str) -> None:
+        self.reconcile_truncations[strat_id] += 1
+
     def as_dict(self) -> dict:
         return {
             "orders_placed": self.orders_placed,
@@ -110,6 +114,7 @@ class HealthMetrics:
             "cancels_failed": self.cancels_failed,
             "rest_errors_by_code": dict(self.rest_errors_by_code),
             "ws_reconnects": dict(self.ws_reconnects),
+            "reconcile_truncations": dict(self.reconcile_truncations),
         }
 
 

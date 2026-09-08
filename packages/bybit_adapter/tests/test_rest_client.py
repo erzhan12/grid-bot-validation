@@ -542,6 +542,63 @@ class TestGetOpenOrders:
         assert result == []
         assert mock_session.get_open_orders.call_count == 1
 
+    def test_return_truncated_when_max_pages_reached(self, client, mock_session, caplog):
+        """Opt-in callers can detect that Bybit advertised another page."""
+        page = [{"orderId": "o1", "orderType": "Limit"}]
+        mock_session.get_open_orders.return_value = _ok_response(
+            {"list": page, "nextPageCursor": "more"}
+        )
+
+        with caplog.at_level("WARNING"):
+            orders, truncated = client.get_open_orders(
+                symbol="BTCUSDT", max_pages=2, return_truncated=True
+            )
+
+        assert orders == page * 2
+        assert truncated is True
+        assert mock_session.get_open_orders.call_count == 2
+        assert "get_open_orders reached max_pages=2 with more data available" in caplog.text
+
+    def test_default_return_remains_list_at_truncation_boundary(self, client, mock_session):
+        page = [{"orderId": "o1", "orderType": "Limit"}]
+        mock_session.get_open_orders.return_value = _ok_response(
+            {"list": page, "nextPageCursor": "more"}
+        )
+
+        result = client.get_open_orders(symbol="BTCUSDT", max_pages=2)
+
+        assert result == page * 2
+        assert isinstance(result, list)
+
+    def test_empty_cursor_at_max_pages_is_not_truncated(self, client, mock_session):
+        mock_session.get_open_orders.side_effect = [
+            _ok_response({
+                "list": [{"orderId": "o1", "orderType": "Limit"}],
+                "nextPageCursor": "cursor2",
+            }),
+            _ok_response({
+                "list": [{"orderId": "o2", "orderType": "Limit"}],
+                "nextPageCursor": "",
+            }),
+        ]
+
+        orders, truncated = client.get_open_orders(
+            symbol="BTCUSDT", max_pages=2, return_truncated=True
+        )
+
+        assert [order["orderId"] for order in orders] == ["o1", "o2"]
+        assert truncated is False
+
+    def test_empty_page_is_complete_for_return_truncated(self, client, mock_session):
+        mock_session.get_open_orders.return_value = _ok_response(
+            {"list": [], "nextPageCursor": "more"}
+        )
+
+        orders, truncated = client.get_open_orders(return_truncated=True)
+
+        assert orders == []
+        assert truncated is False
+
     def test_custom_order_type_filter(self, client, mock_session):
         orders = [
             {"orderId": "o1", "orderType": "Market"},
