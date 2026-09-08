@@ -8,7 +8,7 @@ recovery and live<->shadow parity.
 import json
 from datetime import datetime, UTC, timedelta
 from decimal import Decimal
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -20,6 +20,7 @@ from gridbot.config import (
     StrategyConfig,
 )
 from gridbot.orchestrator import Orchestrator
+from gridbot.reconciler import ReconciliationResult
 
 
 @pytest.fixture(autouse=True)
@@ -121,6 +122,28 @@ def test_health_status_shadow_parity(_mock_priv, _mock_pub, _mock_rest, tmp_path
     # Identical snapshot shape in shadow vs live (parity).
     assert set(snap.keys()) == {"state", "generated_at", "strategies", "metrics", "gauges"}
     assert snap["metrics"]["orders_placed"] == 0  # no real submit in shadow
+
+
+@patch("gridbot.orchestrator.BybitRestClient")
+@patch("gridbot.orchestrator.PublicWebSocketClient")
+@patch("gridbot.orchestrator.PrivateWebSocketClient")
+def test_health_status_includes_reconcile_truncations(
+    _mock_priv, _mock_pub, _mock_rest, tmp_path,
+):
+    cfg = _config(tmp_path)
+    orch = Orchestrator(cfg)
+    orch._init_account(cfg.accounts[0])
+    orch._init_strategy(cfg.strategies[0])
+    orch._build_routing_maps()
+    reconciler = orch._reconcilers["acc"]
+    reconciler.reconcile_reconnect = Mock(
+        return_value=ReconciliationResult(orders_fetched=1, truncated=True)
+    )
+
+    orch._order_sync_once()
+    orch._health_check_once()
+
+    assert _read(cfg.status_file_path)["metrics"]["reconcile_truncations"]["btcusdt_test"] == 1
 
 
 @patch("gridbot.orchestrator.BybitRestClient")

@@ -632,7 +632,8 @@ class BybitRestClient:
         order_type: str = "Limit",
         limit: int = 50,
         max_pages: int = 10,
-    ) -> list[dict]:
+        return_truncated: bool = False,
+    ) -> list[dict] | tuple[list[dict], bool]:
         """Fetch all open orders with pagination.
 
         Args:
@@ -640,13 +641,12 @@ class BybitRestClient:
             order_type: Filter by order type (default "Limit")
             limit: Results per page (max 50)
             max_pages: Maximum number of pages to fetch (safety limit)
+            return_truncated: Return whether pagination stopped at the safety limit
+                while Bybit still advertised another page.
 
         Returns:
-            List of open order dicts.  **Note:** if more orders exist than
-            ``max_pages * limit`` (default 500), results will be silently
-            truncated and a warning is logged.  Callers relying on complete
-            data should increase ``max_pages`` or check the log for
-            truncation warnings.
+            List of all open order dicts across pages. If ``return_truncated``
+            is True, returns ``(orders, truncated)``.
 
         Raises:
             Exception: If API call fails
@@ -685,15 +685,18 @@ class BybitRestClient:
             filtered = [o for o in orders if o.get("orderType") == order_type]
             all_orders.extend(filtered)
 
-            cursor = result.get("nextPageCursor")
+            cursor = result.get("nextPageCursor") or None
             page += 1
             if not cursor:
                 break
 
-        if page >= max_pages and cursor:
+        truncated = page >= max_pages and cursor is not None
+        if truncated:
             logger.warning(f"get_open_orders reached max_pages={max_pages} with more data available")
 
         logger.debug(f"Fetched {len(all_orders)} open {order_type} orders across {page} pages")
+        if return_truncated:
+            return all_orders, truncated
         return all_orders
 
     def get_tickers(self, symbol: str) -> dict:

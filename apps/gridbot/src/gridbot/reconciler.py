@@ -26,12 +26,14 @@ class ReconciliationResult:
         orders_injected: Number of orders injected into the runner.
         untracked_orders_on_exchange: Orders on exchange with no matching
             in-memory tracked order (only set during reconnect reconciliation).
+        truncated: Whether the exchange order fetch stopped at its page limit.
         errors: List of error messages encountered.
     """
 
     orders_fetched: int = 0
     orders_injected: int = 0
     untracked_orders_on_exchange: int = 0
+    truncated: bool = False
     errors: list[str] = None
 
     def __post_init__(self):
@@ -163,11 +165,21 @@ class Reconciler:
 
         try:
             # Fetch current open orders from exchange
-            open_orders = self._client.get_open_orders(
+            open_orders, truncated = self._client.get_open_orders(
                 symbol=runner.symbol,
                 order_type="Limit",
+                return_truncated=True,
             )
+            result.truncated = truncated
             result.orders_fetched = len(open_orders)
+
+            if truncated:
+                logger.warning(
+                    "%s: Open-order reconciliation truncated after %d orders; "
+                    "skipping absence-based cancellation",
+                    runner.strat_id,
+                    result.orders_fetched,
+                )
 
             # Build set of exchange order IDs
             exchange_order_ids = {
@@ -179,9 +191,20 @@ class Reconciler:
             # Get placed order IDs from runner
             tracked_order_ids = runner.get_placed_order_ids()
 
-            # Find discrepancies
-            missing_on_exchange = tracked_order_ids - exchange_order_ids
             missing_in_memory = exchange_order_ids - tracked_order_ids
+
+            if truncated:
+                # Fail closed: skip the absence-based cancellation pass (a locally
+                # tracked order absent from a PARTIAL snapshot may still be live on
+                # an unfetched page), but still adopt the positive-evidence orphans
+                # we did observe on the exchange.
+                self._inject_missing_in_memory(
+                    runner, open_orders, missing_in_memory, result
+                )
+                return result
+
+            # Find discrepancies from a complete exchange snapshot.
+            missing_on_exchange = tracked_order_ids - exchange_order_ids
 
             if missing_on_exchange:
                 logger.warning(
@@ -192,24 +215,40 @@ class Reconciler:
                 for order_id in missing_on_exchange:
                     runner.mark_order_cancelled_by_order_id(order_id)
 
-            if missing_in_memory:
-                logger.warning(
-                    f"{runner.strat_id}: {len(missing_in_memory)} orders on exchange "
-                    f"but not in memory (orphans or missed updates)"
-                )
-                result.untracked_orders_on_exchange = len(missing_in_memory)
-
-                # Inject missing orders
-                orders_to_inject = [
-                    o for o in open_orders
-                    if o.get("orderId") in missing_in_memory
-                ]
-                if orders_to_inject:
-                    runner.inject_open_orders(orders_to_inject)
-                    result.orders_injected = len(orders_to_inject)
+            self._inject_missing_in_memory(
+                runner, open_orders, missing_in_memory, result
+            )
 
         except Exception as e:
             logger.error(f"{runner.strat_id}: Reconnect reconciliation error: {e}")
             result.errors.append(str(e))
 
         return result
+
+    def _inject_missing_in_memory(
+        self,
+        runner: StrategyRunner,
+        open_orders: list[dict],
+        missing_in_memory: set,
+        result: ReconciliationResult,
+    ) -> None:
+        """Adopt exchange orders that are not yet tracked in memory.
+
+        Positive-evidence pass shared by the truncated and complete reconnect
+        paths: orders observed on the exchange but absent from local state are
+        injected into the runner. Updates ``result`` counts in place.
+        """
+        if not missing_in_memory:
+            return
+        logger.warning(
+            f"{runner.strat_id}: {len(missing_in_memory)} orders on exchange "
+            f"but not in memory (orphans or missed updates)"
+        )
+        result.untracked_orders_on_exchange = len(missing_in_memory)
+        orders_to_inject = [
+            o for o in open_orders
+            if o.get("orderId") in missing_in_memory
+        ]
+        if orders_to_inject:
+            runner.inject_open_orders(orders_to_inject)
+            result.orders_injected = len(orders_to_inject)

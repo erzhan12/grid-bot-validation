@@ -64,10 +64,20 @@ class TestHealthMetrics:
         assert m.rest_errors_by_code == {"110007": 2}
         assert m.ws_reconnects == {"public": 1}
 
+    def test_record_reconcile_truncation_by_strategy(self):
+        m = HealthMetrics()
+        m.record_reconcile_truncation("btc")
+        m.record_reconcile_truncation("btc")
+        m.record_reconcile_truncation("eth")
+
+        assert m.reconcile_truncations == {"btc": 2, "eth": 1}
+        assert m.as_dict()["reconcile_truncations"] == {"btc": 2, "eth": 1}
+
     def test_as_dict_is_json_serializable(self):
         m = HealthMetrics()
         m.record_place(shadow=False)
         m.record_reject("other")
+        m.record_reconcile_truncation("btc")
         json.dumps(m.as_dict())  # must not raise
 
 

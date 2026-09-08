@@ -3329,6 +3329,64 @@ class TestOrchestratorOrderSyncOnce:
 
         reconciler.reconcile_reconnect.assert_called_once()
 
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_truncated_order_sync_alerts_and_never_logs_orders_checked(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config, caplog,
+    ):
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        notifier = Mock()
+        orchestrator._notifier = notifier
+        reconciler = orchestrator._reconcilers["test_account"]
+        reconciler.reconcile_reconnect = Mock(
+            return_value=ReconciliationResult(orders_fetched=2, truncated=True)
+        )
+
+        with caplog.at_level("DEBUG", logger="gridbot.orchestrator"):
+            orchestrator._order_sync_once()
+
+        assert orchestrator._health_metrics.reconcile_truncations["btcusdt_test"] == 1
+        assert any(
+            call.kwargs.get("error_key") == "reconcile_truncated_btcusdt_test"
+            for call in notifier.alert.call_args_list
+        )
+        assert not any(
+            "Order sync -" in record.getMessage()
+            and "orders checked" in record.getMessage()
+            for record in caplog.records
+        )
+
+    @patch("gridbot.orchestrator.BybitRestClient")
+    @patch("gridbot.orchestrator.PublicWebSocketClient")
+    @patch("gridbot.orchestrator.PrivateWebSocketClient")
+    def test_truncated_order_sync_with_errors_sends_both_alerts(
+        self, mock_private_ws, mock_public_ws, mock_rest_client,
+        gridbot_config, account_config, strategy_config,
+    ):
+        orchestrator = Orchestrator(gridbot_config)
+        orchestrator._init_account(account_config)
+        orchestrator._init_strategy(strategy_config)
+        orchestrator._build_routing_maps()
+        notifier = Mock()
+        orchestrator._notifier = notifier
+        reconciler = orchestrator._reconcilers["test_account"]
+        reconciler.reconcile_reconnect = Mock(
+            return_value=ReconciliationResult(truncated=True, errors=["inject failed"])
+        )
+
+        orchestrator._order_sync_once()
+
+        error_keys = {call.kwargs.get("error_key") for call in notifier.alert.call_args_list}
+        assert error_keys == {
+            "reconcile_truncated_btcusdt_test",
+            "order_sync_btcusdt_test",
+        }
+
 
 class TestOrchestratorWalletCache:
     """Tests for wallet balance caching."""
@@ -4163,6 +4221,21 @@ class TestForcedReconcile:
         notifier.alert_exception.assert_called_once()
         assert "force_reconcile" in notifier.alert_exception.call_args.kwargs.get("error_key", "")
         # P2: order-reconcile failure must NOT skip the position resync.
+        runner._refresh_position_size_from_rest.assert_called_once_with("long", force=True)
+
+    def test_force_reconcile_reports_truncation_and_keeps_position_refresh(self, gridbot_config):
+        orchestrator, runner, reconciler = self._wire(gridbot_config)
+        notifier = Mock()
+        orchestrator._notifier = notifier
+        reconciler.reconcile_reconnect.return_value = ReconciliationResult(
+            orders_fetched=3, truncated=True
+        )
+
+        orchestrator._force_reconcile_strat("btcusdt_test", "long")
+
+        assert orchestrator._health_metrics.reconcile_truncations["btcusdt_test"] == 1
+        notifier.alert.assert_called_once()
+        assert notifier.alert.call_args.kwargs["error_key"] == "reconcile_truncated_btcusdt_test"
         runner._refresh_position_size_from_rest.assert_called_once_with("long", force=True)
 
     def test_health_check_logs_breaker_trip_count(self, gridbot_config, caplog):

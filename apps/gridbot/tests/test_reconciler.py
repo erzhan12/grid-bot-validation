@@ -1,7 +1,7 @@
 """Tests for gridbot reconciler module."""
 
 from decimal import Decimal
-from unittest.mock import Mock, MagicMock
+from unittest.mock import Mock, MagicMock, patch
 
 import pytest
 
@@ -9,6 +9,7 @@ from gridbot.config import StrategyConfig
 from gridbot.executor import IntentExecutor, OrderResult, CancelResult
 from gridbot.reconciler import Reconciler, ReconciliationResult
 from gridbot.runner import StrategyRunner
+from bybit_adapter.rest_client import BybitRestClient
 
 
 @pytest.fixture
@@ -70,6 +71,7 @@ class TestReconciliationResult:
         assert result.orders_fetched == 0
         assert result.orders_injected == 0
         assert result.untracked_orders_on_exchange == 0
+        assert result.truncated is False
         assert result.errors == []
 
     def test_custom_values(self):
@@ -82,6 +84,10 @@ class TestReconciliationResult:
         assert result.orders_fetched == 10
         assert result.orders_injected == 8
         assert result.untracked_orders_on_exchange == 2
+
+    def test_accepts_truncated(self):
+        result = ReconciliationResult(truncated=True)
+        assert result.truncated is True
 
 
 class TestReconcilerStartup:
@@ -153,9 +159,9 @@ class TestReconcilerReconnect:
             {"orderId": "ex_1", "price": "49000", "qty": "0.001", "side": "Buy"},
         ])
 
-        mock_rest_client.get_open_orders.return_value = [
+        mock_rest_client.get_open_orders.return_value = ([
             {"orderId": "ex_1"},
-        ]
+        ], False)
 
         result = reconciler.reconcile_reconnect(runner)
 
@@ -168,7 +174,7 @@ class TestReconcilerReconnect:
             {"orderId": "ex_1", "price": "49000", "qty": "0.001", "side": "Buy"},
         ])
 
-        mock_rest_client.get_open_orders.return_value = []
+        mock_rest_client.get_open_orders.return_value = ([], False)
 
         result = reconciler.reconcile_reconnect(runner)
 
@@ -178,9 +184,9 @@ class TestReconcilerReconnect:
 
     def test_reconcile_reconnect_missing_in_memory(self, reconciler, runner, mock_rest_client):
         """Test reconnect when order is on exchange but not in memory."""
-        mock_rest_client.get_open_orders.return_value = [
+        mock_rest_client.get_open_orders.return_value = ([
             {"orderId": "ex_new", "price": "50000", "qty": "0.001", "side": "Sell"},
-        ]
+        ], False)
 
         result = reconciler.reconcile_reconnect(runner)
 
@@ -188,4 +194,95 @@ class TestReconcilerReconnect:
         assert result.untracked_orders_on_exchange == 1
         assert result.orders_injected == 1
 
+    def test_reconnect_requests_truncation_status(
+        self, reconciler, runner, mock_rest_client
+    ):
+        mock_rest_client.get_open_orders.return_value = ([], False)
 
+        result = reconciler.reconcile_reconnect(runner)
+
+        assert result.truncated is False
+        mock_rest_client.get_open_orders.assert_called_once_with(
+            symbol=runner.symbol,
+            order_type="Limit",
+            return_truncated=True,
+        )
+
+    def test_truncated_reconnect_skips_cancellation_and_injects_orphans(
+        self, reconciler, runner, mock_rest_client
+    ):
+        runner.inject_open_orders([
+            {"orderId": "tracked", "price": "49000", "qty": "0.001", "side": "Buy"},
+        ])
+        runner.mark_order_cancelled_by_order_id = MagicMock(
+            wraps=runner.mark_order_cancelled_by_order_id
+        )
+        runner.inject_open_orders = MagicMock(wraps=runner.inject_open_orders)
+        orphan = {"orderId": "orphan", "price": "50000", "qty": "0.001", "side": "Sell"}
+        mock_rest_client.get_open_orders.return_value = ([orphan], True)
+
+        result = reconciler.reconcile_reconnect(runner)
+
+        assert result.orders_fetched == 1
+        assert result.truncated is True
+        runner.mark_order_cancelled_by_order_id.assert_not_called()
+        runner.inject_open_orders.assert_called_once_with([orphan])
+        assert result.untracked_orders_on_exchange == 1
+        assert result.orders_injected == 1
+
+    def test_truncated_reconnect_keeps_unfetched_tracked_order_and_adopts_fetched_orphan(
+        self, runner
+    ):
+        """Real adapter pagination proves the issue #207 acceptance case."""
+        runner.inject_open_orders([
+            {"orderId": "unfetched", "price": "49000", "qty": "0.001", "side": "Buy"},
+        ])
+        session = MagicMock()
+        fetched_orphan = {
+            "orderId": "fetched_orphan",
+            "orderType": "Limit",
+            "price": "50000",
+            "qty": "0.001",
+            "side": "Sell",
+        }
+        session.get_open_orders.side_effect = [
+            {"retCode": 0, "retMsg": "OK", "result": {
+                "list": [fetched_orphan], "nextPageCursor": "unfetched-page",
+            }},
+            {"retCode": 0, "retMsg": "OK", "result": {
+                "list": [{
+                    "orderId": "another-page",
+                    "orderType": "Limit",
+                    "price": "51000",
+                    "qty": "0.001",
+                    "side": "Sell",
+                }],
+                "nextPageCursor": "still-more",
+            }},
+        ]
+        with patch("bybit_adapter.rest_client.HTTP", return_value=session):
+            client = BybitRestClient(api_key="key", api_secret="secret")
+        reconciler = Reconciler(client)
+        # Exercise the adapter's actual pagination with a tight test page limit.
+        original_get_open_orders = client.get_open_orders
+        client.get_open_orders = MagicMock(
+            side_effect=lambda **kwargs: original_get_open_orders(max_pages=1, **kwargs)
+        )
+
+        result = reconciler.reconcile_reconnect(runner)
+
+        assert result.truncated is True
+        assert runner._tracked_orders["unfetched"].status != "cancelled"
+        assert "fetched_orphan" in runner._tracked_orders
+        assert session.get_open_orders.call_count == 1
+
+    def test_truncated_reconnect_preserves_flag_when_injection_fails(
+        self, reconciler, runner, mock_rest_client
+    ):
+        mock_rest_client.get_open_orders.return_value = ([{"orderId": "orphan"}], True)
+        runner.inject_open_orders = MagicMock(side_effect=Exception("inject failed"))
+
+        result = reconciler.reconcile_reconnect(runner)
+
+        assert result.truncated is True
+        assert result.errors == ["inject failed"]
