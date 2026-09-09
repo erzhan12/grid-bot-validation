@@ -1,5 +1,6 @@
 """Tests for gridbot strategy runner module."""
 
+import logging
 from dataclasses import replace
 from datetime import datetime, timedelta, UTC
 from decimal import Decimal
@@ -791,8 +792,12 @@ class TestStrategyRunnerExecution:
             reason="test",
         )
 
-        runner._execute_cancel_intent(intent)
+        expected = CancelResult(success=True)
+        mock_executor.execute_cancel.return_value = expected
 
+        result = runner._execute_cancel_intent(intent)
+
+        assert result is expected
         mock_executor.execute_cancel.assert_called_once_with(intent)
 
 
@@ -5216,6 +5221,46 @@ class TestSafetyCapsIntegration:
             grid_level=1, direction=direction, reduce_only=True,
         )
 
+    def _add_working_order(self, runner, order_id, direction="long"):
+        """Add a tracked working order for a loss-breaker sweep."""
+        intent = self._open(
+            side="Buy" if direction == "long" else "Sell",
+            direction=direction,
+            price="49000" if direction == "long" else "51000",
+        )
+        tracked = TrackedOrder(
+            client_order_id=f"client_{order_id}", intent=intent, status="placed"
+        )
+        tracked.order_id = order_id
+        runner._tracked_orders[tracked.client_order_id] = tracked
+
+    @staticmethod
+    def _trip_loss_breaker(runner):
+        """Send the position update that trips C3."""
+        runner.on_position_update(
+            long_position={
+                "size": "0.01",
+                "avgPrice": "50000",
+                "curRealisedPnl": "-30",
+                "leverage": "10",
+            },
+            short_position=None,
+            wallet_balance=10000.0,
+            last_close=50000.0,
+        )
+
+    @staticmethod
+    def _cancel_failure_alert(notifier):
+        """Return the one loss-breaker cancellation failure alert call."""
+        calls = [
+            call
+            for call in notifier.alert.call_args_list
+            if call.kwargs.get("error_key")
+            == "safety_cap_loss_breaker_cancel_failed_btcusdt_test"
+        ]
+        assert len(calls) == 1
+        return calls[0].args[0]
+
     def test_c1_suppresses_open_but_allows_reduce_only_close(
         self, strategy_config, mock_executor, instrument_info
     ):
@@ -5296,6 +5341,294 @@ class TestSafetyCapsIntegration:
         mock_executor.execute_place.reset_mock()
         r._execute_place_intent(self._open(), {"long": [], "short": []})
         mock_executor.execute_place.assert_not_called()
+
+    def test_c3_cancel_failure_emits_emergency_alert(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """A serious loss-breaker cancel failure emits the dedicated alert."""
+        notifier = Mock()
+        caps = SafetyCaps(
+            SafetyCapsConfig(session_loss_limit="25"), strat_id="btcusdt_test"
+        )
+        runner = self._runner(
+            strategy_config, mock_executor, instrument_info, caps, notifier=notifier
+        )
+        self._add_working_order(runner, "wire_1")
+        mock_executor.execute_cancel.return_value = CancelResult(
+            success=False, error="Connection timeout"
+        )
+
+        self._trip_loss_breaker(runner)
+
+        assert notifier.alert.call_count == 2
+        message = self._cancel_failure_alert(notifier)
+        assert "btcusdt_test" in message
+        assert "wire_1" in message
+        assert "Connection timeout" in message
+
+    def test_c3_multiple_cancel_failures_emit_one_aggregated_alert(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """Multiple serious failures produce one aggregated emergency alert."""
+        notifier = Mock()
+        caps = SafetyCaps(
+            SafetyCapsConfig(session_loss_limit="25"), strat_id="btcusdt_test"
+        )
+        runner = self._runner(
+            strategy_config, mock_executor, instrument_info, caps, notifier=notifier
+        )
+        for order_id in ("wire_1", "wire_2", "wire_3"):
+            self._add_working_order(runner, order_id)
+        mock_executor.execute_cancel.return_value = CancelResult(success=False, error="boom")
+
+        self._trip_loss_breaker(runner)
+
+        message = self._cancel_failure_alert(notifier)
+        assert "3 failed" in message
+        for order_id in ("wire_1", "wire_2", "wire_3"):
+            assert order_id in message
+
+    def test_c3_breaks_on_auth_cooldown_and_reports_skipped(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """A cooldown latched mid-sweep skips both remaining directions."""
+        notifier = Mock()
+        caps = SafetyCaps(
+            SafetyCapsConfig(session_loss_limit="25"), strat_id="btcusdt_test"
+        )
+        runner = self._runner(
+            strategy_config, mock_executor, instrument_info, caps, notifier=notifier
+        )
+        self._add_working_order(runner, "wire_long", "long")
+        self._add_working_order(runner, "wire_short_1", "short")
+        self._add_working_order(runner, "wire_short_2", "short")
+
+        def fail_and_latch(_intent):
+            mock_executor.auth_cooldown = True
+            return CancelResult(success=False, error="Permission denied")
+
+        mock_executor.execute_cancel.side_effect = fail_and_latch
+        self._trip_loss_breaker(runner)
+
+        mock_executor.execute_cancel.assert_called_once()
+        message = self._cancel_failure_alert(notifier)
+        assert "1 failed, 2 not attempted" in message
+
+    def test_c3_pre_latched_auth_cooldown_skips_all_and_alerts(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """A pre-latched cooldown leaves every working order unattempted."""
+        notifier = Mock()
+        caps = SafetyCaps(
+            SafetyCapsConfig(session_loss_limit="25"), strat_id="btcusdt_test"
+        )
+        runner = self._runner(
+            strategy_config, mock_executor, instrument_info, caps, notifier=notifier
+        )
+        self._add_working_order(runner, "wire_1")
+        self._add_working_order(runner, "wire_2", "short")
+        mock_executor.auth_cooldown = True
+
+        self._trip_loss_breaker(runner)
+
+        mock_executor.execute_cancel.assert_not_called()
+        message = self._cancel_failure_alert(notifier)
+        assert "2 of 2" in message
+        assert "0 failed, 2 not attempted" in message
+        assert "first_error=none (auth cooldown already active)" in message
+
+    def test_c3_partial_success_reports_only_still_live_orders(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """Successful cancellations are absent from the still-live alert list."""
+        notifier = Mock()
+        caps = SafetyCaps(
+            SafetyCapsConfig(session_loss_limit="25"), strat_id="btcusdt_test"
+        )
+        runner = self._runner(
+            strategy_config, mock_executor, instrument_info, caps, notifier=notifier
+        )
+        for order_id in ("wire_success", "wire_fail_1", "wire_fail_2"):
+            self._add_working_order(runner, order_id)
+        mock_executor.execute_cancel.side_effect = [
+            CancelResult(success=True),
+            CancelResult(success=False, error="boom"),
+            CancelResult(success=False, error="boom"),
+        ]
+
+        self._trip_loss_breaker(runner)
+
+        message = self._cancel_failure_alert(notifier)
+        assert "2 of 3" in message
+        assert "wire_success" not in message.split("order_ids=", 1)[1]
+        assert "wire_fail_1" in message and "wire_fail_2" in message
+
+    @pytest.mark.parametrize(
+        ("order_count", "error"),
+        [(100, "boom"), (1, "x" * 10000), (100, "x" * 10000)],
+    )
+    def test_c3_alert_message_stays_within_telegram_limit(
+        self, strategy_config, mock_executor, instrument_info, order_count, error
+    ):
+        """Emergency alerts bound both order IDs and first-error text."""
+        notifier = Mock()
+        caps = SafetyCaps(
+            SafetyCapsConfig(session_loss_limit="25"), strat_id="btcusdt_test"
+        )
+        runner = self._runner(
+            strategy_config, mock_executor, instrument_info, caps, notifier=notifier
+        )
+        for index in range(order_count):
+            self._add_working_order(runner, f"0123456789abcdef-{index:013d}")
+        mock_executor.execute_cancel.return_value = CancelResult(success=False, error=error)
+
+        self._trip_loss_breaker(runner)
+
+        message = self._cancel_failure_alert(notifier)
+        assert len(message) < 4096
+        # Counts must precede the id list so a long tail can never cost the tally.
+        assert message.index("working orders still live") < message.index("order_ids=")
+        rendered_ids = message.split("order_ids=", 1)[1].split(";", 1)[0]
+        listed = [
+            part for part in rendered_ids.split(" (+", 1)[0].split(",") if part
+        ]
+        assert len(listed) == min(order_count, 20)
+        if order_count > 20:
+            assert f"(+{order_count - 20} more)" in message
+        else:
+            assert "more)" not in message
+        if len(error) > 500:
+            # Truncated to exactly the cap, not merely "shortened".
+            assert "x" * 500 in message
+            assert "x" * 501 not in message
+
+    def test_c3_still_live_orders_are_logged_without_a_notifier(
+        self, strategy_config, mock_executor, instrument_info, caplog
+    ):
+        """Orders left live must be traceable even when no notifier is wired.
+
+        Orders skipped by the auth-cooldown break get no per-order log line, so
+        gating the aggregated summary on a configured notifier would make them
+        completely silent — the failure mode feature 0104 exists to remove.
+        """
+        caps = SafetyCaps(
+            SafetyCapsConfig(session_loss_limit="25"), strat_id="btcusdt_test"
+        )
+        runner = self._runner(
+            strategy_config, mock_executor, instrument_info, caps, notifier=None
+        )
+        self._add_working_order(runner, "wire_1")
+        mock_executor.execute_cancel.return_value = CancelResult(
+            success=False, error="Connection timeout"
+        )
+
+        with caplog.at_level(logging.ERROR, logger="gridbot.runner"):
+            self._trip_loss_breaker(runner)
+
+        summaries = [
+            record.getMessage()
+            for record in caplog.records
+            if "EMERGENCY loss-breaker cancel FAILED" in record.getMessage()
+        ]
+        assert len(summaries) == 1
+        assert "1 of 1" in summaries[0]
+        assert "wire_1" in summaries[0]
+
+    def test_c3_cancel_failure_does_not_enqueue_retry(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """Loss-breaker cancellations do not enqueue dead retry work."""
+        on_failed = Mock()
+        caps = SafetyCaps(
+            SafetyCapsConfig(session_loss_limit="25"), strat_id="btcusdt_test"
+        )
+        runner = self._runner(
+            strategy_config,
+            mock_executor,
+            instrument_info,
+            caps,
+            on_intent_failed=on_failed,
+        )
+        self._add_working_order(runner, "wire_1")
+        mock_executor.execute_cancel.return_value = CancelResult(success=False, error="boom")
+
+        self._trip_loss_breaker(runner)
+
+        on_failed.assert_not_called()
+
+    def test_benign_cancel_failure_does_not_enqueue_retry(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """Only serious routine cancellation failures enqueue a retry."""
+        on_failed = Mock()
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+            on_intent_failed=on_failed,
+        )
+        intent = CancelIntent(symbol="BTCUSDT", order_id="wire_1", reason="rebuild")
+        mock_executor.execute_cancel.return_value = CancelResult(success=False, error=None)
+
+        runner._execute_cancel_intent(intent)
+
+        on_failed.assert_not_called()
+        mock_executor.execute_cancel.return_value = CancelResult(success=False, error="boom")
+        runner._execute_cancel_intent(intent)
+        on_failed.assert_called_once_with(intent, "boom")
+
+    def test_c3_benign_cancel_failure_does_not_emit_emergency_alert(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """Benign loss-breaker cancellation races do not create emergency alerts."""
+        notifier = Mock()
+        caps = SafetyCaps(
+            SafetyCapsConfig(session_loss_limit="25"), strat_id="btcusdt_test"
+        )
+        runner = self._runner(
+            strategy_config, mock_executor, instrument_info, caps, notifier=notifier
+        )
+        self._add_working_order(runner, "wire_1")
+        mock_executor.execute_cancel.return_value = CancelResult(success=False, error=None)
+
+        self._trip_loss_breaker(runner)
+
+        assert notifier.alert.call_count == 1
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "rebuild",
+            "duplicate",
+            "side_mismatch",
+            "outside_grid",
+            "chase_close",
+            "chase_replace",
+            "chase_exit",
+        ],
+    )
+    def test_routine_cancel_failures_do_not_emit_emergency_alert(
+        self, strategy_config, mock_executor, instrument_info, reason
+    ):
+        """Routine engine and chase cancels never use the C3 alert channel."""
+        notifier = Mock()
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+            notifier=notifier,
+        )
+        intent = CancelIntent(symbol="BTCUSDT", order_id="wire_1", reason=reason)
+        mock_executor.execute_cancel.return_value = CancelResult(success=False, error="boom")
+
+        if reason.startswith("chase_"):
+            runner._pending_chase_intents = [intent]
+            runner._drain_pending_chase_intents()
+        else:
+            runner._execute_generated_intents([intent], EMPTY_LIMITS)
+
+        mock_executor.execute_cancel.assert_called_once_with(intent)
+        assert not notifier.alert.called
 
     def test_c3_trip_on_flat_position_cur_realised_pnl(
         self, strategy_config, mock_executor, instrument_info

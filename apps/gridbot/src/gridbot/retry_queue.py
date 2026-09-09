@@ -228,6 +228,23 @@ class RetryQueue:
                     logger.info(f"Retry succeeded: {type(item.intent).__name__}")
                     items_to_remove.append(item)
                     processed += 1
+                elif isinstance(item.intent, CancelIntent) and result.error is None:
+                    # Feature 0104 — an unsuccessful CancelResult carrying NO
+                    # error is the executor's BENIGN sentinel: the order was
+                    # already terminal (filled / cancelled / unknown). Gating
+                    # the initial enqueue is not sufficient, because a
+                    # legitimately enqueued SERIOUS cancel commonly resolves
+                    # benign on a later attempt. Drop rather than re-back-off,
+                    # or the remaining attempts burn REST calls that can only
+                    # return the same answer. INFO not WARNING: this is the
+                    # ordinary resolution of a fill-vs-cancel race, not a
+                    # divergence.
+                    logger.info(
+                        "Retry dropped (benign cancel): %s",
+                        type(item.intent).__name__,
+                    )
+                    items_to_remove.append(item)
+                    processed += 1
                 elif result.error and (
                     result.error.startswith("safety_cap")
                     or result.error == "truncate_breaker_blocked"

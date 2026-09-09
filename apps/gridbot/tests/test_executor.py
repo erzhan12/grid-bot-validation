@@ -1,11 +1,14 @@
 """Tests for gridbot executor module."""
 
+import logging
 from dataclasses import replace
 from decimal import Decimal
 from unittest.mock import Mock, MagicMock
 
 import pytest
+from pybit.exceptions import FailedRequestError
 
+from bybit_adapter.rest_client import CancelOrderResult
 from gridcore.intents import PlaceLimitIntent, CancelIntent
 from gridbot.config import SafetyCapsConfig
 from gridbot.executor import (
@@ -144,7 +147,15 @@ def mock_rest_client():
     """Create a mock REST client."""
     client = Mock()
     client.place_order = MagicMock(return_value={"orderId": "test_order_123"})
-    client.cancel_order = MagicMock(return_value=True)
+    client.cancel_order = MagicMock(
+        return_value=CancelOrderResult(
+            success=True,
+            benign=False,
+            ret_code=0,
+            ret_msg="OK",
+            exception=None,
+        )
+    )
     return client
 
 
@@ -435,13 +446,56 @@ class TestExecutorCancelOrder:
             order_id="order_to_cancel_123",
         )
 
-    def test_cancel_order_not_found(self, executor, mock_rest_client, cancel_intent):
-        """Test cancellation when order not found (returns False)."""
-        mock_rest_client.cancel_order.return_value = False
+    def test_cancel_order_benign_failure_has_no_error(
+        self, executor, mock_rest_client, cancel_intent
+    ):
+        """Terminal-order cancellation races remain quiet."""
+        mock_rest_client.cancel_order.return_value = CancelOrderResult(
+            success=False,
+            benign=True,
+            ret_code=110001,
+            ret_msg="Order does not exist",
+            exception=None,
+        )
 
         result = executor.execute_cancel(cancel_intent)
 
         assert result.success is False
+        assert result.error is None
+
+    def test_unexpected_cancel_ret_code_carries_error(
+        self, executor, mock_rest_client, cancel_intent
+    ):
+        """Unexpected Bybit cancellation responses retain a formatted error."""
+        mock_rest_client.cancel_order.return_value = CancelOrderResult(
+            success=False,
+            benign=False,
+            ret_code=10001,
+            ret_msg="Parameter error",
+            exception=None,
+        )
+
+        result = executor.execute_cancel(cancel_intent)
+
+        assert result.success is False
+        assert result.error == "Bybit API error in cancel_order: [10001] Parameter error"
+
+    def test_network_cancel_exception_carries_error(
+        self, executor, mock_rest_client, cancel_intent
+    ):
+        """Transport cancellation failures retain their exception text."""
+        mock_rest_client.cancel_order.return_value = CancelOrderResult(
+            success=False,
+            benign=False,
+            ret_code=None,
+            ret_msg=None,
+            exception=ConnectionError("Connection timeout"),
+        )
+
+        result = executor.execute_cancel(cancel_intent)
+
+        assert result.success is False
+        assert result.error == "Connection timeout"
 
     def test_cancel_order_failure(self, executor, mock_rest_client, cancel_intent):
         """Test cancellation failure."""
@@ -478,7 +532,13 @@ class TestExecutorBatch:
     def test_batch_partial_failure(self, executor, mock_rest_client, place_intent, cancel_intent):
         """Test batch with partial failures."""
         mock_rest_client.place_order.side_effect = Exception("Rate limited")
-        mock_rest_client.cancel_order.return_value = True
+        mock_rest_client.cancel_order.return_value = CancelOrderResult(
+            success=True,
+            benign=False,
+            ret_code=0,
+            ret_msg="OK",
+            exception=None,
+        )
 
         intents = [place_intent, cancel_intent]
         results = executor.execute_batch(intents)
@@ -630,6 +690,144 @@ class TestAuthErrorDetection:
 
         executor.execute_cancel(cancel_intent)
         assert executor.auth_cooldown is True
+
+    def test_cancel_auth_result_counts_and_activates_cooldown(
+        self, mock_rest_client, cancel_intent
+    ):
+        """Structured 10005 cancellation failures count toward auth cooldown."""
+        mock_rest_client.cancel_order.return_value = CancelOrderResult(
+            success=False,
+            benign=False,
+            ret_code=10005,
+            ret_msg="Permission denied",
+            exception=None,
+        )
+        executor = IntentExecutor(mock_rest_client, max_auth_failures=2)
+
+        executor.execute_cancel(cancel_intent)
+        assert executor.auth_failure_count == 1
+
+        executor.execute_cancel(cancel_intent)
+        assert executor.auth_cooldown is True
+
+    def test_http_401_failed_request_is_auth_and_activates_cooldown(
+        self, mock_rest_client, cancel_intent
+    ):
+        """HTTP 401 pybit failures activate the authentication cooldown."""
+        error = FailedRequestError("cancel_order", "Unauthorized", 401, "now", None)
+        mock_rest_client.cancel_order.return_value = CancelOrderResult(
+            success=False,
+            benign=False,
+            ret_code=None,
+            ret_msg=None,
+            exception=error,
+        )
+        executor = IntentExecutor(mock_rest_client, max_auth_failures=2)
+
+        executor.execute_cancel(cancel_intent)
+        executor.execute_cancel(cancel_intent)
+
+        assert executor._classify_error(str(error)) == "auth"
+        assert executor.auth_failure_count == 2
+        assert executor.auth_cooldown is True
+
+    def test_ret_code_10007_is_auth_and_activates_cooldown(
+        self, mock_rest_client, cancel_intent
+    ):
+        """Bybit's user-authentication retCode activates the cooldown."""
+        mock_rest_client.cancel_order.return_value = CancelOrderResult(
+            success=False,
+            benign=False,
+            ret_code=10007,
+            ret_msg="User authentication failed",
+            exception=None,
+        )
+        executor = IntentExecutor(mock_rest_client, max_auth_failures=2)
+
+        executor.execute_cancel(cancel_intent)
+        executor.execute_cancel(cancel_intent)
+
+        assert executor.auth_failure_count == 2
+        assert executor.auth_cooldown is True
+
+    def test_benign_cancel_resets_auth_failure_count(
+        self, mock_rest_client, cancel_intent
+    ):
+        """A benign race proves the credentials work, so it clears the counter.
+
+        A benign retCode is only reachable via an authenticated,
+        signature-verified round-trip that Bybit processed. Leaving the counter
+        armed would let transient auth blips (e.g. 10004 clock skew) interleaved
+        with ordinary fill-vs-cancel races accumulate to the threshold and latch
+        a 30-minute cooldown on a healthy key.
+        """
+        auth_failure = CancelOrderResult(
+            success=False,
+            benign=False,
+            ret_code=10005,
+            ret_msg="Permission denied",
+            exception=None,
+        )
+        benign = CancelOrderResult(
+            success=False,
+            benign=True,
+            ret_code=110001,
+            ret_msg="Order does not exist",
+            exception=None,
+        )
+        executor = IntentExecutor(mock_rest_client, max_auth_failures=3)
+
+        mock_rest_client.cancel_order.return_value = auth_failure
+        executor.execute_cancel(cancel_intent)
+        executor.execute_cancel(cancel_intent)
+        assert executor.auth_failure_count == 2
+
+        mock_rest_client.cancel_order.return_value = benign
+        executor.execute_cancel(cancel_intent)
+        assert executor.auth_failure_count == 0
+
+        mock_rest_client.cancel_order.return_value = auth_failure
+        executor.execute_cancel(cancel_intent)
+        assert executor.auth_failure_count == 1
+        assert executor.auth_cooldown is False
+
+    def test_benign_cancel_emits_no_error_log(
+        self, mock_rest_client, cancel_intent, caplog
+    ):
+        """Benign races stay silent — the log noise issue #208 exists to fix."""
+        mock_rest_client.cancel_order.return_value = CancelOrderResult(
+            success=False,
+            benign=True,
+            ret_code=110008,
+            ret_msg="The order has been completed or cancelled.",
+            exception=None,
+        )
+        executor = IntentExecutor(mock_rest_client)
+
+        with caplog.at_level(logging.DEBUG, logger="gridbot.executor"):
+            result = executor.execute_cancel(cancel_intent)
+
+        assert result.success is False
+        assert result.error is None
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+    def test_http_403_is_not_auth(self, mock_rest_client, cancel_intent):
+        """HTTP 403 remains outside the auth-failure budget."""
+        error = FailedRequestError("cancel_order", "Forbidden", 403, "now", None)
+        mock_rest_client.cancel_order.return_value = CancelOrderResult(
+            success=False,
+            benign=False,
+            ret_code=None,
+            ret_msg=None,
+            exception=error,
+        )
+        executor = IntentExecutor(mock_rest_client, max_auth_failures=1)
+
+        executor.execute_cancel(cancel_intent)
+
+        assert executor._classify_error(str(error)) != "auth"
+        assert executor.auth_failure_count == 0
+        assert executor.auth_cooldown is False
 
     def test_reset_auth_cooldown(self, mock_rest_client):
         """Test reset_auth_cooldown clears state."""

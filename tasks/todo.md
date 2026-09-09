@@ -58,3 +58,10 @@ Plan: docs/features/0102_PLAN.md | Issue: #246
 
 - [x] Phases 1–4: result fields, shared-pool observer, engine gate, docs.
 - [x] Phase 5: required replay/gridcore/live-check tests, `make test`, and lint.
+
+# Feature 0104 — Cancel failure handling
+
+- [x] Phase 1: adapter structured cancellation result and classification (TDD)
+- [x] Phase 2: executor error routing, cooldown, metrics, and retry handling (TDD)
+- [x] Phase 3: loss-breaker cancellation alerting (TDD)
+- [x] Required verification gates

@@ -52,6 +52,7 @@ from gridcore import (  # noqa: E402
 from gridbot.config import StrategyConfig  # noqa: E402
 from gridbot.executor import (  # noqa: E402
     IntentExecutor,
+    CancelResult,
     OrderResult,
     is_duplicate_link_error,
     is_insufficient_balance,
@@ -112,6 +113,14 @@ _DIRTY_WS_MISMATCH_ALERT_THRESHOLD = 10
 # WARNING to at most one per this many seconds per reason, so a cap held at its
 # threshold (e.g. notional pinned at C1) does not flood the log every tick.
 _SAFETY_CAP_WARN_THROTTLE_SEC = 60.0
+
+# Feature 0104 (issue #208) — bounds on the aggregated emergency-cancel alert.
+# Telegram rejects a sendMessage payload over 4096 characters and Notifier marks
+# the throttle key as sent BEFORE the send, so an over-length alert is lost
+# silently for the throttle window. Both unbounded inputs (the order-id list and
+# the interpolated error string) are therefore capped by construction.
+_LOSS_BREAKER_ALERT_MAX_IDS = 20
+_LOSS_BREAKER_ALERT_MAX_ERROR_CHARS = 500
 
 # Feature 0083 (issue #202) — cap on the processed-exec_id FIFO dedup cache in
 # `on_execution`. Bybit exec_ids are globally unique, so entries never need
@@ -2498,8 +2507,27 @@ class StrategyRunner:
                 self._clear_dirty(intent.direction)
         return result
 
-    def _execute_cancel_intent(self, intent: CancelIntent) -> None:
-        """Execute a cancel order intent."""
+    def _execute_cancel_intent(
+        self,
+        intent: CancelIntent,
+        suppress_failure_enqueue: bool = False,
+    ) -> CancelResult:
+        """Execute a cancel order intent.
+
+        Args:
+            intent: Cancellation request to dispatch.
+            suppress_failure_enqueue: Skip the ``_on_intent_failed`` retry
+                enqueue even for a SERIOUS failure. Used by the C3 loss breaker,
+                whose retry queue is latched-paused by ``loss_tripped()`` so an
+                entry there would never be dispatched (feature 0104).
+
+        Returns:
+            The executor's ``CancelResult``. A BENIGN failure
+            (``success=False`` with ``error=None`` — the order was already
+            terminal) is NEVER handed to ``_on_intent_failed`` regardless of
+            ``suppress_failure_enqueue``; retrying it could only produce the
+            same "already gone" answer.
+        """
         result = self._executor.execute_cancel(intent)
 
         tracked = self._find_tracked_order(None, intent.order_id)
@@ -2519,8 +2547,14 @@ class StrategyRunner:
                         tracked.client_order_id,
                     )
 
-        if not result.success and self._on_intent_failed:
+        if (
+            not result.success
+            and result.error is not None
+            and not suppress_failure_enqueue
+            and self._on_intent_failed
+        ):
             self._on_intent_failed(intent, result.error)
+        return result
 
     def _emit_safety_cap_rejection(self, intent: PlaceLimitIntent, reason: str) -> None:
         """Log (throttled) + alert a safety-cap rejection (feature 0079).
@@ -2576,10 +2610,19 @@ class StrategyRunner:
 
         Uses the per-cycle "Realized" value (``curRealisedPnl`` — the Bybit UI
         Realized column), NOT the ~80x lifetime ``cumRealisedPnl``. On a NEW
-        trip: emit one ERROR + alert and cancel ALL working orders for the
-        symbol via ``_execute_cancel_intent`` (honors shadow mode + tracked-order
-        state). After the trip, every ``_execute_place_intent`` short-circuits
-        via ``loss_tripped()``. No-op when no SafetyCaps is wired.
+        trip: emit one ERROR + trip alert, drain the retry queue, then make a
+        BEST-EFFORT sweep to cancel the symbol's working orders via
+        ``_execute_cancel_intent`` (honors shadow mode + tracked-order state).
+        After the trip, every ``_execute_place_intent`` short-circuits via
+        ``loss_tripped()``. No-op when no SafetyCaps is wired.
+
+        The sweep is best-effort, not exhaustive (feature 0104, issue #208): it
+        breaks early if auth cooldown latches partway through, deliberately
+        leaving the remaining orders live. Whenever any order is left live —
+        failed or never attempted — a SECOND aggregated
+        ``safety_cap_loss_breaker_cancel_failed_*`` alert is emitted after the
+        loop, and the same summary is always logged at ERROR. Do not assume the
+        book is flat once this returns.
         """
         if self._safety_caps is None:
             return
@@ -2614,18 +2657,76 @@ class StrategyRunner:
                     "%s: Cleared %d items from retry queue on session-loss trip",
                     self.strat_id, cleared,
                 )
-        # Cancel all working orders (both directions). order['orderId'] is the
-        # wire id (get_limit_orders maps tracked.order_id → 'orderId'); a
-        # CancelIntent requires symbol + order_id + reason.
+        # Cancel all working orders (both directions). Flatten first so the
+        # cooldown break below is a single unambiguous exit — on the original
+        # nested (per-side, then per-order) loop a bare `break` would only leave
+        # one side's list. order['orderId'] is the wire id (get_limit_orders
+        # maps tracked.order_id → 'orderId'); a CancelIntent requires symbol +
+        # order_id + reason.
         limits = self.get_limit_orders()
-        for side_orders in limits.values():
-            for order in side_orders:
-                self._execute_cancel_intent(
-                    CancelIntent(
-                        symbol=self._config.symbol,
-                        order_id=order["orderId"],
-                        reason="safety_cap_loss_breaker",
-                    )
+        orders = [order for side_orders in limits.values() for order in side_orders]
+        failed_order_ids: list[str] = []
+        skipped_order_ids: list[str] = []
+        first_error: Optional[str] = None
+
+        for index, order in enumerate(orders):
+            if self._executor.auth_cooldown:
+                skipped_order_ids.extend(
+                    remaining["orderId"] for remaining in orders[index:]
+                )
+                break
+            result = self._execute_cancel_intent(
+                CancelIntent(
+                    symbol=self._config.symbol,
+                    order_id=order["orderId"],
+                    reason="safety_cap_loss_breaker",
+                ),
+                suppress_failure_enqueue=True,
+            )
+            if not result.success and result.error is not None:
+                failed_order_ids.append(order["orderId"])
+                if first_error is None:
+                    first_error = result.error
+                logger.error(
+                    "%s: loss-breaker cancel failed for order_id=%s: %s",
+                    self.strat_id,
+                    order["orderId"],
+                    result.error,
+                )
+
+        still_live_order_ids = failed_order_ids + skipped_order_ids
+        if still_live_order_ids:
+            rendered_ids = ",".join(
+                still_live_order_ids[:_LOSS_BREAKER_ALERT_MAX_IDS]
+            )
+            overflow = max(
+                len(still_live_order_ids) - _LOSS_BREAKER_ALERT_MAX_IDS, 0
+            )
+            if overflow:
+                rendered_ids = f"{rendered_ids} (+{overflow} more)"
+            rendered_error = (
+                first_error[:_LOSS_BREAKER_ALERT_MAX_ERROR_CHARS]
+                if first_error is not None
+                else "none (auth cooldown already active)"
+            )
+            summary = (
+                f"Gridbot: EMERGENCY loss-breaker cancel FAILED for {self.strat_id}: "
+                f"{len(still_live_order_ids)} of {len(orders)} working orders still "
+                f"live ({len(failed_order_ids)} failed, {len(skipped_order_ids)} "
+                f"not attempted — auth cooldown); order_ids={rendered_ids}; "
+                f"first_error={rendered_error}"
+            )
+            # Log unconditionally BEFORE alerting: orders skipped by the
+            # auth-cooldown break get no per-order log line above, so gating the
+            # summary on a configured notifier would leave them completely
+            # silent — the exact failure mode feature 0104 exists to remove.
+            logger.error(summary)
+            if self._notifier is not None:
+                self._notifier.alert(
+                    summary,
+                    error_key=(
+                        f"safety_cap_loss_breaker_cancel_failed_{self.strat_id}"
+                    ),
                 )
 
     def inject_open_orders(self, orders: list[dict]) -> None:

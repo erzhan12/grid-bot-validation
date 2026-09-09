@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 import logging
 
+from pybit.exceptions import InvalidRequestError
 from pybit.unified_trading import HTTP
 
 from bybit_adapter.rate_limiter import RateLimiter, RateLimitConfig, RequestType
@@ -33,6 +34,80 @@ logger = logging.getLogger(__name__)
 # Limitation: Does not allow hyphens or underscores. Update this pattern if
 # Bybit introduces symbol formats beyond [A-Z0-9] (check their API docs).
 _SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,20}$")
+
+# Feature 0104 (issue #208) — cancellation outcomes that mean "the order is
+# already gone" and must therefore stay silent (no auth cooldown, no REST-error
+# metric, no emergency alert). Verified against the official V5 error table
+# (see error_codes.py for the URL):
+#   110001 "Order does not exist"
+#   110008 "The order has been completed or cancelled."
+#   110010 "The order has been cancelled"
+#   170213 Spot "Order does not exist." — unreachable under category="linear",
+#          kept because it is pre-existing and its meaning is benign anyway.
+# 110003 is deliberately ABSENT: it means "Order price exceeds the allowable
+# range", a placement error, so treating it as benign would swallow a real
+# anomaly.
+_EXPECTED_CANCEL_CODES = frozenset({110001, 110008, 110010, 170213})
+
+# Message-text fallback for uncatalogued ORDER-scoped terminal codes. The last
+# two phrases match the documented 110008 / 110010 wordings, which contain
+# neither "already cancelled" nor "already filled".
+_EXPECTED_CANCEL_PHRASES = (
+    "not found",
+    "not exist",
+    "already filled",
+    "already cancelled",
+    "has been cancelled",
+    "completed or cancelled",
+)
+
+# The fallback is restricted to the six-digit order-code ranges. Five-digit
+# 10xxx system/routing codes must never match it: 10017 "Route not found." and
+# 10404 "op type is not found" both contain the "not found" phrase but are
+# serious failures, not terminal-order races.
+_ORDER_CODE_RANGES = ((110000, 111000), (170000, 171000))
+
+
+def _is_benign_cancel(ret_code: Optional[int], ret_msg: Optional[str]) -> bool:
+    """Classify a failed cancellation as a benign terminal-order race.
+
+    Shared by the response-dict and ``InvalidRequestError`` paths so the two
+    cannot drift apart.
+
+    Args:
+        ret_code: Bybit retCode, if one was reported.
+        ret_msg: Bybit retMsg, if one was reported.
+
+    Returns:
+        True if the order was already terminal (filled/cancelled/unknown).
+    """
+    if ret_code in _EXPECTED_CANCEL_CODES:
+        return True
+    if ret_code is None:
+        return False
+    if not any(low <= ret_code < high for low, high in _ORDER_CODE_RANGES):
+        return False
+    lowered = (ret_msg or "").lower()
+    return any(phrase in lowered for phrase in _EXPECTED_CANCEL_PHRASES)
+
+
+@dataclass(frozen=True)
+class CancelOrderResult:
+    """Structured outcome of a Bybit order cancellation request.
+
+    Attributes:
+        success: Whether Bybit accepted the cancellation.
+        benign: Whether an unsuccessful result means the order is already terminal.
+        ret_code: Bybit response code, if available.
+        ret_msg: Bybit response message, if available.
+        exception: Request exception, if one was raised.
+    """
+
+    success: bool
+    benign: bool
+    ret_code: int | None
+    ret_msg: str | None
+    exception: Exception | None
 
 
 @dataclass
@@ -528,7 +603,7 @@ class BybitRestClient:
         symbol: str,
         order_id: Optional[str] = None,
         order_link_id: Optional[str] = None,
-    ) -> bool:
+    ) -> CancelOrderResult:
         """Cancel an existing order.
 
         Either order_id or order_link_id must be provided.
@@ -539,10 +614,16 @@ class BybitRestClient:
             order_link_id: Custom order ID (client_order_id)
 
         Returns:
-            True if cancellation succeeded
+            Structured cancellation outcome, including benign terminal-order
+            races. Unlike ``place_order`` / ``cancel_all_orders``, an API
+            failure does NOT raise: every pybit exception and every non-zero
+            retCode is captured and returned as ``success=False`` with
+            ``benign`` distinguishing "the order was already gone" from a real
+            failure. Never test the result for truthiness — ``CancelOrderResult``
+            defines no ``__bool__``, so a bare ``if client.cancel_order(...)``
+            is always True. Branch on ``.success`` / ``.benign``.
 
         Raises:
-            Exception: If API call fails
             ValueError: If neither order_id nor order_link_id provided
 
         Reference:
@@ -563,38 +644,62 @@ class BybitRestClient:
         if order_link_id is not None:
             params["orderLinkId"] = order_link_id
 
-        # Bybit retCodes for orders that are already terminal or not found.
-        # Primary detection uses retCode; message text matching is a fallback
-        # in case Bybit introduces new codes we haven't catalogued yet.
-        _EXPECTED_CANCEL_CODES = {110001, 110003, 170213}
-
         try:
             response = self._session.cancel_order(**params)
-        except Exception as e:
-            logger.error(f"Cancel order request failed: {e}")
-            return False
+        except InvalidRequestError as error:
+            ret_code = error.status_code
+            ret_msg = error.message
+            benign = _is_benign_cancel(ret_code, ret_msg)
+            log = logger.warning if benign else logger.error
+            log(f"Cancel order failed: [{ret_code}] {ret_msg}")
+            return CancelOrderResult(
+                success=False,
+                benign=benign,
+                ret_code=ret_code,
+                ret_msg=ret_msg,
+                exception=error,
+            )
+        except Exception as error:
+            logger.error(f"Cancel order request failed: {error}")
+            return CancelOrderResult(
+                success=False,
+                benign=False,
+                ret_code=None,
+                ret_msg=None,
+                exception=error,
+            )
 
         ret_code = response.get("retCode", -1)
         ret_msg = response.get("retMsg", "Unknown error")
 
         if ret_code == 0:
             logger.info("Order cancelled successfully")
-            return True
+            return CancelOrderResult(
+                success=True,
+                benign=False,
+                ret_code=ret_code,
+                ret_msg=ret_msg,
+                exception=None,
+            )
 
-        if ret_code in _EXPECTED_CANCEL_CODES:
+        if _is_benign_cancel(ret_code, ret_msg):
             logger.warning(f"Cancel order failed (expected): [{ret_code}] {ret_msg}")
-            return False
-
-        # Fallback: check message text for unknown codes
-        if any(
-            phrase in ret_msg.lower()
-            for phrase in ("not found", "not exist", "already filled", "already cancelled")
-        ):
-            logger.warning(f"Cancel order failed (expected): [{ret_code}] {ret_msg}")
-            return False
+            return CancelOrderResult(
+                success=False,
+                benign=True,
+                ret_code=ret_code,
+                ret_msg=ret_msg,
+                exception=None,
+            )
 
         logger.error(f"Cancel order failed (unexpected): [{ret_code}] {ret_msg}")
-        return False
+        return CancelOrderResult(
+            success=False,
+            benign=False,
+            ret_code=ret_code,
+            ret_msg=ret_msg,
+            exception=None,
+        )
 
     def cancel_all_orders(self, symbol: str) -> int:
         """Cancel all open orders for a symbol.

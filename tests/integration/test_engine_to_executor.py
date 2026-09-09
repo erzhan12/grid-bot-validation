@@ -11,6 +11,7 @@ from gridcore.engine import GridEngine
 from gridcore.intents import PlaceLimitIntent, CancelIntent
 
 from gridbot.executor import IntentExecutor
+from bybit_adapter.rest_client import CancelOrderResult
 
 from integration_helpers import make_ticker_event
 
@@ -224,7 +225,13 @@ class TestExecutorRESTPayloadMapping:
     def test_cancel_intent_maps_to_rest_params(self, grid_config, btcusdt_tick_size):
         """CancelIntent fields map correctly to cancel_order kwargs."""
         mock_rest = MagicMock()
-        mock_rest.cancel_order.return_value = True
+        mock_rest.cancel_order.return_value = CancelOrderResult(
+            success=True,
+            benign=False,
+            ret_code=0,
+            ret_msg="OK",
+            exception=None,
+        )
         executor = IntentExecutor(rest_client=mock_rest, shadow_mode=False)
 
         cancel_intent = CancelIntent(

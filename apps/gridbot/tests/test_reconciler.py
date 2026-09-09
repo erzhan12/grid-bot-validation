@@ -10,6 +10,7 @@ from gridbot.executor import IntentExecutor, OrderResult, CancelResult
 from gridbot.reconciler import Reconciler, ReconciliationResult
 from gridbot.runner import StrategyRunner
 from bybit_adapter.rest_client import BybitRestClient
+from bybit_adapter.rest_client import CancelOrderResult
 
 
 @pytest.fixture
@@ -17,7 +18,15 @@ def mock_rest_client():
     """Create mock REST client."""
     client = Mock()
     client.get_open_orders = MagicMock(return_value=[])
-    client.cancel_order = MagicMock(return_value=True)
+    client.cancel_order = MagicMock(
+        return_value=CancelOrderResult(
+            success=True,
+            benign=False,
+            ret_code=0,
+            ret_msg="OK",
+            exception=None,
+        )
+    )
     return client
 
 

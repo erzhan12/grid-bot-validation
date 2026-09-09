@@ -30,8 +30,14 @@ logger = logging.getLogger(__name__)
 # rate-limit (every queued/re-dispatched intent rejected) does not flood the log.
 _RATE_LIMIT_WARN_THROTTLE_SEC = 60.0
 
-# Bybit error codes that indicate auth/permission problems (not retryable)
-AUTH_ERROR_CODES = {10003, 10004, 10005, 33004}
+# Bybit retCodes and HTTP 401, which pybit surfaces in its ErrCode format, that
+# indicate auth/permission problems (not retryable). V5 has short retCodes
+# (including 429 and -1), so this is not a digit-length classification. HTTP 401
+# is not a V5 REST retCode, so including it cannot shadow a real Bybit code.
+# Deliberately exclude 403 (IP/rate-limit) and 10010 (IP allowlist
+# configuration); on a laptop with a changing public IP, an IP-bound key will
+# surface 10010 through logs and health rather than consuming this auth budget.
+AUTH_ERROR_CODES = {401, 10003, 10004, 10005, 10007, 33004}
 
 # Feature 0082 (issue #185) — map a coarse error category to the
 # rest_errors_by_code key used by HealthMetrics. The C4 "rate_limit" sentinel is
@@ -150,7 +156,19 @@ class OrderResult:
 
 @dataclass
 class CancelResult:
-    """Result of order cancellation attempt."""
+    """Result of order cancellation attempt.
+
+    Attributes:
+        success: True if the exchange accepted the cancellation.
+        error: Failure detail, and the BENIGN sentinel when unsuccessful.
+            ``success=False`` with ``error=None`` means the order was already
+            terminal (feature 0104) — a routine fill-vs-cancel race that must
+            stay silent and must NOT be retried. ``success=False`` with a
+            non-None ``error`` is a serious failure. Callers branch on this:
+            see ``StrategyRunner._execute_cancel_intent`` and
+            ``RetryQueue.process_due``.
+        timestamp: When the result was produced (defaults to now, UTC).
+    """
 
     success: bool
     error: Optional[str] = None
@@ -412,7 +430,17 @@ class IntentExecutor:
             intent: CancelIntent from strategy.
 
         Returns:
-            CancelResult with success status.
+            A tri-state ``CancelResult``. The ``error`` field is load-bearing on
+            the failure paths and callers branch on it:
+
+            * ``success=True`` — the exchange accepted the cancellation.
+            * ``success=False, error=None`` — BENIGN: the order was already
+              terminal (filled/cancelled/unknown). Stays silent: no
+              ``_handle_error()``, no auth accounting, no REST-error metric, no
+              alert. ``StrategyRunner`` does not enqueue a retry for it and
+              ``RetryQueue.process_due()`` drops it rather than backing it off.
+            * ``success=False, error=<str>`` — SERIOUS: an unexpected retCode or
+              a transport/auth exception, routed through ``_handle_error()``.
         """
         if self._shadow_mode:
             logger.info(
@@ -422,26 +450,47 @@ class IntentExecutor:
             return CancelResult(success=True)
 
         try:
-            success = self._client.cancel_order(
+            adapter_result = self._client.cancel_order(
                 symbol=intent.symbol,
                 order_id=intent.order_id,
             )
 
-            if success:
+            if adapter_result.success:
                 logger.info(
                     f"Cancelled order: {intent.symbol} "
                     f"order_id={intent.order_id} reason={intent.reason}"
                 )
                 self._auth_failure_count = 0
+                result = CancelResult(success=True)
+            elif adapter_result.benign:
+                # A benign outcome is a fully authenticated, signature-verified
+                # round-trip that Bybit processed and answered with an
+                # order-level retCode — positive evidence the credentials work.
+                # Reset the auth counter exactly as the success branch does, so
+                # transient auth blips (e.g. 10004 clock skew) interleaved with
+                # ordinary fill-vs-cancel races cannot accumulate to the
+                # threshold and latch a 30-minute cooldown on a healthy key.
+                # This also keeps the counter's "consecutive" semantics honest:
+                # _handle_error() already resets it for non-auth failures.
+                self._auth_failure_count = 0
+                result = CancelResult(success=False)
             else:
-                logger.warning(
-                    f"Cancel returned False: {intent.symbol} "
-                    f"order_id={intent.order_id} (may already be filled/cancelled)"
+                error = (
+                    str(adapter_result.exception)
+                    if adapter_result.exception is not None
+                    else "Bybit API error in cancel_order: "
+                    f"[{adapter_result.ret_code}] {adapter_result.ret_msg}"
                 )
+                logger.error(
+                    f"Failed to cancel order: {error}",
+                    exc_info=adapter_result.exception,
+                )
+                self._handle_error(error)
+                result = CancelResult(success=False, error=error)
 
             if self._health_metrics is not None:
-                self._health_metrics.record_cancel(success=success)
-            return CancelResult(success=success)
+                self._health_metrics.record_cancel(success=result.success)
+            return result
 
         except Exception as e:
             logger.error(f"Failed to cancel order: {e}")

@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import pytest
 
 from gridcore.intents import PlaceLimitIntent, CancelIntent
-from gridbot.executor import OrderResult
+from gridbot.executor import CancelResult, OrderResult
 from gridbot.retry_queue import RetryQueue, RetryItem
 
 
@@ -344,6 +344,24 @@ class TestRetryQueueCancelDispatch:
         assert queue.size == 1
         assert queue._queue[0].attempt_count == 2
         executor.assert_called_once_with(cancel_intent)
+
+    def test_benign_cancel_result_is_dropped_not_retried(self, cancel_intent):
+        """A retry resolving to a benign terminal order is dropped."""
+        executor = Mock(return_value=CancelResult(success=False, error=None))
+        queue = RetryQueue(
+            executor_func=executor,
+            max_attempts=3,
+            initial_backoff_seconds=0.01,
+        )
+        queue.add(cancel_intent, "Cancel failed")
+        item = queue._queue[0]
+        _force_due(queue)
+
+        processed = queue.process_due()
+
+        assert processed == 1
+        assert queue.size == 0
+        assert item.attempt_count == 1
 
 
 class TestRetryQueueBackoff:

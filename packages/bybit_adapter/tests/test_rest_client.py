@@ -1,5 +1,8 @@
 """Tests for BybitRestClient."""
+import logging
+
 import pytest
+from pybit.exceptions import InvalidRequestError
 from unittest.mock import MagicMock, patch
 
 from bybit_adapter.rest_client import BybitRestClient
@@ -27,6 +30,11 @@ def _ok_response(result):
 def _error_response(code=10001, msg="Parameter error"):
     """Build an error API response."""
     return {"retCode": code, "retMsg": msg, "result": {}}
+
+
+def _invalid_request_error(code, message):
+    """Build a pybit API error with a Bybit retCode."""
+    return InvalidRequestError("cancel_order", message, code, "now", None)
 
 
 # ---------------------------------------------------------------------------
@@ -429,7 +437,8 @@ class TestCancelOrder:
 
         result = client.cancel_order(symbol="BTCUSDT", order_id="o1")
 
-        assert result is True
+        assert result.success is True
+        assert result.ret_code == 0
         call_kwargs = mock_session.cancel_order.call_args[1]
         assert call_kwargs["orderId"] == "o1"
         assert "orderLinkId" not in call_kwargs
@@ -439,7 +448,8 @@ class TestCancelOrder:
 
         result = client.cancel_order(symbol="BTCUSDT", order_link_id="link1")
 
-        assert result is True
+        assert result.success is True
+        assert result.ret_code == 0
         call_kwargs = mock_session.cancel_order.call_args[1]
         assert call_kwargs["orderLinkId"] == "link1"
         assert "orderId" not in call_kwargs
@@ -449,7 +459,8 @@ class TestCancelOrder:
 
         result = client.cancel_order(symbol="BTCUSDT", order_id="o1", order_link_id="link1")
 
-        assert result is True
+        assert result.success is True
+        assert result.ret_code == 0
         call_kwargs = mock_session.cancel_order.call_args[1]
         assert call_kwargs["orderId"] == "o1"
         assert call_kwargs["orderLinkId"] == "link1"
@@ -458,19 +469,227 @@ class TestCancelOrder:
         with pytest.raises(ValueError, match="Either order_id or order_link_id"):
             client.cancel_order(symbol="BTCUSDT")
 
-    def test_returns_false_on_exception(self, client, mock_session):
+    @pytest.mark.parametrize(
+        ("code", "message"),
+        [
+            (110001, "Order does not exist"),
+            (110001, ""),
+            (110008, "The order has been completed or cancelled."),
+            (110008, ""),
+            (110010, "The order has been cancelled"),
+            (110010, ""),
+            (170213, "Order does not exist"),
+            (170213, ""),
+        ],
+    )
+    def test_expected_cancel_codes_are_benign(self, client, mock_session, code, message):
+        """Terminal-order response codes are benign with or without a message."""
+        mock_session.cancel_order.return_value = _error_response(code, message)
+
+        result = client.cancel_order(symbol="BTCUSDT", order_id="o1")
+
+        assert result.success is False
+        assert result.benign is True
+        assert result.ret_code == code
+        assert result.ret_msg == message
+
+    @pytest.mark.parametrize(
+        ("code", "message"),
+        [
+            (110001, "Order does not exist"),
+            (110001, ""),
+            (110008, "The order has been completed or cancelled."),
+            (110008, ""),
+            (110010, "The order has been cancelled"),
+            (110010, ""),
+            (170213, "Order does not exist"),
+            (170213, ""),
+        ],
+    )
+    def test_expected_cancel_exception_codes_are_benign(
+        self, client, mock_session, code, message
+    ):
+        """Terminal-order pybit exceptions are benign with or without a message."""
+        error = _invalid_request_error(code, message)
+        mock_session.cancel_order.side_effect = error
+
+        result = client.cancel_order(symbol="BTCUSDT", order_id="o1")
+
+        assert result.success is False
+        assert result.benign is True
+        assert result.ret_code == code
+        assert result.ret_msg == message
+        assert result.exception is error
+
+    def test_price_range_code_is_not_benign(self, client, mock_session):
+        """Placement price-range errors must not be swallowed as terminal orders."""
+        mock_session.cancel_order.return_value = _error_response(
+            110003, "Order price exceeds the allowable range"
+        )
+
+        result = client.cancel_order(symbol="BTCUSDT", order_id="o1")
+
+        assert result.success is False
+        assert result.benign is False
+        assert result.ret_code == 110003
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "not found",
+            "not exist",
+            "already filled",
+            "already cancelled",
+            "has been cancelled",
+            "completed or cancelled",
+        ],
+    )
+    def test_benign_message_fallback_is_preserved(self, client, mock_session, message):
+        """Order-scoped terminal phrases retain their benign fallback behavior."""
+        mock_session.cancel_order.return_value = _error_response(110999, message)
+
+        result = client.cancel_order(symbol="BTCUSDT", order_id="o1")
+
+        assert result.success is False
+        assert result.benign is True
+
+    @pytest.mark.parametrize(
+        ("code", "message"),
+        [(10017, "Route not found."), (10404, "op type is not found")],
+    )
+    def test_system_code_not_found_message_is_not_benign(
+        self, client, mock_session, code, message
+    ):
+        """System routing errors are not terminal-order cancellations."""
+        mock_session.cancel_order.return_value = _error_response(code, message)
+
+        result = client.cancel_order(symbol="BTCUSDT", order_id="o1")
+
+        assert result.success is False
+        assert result.benign is False
+
+    @pytest.mark.parametrize(
+        "code",
+        [109999, 111000, 169999, 171000, 140003],
+    )
+    def test_out_of_range_code_with_benign_phrase_is_not_benign(
+        self, client, mock_session, code
+    ):
+        """Phrase fallback is confined to the 110xxx/170xxx order ranges."""
+        mock_session.cancel_order.return_value = _error_response(
+            code, "Order does not exist"
+        )
+
+        result = client.cancel_order(symbol="BTCUSDT", order_id="o1")
+
+        assert result.success is False
+        assert result.benign is False
+
+    def test_spot_range_message_fallback_is_benign(self, client, mock_session):
+        """The 170xxx half of the fallback window is live, not just 110xxx."""
+        mock_session.cancel_order.return_value = _error_response(
+            170999, "Order has been cancelled"
+        )
+
+        result = client.cancel_order(symbol="BTCUSDT", order_id="o1")
+
+        assert result.success is False
+        assert result.benign is True
+
+    def test_generic_exception_with_benign_text_is_serious(
+        self, client, mock_session
+    ):
+        """A non-pybit exception carries no retCode, so no phrase fallback."""
         mock_session.cancel_order.side_effect = Exception("Order already filled")
 
         result = client.cancel_order(symbol="BTCUSDT", order_id="o1")
 
-        assert result is False
+        assert result.success is False
+        assert result.benign is False
+        assert result.ret_code is None
 
-    def test_returns_false_on_api_error(self, client, mock_session):
-        mock_session.cancel_order.return_value = _error_response(110001, "Order not found")
+    def test_benign_cancel_logs_warning_not_error(
+        self, client, mock_session, caplog
+    ):
+        """Benign races must not emit ERROR — the noise #208 exists to remove."""
+        mock_session.cancel_order.return_value = _error_response(
+            110001, "Order does not exist"
+        )
+
+        with caplog.at_level(logging.DEBUG, logger="bybit_adapter.rest_client"):
+            result = client.cancel_order(symbol="BTCUSDT", order_id="o1")
+
+        assert result.benign is True
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert errors == []
+        assert len(warnings) == 1
+
+    def test_unexpected_ret_code_carries_code_and_message(self, client, mock_session):
+        """Unexpected response details remain available to the executor."""
+        mock_session.cancel_order.return_value = _error_response(10001, "Parameter error")
 
         result = client.cancel_order(symbol="BTCUSDT", order_id="o1")
 
-        assert result is False
+        assert result.success is False
+        assert result.benign is False
+        assert result.ret_code == 10001
+        assert result.ret_msg == "Parameter error"
+
+    def test_network_exception_carries_exception(self, client, mock_session):
+        """Network failures retain their original exception object."""
+        error = ConnectionError("network unavailable")
+        mock_session.cancel_order.side_effect = error
+
+        result = client.cancel_order(symbol="BTCUSDT", order_id="o1")
+
+        assert result.success is False
+        assert result.benign is False
+        assert result.exception is error
+
+    def test_pybit_benign_exception_is_classified(self, client, mock_session):
+        """A terminal-order InvalidRequestError is benign."""
+        mock_session.cancel_order.side_effect = _invalid_request_error(
+            110001, "Order does not exist"
+        )
+
+        result = client.cancel_order(symbol="BTCUSDT", order_id="o1")
+
+        assert result.success is False
+        assert result.benign is True
+
+    def test_pybit_auth_exception_is_serious(self, client, mock_session):
+        """Authentication InvalidRequestError remains serious."""
+        error = _invalid_request_error(10005, "Permission denied")
+        mock_session.cancel_order.side_effect = error
+
+        result = client.cancel_order(symbol="BTCUSDT", order_id="o1")
+
+        assert result.success is False
+        assert result.benign is False
+        assert result.exception is error
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "not found",
+            "not exist",
+            "already filled",
+            "already cancelled",
+            "has been cancelled",
+            "completed or cancelled",
+        ],
+    )
+    def test_pybit_exception_message_fallback_is_benign(
+        self, client, mock_session, message
+    ):
+        """Order-scoped terminal phrases also apply to pybit exceptions."""
+        mock_session.cancel_order.side_effect = _invalid_request_error(110999, message)
+
+        result = client.cancel_order(symbol="BTCUSDT", order_id="o1")
+
+        assert result.success is False
+        assert result.benign is True
 
 
 # ---------------------------------------------------------------------------
