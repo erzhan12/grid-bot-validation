@@ -116,3 +116,6 @@ conf/risk_limits_cache.json
 # archives, .summary.md post-mortems) live on disk but are kept out of the repo.
 docs/incidents/
 .quantumbot_ro_keys
+
+# Local deploy memos (per-machine, not source)
+docs/deploy/*.local.md
