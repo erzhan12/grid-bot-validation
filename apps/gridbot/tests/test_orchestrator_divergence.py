@@ -9,6 +9,8 @@ enqueue/drain/fast-track).
     uv run pytest apps/gridbot/tests/test_orchestrator_divergence.py
 """
 
+import threading
+import time
 from datetime import datetime, UTC
 from decimal import Decimal
 from unittest.mock import Mock, MagicMock
@@ -577,10 +579,78 @@ def test_signal4_ws_health_check_enqueues_even_when_reset_raises(fixed_clock):
     orch, runner, reconciler = _wire(_gridbot_config())
     priv = Mock()
     priv.is_socket_alive.return_value = False
-    priv.reset.side_effect = Exception("boom")
     orch._private_ws["test_account"] = priv
+    # Capture what the pending set held AT reset() time. A bare assert inside
+    # the side effect would raise AssertionError, which the per-client
+    # `except Exception` swallows — the test would pass either way.
+    seen = {}
+
+    def _boom():
+        seen["pending"] = set(orch._pending_post_recovery_reconcile)
+        raise Exception("boom")
+
+    priv.reset.side_effect = _boom
     orch._ws_health_check_once()  # must not raise
+    assert seen["pending"] == {"btcusdt_test"}  # enqueued BEFORE reset
     assert orch._pending_post_recovery_reconcile == {"btcusdt_test"}
+    assert orch._health_metrics.ws_reconnects["private"] == 0
+
+
+def test_signal4_ws_health_check_enqueues_on_every_dead_probe(fixed_clock):
+    """The private enqueue is per dead probe, not per alive->dead edge.
+
+    Guards against folding the enqueue into the edge-triggered alert branch,
+    which would silently stop scheduling reconciliation from the second dead
+    probe onward — invisible to every single-probe test.
+    """
+    orch, runner, reconciler = _wire(_gridbot_config())
+    priv = Mock()
+    priv.is_socket_alive.return_value = False
+    orch._private_ws["test_account"] = priv
+    orch._enqueue_post_recovery_reconcile = Mock()
+
+    for _ in range(3):
+        orch._ws_health_check_once()
+
+    assert orch._enqueue_post_recovery_reconcile.call_count == 3
+
+
+def test_signal4_ws_health_check_disconnect_does_not_touch_dead_edge_state():
+    """`_on_ws_disconnect` runs on a worker thread and must not touch the edge.
+
+    Deliberately does NOT take `fixed_clock`: it monkeypatches
+    `gridbot.orchestrator.time.monotonic`, which is the stdlib `time` module,
+    so the wait loop below would never time out and a regression would hang
+    the suite instead of failing it.
+    """
+    # BOTH seed states are needed. Empty catches a stray add(); pre-seeded
+    # catches a stray discard()/clear(). Pre-seeded alone cannot catch add()
+    # — re-adding a key that is already there is idempotent.
+    both_keys = {("test_account", "public"), ("test_account", "private")}
+    for seeded in (set(), both_keys):
+        orch, runner, reconciler = _wire(_gridbot_config())
+        pub = Mock()
+        priv = Mock()
+        orch._public_ws["test_account"] = pub
+        orch._private_ws["test_account"] = priv
+        orch._ws_dead_alerted = set(seeded)
+
+        for kind, client in (("public", pub), ("private", priv)):
+            orch._on_ws_disconnect(
+                "test_account", kind, datetime.now(UTC),
+            )
+            # reset() is dispatched to a worker thread — wait for it.
+            deadline = time.monotonic() + 1.0
+            while not client.reset.called and time.monotonic() < deadline:
+                time.sleep(0.01)
+            client.reset.assert_called_once()
+            # Join the worker so a mutation AFTER reset() inside _do_reset
+            # cannot race past the assertion below.
+            for t in threading.enumerate():
+                if t.name == f"WSReset-test_account-{kind}":
+                    t.join(timeout=1.0)
+
+        assert orch._ws_dead_alerted == seeded
 
 
 def test_signal4_fresh_disconnect_after_throttle_reconciles(fixed_clock):

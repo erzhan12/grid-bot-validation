@@ -139,6 +139,11 @@ class Orchestrator:
         self._rest_clients: dict[str, BybitRestClient] = {}
         self._public_ws: dict[str, PublicWebSocketClient] = {}
         self._private_ws: dict[str, PrivateWebSocketClient] = {}
+        # Feature 0105 — (account_name, kind) edges already alerted as dead, so
+        # a persistently dead socket alerts once per alive->dead transition
+        # rather than every 10s probe. Main-loop-only (_ws_health_check_once),
+        # so no lock; _on_ws_disconnect's worker thread must never touch it.
+        self._ws_dead_alerted: set[tuple[str, str]] = set()
         self._normalizers: dict[str, BybitNormalizer] = {}
 
         # Runners and supporting components
@@ -1451,16 +1456,44 @@ class Orchestrator:
         Distinct from `_health_check_once`, which uses the wrapper's
         state-flag `is_connected()` (only flipped on explicit disconnect)
         and therefore cannot detect a dead-but-not-noticed socket.
+
+        Feature 0105 — the detection is observable: an alive->dead transition
+        alerts, and a successful `reset()` bumps `record_ws_reconnect(kind)`.
+
+        Edge lifecycle (`_ws_dead_alerted`, keyed by `(account_name, kind)`):
+        a key is latched only AFTER `alert()` returns, and re-armed only by a
+        probe that explicitly returns True — a successful `reset()` does not
+        clear it. Level-triggering would emit up to 1440 msgs/day/channel at
+        the 10s cadence, the alert-storm pathology feature 0026 removed.
+        A raising `alert()` does not latch and must not skip `reset()`; note
+        the retry is log-only inside the notifier's 60s throttle window,
+        since `Notifier` stamps `_last_sent` before it starts its thread.
+        A raising probe leaves the key exactly as it was.
+
+        Asymmetries that are deliberate: only the private branch enqueues a
+        forced reconcile, and it does so on EVERY dead probe; the pre-existing
+        reset-failure `alert_exception()` stays level-triggered and unguarded.
+
+        Two further accepted consequences: `Notifier.alert()` logs at ERROR, so
+        each edge now writes an ERROR line where there was only a WARNING (that
+        is the point — it also means a dead socket trips the health analyzer's
+        zero-ERROR check, tracked separately as issue #259); and a probe landing
+        inside an in-flight `_on_ws_disconnect` worker reset reads `_ws is None`
+        as dead, costing one spurious edge plus an overlapping `reset()`
+        (public-only in practice — the private gap watchdog is disabled).
         """
         for account_name, pub_ws in list(self._public_ws.items()):
             try:
                 if pub_ws.is_socket_alive():
+                    self._ws_dead_alerted.discard((account_name, "public"))
                     continue
                 logger.warning(
                     "WS socket dead for %s/public; resetting",
                     account_name,
                 )
+                self._alert_ws_socket_dead(account_name, "public")
                 pub_ws.reset()
+                self._health_metrics.record_ws_reconnect("public")
             except Exception as e:
                 logger.error(
                     "ws_health_check failed for %s/public: %s",
@@ -1473,6 +1506,7 @@ class Orchestrator:
         for account_name, priv_ws in list(self._private_ws.items()):
             try:
                 if priv_ws.is_socket_alive():
+                    self._ws_dead_alerted.discard((account_name, "private"))
                     continue
                 logger.warning(
                     "WS socket dead for %s/private; resetting",
@@ -1485,7 +1519,9 @@ class Orchestrator:
                 # which enqueues after its reconnect try/except regardless of
                 # success. Private-only (public loop above does NOT enqueue).
                 self._enqueue_post_recovery_reconcile(account_name)
+                self._alert_ws_socket_dead(account_name, "private")
                 priv_ws.reset()
+                self._health_metrics.record_ws_reconnect("private")
             except Exception as e:
                 logger.error(
                     "ws_health_check failed for %s/private: %s",
@@ -1495,6 +1531,29 @@ class Orchestrator:
                     f"ws_health_check {account_name}/private", e,
                     error_key=f"ws_health_check_priv_{account_name}",
                 )
+
+    def _alert_ws_socket_dead(self, account_name: str, kind: str) -> None:
+        """Emit the edge-triggered dead-socket alert for one channel.
+
+        No-op when the `(account_name, kind)` edge is already latched. The
+        key is added only after `alert()` returns, and a raising `alert()` is
+        swallowed here so it can never skip the caller's recovery `reset()`.
+        """
+        key = (account_name, kind)
+        if key in self._ws_dead_alerted:
+            return
+        try:
+            self._notifier.alert(
+                f"Gridbot: WS socket dead for {account_name}/{kind}; resetting",
+                error_key=f"ws_socket_dead_{kind}_{account_name}",
+            )
+        except Exception as e:
+            logger.error(
+                "ws dead-socket alert failed for %s/%s: %s",
+                account_name, kind, e, exc_info=True,
+            )
+            return
+        self._ws_dead_alerted.add(key)
 
     def _on_ws_disconnect(
         self, account_name: str, kind: str, disconnected_at: datetime

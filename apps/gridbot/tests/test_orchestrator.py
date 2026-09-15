@@ -4019,7 +4019,13 @@ class TestWsHealthCheck:
         priv = MagicMock()
         orchestrator._public_ws["test_account"] = pub
         orchestrator._private_ws["test_account"] = priv
+        orchestrator._notifier = Mock(spec=Notifier)
         return orchestrator, pub, priv
+
+    @staticmethod
+    def _client_for(pub, priv, kind):
+        """The mock client for `kind`, and its counterpart."""
+        return (pub, priv) if kind == "public" else (priv, pub)
 
     def test_resets_dead_public_ws(self, gridbot_config):
         orchestrator, pub, priv = self._make_orchestrator(gridbot_config)
@@ -4030,6 +4036,12 @@ class TestWsHealthCheck:
 
         pub.reset.assert_called_once()
         priv.reset.assert_not_called()
+        orchestrator._notifier.alert.assert_called_once_with(
+            "Gridbot: WS socket dead for test_account/public; resetting",
+            error_key="ws_socket_dead_public_test_account",
+        )
+        assert orchestrator._health_metrics.ws_reconnects["public"] == 1
+        assert orchestrator._health_metrics.ws_reconnects["private"] == 0
 
     def test_resets_dead_private_ws(self, gridbot_config):
         orchestrator, pub, priv = self._make_orchestrator(gridbot_config)
@@ -4040,6 +4052,147 @@ class TestWsHealthCheck:
 
         pub.reset.assert_not_called()
         priv.reset.assert_called_once()
+        orchestrator._notifier.alert.assert_called_once_with(
+            "Gridbot: WS socket dead for test_account/private; resetting",
+            error_key="ws_socket_dead_private_test_account",
+        )
+        assert orchestrator._health_metrics.ws_reconnects["private"] == 1
+        assert orchestrator._health_metrics.ws_reconnects["public"] == 0
+
+    @pytest.mark.parametrize("kind", ["public", "private"])
+    def test_dead_alert_is_edge_triggered_and_rearms_after_alive_probe(
+        self, gridbot_config, kind
+    ):
+        """Alert fires on alive->dead only; an alive probe re-arms the edge."""
+        orchestrator, pub, priv = self._make_orchestrator(gridbot_config)
+        client, other = self._client_for(pub, priv, kind)
+        other.is_socket_alive.return_value = True
+        key = ("test_account", kind)
+
+        for probe, expect_latched in ((False, True), (False, True),
+                                      (True, False), (False, True)):
+            client.is_socket_alive.return_value = probe
+            orchestrator._ws_health_check_once()
+            assert (key in orchestrator._ws_dead_alerted) is expect_latched
+
+        # Three dead probes -> three resets and three metric increments, but
+        # only two alive->dead transitions -> two detection alerts.
+        assert client.reset.call_count == 3
+        assert orchestrator._health_metrics.ws_reconnects[kind] == 3
+        assert orchestrator._notifier.alert.call_count == 2
+
+    @pytest.mark.parametrize("kind", ["public", "private"])
+    def test_failed_reset_does_not_record_reconnect(self, gridbot_config, kind):
+        """A raising reset() leaves the edge latched and the metric at zero."""
+        orchestrator, pub, priv = self._make_orchestrator(gridbot_config)
+        client, other = self._client_for(pub, priv, kind)
+        other.is_socket_alive.return_value = True
+        client.is_socket_alive.return_value = False
+        client.reset.side_effect = Exception("boom")
+
+        orchestrator._ws_health_check_once()
+
+        assert ("test_account", kind) in orchestrator._ws_dead_alerted
+        assert orchestrator._health_metrics.ws_reconnects[kind] == 0
+        assert orchestrator._notifier.alert_exception.called
+
+    @pytest.mark.parametrize("kind", ["public", "private"])
+    def test_socket_probe_exception_does_not_mark_dead_edge(
+        self, gridbot_config, kind
+    ):
+        """A raising probe touches no edge state and enqueues no reconcile."""
+        orchestrator, pub, priv = self._make_orchestrator(gridbot_config)
+        client, other = self._client_for(pub, priv, kind)
+        other.is_socket_alive.return_value = True
+        client.is_socket_alive.side_effect = RuntimeError("probe boom")
+        # _account_to_runners is empty on a bare Orchestrator, so the real
+        # helper is a silent no-op — patch it to observe the call itself.
+        orchestrator._enqueue_post_recovery_reconcile = Mock()
+
+        orchestrator._ws_health_check_once()
+
+        assert ("test_account", kind) not in orchestrator._ws_dead_alerted
+        orchestrator._notifier.alert.assert_not_called()
+        client.reset.assert_not_called()
+        assert orchestrator._health_metrics.ws_reconnects[kind] == 0
+        orchestrator._enqueue_post_recovery_reconcile.assert_not_called()
+        assert orchestrator._notifier.alert_exception.called
+
+        # A later False probe is a fresh dead edge.
+        client.is_socket_alive.side_effect = None
+        client.is_socket_alive.return_value = False
+        orchestrator._ws_health_check_once()
+
+        assert ("test_account", kind) in orchestrator._ws_dead_alerted
+        assert orchestrator._notifier.alert.call_count == 1
+
+    @pytest.mark.parametrize("kind", ["public", "private"])
+    def test_probe_exception_leaves_existing_dead_edge_latched(
+        self, gridbot_config, kind
+    ):
+        """A raising probe must not silently re-arm an already-latched edge."""
+        orchestrator, pub, priv = self._make_orchestrator(gridbot_config)
+        client, other = self._client_for(pub, priv, kind)
+        other.is_socket_alive.return_value = True
+        key = ("test_account", kind)
+
+        client.is_socket_alive.return_value = False
+        orchestrator._ws_health_check_once()
+        assert key in orchestrator._ws_dead_alerted
+        assert orchestrator._notifier.alert.call_count == 1
+
+        client.is_socket_alive.side_effect = RuntimeError("probe boom")
+        orchestrator._ws_health_check_once()
+        assert key in orchestrator._ws_dead_alerted
+
+        client.is_socket_alive.side_effect = None
+        client.is_socket_alive.return_value = False
+        orchestrator._ws_health_check_once()
+
+        # Still the same unbroken dead edge — no second detection alert.
+        assert key in orchestrator._ws_dead_alerted
+        assert orchestrator._notifier.alert.call_count == 1
+
+    @pytest.mark.parametrize("kind", ["public", "private"])
+    def test_alert_failure_does_not_skip_reset_or_latch(
+        self, gridbot_config, kind
+    ):
+        """A raising alert() must not cost the recovery reset nor latch."""
+        orchestrator, pub, priv = self._make_orchestrator(gridbot_config)
+        client, other = self._client_for(pub, priv, kind)
+        other.is_socket_alive.return_value = True
+        client.is_socket_alive.return_value = False
+        # Record the real call ORDER: a count alone cannot tell enqueue-then-
+        # alert from alert-then-enqueue, because _alert_ws_socket_dead swallows
+        # the alert failure and the enqueue would still run either way.
+        order = []
+
+        def _alert(*_a, **_kw):
+            order.append("alert")
+            raise RuntimeError("no threads")
+
+        orchestrator._notifier.alert.side_effect = _alert
+        orchestrator._enqueue_post_recovery_reconcile = Mock(
+            side_effect=lambda *_a, **_kw: order.append("enqueue")
+        )
+
+        orchestrator._ws_health_check_once()
+
+        client.reset.assert_called_once()
+        assert orchestrator._health_metrics.ws_reconnects[kind] == 1
+        assert ("test_account", kind) not in orchestrator._ws_dead_alerted
+        # The private enqueue precedes the alert, so a failing alert must not
+        # cost the forced reconcile either. Public never enqueues.
+        assert order == (
+            ["enqueue", "alert"] if kind == "private" else ["alert"]
+        )
+
+        # Unlatched, so the next dead probe retries the detection alert.
+        orchestrator._notifier.alert.side_effect = None
+        orchestrator._ws_health_check_once()
+
+        assert orchestrator._notifier.alert.call_count == 2
+        assert ("test_account", kind) in orchestrator._ws_dead_alerted
 
     def test_skipped_when_alive(self, gridbot_config):
         orchestrator, pub, priv = self._make_orchestrator(gridbot_config)
