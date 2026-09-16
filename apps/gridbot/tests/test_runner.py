@@ -801,6 +801,313 @@ class TestStrategyRunnerExecution:
         mock_executor.execute_cancel.assert_called_once_with(intent)
 
 
+class TestTickerFreshnessGuard:
+    """Feature 0106 — live placement only accepts a current ticker."""
+
+    _NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
+
+    @classmethod
+    def _ticker_at(
+        cls,
+        *,
+        local_ts: datetime,
+        exchange_ts: datetime | None = None,
+    ) -> TickerEvent:
+        """Build a hermetic ticker event with independently controllable clocks."""
+        return TickerEvent(
+            event_type=EventType.TICKER,
+            symbol="BTCUSDT",
+            exchange_ts=exchange_ts or local_ts,
+            local_ts=local_ts,
+            last_price=Decimal("50000"),
+            mark_price=Decimal("50000"),
+            bid1_price=Decimal("49999"),
+            ask1_price=Decimal("50001"),
+            funding_rate=Decimal("0"),
+        )
+
+    @staticmethod
+    def _intent(*, grid_level: int = 1) -> PlaceLimitIntent:
+        """Build a resolved place intent for the guarded dispatch path."""
+        return PlaceLimitIntent.create(
+            symbol="BTCUSDT",
+            side="Buy",
+            price=Decimal("49000"),
+            qty=Decimal("0.001"),
+            grid_level=grid_level,
+            direction="long",
+        )
+
+    def _runner(
+        self,
+        strategy_config: StrategyConfig,
+        mock_executor: Mock,
+        instrument_info: InstrumentInfo,
+        ticker_provider,
+        *,
+        notifier: Mock | None = None,
+    ) -> StrategyRunner:
+        """Build a runner with a fixed wall clock and optional ticker provider."""
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+            ticker_provider=ticker_provider,
+            utc_now=lambda: self._NOW,
+            notifier=notifier,
+        )
+        runner._wallet_balance = Decimal("10000")
+        return runner
+
+    def test_place_blocked_when_ticker_stale(
+        self, strategy_config, mock_executor, instrument_info, monkeypatch
+    ):
+        """A stale cache entry submits nothing and creates no placement state."""
+        runner = self._runner(
+            strategy_config,
+            mock_executor,
+            instrument_info,
+            lambda: self._ticker_at(local_ts=self._NOW - timedelta(seconds=16)),
+        )
+        make_link_id = Mock()
+        monkeypatch.setattr("gridbot.runner.make_order_link_id", make_link_id)
+
+        runner._execute_place_intent(self._intent(), EMPTY_LIMITS)
+
+        mock_executor.execute_place.assert_not_called()
+        make_link_id.assert_not_called()
+        assert runner._tracked_orders == {}
+
+    def test_place_proceeds_when_ticker_fresh(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """A current ticker preserves the existing submission path."""
+        runner = self._runner(
+            strategy_config,
+            mock_executor,
+            instrument_info,
+            lambda: self._ticker_at(local_ts=self._NOW - timedelta(seconds=15)),
+        )
+
+        runner._execute_place_intent(self._intent(), EMPTY_LIMITS)
+
+        mock_executor.execute_place.assert_called_once()
+
+    def test_place_blocked_when_no_ticker_data(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """A configured provider with no entry blocks without an outage alert."""
+        notifier = Mock()
+        runner = self._runner(
+            strategy_config,
+            mock_executor,
+            instrument_info,
+            lambda: None,
+            notifier=notifier,
+        )
+
+        runner._execute_place_intent(self._intent(), EMPTY_LIMITS)
+
+        mock_executor.execute_place.assert_not_called()
+        notifier.alert.assert_not_called()
+        # Mirror the stale twin: pin that the gate precedes wire-link-id
+        # construction and order tracking, not just submission.
+        assert runner._tracked_orders == {}
+
+    def test_runner_without_provider_places_normally(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """Bare/test runners retain today's unguarded behavior."""
+        runner = StrategyRunner(
+            strategy_config=strategy_config,
+            executor=mock_executor,
+            instrument_info=instrument_info,
+            utc_now=lambda: self._NOW,
+        )
+        runner._wallet_balance = Decimal("10000")
+
+        runner._execute_place_intent(self._intent(), EMPTY_LIMITS)
+
+        mock_executor.execute_place.assert_called_once()
+
+    def test_age_uses_local_ts_not_exchange_ts(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """An old exchange timestamp cannot make a just-received ticker stale."""
+        runner = self._runner(
+            strategy_config,
+            mock_executor,
+            instrument_info,
+            lambda: self._ticker_at(
+                local_ts=self._NOW - timedelta(seconds=1),
+                exchange_ts=self._NOW - timedelta(days=1),
+            ),
+        )
+
+        runner._execute_place_intent(self._intent(), EMPTY_LIMITS)
+
+        mock_executor.execute_place.assert_called_once()
+
+    def test_future_local_ts_clamped_fresh(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """A host clock step-back clamps negative ticker age to fresh."""
+        runner = self._runner(
+            strategy_config,
+            mock_executor,
+            instrument_info,
+            lambda: self._ticker_at(local_ts=self._NOW + timedelta(seconds=1)),
+        )
+
+        runner._execute_place_intent(self._intent(), EMPTY_LIMITS)
+
+        mock_executor.execute_place.assert_called_once()
+        # The ONLY observable effect of the clamp: without it the age would be
+        # -1.0, which is still <= max, so asserting placement alone passes
+        # either way. Pin the non-negative gauge instead.
+        assert runner.assess_ticker_freshness() == ("fresh", 0.0)
+
+    def test_cancel_intent_executes_while_stale(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """Cancels stay available during stale-price incidents."""
+        runner = self._runner(
+            strategy_config,
+            mock_executor,
+            instrument_info,
+            lambda: self._ticker_at(local_ts=self._NOW - timedelta(seconds=16)),
+        )
+        cancel = CancelIntent(symbol="BTCUSDT", order_id="open_1", reason="test")
+
+        runner._execute_cancel_intent(cancel)
+
+        mock_executor.execute_cancel.assert_called_once_with(cancel)
+
+    def test_retry_dispatch_place_blocked_when_stale(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """Retries use distinct non-terminal errors for stale and no-data."""
+        stale_runner = self._runner(
+            strategy_config,
+            mock_executor,
+            instrument_info,
+            lambda: self._ticker_at(local_ts=self._NOW - timedelta(seconds=16)),
+        )
+        no_data_runner = self._runner(
+            strategy_config, mock_executor, instrument_info, lambda: None
+        )
+
+        stale_result = stale_runner.retry_dispatch_place(self._intent())
+        no_data_result = no_data_runner.retry_dispatch_place(self._intent(grid_level=2))
+
+        assert stale_result.success is False
+        assert no_data_result.success is False
+        assert stale_result.error != no_data_result.error
+        # Exact values, and the drop-path bans applied to BOTH results: a
+        # `safety_cap*` prefix or any of the three sentinels would silently
+        # take retry_queue.process_due's terminal-drop path (retry_queue.py:248-252),
+        # which feature 0106 deliberately does not use.
+        assert stale_result.error == "ticker_stale"
+        assert no_data_result.error == "ticker_no_data"
+        for err in (stale_result.error, no_data_result.error):
+            assert not err.startswith("safety_cap")
+            assert err not in {
+                "truncate_breaker_blocked",
+                "duplicate_order_blocked",
+                "same_order_blocked",
+            }
+        mock_executor.execute_place.assert_not_called()
+
+    def test_stale_alert_is_edge_triggered(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """Stale, stale, fresh, stale emits two edge alerts."""
+        ticker = {"event": self._ticker_at(local_ts=self._NOW - timedelta(seconds=16))}
+        notifier = Mock()
+        runner = self._runner(
+            strategy_config,
+            mock_executor,
+            instrument_info,
+            lambda: ticker["event"],
+            notifier=notifier,
+        )
+
+        runner._execute_place_intent(self._intent(grid_level=1), EMPTY_LIMITS)
+        runner._execute_place_intent(self._intent(grid_level=2), EMPTY_LIMITS)
+        ticker["event"] = self._ticker_at(local_ts=self._NOW)
+        runner._execute_place_intent(self._intent(grid_level=3), EMPTY_LIMITS)
+        ticker["event"] = self._ticker_at(
+            local_ts=self._NOW - timedelta(seconds=16)
+        )
+        runner._execute_place_intent(self._intent(grid_level=4), EMPTY_LIMITS)
+
+        assert notifier.alert.call_count == 2
+
+    def test_alert_failure_does_not_latch_and_still_blocks(
+        self, strategy_config, mock_executor, instrument_info
+    ):
+        """An alert exception leaves the latch clear for the next blocked place."""
+        notifier = Mock()
+        notifier.alert.side_effect = RuntimeError("telegram unavailable")
+        runner = self._runner(
+            strategy_config,
+            mock_executor,
+            instrument_info,
+            lambda: self._ticker_at(local_ts=self._NOW - timedelta(seconds=16)),
+            notifier=notifier,
+        )
+
+        runner._execute_place_intent(self._intent(grid_level=1), EMPTY_LIMITS)
+        runner._execute_place_intent(self._intent(grid_level=2), EMPTY_LIMITS)
+
+        mock_executor.execute_place.assert_not_called()
+        assert notifier.alert.call_count == 2
+        assert runner._ticker_freshness_alerted is False
+
+    def test_shadow_mode_logs_blocked_placement(
+        self, shadow_config, mock_executor, instrument_info, caplog
+    ):
+        """Shadow mode records blocked intents without taking its normal path."""
+        notifier = Mock()
+        runner = self._runner(
+            shadow_config,
+            mock_executor,
+            instrument_info,
+            lambda: self._ticker_at(local_ts=self._NOW - timedelta(seconds=16)),
+            notifier=notifier,
+        )
+
+        with caplog.at_level(logging.INFO):
+            runner._execute_place_intent(self._intent(), EMPTY_LIMITS)
+
+        assert "[SHADOW]" in caplog.text
+        assert "stale" in caplog.text
+        assert "16.0" in caplog.text
+        assert "15.0" in caplog.text
+        assert "Would place" not in caplog.text
+        notifier.alert.assert_called_once()
+        mock_executor.execute_place.assert_not_called()
+
+    def test_stale_place_mutates_no_state(
+        self, strategy_config, mock_executor, instrument_info, monkeypatch
+    ):
+        """The gate runs before tracking or wire-id allocation."""
+        runner = self._runner(
+            strategy_config,
+            mock_executor,
+            instrument_info,
+            lambda: self._ticker_at(local_ts=self._NOW - timedelta(seconds=16)),
+        )
+        before = runner._tracked_orders.copy()
+        make_link_id = Mock()
+        monkeypatch.setattr("gridbot.runner.make_order_link_id", make_link_id)
+
+        runner._execute_place_intent(self._intent(), EMPTY_LIMITS)
+
+        assert runner._tracked_orders == before
+        make_link_id.assert_not_called()
+
+
 class TestStrategyRunnerPositionUpdate:
     """Tests for position updates."""
     def test_on_position_update_calculates_ratio(self, runner):

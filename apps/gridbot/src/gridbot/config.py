@@ -121,6 +121,15 @@ class StrategyConfig(BaseModel):
     # Grid parameters
     grid_count: int = Field(default=50, ge=4, description="Total grid levels")
     grid_step: float = Field(default=0.2, gt=0, description="Grid step percentage")
+    max_ticker_age_seconds: float = Field(
+        default=15.0,
+        gt=0,
+        le=300.0,
+        description=(
+            "Maximum local ticker age before live order placement is blocked. "
+            "Upper bound 300 also rejects float('inf') from misconfigured YAML."
+        ),
+    )
 
     # Position sizing
     amount: str = Field(

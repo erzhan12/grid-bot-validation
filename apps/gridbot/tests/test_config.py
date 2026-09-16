@@ -62,6 +62,42 @@ class TestStrategyConfig:
         assert strategy.grid_step == 0.2  # default
         assert strategy.shadow_mode is False  # default
 
+    def test_max_ticker_age_seconds_defaults_to_15(self):
+        """Feature 0106 — ticker guard defaults to a conservative 15 seconds."""
+        strategy = StrategyConfig(
+            strat_id="btc_main",
+            account="main",
+            symbol="BTCUSDT",
+            tick_size=Decimal("0.1"),
+        )
+
+        assert strategy.max_ticker_age_seconds == 15.0
+
+    @pytest.mark.parametrize("max_ticker_age_seconds", [0, -1])
+    def test_max_ticker_age_seconds_rejects_non_positive(
+        self, max_ticker_age_seconds: float
+    ):
+        """Feature 0106 — zero and negative stale-age limits are invalid."""
+        with pytest.raises(ValidationError):
+            StrategyConfig(
+                strat_id="btc_main",
+                account="main",
+                symbol="BTCUSDT",
+                tick_size=Decimal("0.1"),
+                max_ticker_age_seconds=max_ticker_age_seconds,
+            )
+
+    def test_max_ticker_age_seconds_rejects_infinity(self):
+        """Feature 0106 — a finite upper bound prevents an inert guard."""
+        with pytest.raises(ValidationError):
+            StrategyConfig(
+                strat_id="btc_main",
+                account="main",
+                symbol="BTCUSDT",
+                tick_size=Decimal("0.1"),
+                max_ticker_age_seconds=float("inf"),
+            )
+
     def test_truncate_breaker_defaults(self):
         """Feature 0064 — dirty-refresh + circuit-breaker config defaults."""
         strategy = StrategyConfig(

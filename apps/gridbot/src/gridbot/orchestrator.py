@@ -983,6 +983,11 @@ class Orchestrator:
             wallet_ws_max_age_seconds=self._config.wallet_ws_max_age_seconds,
             # Feature 0079 (issue #182) — SAME SafetyCaps instance as the executor.
             safety_caps=safety_caps,
+            # Feature 0106 (issue #210) — a zero-I/O cache peek for this
+            # strategy symbol. The runner owns all ticker-age wall-clock math.
+            ticker_provider=(
+                lambda symbol=strategy_config.symbol: self._latest_ticker.get(symbol)
+            ),
         )
         _retry_runner["runner"] = runner
         self._runners[strat_id] = runner
@@ -1270,6 +1275,10 @@ class Orchestrator:
             # refresh failures without per-occurrence ERROR spam. Monotonic per
             # runner lifetime.
             for runner in self._runners.values():
+                # Feature 0106 — assess every runner here (not in the guarded
+                # snapshot writer) so fresh data re-arms the placement-alert
+                # edge even when a status-file write fails.
+                runner.assess_ticker_freshness()
                 trips = runner.truncate_breaker_reconcile_count
                 rest_failures = runner.dirty_rest_refresh_failure_count
                 if trips > 0 or rest_failures > 0:
@@ -1395,8 +1404,11 @@ class Orchestrator:
                 cur_dirty = runner.dirty_rest_refresh_failure_count
                 prev_dirty = self._dirty_rest_last_count.get(strat_id, cur_dirty)
                 self._dirty_rest_last_count[strat_id] = cur_dirty
+                ticker_status, ticker_age_seconds = runner.ticker_freshness
                 degraded = bool(
-                    (caps and caps.rate_limited(now)) or cur_dirty > prev_dirty
+                    (caps and caps.rate_limited(now))
+                    or cur_dirty > prev_dirty
+                    or ticker_status == "stale"
                 )
                 if circuit:
                     state = HealthState.CIRCUIT_OPEN
@@ -1422,6 +1434,13 @@ class Orchestrator:
                     "shadow": runner.shadow_mode,
                     "net_position_size": runner.net_position_size,
                     "preflight_skips": runner.preflight_skip_count,
+                    "ticker_status": ticker_status,
+                    "ticker_age_seconds": (
+                        round(ticker_age_seconds, 1)
+                        if ticker_age_seconds is not None
+                        else None
+                    ),
+                    "max_ticker_age_seconds": runner.max_ticker_age_seconds,
                 })
             gauges = {
                 "runners": len(self._runners),

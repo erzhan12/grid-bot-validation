@@ -12,7 +12,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from gridcore import InstrumentInfo
+from gridcore import EventType, InstrumentInfo, TickerEvent
+from gridcore.intents import PlaceLimitIntent
 from gridbot.config import (
     AccountConfig,
     GridbotConfig,
@@ -57,6 +58,33 @@ def _config(tmp_path, shadow=False):
 def _read(path):
     with open(path) as f:
         return json.load(f)
+
+
+def _ticker(*, local_ts: datetime) -> TickerEvent:
+    """Build a ticker cache entry without involving the normalizer or network."""
+    return TickerEvent(
+        event_type=EventType.TICKER,
+        symbol="BTCUSDT",
+        exchange_ts=local_ts,
+        local_ts=local_ts,
+        last_price=Decimal("50000"),
+        mark_price=Decimal("50000"),
+        bid1_price=Decimal("49999"),
+        ask1_price=Decimal("50001"),
+        funding_rate=Decimal("0"),
+    )
+
+
+def _place_intent() -> PlaceLimitIntent:
+    """Build a resolved place intent for the freshness-alert re-arm test."""
+    return PlaceLimitIntent.create(
+        symbol="BTCUSDT",
+        side="Buy",
+        price=Decimal("49000"),
+        qty=Decimal("0.001"),
+        grid_level=1,
+        direction="long",
+    )
 
 
 @patch("gridbot.orchestrator.BybitRestClient")
@@ -216,3 +244,119 @@ def test_health_status_degraded_requires_new_failure_not_sticky(
     # Same count on the next sweep -> still healthy (strict >, not >=).
     orch._health_check_once()
     assert _read(path)["state"] == "healthy"
+
+
+@patch("gridbot.orchestrator.BybitRestClient")
+@patch("gridbot.orchestrator.PublicWebSocketClient")
+@patch("gridbot.orchestrator.PrivateWebSocketClient")
+def test_snapshot_reports_ticker_age_and_status(
+    _mock_priv, _mock_pub, _mock_rest, tmp_path,
+):
+    """Feature 0106 — fresh cache data is surfaced as a current gauge."""
+    cfg = _config(tmp_path)
+    orch = Orchestrator(cfg)
+    orch._init_account(cfg.accounts[0])
+    orch._init_strategy(cfg.strategies[0])
+    orch._latest_ticker["BTCUSDT"] = _ticker(local_ts=datetime.now(UTC))
+
+    orch._health_check_once()
+
+    strategy = _read(cfg.status_file_path)["strategies"][0]
+    assert strategy["ticker_status"] == "fresh"
+    assert strategy["ticker_age_seconds"] >= 0
+    assert strategy["max_ticker_age_seconds"] == 15.0
+
+
+@patch("gridbot.orchestrator.BybitRestClient")
+@patch("gridbot.orchestrator.PublicWebSocketClient")
+@patch("gridbot.orchestrator.PrivateWebSocketClient")
+def test_stale_ticker_degrades_snapshot(_mock_priv, _mock_pub, _mock_rest, tmp_path):
+    """A stale ticker is the lowest-priority state that degrades health."""
+    cfg = _config(tmp_path)
+    orch = Orchestrator(cfg)
+    orch._init_account(cfg.accounts[0])
+    orch._init_strategy(cfg.strategies[0])
+    orch._latest_ticker["BTCUSDT"] = _ticker(
+        local_ts=datetime.now(UTC) - timedelta(seconds=16)
+    )
+
+    orch._health_check_once()
+
+    snapshot = _read(cfg.status_file_path)
+    assert snapshot["state"] == "degraded"
+    assert snapshot["strategies"][0]["ticker_status"] == "stale"
+
+
+@patch("gridbot.orchestrator.BybitRestClient")
+@patch("gridbot.orchestrator.PublicWebSocketClient")
+@patch("gridbot.orchestrator.PrivateWebSocketClient")
+def test_no_data_ticker_does_not_degrade(_mock_priv, _mock_pub, _mock_rest, tmp_path):
+    """Startup before a first ticker remains healthy rather than false-degraded."""
+    cfg = _config(tmp_path)
+    orch = Orchestrator(cfg)
+    orch._init_account(cfg.accounts[0])
+    orch._init_strategy(cfg.strategies[0])
+
+    orch._health_check_once()
+
+    snapshot = _read(cfg.status_file_path)
+    assert snapshot["state"] == "healthy"
+    assert snapshot["strategies"][0]["ticker_status"] == "no_data"
+    assert snapshot["strategies"][0]["ticker_age_seconds"] is None
+
+
+@patch("gridbot.orchestrator.BybitRestClient")
+@patch("gridbot.orchestrator.PublicWebSocketClient")
+@patch("gridbot.orchestrator.PrivateWebSocketClient")
+def test_health_sweep_rearms_alert_latch(_mock_priv, _mock_pub, _mock_rest, tmp_path):
+    """A fresh periodic assessment re-arms alerts without placement activity."""
+    cfg = _config(tmp_path)
+    notifier = Mock()
+    orch = Orchestrator(cfg, notifier=notifier)
+    orch._init_account(cfg.accounts[0])
+    orch._init_strategy(cfg.strategies[0])
+    runner = orch._runners["btcusdt_test"]
+    runner._ticker_freshness_alerted = True
+    orch._latest_ticker["BTCUSDT"] = _ticker(local_ts=datetime.now(UTC))
+
+    # The snapshot writer is deliberately broken for this sweep. The plan puts
+    # the assessment in _health_check_once and NOT inside _write_health_snapshot,
+    # whose try/except swallows everything (orchestrator.py:1442-1446) — if the
+    # assessment ever moved in there, a failing write would silently skip the
+    # re-arm. Without this, the test passes in both placements.
+    orch._health_writer.write = Mock(side_effect=RuntimeError("status write down"))
+
+    orch._health_check_once()
+    assert runner._ticker_freshness_alerted is False
+
+    orch._latest_ticker["BTCUSDT"] = _ticker(
+        local_ts=datetime.now(UTC) - timedelta(seconds=16)
+    )
+    runner._execute_place_intent(_place_intent(), {"long": [], "short": []})
+
+    notifier.alert.assert_called_once()
+
+
+@patch("gridbot.orchestrator.BybitRestClient")
+@patch("gridbot.orchestrator.PublicWebSocketClient")
+@patch("gridbot.orchestrator.PrivateWebSocketClient")
+def test_worse_existing_degradation_not_overwritten(
+    _mock_priv, _mock_pub, _mock_rest, tmp_path,
+):
+    """A stale ticker cannot overwrite a worse circuit-open health state."""
+    cfg = _config(tmp_path)
+    orch = Orchestrator(cfg)
+    orch._init_account(cfg.accounts[0])
+    orch._init_strategy(cfg.strategies[0])
+    orch._latest_ticker["BTCUSDT"] = _ticker(
+        local_ts=datetime.now(UTC) - timedelta(seconds=16)
+    )
+    orch._safety_caps["btcusdt_test"].check_loss_breaker(
+        session_realized_pnl=Decimal("-50"), now_utc=datetime.now(UTC)
+    )
+
+    orch._health_check_once()
+
+    strategy = _read(cfg.status_file_path)["strategies"][0]
+    assert strategy["state"] == "circuit_open"
+    assert strategy["ticker_status"] == "stale"

@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 # Provider returns (snapshot, age_seconds) or None — the non-blocking
 # peek_wallet_snapshot reader injected for the Phase-4 preflight (feature 0066).
 WalletProvider = Callable[[], "Optional[tuple[WalletSnapshot, float]]"]
+TickerProvider = Callable[[], "Optional[TickerEvent]"]
 
 from gridcore import (  # noqa: E402
     GridEngine,
@@ -131,6 +132,14 @@ _LOSS_BREAKER_ALERT_MAX_ERROR_CHARS = 500
 # (~100 bytes/entry incl. dict-node overhead; 4096 ≈ 400 KB per strat).
 _EXEC_DEDUP_MAX_ENTRIES = 4096
 
+# Feature 0106 (issue #210) — ticker freshness is based on wall-clock receipt
+# time. A host clock step-back is the only reachable clock anomaly; clamp it to
+# this floor so a future local timestamp remains fresh rather than crashing.
+_TICKER_AGE_FLOOR_SECONDS = 0.0
+_TICKER_STATUS_FRESH = "fresh"
+_TICKER_STATUS_STALE = "stale"
+_TICKER_STATUS_NO_DATA = "no_data"
+
 
 @dataclass
 class _SameOrderDedupEntry:
@@ -226,6 +235,8 @@ class StrategyRunner:
         wallet_provider: Optional["WalletProvider"] = None,
         wallet_ws_max_age_seconds: float = 45.0,
         safety_caps: Optional[SafetyCaps] = None,
+        ticker_provider: Optional["TickerProvider"] = None,
+        utc_now: Optional[Callable[[], datetime]] = None,
     ):
         """Initialize strategy runner.
 
@@ -282,6 +293,12 @@ class StrategyRunner:
                 truth). When None (direct/test callers) every cap call is
                 short-circuited to allow / no-op; SafetyCaps itself also
                 short-circuits internally when its config.enabled is False.
+            ticker_provider: Optional zero-I/O reader of the latest ticker for
+                this strategy's symbol. When None, placement keeps the legacy
+                unguarded behavior for direct/test tooling construction.
+            utc_now: Wall-clock UTC reader for ticker age calculations. Kept
+                separate from ``clock``, which is monotonic and only serves
+                breaker/throttle windows.
         """
         # 0047: if a DB writer is wired, account_id MUST be explicitly set —
         # the dummy default would FK-mismatch with replay's account scope
@@ -313,6 +330,12 @@ class StrategyRunner:
         # Feature 0064 — 110017 retry-storm self-heal + circuit-breaker (#149).
         self._rest_client = rest_client
         self._clock = clock or time.monotonic
+        self._ticker_provider = ticker_provider
+        self._utc_now = utc_now or (lambda: datetime.now(UTC))
+        self._ticker_freshness_alerted = False
+        self._ticker_freshness_blocked_state: Optional[str] = None
+        self._ticker_status = _TICKER_STATUS_NO_DATA
+        self._ticker_age_seconds: Optional[float] = None
         self._on_truncate_breaker_tripped = on_truncate_breaker_tripped
         # Feature 0069 (issue #151) signal 1 — callback invoked when the rolling
         # placement-failure UNION window crosses its threshold.
@@ -583,6 +606,117 @@ class StrategyRunner:
     def shadow_mode(self) -> bool:
         """Whether running in shadow mode."""
         return self._config.shadow_mode
+
+    @property
+    def ticker_freshness(self) -> tuple[str, Optional[float]]:
+        """Most recently assessed ticker status and non-negative age gauge."""
+        return self._ticker_status, self._ticker_age_seconds
+
+    @property
+    def max_ticker_age_seconds(self) -> float:
+        """Configured ticker-age threshold for the health snapshot gauge."""
+        return self._config.max_ticker_age_seconds
+
+    def assess_ticker_freshness(self) -> tuple[str, Optional[float]]:
+        """Assess the cached ticker age and re-arm the stale-alert edge.
+
+        The ticker provider is a zero-I/O cache peek injected by the live
+        orchestrator. Direct/test runners without one retain their historic
+        unguarded placement behavior; they report ``no_data`` for observation
+        but callers must not use that state as a placement block. A ``fresh``
+        result clears both stale-episode latches, regardless of whether the
+        assessment came from a placement attempt or a health sweep.
+        """
+        if self._ticker_provider is None:
+            self._ticker_status = _TICKER_STATUS_NO_DATA
+            self._ticker_age_seconds = None
+            return _TICKER_STATUS_NO_DATA, None
+
+        ticker = self._ticker_provider()
+        if ticker is None:
+            self._ticker_status = _TICKER_STATUS_NO_DATA
+            self._ticker_age_seconds = None
+            return _TICKER_STATUS_NO_DATA, None
+
+        now = self._utc_now()
+        local_ts = ticker.local_ts
+        if local_ts.tzinfo is None:
+            local_ts = local_ts.replace(tzinfo=UTC)
+        age_seconds = max(
+            _TICKER_AGE_FLOOR_SECONDS,
+            (now - local_ts).total_seconds(),
+        )
+        self._ticker_age_seconds = age_seconds
+        if age_seconds <= self._config.max_ticker_age_seconds:
+            self._ticker_status = _TICKER_STATUS_FRESH
+            self._ticker_freshness_alerted = False
+            self._ticker_freshness_blocked_state = None
+            return _TICKER_STATUS_FRESH, age_seconds
+        self._ticker_status = _TICKER_STATUS_STALE
+        return _TICKER_STATUS_STALE, age_seconds
+
+    def _ticker_freshness_blocks_placement(
+        self, intent: PlaceLimitIntent
+    ) -> tuple[bool, str]:
+        """Return whether a place must be blocked without affecting cancels.
+
+        Stale ticker alerts are edge-triggered per runner. A successful alert
+        latches the stale episode; a failed alert leaves the latch clear so a
+        later blocked placement retries it. ``no_data`` is logged once but is
+        a startup condition, not an alert condition.
+        """
+        if self._ticker_provider is None:
+            return False, _TICKER_STATUS_FRESH
+
+        status, age_seconds = self.assess_ticker_freshness()
+        if status == _TICKER_STATUS_FRESH:
+            return False, status
+
+        if self._ticker_freshness_blocked_state != status:
+            age_display = "none" if age_seconds is None else f"{age_seconds:.1f}"
+            message = (
+                f"{self.strat_id}: ticker freshness={status}; blocking "
+                f"{intent.symbol} {intent.side} qty={intent.qty} @ {intent.price}; "
+                f"age={age_display}s max={self._config.max_ticker_age_seconds:.1f}s"
+            )
+            if self.shadow_mode:
+                logger.info("[SHADOW] %s", message)
+            elif status == _TICKER_STATUS_NO_DATA:
+                # Startup, not a failure: no tick has arrived yet. ERROR here
+                # would count against the health analyzer's zero-ERROR check
+                # for a condition the plan classes as non-degrading.
+                logger.warning(message)
+            else:
+                logger.error(message)
+            self._ticker_freshness_blocked_state = status
+
+        if (
+            status == _TICKER_STATUS_STALE
+            and not self._ticker_freshness_alerted
+            and self._notifier is not None
+        ):
+            # The notifier check belongs in the condition, not inside the try:
+            # a runner built without a notifier never sent anything, so
+            # latching would swallow this edge for a notifier attached later.
+            try:
+                self._notifier.alert(
+                    (
+                        f"{self.strat_id}: ticker freshness stale for "
+                        f"{intent.symbol}; age={age_seconds:.1f}s exceeds "
+                        f"{self._config.max_ticker_age_seconds:.1f}s"
+                    ),
+                    error_key=f"ticker_freshness_{self.strat_id}",
+                )
+            except Exception:
+                logger.error(
+                    "%s: ticker freshness alert failed",
+                    self.strat_id,
+                    exc_info=True,
+                )
+            else:
+                self._ticker_freshness_alerted = True
+
+        return True, status
 
     @property
     def engine(self) -> GridEngine:
@@ -2240,14 +2374,16 @@ class StrategyRunner:
 
         Pipeline (feature 0064 — explicit order, do not reorder):
         1. resolve qty → qty<=0 early return.
-        2. breaker ``is_blocked`` → early return (no REST, no guard, no submit
+        2. ticker freshness → early return (no breakers, REST, tracking, or
+           submit when no current cache entry is available).
+        3. breaker ``is_blocked`` → early return (no REST, no guard, no submit
            while a scope key is in cooldown).
-        3. dirty-mirror REST refresh (reduce-only only, throttled) BEFORE the
+        4. dirty-mirror REST refresh (reduce-only only, throttled) BEFORE the
            guard, so step 4 evaluates fresh size.
-        4. ``_is_good_to_place`` → unchanged guard (now reads the freshened
+        5. ``_is_good_to_place`` → unchanged guard (now reads the freshened
            mirror); oversized reduce-only is rejected here, nothing submitted.
-        5. duplicate-track + wire-link-id (existing).
-        6. ``execute_place`` → post-submit breaker bookkeeping.
+        6. duplicate-track + wire-link-id (existing).
+        7. ``execute_place`` → post-submit breaker bookkeeping.
         """
         # Step 1 — resolve qty (engine emits qty=0, we fill it in)
         intent = self._resolve_qty(intent)
@@ -2255,9 +2391,16 @@ class StrategyRunner:
             logger.debug(f"{self.strat_id}: Skipping order with qty<=0 at {intent.price}")
             return
 
+        # Step 2 — no live placement may reach a breaker, REST refresh,
+        # tracking mutation, wire-id allocation, or executor submit on a stale
+        # (or not-yet-seen) ticker. Cancels intentionally do not use this gate.
+        blocked, _ = self._ticker_freshness_blocks_placement(intent)
+        if blocked:
+            return
+
         now = self._clock()
 
-        # Step 2 — circuit-breaker: drop while this scope key is in cooldown.
+        # Step 3 — circuit-breaker: drop while this scope key is in cooldown.
         # Sits first so a tripped scope never triggers a REST refresh on
         # per-ticker re-emission during cooldown.
         if self._truncate_breaker.is_blocked(intent.side, intent.price, now):
@@ -2451,6 +2594,14 @@ class StrategyRunner:
         Also honors the SAME ORDER soft-block (feature 0031): tick-path
         placements are suppressed while latched, so retries must not bypass it.
         """
+        blocked, ticker_status = self._ticker_freshness_blocks_placement(intent)
+        if blocked:
+            return OrderResult(
+                success=False,
+                order_link_id=intent.order_link_id,
+                error=f"ticker_{ticker_status}",
+            )
+
         if self._same_order_error:
             logger.debug(
                 "%s: SAME ORDER latched — dropping retry %s %s @ %s",

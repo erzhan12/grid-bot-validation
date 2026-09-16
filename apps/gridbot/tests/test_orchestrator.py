@@ -2823,6 +2823,15 @@ class TestOrchestratorRetryDispatcher:
         orchestrator = Orchestrator(gridbot_config)
         orchestrator._init_account(account_config)
         orchestrator._init_strategy(strategy_config)
+        # Feature 0106: this test covers routing after live market data has
+        # arrived; a startup retry without a ticker is intentionally blocked.
+        orchestrator._latest_ticker["BTCUSDT"] = TickerEvent(
+            event_type=EventType.TICKER,
+            symbol="BTCUSDT",
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+            last_price=Decimal("50000.0"),
+        )
 
         executor = orchestrator._runners["btcusdt_test"]._executor
         retry_queue = orchestrator._retry_queues["btcusdt_test"]
