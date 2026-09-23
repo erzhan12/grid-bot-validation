@@ -31,6 +31,7 @@ Records raw Bybit mainnet WebSocket data to SQLite. Reuses `event_saver` collect
 4. **Position/wallet test data format**: `PositionWriter` and `WalletWriter` expect Bybit-formatted dicts with `"data"` keys (e.g., `{"data": [{"symbol": "BTCUSDT", ...}]}`). Flat dicts silently produce zero snapshots.
 5. **Test fixture deduplication**: Shared `db` fixture lives in `conftest.py` — do not duplicate in individual test files. Same for `basic_config` and `config_with_account`.
 6. **Mock config completeness**: When using `MagicMock()` for config in tests, set all attributes that `main()` accesses before the code path under test. E.g., `mock_config.database_url = "sqlite:///test.db"` — bare MagicMock attributes break `urlparse()`.
+7. **Vertical gap tests** live in `test_recorder_gap_reconciliation.py`. Do not mock the collectors. Patch `event_saver.collectors.public_collector.PublicWebSocketClient`, `event_saver.collectors.private_collector.PrivateWebSocketClient`, **and both** `recorder.recorder.BybitRestClient` and `event_saver.reconciler.BybitRestClient`. Private trigger is `PrivateCollector._ws_health_check_once` on a dead fake socket (0037), not 30s silence (0035). Public REST id field is `execId`. Drain fire-and-forget reconcile by polling DB rows, not by reading `_gap_count` alone.
 
 ---
 
