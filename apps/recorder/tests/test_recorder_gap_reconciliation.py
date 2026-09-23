@@ -40,12 +40,14 @@ class FakePublicWS:
         self.on_reconnect = kwargs.get("on_reconnect")
 
     def connect(self) -> None:
-        return None
+        pass
 
     def disconnect(self) -> None:
-        return None
+        pass
 
     def get_connection_state(self) -> None:
+        # PublicCollector.start() never reads this in the gap path;
+        # PublicCollector.get_connection_state() just forwards it.
         return None
 
     def fire_reconnect(self, disconnected_at: datetime, reconnected_at: datetime) -> None:
@@ -63,10 +65,10 @@ class FakePrivateWS:
         self.last_message_ts = _FIXED_TS
 
     def connect(self) -> None:
-        return None
+        pass
 
     def disconnect(self) -> None:
-        return None
+        pass
 
     def is_socket_alive(self) -> bool:
         return self.alive
@@ -163,6 +165,12 @@ async def _wait_for_count(db, model, expected: int, *, timeout: float = _WAIT_TI
     )
 
 
+async def _drain_event_loop(seconds: float = _NEGATIVE_DRAIN) -> None:
+    deadline = asyncio.get_event_loop().time() + seconds
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(_POLL_INTERVAL)
+
+
 async def _wait_until(pred, *, timeout: float = _WAIT_TIMEOUT, desc: str = "condition") -> None:
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
@@ -173,6 +181,8 @@ async def _wait_until(pred, *, timeout: float = _WAIT_TIMEOUT, desc: str = "cond
 
 
 def _public_trade_payload(gap_start: datetime, gap_end: datetime) -> dict:
+    """Bybit public-trade REST payload with ``time`` at the gap midpoint."""
+
     mid = gap_start + (gap_end - gap_start) / 2
     return {
         "execId": _TEST_TRADE_ID,
@@ -184,6 +194,8 @@ def _public_trade_payload(gap_start: datetime, gap_end: datetime) -> dict:
 
 
 def _private_exec_payload(gap_start: datetime, gap_end: datetime) -> dict:
+    """Bybit execution REST payload with ``execTime`` at the gap midpoint."""
+
     mid = gap_start + (gap_end - gap_start) / 2
     return {
         "category": "linear",
@@ -270,9 +282,7 @@ class TestRecorderDisconnectReconciliation:
                 assert recorder._gap_count == 1
                 # Drain long enough that a mistakenly scheduled reconcile
                 # (run_coroutine_threadsafe + to_thread) would have run.
-                deadline = asyncio.get_event_loop().time() + _NEGATIVE_DRAIN
-                while asyncio.get_event_loop().time() < deadline:
-                    await asyncio.sleep(_POLL_INTERVAL)
+                await _drain_event_loop()
                 assert fake_rest.calls["recent_trades"] == 0
                 assert _count(db, PublicTrade) == 0
             finally:
@@ -313,9 +323,7 @@ class TestRecorderDisconnectReconciliation:
                     lambda: fake_rest.calls["recent_trades"] >= 1,
                     desc="get_recent_trades call",
                 )
-                deadline = asyncio.get_event_loop().time() + _NEGATIVE_DRAIN
-                while asyncio.get_event_loop().time() < deadline:
-                    await asyncio.sleep(_POLL_INTERVAL)
+                await _drain_event_loop()
                 assert _count(db, PublicTrade) == 1
             finally:
                 await recorder.stop()
