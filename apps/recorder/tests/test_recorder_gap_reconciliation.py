@@ -8,6 +8,7 @@ See docs/features/0107_PLAN.md and issue #211.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -23,6 +24,11 @@ from recorder.recorder import Recorder
 _POLL_INTERVAL = 0.01
 _WAIT_TIMEOUT = 2.0
 _NEGATIVE_DRAIN = 0.2
+_TEST_SYMBOL = "BTCUSDT"
+_TEST_PRICE = "50000.00"
+_TEST_TRADE_ID = "gap-trade-1"
+_TEST_EXEC_ID = "gap-exec-1"
+_FIXED_TS = datetime(2026, 1, 1, 0, 0, 0, tzinfo=UTC)
 
 
 class FakePublicWS:
@@ -54,7 +60,7 @@ class FakePrivateWS:
         self.on_disconnect = kwargs.get("on_disconnect")
         self.on_reconnect = kwargs.get("on_reconnect")
         self.alive = True
-        self.last_message_ts = datetime.now(UTC)
+        self.last_message_ts = _FIXED_TS
 
     def connect(self) -> None:
         return None
@@ -90,6 +96,8 @@ def _make_fake_rest(*, trades=None, executions=None):
             pass
 
         def get_recent_trades(self, symbol, limit=1000):
+            if symbol != _TEST_SYMBOL:
+                raise ValueError(f"unexpected symbol {symbol!r}")
             calls["recent_trades"] += 1
             return list(trades)
 
@@ -101,6 +109,8 @@ def _make_fake_rest(*, trades=None, executions=None):
             max_pages,
             return_truncated=True,
         ):
+            if symbol != _TEST_SYMBOL:
+                raise ValueError(f"unexpected symbol {symbol!r}")
             calls["executions"] += 1
             return (list(executions), False)
 
@@ -118,7 +128,7 @@ def _make_fake_rest(*, trades=None, executions=None):
 
 
 @contextmanager
-def _patched_network(fake_rest_cls):
+def _patched_network(fake_rest_cls) -> Generator[None, None, None]:
     """Patch both REST import sites and both collector WS clients."""
     with (
         patch(
@@ -165,10 +175,10 @@ async def _wait_until(pred, *, timeout: float = _WAIT_TIMEOUT, desc: str = "cond
 def _public_trade_payload(gap_start: datetime, gap_end: datetime) -> dict:
     mid = gap_start + (gap_end - gap_start) / 2
     return {
-        "execId": "gap-trade-1",
+        "execId": _TEST_TRADE_ID,
         "time": int(mid.timestamp() * 1000),
         "side": "Buy",
-        "price": "50000.00",
+        "price": _TEST_PRICE,
         "size": "0.001",
     }
 
@@ -178,12 +188,12 @@ def _private_exec_payload(gap_start: datetime, gap_end: datetime) -> dict:
     return {
         "category": "linear",
         "execType": "Trade",
-        "execId": "gap-exec-1",
+        "execId": _TEST_EXEC_ID,
         "orderId": "ord-1",
         "orderLinkId": "link-1",
-        "symbol": "BTCUSDT",
+        "symbol": _TEST_SYMBOL,
         "side": "Buy",
-        "execPrice": "50000.00",
+        "execPrice": _TEST_PRICE,
         "execQty": "0.001",
         "execFee": "0.01",
         "closedPnl": "0",
@@ -211,17 +221,17 @@ class TestRecorderDisconnectReconciliation:
 
                 with db.get_session() as session:
                     row = session.query(PublicTrade).one()
-                    assert row.trade_id == "gap-trade-1"
-                    assert row.symbol == "BTCUSDT"
-                    assert row.price == Decimal("50000.00")
+                    assert row.trade_id == _TEST_TRADE_ID
+                    assert row.symbol == _TEST_SYMBOL
+                    assert row.price == Decimal(_TEST_PRICE)
             finally:
                 await recorder.stop()
 
     async def test_private_ws_disconnect_triggers_gap_reconciliation(
         self, config_with_account, db, db_with_gridbot_seed
     ):
-        gap_start = datetime.now(UTC) - timedelta(seconds=30)
-        gap_end = datetime.now(UTC)
+        gap_start = _FIXED_TS
+        gap_end = gap_start + timedelta(seconds=30)
         fake_rest = _make_fake_rest(
             executions=[_private_exec_payload(gap_start, gap_end)]
         )
@@ -239,8 +249,8 @@ class TestRecorderDisconnectReconciliation:
 
                 with db.get_session() as session:
                     row = session.query(PrivateExecution).one()
-                    assert row.exec_id == "gap-exec-1"
-                    assert row.symbol == "BTCUSDT"
+                    assert row.exec_id == _TEST_EXEC_ID
+                    assert row.symbol == _TEST_SYMBOL
                     assert row.run_id == str(recorder._run_id)
             finally:
                 await recorder.stop()
@@ -279,14 +289,14 @@ class TestRecorderDisconnectReconciliation:
         with db.get_session() as session:
             session.add(
                 PublicTrade(
-                    symbol="BTCUSDT",
-                    trade_id="gap-trade-1",
+                    symbol=_TEST_SYMBOL,
+                    trade_id=_TEST_TRADE_ID,
                     exchange_ts=datetime.fromtimestamp(
                         payload["time"] / 1000, tz=UTC
                     ),
-                    local_ts=datetime.now(UTC),
+                    local_ts=_FIXED_TS,
                     side="Buy",
-                    price=Decimal("50000.00"),
+                    price=Decimal(_TEST_PRICE),
                     size=Decimal("0.001"),
                 )
             )

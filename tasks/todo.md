@@ -65,3 +65,11 @@ Plan: docs/features/0102_PLAN.md | Issue: #246
 - [x] Phase 2: executor error routing, cooldown, metrics, and retry handling (TDD)
 - [x] Phase 3: loss-breaker cancellation alerting (TDD)
 - [x] Required verification gates
+
+# Feature 0107 — Recorder gap reconciliation tests
+
+## Follow-ups
+- 0107 review P2: add a recorder-level test where `get_recent_trades` /
+  `get_executions_all` raises, and assert the recorder stays running and the
+  error is logged via `_log_future_error`. Out of scope for #211 (the
+  "marks run unhealthy" case is not current behavior).
