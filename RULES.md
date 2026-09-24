@@ -21,7 +21,7 @@ every ~10 features, sweep the rule files and prune entries that no longer apply.
 | `.claude/rules/grid-db.md` | `shared/db/**` | Multi-tenant DB layer rules, enums, env vars |
 | `.claude/rules/bybit-adapter.md` | `packages/bybit_adapter/**` | REST/WS components, event normalization, V5 API status |
 | `.claude/rules/event-saver.md` | `apps/event_saver/**`, `apps/recorder/**` | Data capture rules, env vars, private WS disconnect handling |
-| `.claude/rules/gridbot.md` | `apps/gridbot/**` | Live bot: architecture, fail-closed startup (0086), health file (0082), exceptions, Telegram, embedded saver, reconciliation invariants, orderLinkId format, WS reconnect (0024) |
+| `.claude/rules/gridbot.md` | `apps/gridbot/**` | Live bot: architecture, fail-closed startup (0086), health file (0082), status consumer (0109), exceptions, Telegram, embedded saver, reconciliation invariants, orderLinkId format, WS reconnect (0024) |
 | `.claude/rules/backtest.md` | `apps/backtest/**` | Backtest engine architecture, risk multiplier composition, CLI, metrics |
 | `.claude/rules/comparator.md` | `apps/comparator/**` | Validation concepts, NormalizedTrade, spike-vs-drift stats (0070) |
 | `.claude/rules/recorder.md` | `apps/recorder/**` | Standalone recorder rules + test pitfalls |

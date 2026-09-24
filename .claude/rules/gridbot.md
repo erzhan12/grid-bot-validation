@@ -76,6 +76,51 @@ log parsing. Example:
   (which owns the durable cross-restart `health_state.json` ledger); this file does
   not touch `health_state.json`.
 
+#### Consumer contract (feature 0109, issue #258 Phase 1)
+
+Feature 0082 wrote the file; nothing read it until 0109 — a crashed / SIGKILLed /
+OOM-killed / wedged process left a frozen `healthy` file that nobody noticed.
+`gridbot.status_check.check_status(path, *, now, max_age_seconds)` (stdlib +
+`gridbot.health.HealthState` only, no pybit/DB/config import) is the pure evaluator;
+five rules, **first failure wins**:
+
+1. **missing** — file does not exist.
+2. **malformed** — unreadable (other `OSError`), not valid UTF-8, not valid JSON
+   (incl. empty file / pathological nesting), top-level not a JSON object, or
+   `state`/`generated_at` absent/wrong-typed/unparseable/naive (no tzinfo); also a
+   `generated_at` further in the future than `max_age_seconds` allows (a same-host
+   clock cannot legitimately do that — an unchecked future stamp would mask a frozen
+   file indefinitely).
+3. **stale** — `now − generated_at > max_age_seconds` (strict `>`; equal-to-threshold
+   is fresh), **regardless of `state`** — a frozen `healthy` file is the primary
+   failure mode this exists to catch.
+4. **unhealthy** — fresh, but `state` ∈ `{degraded, auth_cooldown, circuit_open}`.
+5. **ok** — fresh and `state` ∈ `{healthy, starting}`. `starting` is accepted while
+   fresh because it is written once at end of `start()` and superseded by the first
+   ~10s sweep; a wedged startup stops refreshing it and is caught by rule 3, not rule 5.
+
+Default threshold `max_age_seconds=60` = 6 missed 10s sweeps, head-room for blocking
+REST calls on the main loop. The producer writes tmp+fsync+`os.replace` (atomic
+rename — see `HealthStatusWriter.write` in `apps/gridbot/src/gridbot/health.py`), so rule 2 only fires on genuinely bad
+content, never a torn read. Only `state` and `generated_at` are contract keys — every
+other top-level key (e.g. a future `reasons[]`) is ignored, forward-compatible with
+Phase 2.
+
+CLI: `python -m gridbot.status_check --path <p> --max-age-seconds <n>` (defaults:
+`/tmp/gridbot_status.json`, 60) prints one line
+(`OK state=<s> age=<a>s path=<p>` / `ALERT reason=<r> state=<s|-> age=<a|->s
+path=<p> detail=<d>`) and exits 0 if healthy else 1; invalid `--max-age-seconds`
+(`<= 0`, `nan`, `inf`) exits 2. Invoked as a module (`python -m`, not a console
+script) so `uv.lock` never churns from this feature.
+
+**Pitfall — don't use `Notifier` from this module or its caller.** `Notifier` sends
+from a daemon background thread inside the long-lived bot process; a short-lived cron
+invocation exits before the thread flushes, silently dropping the alert. `status_check`
+only returns an exit code + one stdout line; the VPS `watchdog.sh` cron job (Phase 4c,
+see `docs/deploy/status_watchdog.md`) calls the CLI and routes a non-zero verdict
+through its own existing Telegram send + throttle — no new alert channel, no new cron
+line.
+
 ### Key Patterns
 
 - **Order tracking**: `TrackedOrder` dataclass, deterministic 16-char hex `client_order_id`
