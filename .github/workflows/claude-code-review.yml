@@ -42,41 +42,13 @@ jobs:
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number }}
 
-            Please perform a comprehensive code review with the following focus areas:
+            Review this PR for defects that matter in this repository: a Bybit USDT-perp grid trading bot that runs live on mainnet, plus its backtest, replay, and validation tooling. Weight findings by how they could lose money or corrupt state — wrong order placement or sizing, broken reconciliation after reconnects, `float` in price/qty math (the codebase uses `Decimal`), network or DB imports in `packages/gridcore` (pure logic), event handlers that swallow exceptions, DB queries not filtered by `user_id`, and behavior changes without a test. Also report leaked secrets, unsafe shell/SQL construction, and real performance problems in hot paths.
 
-            1. **Code Quality**
-               - Clean code principles and best practices
-               - Proper error handling and edge cases
-               - Code readability and maintainability
-
-            2. **Security**
-               - Check for potential security vulnerabilities
-               - Validate input sanitization
-               - Review authentication/authorization logic
-
-            3. **Performance**
-               - Identify potential performance bottlenecks
-               - Review database queries for efficiency
-               - Check for memory leaks or resource issues
-
-            4. **Testing**
-               - Verify adequate test coverage
-               - Review test quality and edge cases
-               - Check for missing test scenarios
-
-            5. **Documentation**
-               - Ensure code is properly documented
-               - Verify README updates for new features
-               - Check API documentation accuracy
-
-            Use the repository's CLAUDE.md for guidance on style and conventions. Be constructive and helpful in your feedback.
+            Project conventions and invariants live in `CLAUDE.md` and `.claude/rules/*.md`. Read the rules file for each component the PR touches and treat its invariants as the review bar.
 
             ## Output Instructions
 
-            1. Review all changed files in the PR thoroughly.
-            2. Post exactly ONE top-level comment using `gh pr comment` containing ALL findings.
-            3. Do NOT use `gh pr review` with inline comments.
-            4. Do NOT post multiple comments. Everything must be in a SINGLE `gh pr comment`.
+            Review every changed file, then post all findings in a single top-level `gh pr comment` — a downstream parser reads exactly one comment in the format below.
 
             ## Comment Format
 
@@ -121,7 +93,6 @@ jobs:
             - **CHANGES REQUESTED**: Any P0 issue exists, or multiple P1 issues that together pose a significant risk.
 
             ## Rules
-            - Everything in ONE `gh pr comment` call, no inline comments
             - Use exact file paths relative to repo root with line numbers from the diff
             - Each fix must be a specific actionable instruction, not vague advice
             - Use category tags: [SECURITY], [BUG], [PERFORMANCE], [QUALITY], [TESTING], [DOCS]
@@ -134,6 +105,6 @@ jobs:
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
           claude_args: |
-            --model claude-sonnet-4-5-20250929
-            --allowed-tools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*)"
+            --model opus
+            --allowed-tools "Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
 
