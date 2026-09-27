@@ -32,8 +32,9 @@ strategies:
       max_open_orders: 60  # C2: reject place intents (open AND reduce-only — a count limit) at/above this many tracked orders. Omit to disable.
       session_loss_limit: "50"  # C3: positive USDT magnitude; when session realized PnL <= -this, cancel working orders once then suppress all new places. Omit to disable.
       # C3 recovery: true = latch clears at the next UTC date; false = stays latched until
-      # process restart. Either way the loss is re-checked and re-trips while the long+short
-      # cycle-scoped curRealisedPnl sum is still <= -session_loss_limit.
+      # process restart. The loss is re-checked when the latch clears (next UTC date for
+      # true, next process start for false) and re-trips while the long+short cycle-scoped
+      # curRealisedPnl sum is still <= -session_loss_limit.
       session_loss_auto_reset_utc_midnight: true  # clearing the latch alone does NOT resume trading.
       max_orders_per_minute: 30  # C4: reject submissions above this many accepted real orders in any trailing 60s (at the executor; shadow placements don't count). Omit to disable.
 
