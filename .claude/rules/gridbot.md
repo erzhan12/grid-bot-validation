@@ -621,7 +621,9 @@ builds ONE instance per strat in `_init_strategy` and passes the SAME object
     `check_loss_breaker` re-evaluates it in the same call right after the
     UTC-midnight reset. So `session_loss_auto_reset_utc_midnight=True` does NOT
     restore trading while that sum is still `<= -cap`: it re-trips once per UTC day
-    (one new alert + one cancel sweep, on the first position update after midnight)
+    (one new alert + one cancel sweep, on the first position update after midnight —
+    the periodic `PositionFetcher` sweep calls `runner.on_position_update` → the
+    breaker regardless of trading activity, so this evaluates even when idle)
     and stays latched for the rest of that UTC day unconditionally — no intraday
     clear on PnL recovery or cycle close; only a process restart clears it early.
     Recovering above `-cap` (or the cycle closing, which zeroes `curRealisedPnl`)
