@@ -611,24 +611,28 @@ builds ONE instance per strat in `_init_strategy` and passes the SAME object
     `_execute_cancel_intent` → honors shadow mode + tracked-order state; uses the
     wire `orderId`, not `orderLinkId`) then suppress ALL new places (open AND
     reduce-only) via `loss_tripped()`. Recovery: latch clears on the first
-    position update of the next UTC date (auto-reset True — but see the residual
-    below: the loss is re-evaluated in the same call) or only on process
-    restart (False). The UTC reset date is seeded lazily on the first
+    position update of the next UTC date (auto-reset True) or only on process
+    restart (False) — but see the residual below: in both cases the loss is
+    re-evaluated immediately, so neither restores trading while it is still
+    `<= -cap`. The UTC reset date is seeded lazily on the first
     `check_loss_breaker` (the constructor has only a monotonic clock; UTC enters
     via the `now_utc` arg). Known residual (PR #217 review, not fixed): the PnL
     source is cycle-scoped, not day-scoped — `session_realized_pnl` is the sum of
     the long and short legs' current-cycle `curRealisedPnl`, and
     `check_loss_breaker` re-evaluates it in the same call right after the
-    UTC-midnight reset. So `session_loss_auto_reset_utc_midnight=True` does NOT
-    restore trading while that sum is still `<= -cap`: it re-trips once per UTC day
+    UTC-midnight reset. So neither recovery path durably restores trading while
+    that sum is still `<= -cap`. With auto-reset True it re-trips once per UTC day
     (one new alert + one cancel sweep, on the first position update after midnight —
     the periodic `PositionFetcher` sweep calls `runner.on_position_update` → the
     breaker regardless of trading activity, so this evaluates even when idle)
-    and stays latched for the rest of that UTC day unconditionally — no intraday
-    clear on PnL recovery or cycle close; only a process restart clears it early.
-    Recovering above `-cap` (or the cycle closing, which zeroes `curRealisedPnl`)
-    only takes effect at the next UTC-midnight evaluation, where the reset then
-    sticks. Re-tripping on a new day while still in loss is intended at the
+    and stays latched for the rest of that UTC day (no intraday clear on PnL
+    recovery). A process restart (either flag) clears the in-memory latch — a fresh
+    `SafetyCaps`, nothing persisted — but re-trips the same way on the first
+    post-restart position update (fresh alert + cancel sweep). Trading resumes
+    only when the reported leg sum is above `-cap` at one of those evaluations. Do
+    not assume flattening clears it: a flat (`size == 0`) payload can still carry
+    the closing cycle's `curRealisedPnl` — that is exactly why the breaker reads
+    flat payloads. Re-tripping on a new day while still in loss is intended at the
     `SafetyCaps` level
     (`apps/gridbot/tests/test_safety_caps.py::TestC3LossBreaker::test_can_retrip_on_new_day`).
     Fails safe (blocks trading), never fail-open.
