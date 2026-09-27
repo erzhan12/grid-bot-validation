@@ -75,13 +75,14 @@ class SafetyCapsConfig(BaseModel):
     session_loss_auto_reset_utc_midnight: bool = Field(
         default=True,
         description=(
-            "C3 recovery mode. True = the loss latch auto-clears on the first "
-            "position update of the next UTC calendar date. False = stay "
-            "latched until process restart. In both cases the loss is "
-            "re-evaluated immediately, so trading does not resume while the "
-            "long+short cycle-scoped curRealisedPnl sum is still <= "
-            "-session_loss_limit (it re-trips once per UTC day / on the first "
-            "post-restart position update)."
+            "C3 recovery mode. True = the latch auto-clears on the first "
+            "position update of the next UTC calendar date, then the loss is "
+            "re-checked in the same call and re-trips while the long+short "
+            "cycle-scoped curRealisedPnl sum is still <= -session_loss_limit "
+            "(so it re-trips once per UTC day instead of resuming trading). "
+            "False = stay latched until process restart; after a restart the "
+            "loss is re-checked on the first position update and re-trips "
+            "under the same condition."
         ),
     )
     max_orders_per_minute: Optional[int] = Field(
