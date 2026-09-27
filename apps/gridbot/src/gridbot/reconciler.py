@@ -125,12 +125,13 @@ class Reconciler:
         #
         # IMPORTANT: "adoption" here lasts exactly one ticker event. On the
         # first on_ticker after startup, GridEngine._place_grid_orders
-        # (packages/gridcore/src/gridcore/engine.py:319-325) cancels any
+        # (packages/gridcore/src/gridcore/engine.py) cancels any
         # injected order whose price is not in the current grid_price_set
-        # ('outside_grid' reason), and engine.py:305-312 cancels any at a
+        # ('outside_grid' reason), and the same method cancels any at a
         # grid price with the wrong side ('side_mismatch' reason). Over-limit
-        # cases (engine.py:237-243) trigger a full rebuild that cancels
-        # everything. bbu2 reference: strat.py:154-160, :145-149, :103-104.
+        # cases (GridEngine._check_and_place) trigger a full rebuild that
+        # cancels everything. bbu2 reference: strat.py:154-160, :145-149,
+        # :103-104.
         # Do NOT add a refuse-to-start check here — it would re-break normal
         # crash-restart (bot's own prior orders look identical to manual ones)
         # and was already removed in commit 138737a for that reason.
