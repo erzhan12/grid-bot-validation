@@ -615,7 +615,8 @@ builds ONE instance per strat in `_init_strategy` and passes the SAME object
     (either flag; the latch is in-memory only). Either way the loss is re-evaluated
     immediately — for auto-reset in the same `check_loss_breaker` call, after a
     restart on the first position update (see residual). The UTC reset date is
-    seeded lazily on the first `check_loss_breaker` (the constructor has only a monotonic clock; UTC enters
+    seeded lazily on the first `check_loss_breaker` (the constructor has only a
+    monotonic clock; UTC enters
     via the `now_utc` arg). Known residual (PR #217 review, not fixed):
     `session_realized_pnl` is the long+short sum of cycle-scoped `curRealisedPnl`
     (it holds a completed cycle's total until the next opening fill resets it —
