@@ -626,7 +626,8 @@ builds ONE instance per strat in `_init_strategy` and passes the SAME object
         even when idle) if the sum is still `<= -cap`, with no intraday clear — and
         since the latch blocks new placements, including the opening fill that would
         reset the sum (only an order left live by the best-effort cancel sweep could
-        still fill), recovery may need operator action.
+        still fill), recovery may need operator action. With a non-flat position
+        the bot stops managing it meanwhile (reduce-only is blocked too).
       - (b) Losses spread across several closed cycles can go undetected — it is a
         per-cycle cap, not a daily one.
       - The new-day re-trip itself is intended at the `SafetyCaps` level
