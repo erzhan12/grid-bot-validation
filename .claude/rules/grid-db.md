@@ -19,6 +19,7 @@ paths:
 - Bulk inserts use `ON CONFLICT DO NOTHING` (trades/executions) or `ON CONFLICT DO UPDATE` (orders)
 - `redact_db_url()` from `grid_db.utils` — **always** use when logging DB URLs
 - **Repository module layout (feature 0081, issue #184)**: repositories live in the `grid_db.repositories` **package**, not a flat module — `base.py` (`BaseRepository` + `T`), `identity.py` (User/BybitAccount/ApiCredential/Strategy/Run), `market_data.py` (PublicTrade/TickerSnapshot), `execution.py` (PrivateExecution/Order), `snapshots.py` (Position/Wallet/GridState). Add a new repository to the matching domain module **and re-export it from `repositories/__init__.py`**. Both `from grid_db import XRepository` and `from grid_db.repositories import XRepository` must keep resolving (guarded by `shared/db/tests/test_repository_imports.py`).
+- **`GridStateSnapshotRepository`** (`grid_state_snapshots`): `get_at_or_before` intentionally does NOT filter by `run_id` (cross-run lookup, feature 0052), and `insert()` must pass both `index_elements` and `index_where` to `ON CONFLICT DO NOTHING` or the partial unique index won't bind — see `gridbot.md` → "Grid State DB snapshots — feature 0047".
 
 ### Enums
 

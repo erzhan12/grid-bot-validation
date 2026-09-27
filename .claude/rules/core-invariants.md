@@ -39,7 +39,7 @@ Project-specific "what not to do" — pairs with the universal Constraints in `.
 - **Don't edit `bbu_reference/`** — vendored legacy BBU2 bot our code was ported from (its own `ruff.toml`, line-length 140; outside our lint/test scope). Read it to understand original behavior (see "Legacy bbu2 paths" above), but never modify it.
 - **Don't hand-edit generated/data dirs** — `data/`, `output/`, `results/`, `db/` are gitignored recorder/replay/backtest artifacts and SQLite DBs, not source. `conf/` holds real tracked config (risk-limit tiers, instrument caches) — leave unless asked.
 - **Backward-compat is deliberate, not speculative** — existing compat (`DirectionType`/`SideType` StrEnum aliases, replay `strict_cross` baseline, `extract_client_order_prefix` no-hyphen fallback) is intentional. Don't add new compat shims without a stated reason.
-- **No dead config fields** — don't add YAML fields/flags "for later"; e.g. `max_margin` is declared but never read. (Feature 0079 added a real automatic position cap via the **C1 `safety_caps.max_notional_per_symbol`** notional limit — see "Production safety caps"; `max_margin` itself remains dead/unrevived.)
+- **No dead config fields** — don't add YAML fields/flags "for later"; e.g. `max_margin` is declared but never read. (Feature 0079 added a real automatic position cap via the **C1 `safety_caps.max_notional_per_symbol`** notional limit — see `gridbot.md` → "Production safety caps"; `max_margin` itself remains dead/unrevived.)
 - **Don't point tooling at live state without explicit ask** — the account is Bybit **mainnet** (`mainnet_live`); never run against the live gridbot DB or live orders unless told.
 
 ## Running Tests
