@@ -614,7 +614,9 @@ builds ONE instance per strat in `_init_strategy` and passes the SAME object
     position update of the next UTC date (auto-reset True) or only on process
     restart (False). The UTC reset date is seeded lazily on the first
     `check_loss_breaker` (the constructor has only a monotonic clock; UTC enters
-    via the `now_utc` arg).
+    via the `now_utc` arg). Known residual (0084 review, not fixed): a stale flat
+    payload arriving right after the UTC-midnight reset can re-trip the latch
+    spuriously — fails safe (blocks trading), never fail-open.
   - **C4 `max_orders_per_minute`** — trailing-60s rate limit at
     `IntentExecutor.execute_place` (the single live-submit choke point, so
     retry-queue re-dispatch is rate-limited too). Returns the non-retryable
