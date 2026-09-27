@@ -128,6 +128,11 @@ class SafetyCaps:
         the place path. A True return means the caller should cancel working
         orders once and alert. ``loss_tripped()`` is the cheap read for the
         place path thereafter.
+
+        The UTC-midnight reset falls through to the loss check in the same
+        call, so an unchanged loss re-trips (returns True again). The PnL input
+        is cycle-scoped, not daily — see the C3 "Known residual" in
+        ``.claude/rules/gridbot.md``.
         """
         if not self._config.enabled:
             return False
