@@ -622,8 +622,11 @@ builds ONE instance per strat in `_init_strategy` and passes the SAME object
     UTC-midnight reset. So `session_loss_auto_reset_utc_midnight=True` does NOT
     restore trading while that sum is still `<= -cap`: it re-trips once per UTC day
     (one new alert + one cancel sweep, on the first position update after midnight)
-    and stays latched for the rest of that day, until the cycle closes or recovers
-    above `-cap`. Re-tripping on a new day while still in loss is intended at the
+    and stays latched for the rest of that UTC day unconditionally — no intraday
+    clear on PnL recovery or cycle close; only a process restart clears it early.
+    Recovering above `-cap` (or the cycle closing, which zeroes `curRealisedPnl`)
+    only takes effect at the next UTC-midnight evaluation, where the reset then
+    sticks. Re-tripping on a new day while still in loss is intended at the
     `SafetyCaps` level
     (`apps/gridbot/tests/test_safety_caps.py::TestC3LossBreaker::test_can_retrip_on_new_day`).
     Fails safe (blocks trading), never fail-open.
