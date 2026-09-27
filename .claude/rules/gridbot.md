@@ -624,14 +624,14 @@ builds ONE instance per strat in `_init_strategy` and passes the SAME object
       - (a) Once tripped, C3 only blocks: after a midnight reset or restart it
         re-trips (one alert + cancel sweep; the periodic position sweep evaluates it
         even when idle, provided Bybit still returns the position row — a missing
-        payload reads as 0) if the sum is still `<= -cap`, with no intraday clear — and
-        since the latch blocks new placements, including the opening fill that would
-        reset the sum (only an order left live by the best-effort cancel sweep could
-        still fill), recovery may need operator action. With a non-flat position
-        the bot stops managing it meanwhile (reduce-only is blocked too). Detection:
-        each trip sends a notifier alert, and the status file reports
-        `state="circuit_open"` (`gauges.loss_breaker_latched`), which
-        `status_check` classifies `unhealthy` for the VPS watchdog.
+        payload reads as 0) if the sum is still `<= -cap`, with no intraday clear —
+        and since the latch blocks new placements, including the opening fill that
+        would reset the sum (only an order left live by the best-effort cancel sweep
+        could still fill), recovery may need operator action. With a non-flat
+        position the bot stops managing it meanwhile (reduce-only is blocked too).
+        Detection: each trip sends a notifier alert, and the status file reports
+        `state="circuit_open"` (`gauges.loss_breaker_latched`), which `status_check`
+        classifies `unhealthy` for the VPS watchdog.
       - (b) Losses spread across several closed cycles can go undetected — it is a
         per-cycle cap, not a daily one.
       - The new-day re-trip itself is intended at the `SafetyCaps` level
