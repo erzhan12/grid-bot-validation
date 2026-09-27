@@ -614,16 +614,18 @@ builds ONE instance per strat in `_init_strategy` and passes the SAME object
     position update of the next UTC date (auto-reset True) or on process restart
     (either flag; the latch is in-memory only). Either way the loss is re-evaluated
     immediately — for auto-reset in the same `check_loss_breaker` call, after a
-    restart on the first position update (see residual). The UTC reset date is seeded lazily on the first
-    `check_loss_breaker` (the constructor has only a monotonic clock; UTC enters
+    restart on the first position update (see residual). The UTC reset date is
+    seeded lazily on the first `check_loss_breaker` (the constructor has only a monotonic clock; UTC enters
     via the `now_utc` arg). Known residual (PR #217 review, not fixed):
     `session_realized_pnl` is the long+short sum of cycle-scoped `curRealisedPnl`
     (it holds a completed cycle's total until the next opening fill resets it —
     `docs/features/0056_PLAN.md`), not a day total. (a) Once tripped, C3 only
     blocks: after a midnight reset or restart it re-trips (one alert + cancel
     sweep; the periodic position sweep evaluates it even when idle) if the sum is
-    still `<= -cap`, with no intraday clear — and since the latch also blocks the
-    opening fill that would reset the sum, recovery may need operator action.
+    still `<= -cap`, with no intraday clear — and since the latch blocks new
+    placements, including the opening fill that would reset the sum (only an order
+    left live by the best-effort cancel sweep could still fill), recovery may need
+    operator action.
     (b) Losses spread across several closed cycles can go undetected — it is a
     per-cycle cap, not a daily one. The new-day re-trip itself is intended at the
     `SafetyCaps` level
