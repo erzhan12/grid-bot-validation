@@ -32,7 +32,11 @@ def _rest_exec_pnl(exec_data: dict) -> Optional[Decimal]:
     is exactly zero. Missing/empty/non-zero ``closedSize`` stays unknown;
     an explicit ``execPnl``/``closedPnl`` always wins.
     """
-    pnl = parse_exec_pnl(exec_data)
+    try:
+        pnl = parse_exec_pnl(exec_data)
+    except (InvalidOperation, ValueError, TypeError):
+        # Malformed PnL field: unknown — never drop the recovered execution.
+        return None
     if pnl is not None:
         return pnl
     closed_size = exec_data.get("closedSize")

@@ -251,6 +251,27 @@ class TestNormalizeExecution:
         assert events[0].closed_pnl == expected
         assert parse_exec_pnl(row) == expected
 
+    def test_unknown_ws_execution_pnl_logs_warning(self, caplog):
+        """A WS Trade row without PnL warns at ingest (exec_id, symbol)."""
+        row = {
+            "category": "linear", "symbol": "LTCUSDT", "execId": "ws-9",
+            "orderId": "o1", "orderLinkId": "l1", "execPrice": "100",
+            "execQty": "0.2", "execFee": "0.01", "execType": "Trade",
+            "execTime": "1704639600000", "side": "Sell", "closedSize": "0.2",
+        }
+        with caplog.at_level("WARNING", logger="bybit_adapter.normalizer"):
+            BybitNormalizer().normalize_execution(
+                {"topic": "execution", "data": [row]}
+            )
+        assert "ws-9" in caplog.text and "LTCUSDT" in caplog.text
+
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="bybit_adapter.normalizer"):
+            BybitNormalizer().normalize_execution(
+                {"topic": "execution", "data": [row | {"execPnl": "0.1"}]}
+            )
+        assert caplog.text == ""
+
     def test_normalize_execution_with_context(
         self, sample_execution_message, sample_user_id, sample_account_id, sample_run_id
     ):

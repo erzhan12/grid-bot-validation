@@ -10,6 +10,7 @@ Bybit API Reference:
 - Order: https://bybit-exchange.github.io/docs/v5/websocket/private/order
 """
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from decimal import Decimal
@@ -24,6 +25,8 @@ from gridcore.events import (
     OrderUpdateEvent,
 )
 
+
+logger = logging.getLogger(__name__)
 
 def parse_exec_pnl(exec_data: dict) -> Optional[Decimal]:
     """Per-execution PnL from a Bybit execution row, or None when unknown.
@@ -246,6 +249,18 @@ class BybitNormalizer:
             # leavesQty: remaining unfilled quantity ("0" = fully filled)
             leaves_qty_str = exec_data.get("leavesQty", "0")
 
+            closed_pnl = parse_exec_pnl(exec_data)
+            if closed_pnl is None:
+                # 0110: stored as NULL (unknown) — live-check will SKIP the
+                # window. Bybit documents execPnl on WS rows; flag at ingest.
+                logger.warning(
+                    "Execution %s %s has no execPnl/closedPnl "
+                    "(closedSize=%s); closed_pnl stored as unknown",
+                    exec_data.get("execId", ""),
+                    exec_data.get("symbol", ""),
+                    exec_data.get("closedSize"),
+                )
+
             event = ExecutionEvent(
                 event_type=EventType.EXECUTION,
                 symbol=exec_data.get("symbol", ""),
@@ -261,7 +276,7 @@ class BybitNormalizer:
                 price=Decimal(exec_data.get("execPrice", "0")),
                 qty=Decimal(exec_data.get("execQty", "0")),
                 fee=Decimal(exec_data.get("execFee", "0")),
-                closed_pnl=parse_exec_pnl(exec_data),
+                closed_pnl=closed_pnl,
                 closed_size=Decimal(closed_size_str),
                 leaves_qty=Decimal(leaves_qty_str),
             )

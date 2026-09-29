@@ -64,6 +64,15 @@ Verdict APPROVED, no P0. Triage:
 - [P3] enrichment keeps `raw_json` (origin payload) — commented as deliberate.
 - [P2 ×4] `.claude/rules/` updates — still deferred to the post-verification rules step.
 
+## PR #281 claude-review (round 3, on d103445)
+
+Verdict APPROVED, no P0. Triage:
+- **[P1] unguarded `parse_exec_pnl` in `_rest_exec_pnl`** — ACCEPT (pre-existing: the old reconciler also parsed `closedPnl` unguarded; REST rows carry no PnL field, so near-zero likelihood). Guarded for consistency: any PnL parse error → `None`; test case `execPnl="n/a"`.
+- [P2] WARNING at WS ingest when a Trade row's PnL is unknown — applied (the post-deploy watch signal).
+- [P3] blank line in `test_writers.py` — applied.
+- Held: [P2] `closedSize == 0` inference for WS rows (Bybit documents `execPnl` on WS; revisit only if the ingest warning fires); [P2] Postgres compile test (accepted gap); [P3] dropped-row summary log (Phase B1 structured recovery result); [P2] `.claude/rules/` updates (post-verification rules step).
+- Loop stopped here: each round now surfaces a fresh smaller item rather than a real defect.
+
 ### Final verification
 
 - `make test`: exit 0, merged coverage 91% (gridcore 94.8%).

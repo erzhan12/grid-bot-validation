@@ -511,6 +511,7 @@ class TestExecutionWriter:
         finally:
             db.drop_tables()
 
+
 class TestOrderWriter:
     """Test OrderWriter buffering and bulk insert."""
 

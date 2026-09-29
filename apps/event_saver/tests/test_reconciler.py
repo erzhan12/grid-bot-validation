@@ -695,6 +695,7 @@ class TestExecutionsConversion:
             ({"closedSize": "1"}, None),  # closing fill: unknown
             ({"closedSize": ""}, None),  # empty (e.g. USDC-perp rows)
             ({"closedSize": "n/a"}, None),  # malformed: kept, PnL unknown
+            ({"closedSize": "0", "execPnl": "n/a"}, None),  # malformed PnL
             ({}, None),  # absent
             ({"closedSize": "0", "execPnl": "0.4"}, Decimal("0.4")),
         ],
