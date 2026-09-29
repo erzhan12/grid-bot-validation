@@ -45,8 +45,17 @@ Engines: codex (`gpt-5.6-sol`, high) + cursor. Rounds: 1/4. Result: SUCCESS.
 
 codex: NO P1/P2 FINDINGS, no P3. cursor: NO P1/P2 FINDINGS (with verification log).
 
+## PR #281 claude-review (round 1)
+
+Verdict APPROVED. Triage:
+- **[P1] REST opening fills marked unknown** — ACCEPT, reclassified P2 (coverage, fail-closed; no false PASS). Verified: REST rows carry `closedSize`; Bybit `execPnl` is the PnL of a *close* (= `cashFlow`, gross), so `closedSize == 0` ⇒ realized PnL exactly 0. Fixed in `reconciler._rest_exec_pnl` (+ 6-case test). Benefit is narrow: a gap with any closing fill still SKIPs, and after Phase B2 any window overlapping a gap SKIPs regardless.
+- [P2] per-fill `UNKNOWN` unreachable via CLI (window SKIPs first) — open, needs a user choice (render despite unknowns vs delete the dead branch).
+- [P2 ×3] `.claude/rules/` updates (grid-db, bybit-adapter, replay, live-check) — deferred to workflow step 6 (after user verification).
+- [P2] `RecordedExecution.closed_pnl` annotation `Optional[Decimal]` — open (trivial).
+- [P3] validate `result.category` on empty pages too — not applied: Bybit's empty-page shape is unverified (deliberate choice, plan GREEN step 1).
+
 ### Final verification
 
 - `make test`: exit 0, merged coverage 91% (gridcore 94.8%).
 - `make lint`: all checks passed.
-- Not committed — awaiting user review.
+- Shipped on PR #281 (feature/0110-rest-exec-recovery); merge awaits explicit user approval.

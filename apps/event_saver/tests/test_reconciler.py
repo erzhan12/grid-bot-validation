@@ -687,6 +687,34 @@ class TestExecutionsConversion:
         assert len(closing) == 1
         assert closing[0].closed_pnl is None
 
+    @pytest.mark.parametrize(
+        "extra, expected",
+        [
+            ({"closedSize": "0"}, Decimal("0")),  # opening fill: known zero
+            ({"closedSize": "0.000"}, Decimal("0")),
+            ({"closedSize": "1"}, None),  # closing fill: unknown
+            ({"closedSize": ""}, None),  # empty (e.g. USDC-perp rows)
+            ({}, None),  # absent
+            ({"closedSize": "0", "execPnl": "0.4"}, Decimal("0.4")),
+        ],
+    )
+    def test_rest_opening_fill_pnl_is_known_zero(
+        self, mock_db, mock_rest_client, extra, expected
+    ):
+        """closedSize == 0 means nothing closed: realized PnL is exactly 0."""
+        row = {
+            "symbol": "LTCUSDT", "execId": "rest-1", "orderId": "order-1",
+            "orderLinkId": "open-1", "side": "Buy", "execPrice": "100",
+            "execQty": "1", "execFee": "0.02", "execType": "Trade",
+            "execTime": "1790481601000", **extra,
+        }
+        reconciler = GapReconciler(db=mock_db, rest_client=mock_rest_client)
+        models = reconciler._executions_to_models(
+            user_id=uuid4(), account_id=uuid4(), run_id=uuid4(),
+            executions=[row],
+        )
+        assert models[0].closed_pnl == expected
+
     def test_executions_filters_exec_type(self, mock_db, mock_rest_client):
         """Test that non-Trade executions are filtered out."""
         reconciler = GapReconciler(

@@ -23,6 +23,24 @@ logger = logging.getLogger(__name__)
 _PRIVATE_EXECUTION_RECONCILE_MAX_PAGES = 100
 
 
+def _rest_exec_pnl(exec_data: dict) -> Optional[Decimal]:
+    """Closed PnL for a REST ``/v5/execution/list`` row, or None if unknown.
+
+    REST rows carry no per-execution PnL, so it stays NULL (unknown) unless
+    the row is an opening fill: ``closedSize`` == 0 means nothing was
+    closed, so realized PnL (Bybit ``execPnl``/``cashFlow``, gross of fees)
+    is exactly zero. Missing/empty/non-zero ``closedSize`` stays unknown;
+    an explicit ``execPnl``/``closedPnl`` always wins.
+    """
+    pnl = parse_exec_pnl(exec_data)
+    if pnl is not None:
+        return pnl
+    closed_size = exec_data.get("closedSize")
+    if closed_size not in (None, "") and Decimal(str(closed_size)) == 0:
+        return Decimal("0")
+    return None
+
+
 class GapReconciler:
     """Detects and fills gaps in captured data using REST API.
 
@@ -411,9 +429,7 @@ class GapReconciler:
                         exec_price=Decimal(str(exec_data.get("execPrice", "0"))),
                         exec_qty=Decimal(str(exec_data.get("execQty", "0"))),
                         exec_fee=Decimal(str(exec_data.get("execFee", "0"))),
-                        # REST rows carry no per-execution PnL → NULL
-                        # (unknown), later enriched by the WS row if seen.
-                        closed_pnl=parse_exec_pnl(exec_data),
+                        closed_pnl=_rest_exec_pnl(exec_data),
                         exchange_ts=datetime.fromtimestamp(
                             int(exec_data.get("execTime", 0)) / 1000, tz=UTC
                         ),
