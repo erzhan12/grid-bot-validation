@@ -54,6 +54,16 @@ Verdict APPROVED. Triage:
 - [P2] `RecordedExecution.closed_pnl` annotation `Optional[Decimal]` — open (trivial).
 - [P3] validate `result.category` on empty pages too — not applied: Bybit's empty-page shape is unverified (deliberate choice, plan GREEN step 1).
 
+## PR #281 claude-review (round 2, on 658c606)
+
+Verdict APPROVED, no P0. Triage:
+- **[P1] malformed `closedSize` drops the whole recovered row** — ACCEPT. The new `Decimal(str(closedSize))` parse raised inside `_executions_to_models`' per-row `except Exception` → row skipped (fail-open: a missing fill). Fixed: parse errors degrade to `None` (unknown); test case `closedSize="n/a"` keeps the row.
+- [P2] `RecordedExecution.closed_pnl: Optional[Decimal]` — applied.
+- [P3] `get_executions_all` `Raises:` documents the propagated `ValueError` — applied.
+- [P3] reconciler `except → return 0` commented as a known fail-open window closed by Phase B1 — applied.
+- [P3] enrichment keeps `raw_json` (origin payload) — commented as deliberate.
+- [P2 ×4] `.claude/rules/` updates — still deferred to the post-verification rules step.
+
 ### Final verification
 
 - `make test`: exit 0, merged coverage 91% (gridcore 94.8%).

@@ -146,6 +146,8 @@ class PrivateExecutionRepository(BaseRepository[PrivateExecution]):
             )
             stmt = dialect_insert(PrivateExecution).values(executions_data)
             # Predicated so rowcount counts only real inserts/enrichments.
+            # Only closed_pnl is enriched; raw_json deliberately keeps the
+            # first (e.g. REST) payload as a record of the row's origin.
             stmt = stmt.on_conflict_do_update(
                 index_elements=["exec_id"],
                 set_={"closed_pnl": stmt.excluded.closed_pnl},

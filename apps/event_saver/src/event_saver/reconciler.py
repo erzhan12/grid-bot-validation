@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from datetime import datetime, UTC, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 from uuid import UUID
 
@@ -36,9 +36,14 @@ def _rest_exec_pnl(exec_data: dict) -> Optional[Decimal]:
     if pnl is not None:
         return pnl
     closed_size = exec_data.get("closedSize")
-    if closed_size not in (None, "") and Decimal(str(closed_size)) == 0:
-        return Decimal("0")
-    return None
+    if closed_size in (None, ""):
+        return None
+    try:
+        parsed = Decimal(str(closed_size))
+    except (InvalidOperation, ValueError, TypeError):
+        # Degrade to unknown — never drop the recovered execution.
+        return None
+    return Decimal("0") if parsed == 0 else None
 
 
 class GapReconciler:
@@ -347,6 +352,9 @@ class GapReconciler:
 
             return count
 
+        # Known fail-open window: any failure (incl. a bad REST envelope)
+        # returns 0, indistinguishable from an empty gap. Phase B1's
+        # structured ExecutionRecoveryResult closes it (0110_PLAN.md).
         except Exception as e:
             logger.error(f"Error reconciling executions for {symbol}: {e}")
             return 0

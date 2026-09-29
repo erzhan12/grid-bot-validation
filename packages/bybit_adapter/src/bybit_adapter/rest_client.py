@@ -316,6 +316,9 @@ class BybitRestClient:
 
         Raises:
             Exception: If API call fails
+            ValueError: A page's envelope ``result.category`` is not
+                ``"linear"`` (from :meth:`get_executions`); pages already
+                collected are discarded.
         """
         all_executions = []
         cursor = None

@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from gridcore import SideType, TickerEvent, extract_client_order_prefix
 from grid_db import RecordedDataQualityError
@@ -352,7 +352,7 @@ class RecordedExecution:
     exec_price: Decimal
     exec_qty: Decimal
     exec_fee: Decimal
-    closed_pnl: Decimal
+    closed_pnl: Optional[Decimal]  # None rejected in __post_init__
     exchange_ts: datetime
 
     def __post_init__(self) -> None:
