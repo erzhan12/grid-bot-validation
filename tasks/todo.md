@@ -7,7 +7,8 @@ Plan: docs/features/0110_PLAN.md (B1 split into B1a/B1b/B1c)  |  Branch: feature
 - [x] recorder: pending gap row per symbol + outcome done-callback; EventSaver logs outcome
 - [x] prepare_session wipe clears gaps (CASCADE) test
 - [x] make test + make lint green
-- [ ] rules update (event-saver, grid-db, recorder) after review
+- [x] rules update (event-saver, grid-db, recorder, core-invariants pitfall 24)
+- [x] PR #282 review round 1: 7-day clamp keeps the tail, distinct-id duplicates, status round-trip test, callback type hints
 
 # Feature 0110 Phase A — REST execution recovery + unknown closed PnL (#271)
 

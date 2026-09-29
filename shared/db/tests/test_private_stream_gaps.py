@@ -85,6 +85,26 @@ class TestPrivateStreamGapRepository:
         session.commit()
         assert session.query(PrivateStreamGap).count() == 0
 
+    @pytest.mark.parametrize("status", list(RecoveryStatus))
+    def test_every_status_round_trips(
+        self, session, sample_account, sample_run, status
+    ):
+        """Each status value survives a commit + reload (fits String(12))."""
+        repo = PrivateStreamGapRepository(session)
+        gap = repo.add_gap(
+            run_id=sample_run.run_id,
+            account_id=sample_account.account_id,
+            symbol="LTCUSDT",
+            gap_start=datetime(2026, 9, 1, tzinfo=UTC),
+            gap_end=datetime(2026, 9, 1, 0, 1, tzinfo=UTC),
+        )
+        repo.set_outcome(
+            gap.id, status=status, inserted=0, duplicates=0, reason=None
+        )
+        session.commit()
+        session.expire_all()
+        assert session.get(PrivateStreamGap, gap.id).recovery_status == status
+
     def test_set_outcome_on_missing_row_raises(self, session):
         """An unknown gap id is an error, not a silent no-op."""
         with pytest.raises(ValueError, match="not found"):

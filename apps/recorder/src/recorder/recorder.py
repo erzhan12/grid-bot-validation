@@ -11,7 +11,7 @@ import threading
 from concurrent.futures import Future
 from datetime import datetime, UTC
 from decimal import Decimal
-from typing import Optional
+from typing import Callable, Optional
 from uuid import UUID, uuid4
 
 from bybit_adapter.rest_client import BybitRestClient
@@ -1027,7 +1027,9 @@ class Recorder:
             )
             return None
 
-    def _persist_gap_outcome(self, gap_id: int, symbol: str):
+    def _persist_gap_outcome(
+        self, gap_id: int, symbol: str
+    ) -> Callable[[Future], None]:
         """Return a done-callback that stores a gap's recovery outcome."""
         def _cb(future: Future) -> None:
             result = recovery_result_from_future(future)

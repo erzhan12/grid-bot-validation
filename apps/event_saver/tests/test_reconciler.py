@@ -524,18 +524,44 @@ class TestReconcileExecutions:
         assert "run_id" in result.reason
         client.get_executions_all.assert_not_called()
 
-    async def test_window_over_seven_days_is_failed(
+    async def test_window_over_seven_days_recovers_clamped_tail(
         self, mock_db, mock_rest_client
     ):
-        """Bybit caps endTime - startTime at 7 days: FAILED, no REST call."""
-        result, client, _ = await _run_exec_recovery(
+        """Over Bybit's 7-day cap: query the latest 7 days, keep those rows,
+        and still mark the gap FAILED because its head is unrecovered."""
+        gap_end = self._GAP_START + timedelta(days=9)
+        result, client, repo = await _run_exec_recovery(
             self._reconciler(mock_db, mock_rest_client),
             gap_start=self._GAP_START,
-            gap_end=self._GAP_START + timedelta(days=7),
+            gap_end=gap_end,
+            rest_result=([_rest_row("tail")], False),
         )
+        kwargs = client.get_executions_all.call_args.kwargs
+        query_end = gap_end + _RECOVERY_WINDOW_MARGIN
+        assert kwargs["end_time"] == int(query_end.timestamp() * 1000)
+        assert kwargs["start_time"] == int(
+            (query_end - timedelta(days=7)).timestamp() * 1000
+        )
+        (models,), _ = repo.bulk_insert.call_args
+        assert [m.exec_id for m in models] == ["tail"]
         assert result.status == RecoveryStatus.FAILED
-        assert "7 days" in result.reason
-        client.get_executions_all.assert_not_called()
+        assert result.inserted == 1
+        assert "7 days" in result.reason and "unrecovered" in result.reason
+
+    async def test_duplicates_count_distinct_exec_ids(
+        self, mock_db, mock_rest_client
+    ):
+        """A repeated exec_id across REST pages is not a DB duplicate."""
+        rows = [_rest_row("e1"), _rest_row("e1"), _rest_row("e2")]
+        result, _, _ = await _run_exec_recovery(
+            self._reconciler(mock_db, mock_rest_client),
+            gap_start=self._GAP_START,
+            gap_end=self._GAP_END,
+            rest_result=(rows, False),
+            bulk_count=1,
+        )
+        assert result.status == RecoveryStatus.RECOVERED
+        assert (result.inserted, result.duplicates) == (1, 1)
 
     async def test_row_conversion_error_is_failed_but_good_rows_kept(
         self, mock_db, mock_rest_client

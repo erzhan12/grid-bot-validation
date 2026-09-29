@@ -318,8 +318,9 @@ class GapReconciler:
             The recovery outcome (never raises): ``SKIPPED`` below the gap
             threshold; ``TRUNCATED`` when pagination stopped at
             ``max_pages`` (nothing persisted); ``FAILED`` for a missing
-            ``run_id``, a window over Bybit's limit, a REST/DB/conversion
-            error, or any Trade row dropped in conversion; else
+            ``run_id``, a REST/DB/conversion error, any Trade row dropped in
+            conversion, or a window over Bybit's 7-day limit (the most
+            recent 7 days are still queried and persisted); else
             ``RECOVERED``.
         """
         if not self.should_reconcile(gap_start, gap_end):
@@ -337,13 +338,17 @@ class GapReconciler:
 
         query_start = gap_start - _RECOVERY_WINDOW_MARGIN
         query_end = gap_end + _RECOVERY_WINDOW_MARGIN
+        clamp_reason: Optional[str] = None
         if query_end - query_start > _BYBIT_MAX_EXECUTION_WINDOW:
-            reason = (
+            # Recover the queryable tail; the head stays unrecovered (FAILED).
+            clamped_start = query_end - _BYBIT_MAX_EXECUTION_WINDOW
+            clamp_reason = (
                 f"window {query_start} to {query_end} exceeds Bybit's "
-                f"{_BYBIT_MAX_EXECUTION_WINDOW.days} days"
+                f"{_BYBIT_MAX_EXECUTION_WINDOW.days} days; queried from "
+                f"{clamped_start}, {query_start} to {clamped_start} unrecovered"
             )
-            logger.error("Execution reconciliation for %s: %s", symbol, reason)
-            return ExecutionRecoveryResult(RecoveryStatus.FAILED, reason=reason)
+            logger.error("Execution reconciliation for %s: %s", symbol, clamp_reason)
+            query_start = clamped_start
 
         logger.info(
             f"Reconciling executions for {symbol} account {account_id} "
@@ -430,7 +435,8 @@ class GapReconciler:
                 return ExecutionRecoveryResult(
                     RecoveryStatus.FAILED, reason=f"DB error: {e}"
                 )
-        duplicates = len(models) - inserted
+        # bulk_insert dedupes the batch by exec_id, so count distinct ids.
+        duplicates = len({m.exec_id for m in models}) - inserted
         if inserted > 0:
             self._executions_reconciled += inserted
             self._reconciliation_count += 1
@@ -439,14 +445,17 @@ class GapReconciler:
                 f"(skipped {duplicates} duplicates via unique constraint)"
             )
 
+        reasons = [clamp_reason] if clamp_reason else []
         if len(models) < trade_rows:
             reason = (
                 f"{trade_rows - len(models)} of {trade_rows} Trade rows failed "
                 f"conversion and were not persisted"
             )
             logger.error("Execution reconciliation for %s: %s", symbol, reason)
+            reasons.append(reason)
+        if reasons:
             return ExecutionRecoveryResult(
-                RecoveryStatus.FAILED, inserted, duplicates, reason
+                RecoveryStatus.FAILED, inserted, duplicates, "; ".join(reasons)
             )
         return ExecutionRecoveryResult(
             RecoveryStatus.RECOVERED, inserted, duplicates

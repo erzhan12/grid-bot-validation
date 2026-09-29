@@ -7,8 +7,9 @@ persistence to database, and gap reconciliation.
 import asyncio
 import logging
 import signal
+from concurrent.futures import Future
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 from uuid import UUID
 
 from bybit_adapter.rest_client import BybitRestClient
@@ -31,7 +32,7 @@ from event_saver.reconciler import GapReconciler, recovery_result_from_future
 logger = logging.getLogger(__name__)
 
 
-def _log_recovery_result(symbol: str):
+def _log_recovery_result(symbol: str) -> Callable[[Future], None]:
     """Done-callback logging a private-gap recovery outcome (no persistence)."""
     def _cb(future) -> None:
         result = recovery_result_from_future(future)

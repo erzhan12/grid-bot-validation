@@ -314,7 +314,9 @@ class PrivateStreamGap(Base):
 
     One row per (gap, symbol). ``recovery_status`` is a
     :class:`grid_db.enums.RecoveryStatus` value; it starts ``pending`` and is
-    set once the recovery for that symbol finishes.
+    set once the recovery for that symbol finishes. No unique constraint:
+    the recorder writes exactly one row per detected gap per symbol, and a
+    constraint would make a re-detected outage raise instead of recording it.
     """
 
     __tablename__ = "private_stream_gaps"
