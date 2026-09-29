@@ -18,15 +18,15 @@ every ~10 features, sweep the rule files and prune entries that no longer apply.
 | `.claude/rules/code-style.md` | always | Coding principles, conventions, safety rules |
 | `.claude/rules/core-invariants.md` | always | Project overview, Constraints (do-not), running tests, CI, Dependency / lockfile (`uv sync` local vs `uv sync --locked` in CI, `uv lock` after manifest edits, pre-commit `uv lock --check`), logging levels, cross-package testing + pitfalls, margin-ratio vs positionIM distinction, Common Pitfalls (cross-cutting) |
 | `.claude/rules/gridcore.md` | `packages/gridcore/**` | Strategy engine: grid/engine/position modules, enums, events/intents, persistence, PnL functions |
-| `.claude/rules/grid-db.md` | `shared/db/**` | Multi-tenant DB layer rules, grid-state snapshot reader contract (0047/0052/0062), enums, env vars |
-| `.claude/rules/bybit-adapter.md` | `packages/bybit_adapter/**` | REST/WS components, event normalization, V5 API status |
-| `.claude/rules/event-saver.md` | `apps/event_saver/**`, `apps/recorder/**` | Data capture rules, env vars, private WS disconnect handling |
+| `.claude/rules/grid-db.md` | `shared/db/**` | Multi-tenant DB layer rules, execution `bulk_insert` NULL-PnL enrichment upsert (0110), grid-state snapshot reader contract (0047/0052/0062), enums, env vars |
+| `.claude/rules/bybit-adapter.md` | `packages/bybit_adapter/**` | REST/WS components, event normalization, execution `category` envelope vs row + tri-state PnL / `parse_exec_pnl` (0110), V5 API status |
+| `.claude/rules/event-saver.md` | `apps/event_saver/**`, `apps/recorder/**` | Data capture rules, REST execution recovery + `_rest_exec_pnl` (0110), env vars, private WS disconnect handling |
 | `.claude/rules/gridbot.md` | `apps/gridbot/**` | Live bot: architecture, fail-closed startup (0086), health file (0082), status consumer (0109), exceptions, Telegram, embedded saver, reconciliation invariants, orderLinkId format, WS reconnect (0024), pre-placement guard, 110017 self-heal (0064), state-divergence detector (0069), 110007 preflight + chase-close (0066), safety caps (0079), SAME ORDER, DB snapshots (0047) |
 | `.claude/rules/backtest.md` | `apps/backtest/**` | Backtest engine architecture, risk multiplier composition, CLI, metrics |
 | `.claude/rules/comparator.md` | `apps/comparator/**` | Validation concepts, NormalizedTrade, spike-vs-drift stats (0070) |
 | `.claude/rules/recorder.md` | `apps/recorder/**` | Standalone recorder rules + test pitfalls |
 | `.claude/rules/replay.md` | `apps/replay/**` | Replay engine, telemetry parity (0034), UTA wallet semantics (0042), fill simulator modes incl. `last_cross` + `event_follower` (0072), seed-time U0 subtraction (0101), grid-state seed loader priority, test pitfalls |
 | `.claude/rules/pnl-checker.md` | `apps/pnl_checker/**` | Live PnL validation rules |
-| `.claude/rules/live-check.md` | `apps/live_check/**` | Replay-vs-live reconciliation (0088): read-only DB, verdict gates, freshness |
+| `.claude/rules/live-check.md` | `apps/live_check/**` | Replay-vs-live reconciliation (0088): read-only DB, verdict gates, freshness, unknown-PnL SKIP (0110) |
 | `.claude/rules/importer.md` | `apps/importer/**` | Remote importer: environment-only auth, request isolation, opaque cursor commits, source-scoped HTTP outputs |
 | `.claude/rules/risk-tiers.md` | tier-related files (see its `paths:`) | Dynamic risk limit tiers: architecture, consumers, caching, drift monitoring, cache format evolution |

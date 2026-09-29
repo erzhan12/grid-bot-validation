@@ -33,6 +33,7 @@ paths:
 - `run_id` is REQUIRED for PrivateExecution FK; events without it are filtered out
 - `symbols` field is string — use `config.get_symbols()` to get list
 - `PublicTradeRepository.exists_by_trade_id()` takes only `trade_id` (no symbol param)
+- **REST execution recovery (feature 0110, audit #270 F4)** — `GapReconciler._executions_to_models` must NOT filter on a per-row `category` (REST rows carry none; `BybitRestClient.get_executions` validates the envelope). PnL comes from `reconciler._rest_exec_pnl`: explicit `execPnl`/`closedPnl` wins; else `closedSize` parsing to exactly 0 → known `Decimal("0")` (opening fill: nothing closed); else `None` (unknown). Any parse error degrades to `None` — never let a malformed field raise into the per-row `except Exception` (which skips the row: a fail-open missing fill). The original REST row is stored in `raw_json`. Known fail-open window until feature 0110 Phase B1: `reconcile_executions` still returns `int` and maps any failure (incl. a bad envelope `ValueError`) to `0`, indistinguishable from an empty gap.
 
 ### Environment Variables
 
