@@ -9,6 +9,7 @@ from grid_db import (
     PositionSnapshot,
     PrivateExecution,
     RecordedDataQualityError,
+    Run,
     TickerSnapshot,
 )
 
@@ -19,10 +20,11 @@ RUN_ID = "test-run-id"
 
 
 def _insert_exec(db, *, exec_id, ts, symbol="LTCUSDT", side="Buy",
-                 price="80", qty="0.2", fee=None, pnl=None, link=None):
+                 price="80", qty="0.2", fee=None, pnl=None, link=None,
+                 run_id=RUN_ID):
     with db.get_session() as session:
         session.add(PrivateExecution(
-            run_id=RUN_ID,
+            run_id=run_id,
             account_id="acc1",
             symbol=symbol,
             exec_id=exec_id,
@@ -142,6 +144,35 @@ class TestSums:
                 s, RUN_ID, "LTCUSDT", ts - timedelta(hours=1),
                 ts + timedelta(hours=1),
             ) == Decimal("2.0")
+
+    def test_unknown_pnl_exec_ids_is_run_symbol_window_scoped(
+        self, db, seeded_run_account, ts
+    ):
+        """Only in-scope NULL rows are returned; other symbol/window/run excluded."""
+        with db.get_session() as session:
+            base = session.get(Run, RUN_ID)
+            session.add(Run(
+                run_id="other-run",
+                user_id=base.user_id,
+                account_id=base.account_id,
+                strategy_id=base.strategy_id,
+                run_type="recording",
+                start_ts=base.start_ts,
+            ))
+        _insert_exec(db, exec_id="in-scope", ts=ts, pnl=None)
+        _insert_exec(db, exec_id="known", ts=ts, pnl="1.0")
+        _insert_exec(db, exec_id="other-symbol", ts=ts, symbol="SOLUSDT",
+                     pnl=None)
+        _insert_exec(db, exec_id="outside-window", ts=ts + timedelta(hours=2),
+                     pnl=None)
+        _insert_exec(db, exec_id="other-run", ts=ts, pnl=None,
+                     run_id="other-run")
+        with db.get_readonly_session() as s:
+            ids = ground_truth.unknown_pnl_exec_ids(
+                s, RUN_ID, "LTCUSDT", ts - timedelta(hours=1),
+                ts + timedelta(hours=1),
+            )
+        assert ids == ["in-scope"]
 
     def test_multi_symbol_shared_run_isolation(self, db, seeded_run_account, ts):
         """SOL sums EXCLUDE LTC execs under the SAME run_id (symbol-scoped)."""

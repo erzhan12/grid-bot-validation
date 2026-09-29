@@ -27,7 +27,7 @@ Phase A deviations from plan (recorded in 0110_PLAN.md "Phase A implementation n
 - comparator CLI unchanged: existing logger.exception("Comparison failed") already surfaces the error
 - cycles not committed separately (no commit without explicit ask)
 
-Merged to main via PR #281 (4d3cdb0). Open: .claude/rules updates; recorder gap test REST shape; unknown_pnl_exec_ids scoping test; Phases B1/B2.
+Merged to main via PR #281 (4d3cdb0). Rules updated (f9b5580); recorder gap test uses the documented REST row shape and unknown_pnl_exec_ids has a scoping test (feature/0110-test-gaps). Open: Phases B1/B2.
 
 # Feature 0093 — apps/importer (trad_save_history → replay-compatible SQLite)
 

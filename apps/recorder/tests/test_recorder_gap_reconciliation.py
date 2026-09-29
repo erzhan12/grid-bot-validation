@@ -193,12 +193,17 @@ def _public_trade_payload(gap_start: datetime, gap_end: datetime) -> dict:
     }
 
 
-def _private_exec_payload(gap_start: datetime, gap_end: datetime) -> dict:
-    """Bybit execution REST payload with ``execTime`` at the gap midpoint."""
+def _private_exec_payload(
+    gap_start: datetime, gap_end: datetime, *, closed_size: str = "0"
+) -> dict:
+    """Documented ``/v5/execution/list`` row with ``execTime`` at the gap midpoint.
+
+    Matches Bybit's REST shape (feature 0110): ``category`` lives on the
+    result envelope, so rows carry none, and rows carry no PnL field.
+    """
 
     mid = gap_start + (gap_end - gap_start) / 2
     return {
-        "category": "linear",
         "execType": "Trade",
         "execId": _TEST_EXEC_ID,
         "orderId": "ord-1",
@@ -208,7 +213,7 @@ def _private_exec_payload(gap_start: datetime, gap_end: datetime) -> dict:
         "execPrice": _TEST_PRICE,
         "execQty": "0.001",
         "execFee": "0.01",
-        "closedPnl": "0",
+        "closedSize": closed_size,
         "execTime": int(mid.timestamp() * 1000),
     }
 
@@ -239,13 +244,21 @@ class TestRecorderDisconnectReconciliation:
             finally:
                 await recorder.stop()
 
+    @pytest.mark.parametrize(
+        "closed_size, expected_pnl",
+        [("0", Decimal("0")), ("0.001", None)],
+        ids=["opening-fill-known-zero", "closing-fill-unknown"],
+    )
     async def test_private_ws_disconnect_triggers_gap_reconciliation(
-        self, config_with_account, db, db_with_gridbot_seed
+        self, config_with_account, db, db_with_gridbot_seed,
+        closed_size, expected_pnl,
     ):
         gap_start = _FIXED_TS
         gap_end = gap_start + timedelta(seconds=30)
         fake_rest = _make_fake_rest(
-            executions=[_private_exec_payload(gap_start, gap_end)]
+            executions=[
+                _private_exec_payload(gap_start, gap_end, closed_size=closed_size)
+            ]
         )
 
         with _patched_network(fake_rest):
@@ -264,6 +277,7 @@ class TestRecorderDisconnectReconciliation:
                     assert row.exec_id == _TEST_EXEC_ID
                     assert row.symbol == _TEST_SYMBOL
                     assert row.run_id == str(recorder._run_id)
+                    assert row.closed_pnl == expected_pnl
             finally:
                 await recorder.stop()
 
