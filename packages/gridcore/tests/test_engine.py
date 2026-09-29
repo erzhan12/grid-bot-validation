@@ -576,6 +576,19 @@ class TestEventModelValidation:
                 qty=Decimal('0.001')
             )
 
+    def test_execution_event_closed_pnl_defaults_to_none(self):
+        """closed_pnl defaults to unknown (None); an explicit zero is kept."""
+        common = dict(
+            event_type=EventType.EXECUTION,
+            symbol='BTCUSDT',
+            exchange_ts=datetime.now(UTC),
+            local_ts=datetime.now(UTC),
+        )
+        assert ExecutionEvent(**common).closed_pnl is None
+        assert ExecutionEvent(
+            **common, closed_pnl=Decimal('0')
+        ).closed_pnl == Decimal('0')
+
     def test_order_update_event_validates_event_type(self):
         """OrderUpdateEvent enforces event_type=ORDER_UPDATE."""
         # Valid event

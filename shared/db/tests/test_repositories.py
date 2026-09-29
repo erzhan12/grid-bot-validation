@@ -780,7 +780,7 @@ class TestPrivateExecutionRepository:
         assert count == 2
 
     def test_bulk_insert_skips_duplicates(self, session, sample_user, sample_account):
-        """Bulk insert skips duplicates via ON CONFLICT DO NOTHING."""
+        """Unchanged duplicates are not counted (DO UPDATE WHERE unmatched)."""
         from datetime import datetime, UTC
         from decimal import Decimal
 
@@ -866,6 +866,107 @@ class TestPrivateExecutionRepository:
         repo = PrivateExecutionRepository(session)
         count = repo.bulk_insert([])
         assert count == 0
+
+    def test_execution_insert_enriches_null_pnl(
+        self, session, sample_account, sample_run
+    ):
+        """NULL closed_pnl is enriched by a known value; nothing else moves."""
+        from datetime import datetime, UTC
+        from decimal import Decimal
+
+        def _exec(exec_id, pnl):
+            return PrivateExecution(
+                run_id=sample_run.run_id,
+                account_id=sample_account.account_id,
+                symbol="BTCUSDT",
+                exec_id=exec_id,
+                order_id="order_1",
+                order_link_id="link_1",
+                exchange_ts=datetime(2026, 9, 1, tzinfo=UTC),
+                side="Sell",
+                exec_price=Decimal("50000"),
+                exec_qty=Decimal("0.001"),
+                exec_fee=Decimal("0.01"),
+                closed_pnl=pnl,
+                raw_json={},
+            )
+
+        def _stored(exec_id):
+            session.expire_all()
+            return (
+                session.query(PrivateExecution.closed_pnl)
+                .filter(PrivateExecution.exec_id == exec_id)
+                .scalar()
+            )
+
+        repo = PrivateExecutionRepository(session)
+
+        # REST NULL row first, then the WS row with known PnL → enriched.
+        assert repo.bulk_insert([_exec("e1", None)]) == 1
+        assert repo.bulk_insert([_exec("e1", Decimal("1.5"))]) == 1
+        assert _stored("e1") == Decimal("1.5")
+
+        # Known row, then a REST NULL duplicate → unchanged, not counted.
+        assert repo.bulk_insert([_exec("e1", None)]) == 0
+        assert _stored("e1") == Decimal("1.5")
+
+        # WS redelivery known/known → unchanged, no exception.
+        assert repo.bulk_insert([_exec("e1", Decimal("1.5"))]) == 0
+
+        # NULL/NULL duplicate → unchanged.
+        assert repo.bulk_insert([_exec("e2", None)]) == 1
+        assert repo.bulk_insert([_exec("e2", None)]) == 0
+        assert _stored("e2") is None
+
+        # In-batch duplicate → one row; the known-PnL member wins.
+        assert repo.bulk_insert(
+            [_exec("e3", None), _exec("e3", Decimal("-0.5"))]
+        ) == 1
+        assert _stored("e3") == Decimal("-0.5")
+        # Reverse order: a later NULL member must not beat the known one.
+        assert repo.bulk_insert(
+            [_exec("e4", Decimal("-0.5")), _exec("e4", None)]
+        ) == 1
+        assert _stored("e4") == Decimal("-0.5")
+
+    def test_execution_enrichment_is_account_scoped(
+        self, session, sample_user, sample_account, sample_run
+    ):
+        """A known PnL from another account never fills this account's NULL."""
+        from datetime import datetime, UTC
+        from decimal import Decimal
+
+        other = BybitAccount(
+            user_id=sample_user.user_id,
+            account_name="other",
+            environment="testnet",
+        )
+        session.add(other)
+        session.flush()
+
+        def _exec(account_id, pnl):
+            return PrivateExecution(
+                run_id=sample_run.run_id,
+                account_id=account_id,
+                symbol="BTCUSDT",
+                exec_id="shared-exec",
+                order_id="order_1",
+                order_link_id="link_1",
+                exchange_ts=datetime(2026, 9, 1, tzinfo=UTC),
+                side="Sell",
+                exec_price=Decimal("50000"),
+                exec_qty=Decimal("0.001"),
+                exec_fee=Decimal("0.01"),
+                closed_pnl=pnl,
+                raw_json={},
+            )
+
+        repo = PrivateExecutionRepository(session)
+        assert repo.bulk_insert([_exec(sample_account.account_id, None)]) == 1
+        assert repo.bulk_insert([_exec(other.account_id, Decimal("9"))]) == 0
+        session.expire_all()
+        assert session.query(PrivateExecution.closed_pnl).scalar() is None
+
 
 class TestOrderRepository:
     """Test OrderRepository bulk insert and conflict handling."""

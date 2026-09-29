@@ -6,7 +6,10 @@ from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from gridcore import EventType, GridEngine, TickerEvent
+from grid_db import RecordedDataQualityError
 from grid_db.models import PrivateExecution
 
 from backtest.data_provider import InMemoryDataProvider
@@ -508,6 +511,38 @@ class TestEventFollowerLoading:
         rows = follower.drain(TS - timedelta(seconds=1), TS)
         assert [row.exec_id for row in rows] == ["SOLUSDT-exec"]
         assert rows[0].order_id == "SOLUSDT-oid"
+
+    def test_event_follower_rejects_unknown_recorded_pnl(
+        self, db, seeded_run_account
+    ):
+        """NULL closed_pnl is unknown, never coerced to 0 at load time."""
+        with db.get_session() as session:
+            session.add(
+                PrivateExecution(
+                    run_id="test-run-id",
+                    account_id=seeded_run_account.account_id,
+                    symbol="SOLUSDT",
+                    exec_id="sol-exec",
+                    order_id="sol-oid",
+                    order_link_id="sol-link",
+                    exchange_ts=TS,
+                    side="Sell",
+                    exec_price=Decimal("10"),
+                    exec_qty=Decimal("1"),
+                    exec_fee=Decimal("0.01"),
+                    closed_pnl=None,
+                )
+            )
+        engine = MultiReplayEngine.__new__(MultiReplayEngine)
+        engine._db = db
+        with pytest.raises(RecordedDataQualityError, match="sol-exec"):
+            engine._event_follower(
+                "test-run-id",
+                "SOLUSDT",
+                TS - timedelta(seconds=1),
+                TS + timedelta(seconds=1),
+                FillMode.EVENT_FOLLOWER,
+            )
 
 
 class TestAccountHaltEventFollowerIntegration:

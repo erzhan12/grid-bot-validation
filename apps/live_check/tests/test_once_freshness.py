@@ -6,17 +6,35 @@ pin the gate: stale ticker → SKIP before any replay is attempted; fresh
 ticker → the per-strat check runs.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
-from grid_db import TickerSnapshot
+from grid_db import PrivateExecution, RecordedDataQualityError, TickerSnapshot
 
 from live_check import main as lc_main
 
 
 def _args():
     return SimpleNamespace(last="1h", lag="2m", per_fill=False, curve=False)
+
+
+def _add_exec(db, exchange_ts, closed_pnl):
+    with db.get_session() as session:
+        session.add(PrivateExecution(
+            run_id="test-run-id",
+            account_id="acc1",
+            symbol="LTCUSDT",
+            exec_id="e1",
+            order_id="o1",
+            order_link_id="L1",
+            exchange_ts=exchange_ts,
+            side="Sell",
+            exec_price=Decimal("80"),
+            exec_qty=Decimal("0.2"),
+            exec_fee=Decimal("0.01"),
+            closed_pnl=closed_pnl,
+        ))
 
 
 def _add_ticker(db, exchange_ts):
@@ -61,6 +79,59 @@ class TestOnceFreshnessGate:
         rc = lc_main.run_single(live_check_config, _args(), db)
         assert rc == lc_main.EXIT_SKIP
         assert "no ticker data" in capsys.readouterr().out
+
+    def test_unknown_execution_pnl_skips_validation(
+        self, db, seeded_run_account, live_check_config, monkeypatch, capsys
+    ):
+        """Fresh ticker + NULL closed_pnl in window → SKIP, no replay."""
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        _add_ticker(db, now_naive)
+        _add_exec(db, now_naive - timedelta(minutes=30), closed_pnl=None)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("replay must not run on unknown PnL")
+
+        monkeypatch.setattr(lc_main.runner, "run_strat", _boom)
+        rc = lc_main.run_single(live_check_config, _args(), db)
+        assert rc == lc_main.EXIT_SKIP
+        out = capsys.readouterr().out
+        assert "LTCUSDT" in out and "SKIP" in out
+        assert "unknown closed_pnl" in out
+
+    def test_shared_unknown_execution_pnl_skips_validation(
+        self, db, seeded_run_account, live_check_config, monkeypatch, capsys
+    ):
+        """--shared: NULL closed_pnl in window → SKIP before shared replay."""
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        _add_ticker(db, now_naive)
+        _add_exec(db, now_naive - timedelta(minutes=30), closed_pnl=None)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("shared replay must not run on unknown PnL")
+
+        monkeypatch.setattr(lc_main.runner, "run_shared", _boom)
+        rc = lc_main.run_shared_single(live_check_config, _args(), db)
+        assert rc == lc_main.EXIT_SKIP
+        out = capsys.readouterr().out
+        assert "LTCUSDT" in out and "SKIP" in out
+        assert "unknown closed_pnl" in out
+
+    def test_shared_late_unknown_pnl_during_replay_skips(
+        self, db, seeded_run_account, live_check_config, monkeypatch, capsys
+    ):
+        """--shared: a NULL landing after the pre-check → SKIP, no crash."""
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        _add_ticker(db, now_naive)
+        _add_exec(db, now_naive - timedelta(minutes=30),
+                  closed_pnl=Decimal("0"))
+
+        def _raise_quality(*args, **kwargs):
+            raise RecordedDataQualityError("recorded execution e9 unknown")
+
+        monkeypatch.setattr(lc_main.runner, "run_shared", _raise_quality)
+        rc = lc_main.run_shared_single(live_check_config, _args(), db)
+        assert rc == lc_main.EXIT_SKIP
+        assert "recorded data quality" in capsys.readouterr().out
 
     def test_fresh_ticker_reaches_per_strat_check(
         self, db, seeded_run_account, live_check_config, monkeypatch

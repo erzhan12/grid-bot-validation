@@ -25,6 +25,7 @@ from decimal import Decimal
 import pytest
 
 from gridcore import CancelIntent, EventType, TickerEvent
+from grid_db import RecordedDataQualityError
 
 from backtest.config import BacktestStrategyConfig
 from backtest.executor import BacktestExecutor
@@ -84,6 +85,27 @@ def _ticker(at: float, price: str = "100") -> TickerEvent:
         last_price=Decimal(price),
         mark_price=Decimal(price),
     )
+
+
+class TestRecordedExecutionGuard:
+    def test_recorded_execution_rejects_unknown_pnl(self):
+        """Direct construction cannot bypass the known-PnL precondition."""
+        with pytest.raises(RecordedDataQualityError, match="e-null"):
+            RecordedExecution(
+                exec_id="e-null",
+                order_link_id=None,
+                order_id="o1",
+                side="Sell",
+                exec_price=Decimal("100"),
+                exec_qty=Decimal("1"),
+                exec_fee=Decimal("0.02"),
+                closed_pnl=None,
+                exchange_ts=_ts(0),
+            )
+
+    def test_recorded_execution_keeps_known_zero_pnl(self):
+        """A known zero PnL (opening fill) is valid."""
+        assert _exec("e1", "o1", pnl="0").closed_pnl == Decimal("0")
 
 
 class TestEventFollowerDrain:

@@ -1,3 +1,34 @@
+# Feature 0110 Phase A — REST execution recovery + unknown closed PnL (#271)
+
+Plan: docs/features/0110_PLAN.md (Phase A only; B1/B2 deferred)  |  Branch: feature/0110-rest-exec-recovery
+
+Cycle 1 — consumers reject unknown PnL (lands first):
+- [x] grid_db.data_quality.RecordedDataQualityError
+- [x] live_check ground_truth.sum_realized raises on NULL closed_pnl
+- [x] replay engine + multi_engine event-follower loaders reject NULL
+- [x] backtest RecordedExecution guard
+- [x] comparator _aggregate_fills rejects NULL group
+- [x] live_check render shows UNKNOWN, no positive flag
+- [x] live_check once/watch/shared SKIP on unknown PnL before replay
+
+Cycle 2 — producers emit NULL:
+- [x] adapter get_executions validates result.category (non-empty list)
+- [x] gridcore ExecutionEvent.closed_pnl Optional (default None)
+- [x] normalizer: missing/empty PnL → None, explicit 0 kept
+- [x] reconciler: no per-item category filter, REST PnL via same parser → NULL, raw_json
+- [x] repository bulk_insert: predicated upsert enrich NULL→known, in-batch dedup (return stays int = inserted+enriched; see plan deviations)
+- [x] callers: none needed (int return kept)
+- [x] ported audit test green; make test + make lint
+
+
+Phase A deviations from plan (recorded in 0110_PLAN.md "Phase A implementation notes"):
+- bulk_insert keeps its int return (inserted+enriched); callers' len-count math already = unchanged
+- live-check unknown-PnL SKIP lives in check_strat + run_shared_single (next to the empty-window guard), not inside freshness_skip_reason
+- comparator CLI unchanged: existing logger.exception("Comparison failed") already surfaces the error
+- cycles not committed separately (no commit without explicit ask)
+
+Not committed — awaiting user review.
+
 # Feature 0093 — apps/importer (trad_save_history → replay-compatible SQLite)
 
 Plan: docs/features/0093_PLAN.md  |  Branch: feature/0093-importer

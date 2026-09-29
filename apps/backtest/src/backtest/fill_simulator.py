@@ -15,6 +15,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from gridcore import SideType, TickerEvent, extract_client_order_prefix
+from grid_db import RecordedDataQualityError
 
 if TYPE_CHECKING:
     from backtest.order_manager import SimulatedOrder
@@ -339,8 +340,9 @@ class RecordedExecution:
     ``DetachedInstanceError`` on lazy attribute access after the session
     closes; cf. feature 0038). ``exchange_ts`` is naive UTC (normalized at
     conversion time with the same tz-strip helper the loaders use).
-    ``exec_fee`` / ``closed_pnl`` default to ``Decimal("0")`` when the DB
-    column is NULL.
+    ``exec_fee`` defaults to ``Decimal("0")`` when the DB column is NULL.
+    ``closed_pnl`` must be KNOWN: a NULL (e.g. a REST-backfilled row) raises
+    ``RecordedDataQualityError`` instead of being applied as zero PnL.
     """
 
     exec_id: str
@@ -352,6 +354,12 @@ class RecordedExecution:
     exec_fee: Decimal
     closed_pnl: Decimal
     exchange_ts: datetime
+
+    def __post_init__(self) -> None:
+        if self.closed_pnl is None:
+            raise RecordedDataQualityError(
+                f"recorded execution {self.exec_id} has unknown closed_pnl"
+            )
 
 
 @dataclass(frozen=True)

@@ -7,6 +7,7 @@ from decimal import Decimal
 from typing import Optional
 from uuid import UUID
 
+from bybit_adapter.normalizer import parse_exec_pnl
 from bybit_adapter.rest_client import BybitRestClient
 from grid_db import (
     DatabaseFactory,
@@ -393,9 +394,8 @@ class GapReconciler:
         models = []
         for exec_data in executions:
             try:
-                # Filter: only linear perpetuals and trade executions
-                if exec_data.get("category") != "linear":
-                    continue
+                # Category is validated on the REST envelope by
+                # BybitRestClient.get_executions — rows carry none.
                 if exec_data.get("execType") != "Trade":
                     continue
 
@@ -411,10 +411,13 @@ class GapReconciler:
                         exec_price=Decimal(str(exec_data.get("execPrice", "0"))),
                         exec_qty=Decimal(str(exec_data.get("execQty", "0"))),
                         exec_fee=Decimal(str(exec_data.get("execFee", "0"))),
-                        closed_pnl=Decimal(str(exec_data.get("closedPnl", "0"))),
+                        # REST rows carry no per-execution PnL → NULL
+                        # (unknown), later enriched by the WS row if seen.
+                        closed_pnl=parse_exec_pnl(exec_data),
                         exchange_ts=datetime.fromtimestamp(
                             int(exec_data.get("execTime", 0)) / 1000, tz=UTC
                         ),
+                        raw_json=exec_data,
                     )
                 )
             except Exception as e:

@@ -5,7 +5,12 @@ from decimal import Decimal
 
 import pytest
 
-from grid_db import PositionSnapshot, PrivateExecution, TickerSnapshot
+from grid_db import (
+    PositionSnapshot,
+    PrivateExecution,
+    RecordedDataQualityError,
+    TickerSnapshot,
+)
 
 from live_check import ground_truth
 from live_check.window import Window
@@ -99,18 +104,44 @@ class TestSums:
                 s, RUN_ID, "LTCUSDT", ts, ts + timedelta(hours=1)
             ) == Decimal("0")
 
-    def test_sums_coalesce_all_null_rows_to_zero(self, db, seeded_run_account, ts):
-        """SUM over all-NULL closed_pnl/exec_fee rows returns Decimal(0)."""
-        _insert_exec(db, exec_id="e1", ts=ts, pnl=None, fee=None)
+    def test_commission_coalesces_all_null_rows_to_zero(
+        self, db, seeded_run_account, ts
+    ):
+        """SUM over all-NULL exec_fee rows returns Decimal(0)."""
+        _insert_exec(db, exec_id="e1", ts=ts, pnl="0", fee=None)
         with db.get_readonly_session() as s:
-            assert ground_truth.sum_realized(
-                s, RUN_ID, "LTCUSDT", ts - timedelta(hours=1),
-                ts + timedelta(hours=1),
-            ) == Decimal("0")
             assert ground_truth.sum_commission(
                 s, RUN_ID, "LTCUSDT", ts - timedelta(hours=1),
                 ts + timedelta(hours=1),
             ) == Decimal("0")
+
+    @pytest.mark.parametrize("pnls", [[None], ["1.5", None]])
+    def test_sum_realized_rejects_any_unknown_pnl(
+        self, db, seeded_run_account, ts, pnls
+    ):
+        """All-NULL and mixed known/NULL closed_pnl windows are unknown."""
+        for i, pnl in enumerate(pnls):
+            _insert_exec(db, exec_id=f"e{i}", ts=ts + timedelta(seconds=i),
+                         pnl=pnl)
+        with db.get_readonly_session() as s:
+            with pytest.raises(RecordedDataQualityError, match="closed_pnl"):
+                ground_truth.sum_realized(
+                    s, RUN_ID, "LTCUSDT", ts - timedelta(hours=1),
+                    ts + timedelta(hours=1),
+                )
+
+    def test_unknown_pnl_outside_window_or_symbol_is_ignored(
+        self, db, seeded_run_account, ts
+    ):
+        """A NULL closed_pnl outside the window or symbol does not taint it."""
+        _insert_exec(db, exec_id="in", ts=ts, pnl="2.0")
+        _insert_exec(db, exec_id="late", ts=ts + timedelta(hours=2), pnl=None)
+        _insert_exec(db, exec_id="sol", ts=ts, symbol="SOLUSDT", pnl=None)
+        with db.get_readonly_session() as s:
+            assert ground_truth.sum_realized(
+                s, RUN_ID, "LTCUSDT", ts - timedelta(hours=1),
+                ts + timedelta(hours=1),
+            ) == Decimal("2.0")
 
     def test_multi_symbol_shared_run_isolation(self, db, seeded_run_account, ts):
         """SOL sums EXCLUDE LTC execs under the SAME run_id (symbol-scoped)."""

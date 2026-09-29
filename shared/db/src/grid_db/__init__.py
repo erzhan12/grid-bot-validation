@@ -22,6 +22,7 @@ from grid_db.models import (
     GridStateSnapshot,
 )
 from grid_db.enums import RunType
+from grid_db.data_quality import RecordedDataQualityError
 from grid_db.identity import (
     UUID_NAMESPACE,
     account_id_for,
@@ -88,4 +89,6 @@ __all__ = [
     "user_id_for",
     # Utils
     "redact_db_url",
+    # Data quality
+    "RecordedDataQualityError",
 ]

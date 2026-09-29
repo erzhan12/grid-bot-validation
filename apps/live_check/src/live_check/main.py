@@ -10,8 +10,8 @@ Exit codes (pinned so cron/automation never mistakes a zero-data window for
 success):
     0 — all strats PASS.
     1 — any strat FAIL (verdict diverges) OR a config error.
-    2 — SKIP / no-data / N/A (empty window, seed miss, stale data) or an
-        unexpected exception.
+    2 — SKIP / no-data / N/A (empty window, seed miss, stale data, unknown
+        closed_pnl / recorded-data-quality) or an unexpected exception.
 """
 
 import argparse
@@ -21,7 +21,14 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from grid_db import DatabaseFactory, DatabaseSettings, Run, RunRepository, redact_db_url
+from grid_db import (
+    DatabaseFactory,
+    DatabaseSettings,
+    RecordedDataQualityError,
+    Run,
+    RunRepository,
+    redact_db_url,
+)
 from replay.snapshot_loader import SeedDataQualityError
 
 from live_check import ground_truth, render, runner, shared_wallet
@@ -82,7 +89,8 @@ def check_strat(
     """Run one strat's replay + ground truth + verdict for a window.
 
     Returns:
-        ``("skip", reason)`` for empty-window / no-ticker / seed-miss, else
+        ``("skip", reason)`` for empty-window / no-ticker / unknown
+        closed_pnl / seed-miss / recorded-data-quality, else
         ``("pass" | "fail", Verdict, ReplayResult)``.
     """
     with db.get_readonly_session() as session:
@@ -92,22 +100,32 @@ def check_strat(
         has_ticker = (
             ground_truth.latest_ticker_ts(session, strat.symbol) is not None
         )
+        unknown_pnl = ground_truth.unknown_pnl_exec_ids(
+            session, run_id, strat.symbol, window.start, window.end
+        )
     # Empty-window guard: a zero-data window yields matched==0 and zero
     # deltas — an all-PASS lie. Report SKIP instead, never PASS.
     if exec_count == 0:
         return ("skip", "no data in window (0 live executions)")
     if not has_ticker:
         return ("skip", "no ticker data")
+    # 0110: unknown (NULL) closed_pnl — e.g. REST-backfilled rows — makes
+    # realized PnL undefined on both sides; never coerce it to zero.
+    if unknown_pnl:
+        return ("skip", ground_truth.unknown_pnl_reason(unknown_pnl))
 
     try:
         result = runner.run_strat(strat, window, run_id, account_id, db)
+        with db.get_readonly_session() as session:
+            truth = ground_truth.collect(
+                session, run_id, account_id, strat.symbol, window
+            )
     except SeedDataQualityError as e:
         return ("skip", f"seed miss at {window.start.isoformat()}: {e}")
-
-    with db.get_readonly_session() as session:
-        truth = ground_truth.collect(
-            session, run_id, account_id, strat.symbol, window
-        )
+    except RecordedDataQualityError as e:
+        # Defensive: a NULL can land between the pre-check and the reads,
+        # or replay can meet one outside the pre-checked window/symbol.
+        return ("skip", f"recorded data quality: {e}")
     v = evaluate(result, truth, config.thresholds)
     return ("pass" if v.passed else "fail", v, result)
 
@@ -230,6 +248,12 @@ def run_shared_single(config: LiveCheckConfig, args, db: DatabaseFactory) -> int
             )
             for strat in config.strats
         }
+        unknown_pnl = {
+            strat.strat_id: ground_truth.unknown_pnl_exec_ids(
+                session, run_id, strat.symbol, window.start, window.end
+            )
+            for strat in config.strats
+        }
     if any(count == 0 for count in exec_counts.values()):
         for strat in config.strats:
             if exec_counts[strat.symbol] == 0:
@@ -241,15 +265,37 @@ def run_shared_single(config: LiveCheckConfig, args, db: DatabaseFactory) -> int
             if reason is not None:
                 print(f"{strat.strat_id} ({strat.symbol}) — SKIP: {reason}")
         return EXIT_SKIP
+    if any(unknown_pnl.values()):
+        for strat in config.strats:
+            ids = unknown_pnl[strat.strat_id]
+            if ids:
+                print(
+                    f"{strat.strat_id} ({strat.symbol}) — SKIP: "
+                    f"{ground_truth.unknown_pnl_reason(ids)}"
+                )
+        return EXIT_SKIP
 
-    result = runner.run_shared(config.strats, window, run_id, account_id, db)
+    try:
+        result = runner.run_shared(
+            config.strats, window, run_id, account_id, db
+        )
+        with db.get_readonly_session() as session:
+            truths = {
+                strat.strat_id: ground_truth.collect(
+                    session, run_id, account_id, strat.symbol, window
+                )
+                for strat in config.strats
+            }
+    except RecordedDataQualityError as e:
+        # Defensive: a NULL can land between the pre-check and the reads,
+        # or replay can meet one outside the pre-checked window/symbol.
+        print(f"shared — SKIP: recorded data quality: {e}")
+        return EXIT_SKIP
     per_strat = {}
     rendered = []
     with db.get_readonly_session() as session:
         for strat in config.strats:
-            truth = ground_truth.collect(
-                session, run_id, account_id, strat.symbol, window
-            )
+            truth = truths[strat.strat_id]
             strategy_result = result.strategies[strat.symbol]
             verdict = evaluate_multi_strategy(
                 strategy_result, truth, config.thresholds

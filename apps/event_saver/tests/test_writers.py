@@ -439,6 +439,78 @@ class TestExecutionWriter:
         assert writer._running is False
         assert writer._flush_task is None
 
+    @pytest.mark.asyncio
+    async def test_ws_execution_without_pnl_persists_null(self):
+        """WS payload without execPnl/closedPnl → normalizer → writer → NULL."""
+        from bybit_adapter.normalizer import BybitNormalizer, NormalizerContext
+        from grid_db import (
+            BybitAccount,
+            DatabaseSettings,
+            PrivateExecution,
+            Run,
+            Strategy,
+            User,
+        )
+
+        db = DatabaseFactory(
+            DatabaseSettings(db_type="sqlite", db_name=":memory:")
+        )
+        db.create_tables()
+        try:
+            with db.get_session() as session:
+                user = User(username="u", email="u@example.invalid")
+                session.add(user)
+                session.flush()
+                account = BybitAccount(
+                    user_id=user.user_id, account_name="a",
+                    environment="testnet",
+                )
+                session.add(account)
+                session.flush()
+                strategy = Strategy(
+                    account_id=account.account_id,
+                    strategy_type="GridStrategy",
+                    symbol="LTCUSDT",
+                    config_json={},
+                )
+                session.add(strategy)
+                session.flush()
+                run = Run(
+                    user_id=user.user_id,
+                    account_id=account.account_id,
+                    strategy_id=strategy.strategy_id,
+                    run_type="recording",
+                    start_ts=datetime(2026, 9, 1, tzinfo=UTC),
+                )
+                session.add(run)
+                session.flush()
+                ctx = NormalizerContext(
+                    user_id=user.user_id,
+                    account_id=account.account_id,
+                    run_id=run.run_id,
+                )
+
+            events = BybitNormalizer(context=ctx).normalize_execution({
+                "topic": "execution",
+                "data": [{
+                    "category": "linear", "symbol": "LTCUSDT",
+                    "execId": "ws-1", "orderId": "o1", "orderLinkId": "l1",
+                    "side": "Sell", "execPrice": "100", "execQty": "0.2",
+                    "execFee": "0.01", "execType": "Trade",
+                    "execTime": "1790481601000", "closedSize": "0.2",
+                }],
+            })
+            writer = ExecutionWriter(db=db, batch_size=100)
+            await writer.write(events)
+            await writer.flush()
+
+            with db.get_session() as session:
+                row = session.query(PrivateExecution).one()
+                assert row.exec_id == "ws-1"
+                assert row.closed_pnl is None
+        finally:
+            db.drop_tables()
+
 class TestOrderWriter:
     """Test OrderWriter buffering and bulk insert."""
 

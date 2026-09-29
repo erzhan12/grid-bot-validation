@@ -37,6 +37,7 @@ from gridcore import (
     PlaceLimitIntent,
     TickerEvent,
 )
+from grid_db import RecordedDataQualityError
 from grid_db.models import PrivateExecution
 
 from backtest.data_provider import InMemoryDataProvider
@@ -386,6 +387,21 @@ class TestEventFollowerRoundTrip:
         assert m.backtest_only_count == 0
         assert m.total_backtest_trades == 0
         assert result.session.trades == []
+
+    def test_event_follower_rejects_unknown_recorded_pnl(
+        self, mock_instrument, db, seeded_run_account
+    ):
+        """A NULL closed_pnl stops the run before any fill or wallet change."""
+        _insert_execution(db, exec_id="e-null", order_id="LIVE_X",
+                          link="deadbeefdeadbeef-1", side="Sell",
+                          price=Decimal("100200"), qty=Decimal("0.001"),
+                          fee=Decimal("0.01"), pnl=None,
+                          ts=TS + timedelta(seconds=70))
+        engine = ReplayEngine(config=_replay_config(TS), db=db)
+        with pytest.raises(RecordedDataQualityError, match="e-null"):
+            engine.run(
+                data_provider=InMemoryDataProvider([_make_tick(PRICE, TS)])
+            )
 
     def test_last_cross_default_unaffected(self, mock_instrument, db,
                                            seeded_run_account):

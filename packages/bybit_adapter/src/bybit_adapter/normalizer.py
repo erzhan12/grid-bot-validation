@@ -25,6 +25,21 @@ from gridcore.events import (
 )
 
 
+def parse_exec_pnl(exec_data: dict) -> Optional[Decimal]:
+    """Per-execution PnL from a Bybit execution row, or None when unknown.
+
+    Prefers ``closedPnl`` (legacy) then ``execPnl`` (documented WS field).
+    Missing, null, or empty values are UNKNOWN — never zero: the REST
+    ``/v5/execution/list`` rows carry neither field. An explicit ``"0"``
+    stays a known zero.
+    """
+    for key in ("closedPnl", "execPnl"):
+        value = exec_data.get(key)
+        if value not in (None, ""):
+            return Decimal(str(value))
+    return None
+
+
 @dataclass
 class NormalizerContext:
     """Context for normalizing private events with multi-tenant tags."""
@@ -194,7 +209,7 @@ class BybitNormalizer:
                     "execTime": "1704639600000",
                     "side": "Buy",
                     "leavesQty": "0",
-                    "closedPnl": "10.50",
+                    "execPnl": "10.50",
                     "isMaker": true,
                     ...
                 },
@@ -226,8 +241,6 @@ class BybitNormalizer:
                 exec_ts_ms = int(local_ts.timestamp() * 1000)
             exchange_ts = datetime.fromtimestamp(exec_ts_ms / 1000, tz=UTC)
 
-            # Parse closed PnL - may be "closedPnl" or "execPnl" depending on API version
-            closed_pnl_str = exec_data.get("closedPnl") or exec_data.get("execPnl", "0")
             # closedSize: qty of position closed by this execution ("0" = opening trade)
             closed_size_str = exec_data.get("closedSize", "0")
             # leavesQty: remaining unfilled quantity ("0" = fully filled)
@@ -248,7 +261,7 @@ class BybitNormalizer:
                 price=Decimal(exec_data.get("execPrice", "0")),
                 qty=Decimal(exec_data.get("execQty", "0")),
                 fee=Decimal(exec_data.get("execFee", "0")),
-                closed_pnl=Decimal(closed_pnl_str),
+                closed_pnl=parse_exec_pnl(exec_data),
                 closed_size=Decimal(closed_size_str),
                 leaves_qty=Decimal(leaves_qty_str),
             )

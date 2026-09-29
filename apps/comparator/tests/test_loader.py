@@ -4,9 +4,12 @@ import csv
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 
+import pytest
+
 from grid_db import (
     DatabaseFactory,
     PrivateExecution,
+    RecordedDataQualityError,
     User,
     BybitAccount,
     Strategy,
@@ -279,6 +282,29 @@ class TestLiveTradeLoader:
             trades = loader.load(run_id, ts - timedelta(hours=1), ts + timedelta(hours=1))
 
         assert trades[0].realized_pnl == Decimal("0.10")
+
+    def test_partial_fill_group_with_unknown_pnl_is_rejected(self, db):
+        """One NULL closed_pnl member blocks the PnL aggregate and direction."""
+        run_id = self._seed_data(db)
+        ts = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+        self._add_execution(
+            db, run_id, "e1", "client_1", "Sell",
+            Decimal("100200"), Decimal("0.0005"), Decimal("0.01"), Decimal("0.05"),
+            ts, order_id="oid_shared",
+        )
+        self._add_execution(
+            db, run_id, "e2", "client_1", "Sell",
+            Decimal("100200"), Decimal("0.0005"), Decimal("0.01"), None,
+            ts + timedelta(seconds=1), order_id="oid_shared",
+        )
+
+        with db.get_session() as session:
+            loader = LiveTradeLoader(session)
+            with pytest.raises(RecordedDataQualityError, match="e2"):
+                loader.load(
+                    run_id, ts - timedelta(hours=1), ts + timedelta(hours=1)
+                )
 
     def test_direction_inferred_opening_buy(self, db):
         """Buy with zero closed_pnl inferred as long."""

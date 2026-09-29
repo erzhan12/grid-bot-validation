@@ -746,9 +746,8 @@ class MultiReplayEngine(ReplayEngine):
                         exec_price=ex.exec_price,
                         exec_qty=ex.exec_qty,
                         exec_fee=ex.exec_fee if ex.exec_fee is not None else Decimal("0"),
-                        closed_pnl=(
-                            ex.closed_pnl if ex.closed_pnl is not None else Decimal("0")
-                        ),
+                        # NULL is unknown PnL: RecordedExecution raises.
+                        closed_pnl=ex.closed_pnl,
                         exchange_ts=_strip_tz(ex.exchange_ts),
                     )
                 )

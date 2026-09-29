@@ -256,6 +256,8 @@ class BybitRestClient:
 
         Raises:
             Exception: If API call fails
+            ValueError: A non-empty page whose envelope ``result.category`` is
+                not ``"linear"``.
         """
         logger.debug(f"Fetching executions for {symbol}, start={start_time}, end={end_time}")
         self._wait_for_rate_limit("query")
@@ -279,6 +281,13 @@ class BybitRestClient:
         result = response.get("result", {})
         executions = result.get("list", [])
         next_cursor = result.get("nextPageCursor")
+        # Bybit puts category on the result envelope, not on each row. An
+        # empty page is accepted as-is (its category shape is unverified).
+        if executions and result.get("category") != params["category"]:
+            raise ValueError(
+                "get_executions: expected result.category='linear', "
+                f"got {result.get('category')!r}"
+            )
 
         logger.debug(f"Fetched {len(executions)} executions, has_more={bool(next_cursor)}")
         return executions, next_cursor if next_cursor else None

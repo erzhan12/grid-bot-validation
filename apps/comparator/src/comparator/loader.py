@@ -14,7 +14,11 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from grid_db import PrivateExecution, PrivateExecutionRepository
+from grid_db import (
+    PrivateExecution,
+    PrivateExecutionRepository,
+    RecordedDataQualityError,
+)
 from gridcore.intents import extract_client_order_prefix
 from gridcore.position import DirectionType, SideType
 
@@ -99,6 +103,10 @@ class LiveTradeLoader:
 
         Returns:
             List of NormalizedTrade sorted by timestamp.
+
+        Raises:
+            RecordedDataQualityError: An execution in scope has NULL
+                (unknown) closed_pnl.
         """
         executions = self._repo.get_by_run_range(run_id, start_ts, end_ts)
 
@@ -150,7 +158,17 @@ class LiveTradeLoader:
         """Aggregate partial fills into one NormalizedTrade.
 
         Uses VWAP for price, sums qty/fee/pnl, takes latest timestamp.
+
+        Raises:
+            RecordedDataQualityError: A fill has unknown (NULL) closed_pnl;
+                the aggregate PnL and PnL-based direction are undefined.
         """
+        unknown = [f.exec_id for f in fills if f.closed_pnl is None]
+        if unknown:
+            raise RecordedDataQualityError(
+                f"order {client_order_id}: unknown closed_pnl on "
+                f"execution(s) {', '.join(unknown)}"
+            )
         total_qty = Decimal("0")
         total_notional = Decimal("0")
         total_fee = Decimal("0")
@@ -162,7 +180,7 @@ class LiveTradeLoader:
             total_qty += qty
             total_notional += f.exec_price * qty
             total_fee += f.exec_fee or Decimal("0")
-            total_pnl += f.closed_pnl or Decimal("0")
+            total_pnl += f.closed_pnl
             f_ts = _normalize_ts(f.exchange_ts)
             if f_ts > latest_ts:
                 latest_ts = f_ts

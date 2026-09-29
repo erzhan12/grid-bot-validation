@@ -154,8 +154,12 @@ def render_per_fill(results) -> str:
             if bt is None:
                 group_ok[key] = False
                 continue
+            if any(e.closed_pnl is None for e in execs):
+                # Unknown PnL can never compare equal to the bt rollup.
+                group_ok[key] = False
+                continue
             qty_sum = sum((e.exec_qty or _ZERO) for e in execs)
-            pnl_sum = sum((e.closed_pnl or _ZERO) for e in execs)
+            pnl_sum = sum(e.closed_pnl for e in execs)
             notional = sum(
                 (e.exec_price or _ZERO) * (e.exec_qty or _ZERO) for e in execs
             )
@@ -172,21 +176,25 @@ def render_per_fill(results) -> str:
             bt = bt_by_key.get(key)
             live_px = ex.exec_price if ex.exec_price is not None else _ZERO
             live_qty = ex.exec_qty if ex.exec_qty is not None else _ZERO
-            live_pnl = ex.closed_pnl if ex.closed_pnl is not None else _ZERO
+            live_pnl = (
+                f"{ex.closed_pnl:>10.4f}"
+                if ex.closed_pnl is not None
+                else f"{'UNKNOWN':>10}"
+            )
             if bt is not None:
                 dpx = live_px - bt.price
                 lines.append(
                     f"{ex.exec_id:<20} {ex.exchange_ts:%Y-%m-%d %H:%M:%S} "
                     f"{ex.side:<4} {live_px:>10.4f} {bt.price:>10.4f} "
                     f"{dpx:>8.4f} {live_qty:>9.4f} {bt.qty:>9.4f} "
-                    f"{live_pnl:>10.4f} {bt.realized_pnl:>10.4f} "
+                    f"{live_pnl} {bt.realized_pnl:>10.4f} "
                     f"{_flag(group_ok[key])}"
                 )
             else:
                 lines.append(
                     f"{ex.exec_id:<20} {ex.exchange_ts:%Y-%m-%d %H:%M:%S} "
                     f"{ex.side:<4} {live_px:>10.4f} {'—':>10} {'—':>8} "
-                    f"{live_qty:>9.4f} {'—':>9} {live_pnl:>10.4f} {'—':>10} ✗"
+                    f"{live_qty:>9.4f} {'—':>9} {live_pnl} {'—':>10} ✗"
                 )
         blocks.append("\n".join(lines))
     return "\n\n".join(blocks)

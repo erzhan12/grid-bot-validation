@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from grid_db import (
     PositionSnapshotRepository,
     PrivateExecution,
+    RecordedDataQualityError,
     Run,
     TickerSnapshot,
 )
@@ -86,13 +87,66 @@ def _sum_column(
     return Decimal(str(value))
 
 
+def unknown_pnl_exec_ids(
+    session: Session, run_id: str, symbol: str, start: datetime, end: datetime
+) -> list[str]:
+    """``exec_id``s in the window whose ``closed_pnl`` is NULL (unknown).
+
+    A NULL is not zero PnL: REST-backfilled executions carry no per-execution
+    PnL. Any such row makes the window's realized sum undefined.
+    """
+    rows = (
+        session.query(PrivateExecution.exec_id)
+        .filter(
+            PrivateExecution.run_id == run_id,
+            PrivateExecution.symbol == symbol,
+            PrivateExecution.exchange_ts >= to_naive_utc(start),
+            PrivateExecution.exchange_ts <= to_naive_utc(end),
+            PrivateExecution.closed_pnl.is_(None),
+        )
+        .order_by(PrivateExecution.exchange_ts, PrivateExecution.exec_id)
+        .all()
+    )
+    return [row[0] for row in rows]
+
+
+def unknown_pnl_reason(exec_ids: list[str]) -> str:
+    """Human-readable SKIP/error reason for unknown-PnL executions."""
+    return (
+        f"unknown closed_pnl on {len(exec_ids)} execution(s) "
+        f"(first: {exec_ids[0]})"
+    )
+
+
 def sum_realized(
     session: Session, run_id: str, symbol: str, start: datetime, end: datetime
 ) -> Decimal:
-    """SUM ``closed_pnl`` over the window, scoped by run_id + symbol."""
-    return _sum_column(
-        session, PrivateExecution.closed_pnl, run_id, symbol, start, end
+    """SUM ``closed_pnl`` over the window, scoped by run_id + symbol.
+
+    Raises:
+        RecordedDataQualityError: Any execution in scope has NULL
+            ``closed_pnl`` — SQL ``SUM`` would silently drop it.
+    """
+    # One aggregate statement so a NULL row cannot land between the
+    # NULL check and the SUM (SUM silently skips NULLs).
+    total, unknown_count = (
+        session.query(
+            func.coalesce(func.sum(PrivateExecution.closed_pnl), 0),
+            func.count() - func.count(PrivateExecution.closed_pnl),
+        )
+        .filter(
+            PrivateExecution.run_id == run_id,
+            PrivateExecution.symbol == symbol,
+            PrivateExecution.exchange_ts >= to_naive_utc(start),
+            PrivateExecution.exchange_ts <= to_naive_utc(end),
+        )
+        .one()
     )
+    if unknown_count:
+        raise RecordedDataQualityError(
+            f"unknown closed_pnl on {unknown_count} execution(s)"
+        )
+    return Decimal(str(total)) if total is not None else _ZERO
 
 
 def sum_commission(
@@ -219,7 +273,12 @@ def collect(
     symbol: str,
     window: Window,
 ) -> GroundTruth:
-    """Gather all recorded ground truth for one strat over one window."""
+    """Gather all recorded ground truth for one strat over one window.
+
+    Raises:
+        RecordedDataQualityError: NULL closed_pnl in the window
+            (via :func:`sum_realized`).
+    """
     return GroundTruth(
         sum_realized=sum_realized(session, run_id, symbol, window.start, window.end),
         sum_commission=sum_commission(

@@ -89,7 +89,7 @@ class TestGetExecutions:
     def test_returns_executions_and_cursor(self, client, mock_session):
         execs = [{"execId": "e1", "orderId": "o1", "execPrice": "100000"}]
         mock_session.get_executions.return_value = _ok_response(
-            {"list": execs, "nextPageCursor": "cursor123"}
+            {"category": "linear", "list": execs, "nextPageCursor": "cursor123"}
         )
 
         result, cursor = client.get_executions(symbol="BTCUSDT")
@@ -99,7 +99,7 @@ class TestGetExecutions:
 
     def test_no_cursor_returns_none(self, client, mock_session):
         mock_session.get_executions.return_value = _ok_response(
-            {"list": [], "nextPageCursor": ""}
+            {"category": "linear", "list": [], "nextPageCursor": ""}
         )
 
         result, cursor = client.get_executions(symbol="BTCUSDT")
@@ -108,7 +108,9 @@ class TestGetExecutions:
         assert cursor is None
 
     def test_passes_optional_params(self, client, mock_session):
-        mock_session.get_executions.return_value = _ok_response({"list": [], "nextPageCursor": ""})
+        mock_session.get_executions.return_value = _ok_response(
+            {"category": "linear", "list": [], "nextPageCursor": ""}
+        )
 
         client.get_executions(
             symbol="ETHUSDT",
@@ -127,7 +129,9 @@ class TestGetExecutions:
         )
 
     def test_clamps_limit_to_100(self, client, mock_session):
-        mock_session.get_executions.return_value = _ok_response({"list": [], "nextPageCursor": ""})
+        mock_session.get_executions.return_value = _ok_response(
+            {"category": "linear", "list": [], "nextPageCursor": ""}
+        )
 
         client.get_executions(limit=500)
 
@@ -135,7 +139,9 @@ class TestGetExecutions:
         assert call_kwargs["limit"] == 100
 
     def test_no_symbol_omits_param(self, client, mock_session):
-        mock_session.get_executions.return_value = _ok_response({"list": [], "nextPageCursor": ""})
+        mock_session.get_executions.return_value = _ok_response(
+            {"category": "linear", "list": [], "nextPageCursor": ""}
+        )
 
         client.get_executions()
 
@@ -148,6 +154,46 @@ class TestGetExecutions:
         with pytest.raises(Exception, match="Auth failed"):
             client.get_executions(symbol="BTCUSDT")
 
+    def test_execution_response_category_is_validated_at_result_level(
+        self, client, mock_session
+    ):
+        """Documented envelope: category on result, rows carry none."""
+        rows = [{
+            "symbol": "BTCUSDT", "execId": "e1", "orderId": "o1",
+            "orderLinkId": "l1", "side": "Sell", "execPrice": "100000",
+            "execQty": "0.001", "execFee": "0.02", "execType": "Trade",
+            "execTime": "1790481601000", "closedSize": "0.001",
+        }]
+        mock_session.get_executions.return_value = _ok_response(
+            {"category": "linear", "list": rows, "nextPageCursor": "c2"}
+        )
+
+        result, cursor = client.get_executions(symbol="BTCUSDT")
+
+        assert result == rows
+        assert cursor == "c2"
+
+    @pytest.mark.parametrize("category", [None, "", "spot", "inverse"])
+    def test_non_linear_result_category_raises(
+        self, client, mock_session, category
+    ):
+        """A non-empty page without result.category == linear is rejected."""
+        result = {"list": [{"execId": "e1"}], "nextPageCursor": ""}
+        if category is not None:
+            result["category"] = category
+        mock_session.get_executions.return_value = _ok_response(result)
+
+        with pytest.raises(ValueError, match="category"):
+            client.get_executions(symbol="BTCUSDT")
+
+    def test_empty_page_without_category_is_accepted(self, client, mock_session):
+        """Bybit's empty-result shape is unverified: an empty list passes."""
+        mock_session.get_executions.return_value = _ok_response(
+            {"list": [], "nextPageCursor": ""}
+        )
+
+        assert client.get_executions(symbol="BTCUSDT") == ([], None)
+
 
 # ---------------------------------------------------------------------------
 # get_executions_all (pagination)
@@ -158,7 +204,7 @@ class TestGetExecutionsAll:
     def test_single_page(self, client, mock_session):
         execs = [{"execId": "e1"}]
         mock_session.get_executions.return_value = _ok_response(
-            {"list": execs, "nextPageCursor": ""}
+            {"category": "linear", "list": execs, "nextPageCursor": ""}
         )
 
         result = client.get_executions_all(symbol="BTCUSDT")
@@ -170,8 +216,10 @@ class TestGetExecutionsAll:
         page1 = [{"execId": "e1"}]
         page2 = [{"execId": "e2"}]
         mock_session.get_executions.side_effect = [
-            _ok_response({"list": page1, "nextPageCursor": "cursor2"}),
-            _ok_response({"list": page2, "nextPageCursor": ""}),
+            _ok_response(
+                {"category": "linear", "list": page1, "nextPageCursor": "cursor2"}
+            ),
+            _ok_response({"category": "linear", "list": page2, "nextPageCursor": ""}),
         ]
 
         result = client.get_executions_all(symbol="BTCUSDT")
@@ -181,7 +229,7 @@ class TestGetExecutionsAll:
 
     def test_stops_at_max_pages(self, client, mock_session):
         mock_session.get_executions.return_value = _ok_response(
-            {"list": [{"execId": "e"}], "nextPageCursor": "more"}
+            {"category": "linear", "list": [{"execId": "e"}], "nextPageCursor": "more"}
         )
 
         result = client.get_executions_all(symbol="BTCUSDT", max_pages=3)
@@ -191,7 +239,7 @@ class TestGetExecutionsAll:
 
     def test_return_truncated_flag_when_max_pages_reached(self, client, mock_session):
         mock_session.get_executions.return_value = _ok_response(
-            {"list": [{"execId": "e"}], "nextPageCursor": "more"}
+            {"category": "linear", "list": [{"execId": "e"}], "nextPageCursor": "more"}
         )
 
         result, truncated = client.get_executions_all(
@@ -208,8 +256,16 @@ class TestGetExecutionsAll:
         self, client, mock_session
     ):
         mock_session.get_executions.side_effect = [
-            _ok_response({"list": [{"execId": "e1"}], "nextPageCursor": "cursor2"}),
-            _ok_response({"list": [{"execId": "e2"}], "nextPageCursor": ""}),
+            _ok_response({
+                "category": "linear",
+                "list": [{"execId": "e1"}],
+                "nextPageCursor": "cursor2",
+            }),
+            _ok_response({
+                "category": "linear",
+                "list": [{"execId": "e2"}],
+                "nextPageCursor": "",
+            }),
         ]
 
         result, truncated = client.get_executions_all(
@@ -224,7 +280,7 @@ class TestGetExecutionsAll:
 
     def test_passes_time_range(self, client, mock_session):
         mock_session.get_executions.return_value = _ok_response(
-            {"list": [], "nextPageCursor": ""}
+            {"category": "linear", "list": [], "nextPageCursor": ""}
         )
 
         client.get_executions_all(symbol="BTCUSDT", start_time=100, end_time=200)

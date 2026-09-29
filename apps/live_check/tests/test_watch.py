@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta
 from decimal import Decimal
 
-from grid_db import PrivateExecution, TickerSnapshot
+from grid_db import PrivateExecution, RecordedDataQualityError, TickerSnapshot
 from replay.snapshot_loader import SeedDataQualityError
 
 from live_check import main as lc_main
@@ -13,7 +13,7 @@ _NOW = datetime(2026, 7, 1, 12, 0, 0)
 _LAG = timedelta(minutes=2)
 
 
-def _seed_window_data(db, ts):
+def _seed_window_data(db, ts, closed_pnl=Decimal("0")):
     """One exec + one fresh ticker so the tick reaches the seed path."""
     with db.get_session() as session:
         session.add(PrivateExecution(
@@ -28,7 +28,7 @@ def _seed_window_data(db, ts):
             exec_price=Decimal("80"),
             exec_qty=Decimal("0.2"),
             exec_fee=Decimal("0.01"),
-            closed_pnl=Decimal("0"),
+            closed_pnl=closed_pnl,
         ))
         session.add(TickerSnapshot(
             symbol="LTCUSDT",
@@ -68,6 +68,65 @@ class TestWatchSeedMiss:
             assert len(lines) == 1
             assert "SKIP" in lines[0]
             assert "seed miss" in lines[0]
+
+    def test_unknown_execution_pnl_skips_validation(
+        self, db, seeded_run_account, strat, live_check_config, monkeypatch
+    ):
+        """NULL closed_pnl in the window → SKIP line, replay never invoked."""
+        _seed_window_data(db, _NOW, closed_pnl=None)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("replay must not run on unknown PnL")
+
+        monkeypatch.setattr(lc_main.runner, "run_strat", _boom)
+        lines = lc_main.watch_tick(
+            live_check_config, db, seeded_run_account.run_id,
+            seeded_run_account.account_id, timedelta(hours=1), _LAG,
+            staleness_threshold(_LAG), now=_NOW,
+        )
+        assert len(lines) == 1
+        assert "SKIP" in lines[0]
+        assert "unknown closed_pnl" in lines[0]
+        assert "LTCUSDT" in lines[0] or "ltcusdt_test" in lines[0]
+
+    def test_late_unknown_pnl_during_replay_renders_skip(
+        self, db, seeded_run_account, strat, live_check_config, monkeypatch
+    ):
+        """A NULL landing after the pre-check → SKIP line, tick survives."""
+        _seed_window_data(db, _NOW)
+
+        def _raise_quality(*args, **kwargs):
+            raise RecordedDataQualityError("recorded execution e9 unknown")
+
+        monkeypatch.setattr(lc_main.runner, "run_strat", _raise_quality)
+        lines = lc_main.watch_tick(
+            live_check_config, db, seeded_run_account.run_id,
+            seeded_run_account.account_id, timedelta(hours=1), _LAG,
+            staleness_threshold(_LAG), now=_NOW,
+        )
+        assert len(lines) == 1
+        assert "SKIP" in lines[0]
+        assert "recorded data quality" in lines[0]
+
+    def test_unknown_pnl_in_ground_truth_after_replay_renders_skip(
+        self, db, seeded_run_account, strat, live_check_config, monkeypatch
+    ):
+        """Replay succeeds, then collect() meets a NULL → SKIP, tick survives."""
+        _seed_window_data(db, _NOW)
+
+        def _raise_quality(*args, **kwargs):
+            raise RecordedDataQualityError("unknown closed_pnl on 1 execution(s)")
+
+        monkeypatch.setattr(lc_main.runner, "run_strat", lambda *a, **k: object())
+        monkeypatch.setattr(lc_main.ground_truth, "collect", _raise_quality)
+        lines = lc_main.watch_tick(
+            live_check_config, db, seeded_run_account.run_id,
+            seeded_run_account.account_id, timedelta(hours=1), _LAG,
+            staleness_threshold(_LAG), now=_NOW,
+        )
+        assert len(lines) == 1
+        assert "SKIP" in lines[0]
+        assert "recorded data quality" in lines[0]
 
     def test_stale_data_renders_skip_line(
         self, db, seeded_run_account, strat, live_check_config

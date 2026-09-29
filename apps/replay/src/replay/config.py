@@ -273,7 +273,8 @@ class FillSimulatorConfig(BaseModel):
             "0072) sources fills from the recorded live "
             "private_executions stream instead of simulating against "
             "the ticker: recorded exec_price/exec_qty/exec_fee/"
-            "closed_pnl are applied as-is, backtest_only is "
+            "closed_pnl are applied as-is (a NULL/unknown closed_pnl "
+            "raises RecordedDataQualityError), backtest_only is "
             "structurally 0, and live_only measures intent-set "
             "divergence from live (not simulator misses)."
         ),

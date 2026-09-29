@@ -3,7 +3,13 @@ from datetime import datetime, UTC
 from decimal import Decimal
 from uuid import uuid4
 
-from bybit_adapter.normalizer import BybitNormalizer, NormalizerContext
+import pytest
+
+from bybit_adapter.normalizer import (
+    BybitNormalizer,
+    NormalizerContext,
+    parse_exec_pnl,
+)
 from gridcore.events import EventType
 
 
@@ -208,6 +214,42 @@ class TestNormalizeExecution:
 
         assert len(events) == 1
         assert events[0].closed_size == Decimal("0")
+
+    @pytest.mark.parametrize(
+        "pnl_fields, expected",
+        [
+            ({"execPnl": "0.05"}, Decimal("0.05")),  # documented WS field
+            ({"closedPnl": "10.5"}, Decimal("10.5")),  # legacy alias
+            ({"execPnl": "0"}, Decimal("0")),  # explicit zero stays known
+            ({}, None),  # missing → unknown
+            ({"execPnl": None}, None),  # null → unknown
+            ({"execPnl": ""}, None),  # empty → unknown
+            ({"closedPnl": "", "execPnl": "1.25"}, Decimal("1.25")),
+        ],
+    )
+    def test_execution_pnl_preserves_unknown_and_explicit_zero(
+        self, pnl_fields, expected
+    ):
+        """Missing/null/empty PnL is unknown (None), never zero."""
+        row = {
+            "category": "linear",
+            "symbol": "BTCUSDT",
+            "execId": "exec-1",
+            "orderId": "order-1",
+            "orderLinkId": "link-1",
+            "execPrice": "50000.0",
+            "execQty": "0.1",
+            "execFee": "0.5",
+            "execType": "Trade",
+            "execTime": "1704639600000",
+            "side": "Sell",
+            **pnl_fields,
+        }
+        events = BybitNormalizer().normalize_execution(
+            {"topic": "execution", "data": [row]}
+        )
+        assert events[0].closed_pnl == expected
+        assert parse_exec_pnl(row) == expected
 
     def test_normalize_execution_with_context(
         self, sample_execution_message, sample_user_id, sample_account_id, sample_run_id

@@ -185,6 +185,23 @@ class TestRenderPerFill:
         )
         assert "✗" not in out
 
+    def test_per_fill_unknown_pnl_is_not_rendered_as_zero(self):
+        """A NULL closed_pnl renders UNKNOWN and its group never flags ✓."""
+        ts = datetime(2026, 7, 1, 12, 0, 0)
+        execs = [
+            ExecRow("exec-1", ts, "Sell", Decimal("80"), Decimal("0.1"),
+                    Decimal("0"), "L1-1751371200000", "O1"),
+            ExecRow("exec-2", ts, "Sell", Decimal("80"), Decimal("0.1"),
+                    None, "L1-1751371200000", "O1"),
+        ]
+        trades = [_trade("L1", qty="0.2", pnl="0", order_id="O1")]
+        out = render_per_fill(
+            [(_strat(), _verdict(True), _result(trades=trades), execs)]
+        )
+        exec2_line = next(ln for ln in out.splitlines() if "exec-2" in ln)
+        assert "UNKNOWN" in exec2_line
+        assert "✓" not in out  # incomplete group cannot compare equal
+
     def test_unmatched_exec_renders_dash_row(self):
         """A live exec with no bt fill renders a placeholder row, no crash."""
         ts = datetime(2026, 7, 1, 12, 0, 0)
@@ -194,6 +211,7 @@ class TestRenderPerFill:
             [(_strat(), _verdict(False), _result(), execs)]
         )
         assert "exec-1" in out
+        assert "UNKNOWN" in out  # NULL closed_pnl on the unmatched branch
         assert "✗" in out
 
 

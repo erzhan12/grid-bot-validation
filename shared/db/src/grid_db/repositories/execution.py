@@ -92,16 +92,31 @@ class PrivateExecutionRepository(BaseRepository[PrivateExecution]):
     def bulk_insert(self, executions: List[PrivateExecution]) -> int:
         """Bulk insert executions for efficient data insertion.
 
-        Uses ON CONFLICT DO NOTHING to skip duplicate exec_ids silently.
+        A duplicate ``exec_id`` is skipped, except that an existing NULL
+        (unknown) ``closed_pnl`` is enriched by an incoming known value — the
+        race where a REST backfill row (no per-execution PnL) lands before
+        the buffered WS row. A known PnL is never overwritten.
 
         Args:
             executions: List of PrivateExecution instances to insert.
 
         Returns:
-            Number of executions inserted (excluding duplicates).
+            Number of rows inserted or enriched; ``len(executions) - result``
+            are unchanged duplicates (in-batch duplicates included).
         """
         if not executions:
             return 0
+
+        # In-batch dedupe by exec_id, keeping a known-PnL member: Postgres
+        # rejects one upsert touching the same row twice.
+        by_exec_id: dict[str, PrivateExecution] = {}
+        for e in executions:
+            kept = by_exec_id.get(e.exec_id)
+            if kept is None or (
+                kept.closed_pnl is None and e.closed_pnl is not None
+            ):
+                by_exec_id[e.exec_id] = e
+        executions = list(by_exec_id.values())
 
         # Convert ORM instances to dict for insert
         executions_data = [
@@ -125,12 +140,21 @@ class PrivateExecutionRepository(BaseRepository[PrivateExecution]):
 
         # Use dialect-specific insert for ON CONFLICT support
         db_dialect = self.session.get_bind().dialect.name
-        if db_dialect == "postgresql":
-            stmt = postgresql_insert(PrivateExecution).values(executions_data)
-            stmt = stmt.on_conflict_do_nothing(index_elements=["exec_id"])
-        elif db_dialect == "sqlite":
-            stmt = sqlite_insert(PrivateExecution).values(executions_data)
-            stmt = stmt.on_conflict_do_nothing(index_elements=["exec_id"])
+        if db_dialect in ("postgresql", "sqlite"):
+            dialect_insert = (
+                postgresql_insert if db_dialect == "postgresql" else sqlite_insert
+            )
+            stmt = dialect_insert(PrivateExecution).values(executions_data)
+            # Predicated so rowcount counts only real inserts/enrichments.
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["exec_id"],
+                set_={"closed_pnl": stmt.excluded.closed_pnl},
+                where=(
+                    PrivateExecution.closed_pnl.is_(None)
+                    & stmt.excluded.closed_pnl.is_not(None)
+                    & (PrivateExecution.account_id == stmt.excluded.account_id)
+                ),
+            )
         else:
             # Fallback for unsupported dialects - no conflict handling
             stmt = insert(PrivateExecution).values(executions_data)
@@ -138,7 +162,7 @@ class PrivateExecutionRepository(BaseRepository[PrivateExecution]):
         result = self.session.execute(stmt)
         self.session.flush()
 
-        # Return rowcount (number of rows actually inserted, excluding skipped duplicates)
+        # Rows inserted or enriched (unchanged duplicates excluded)
         return result.rowcount if result.rowcount else 0
 
     def get_by_order_link_id(self, run_id: str, order_link_id: str) -> List[PrivateExecution]:

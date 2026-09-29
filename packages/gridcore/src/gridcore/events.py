@@ -93,7 +93,8 @@ class ExecutionEvent(Event):
     price: Decimal = Decimal('0')
     qty: Decimal = Decimal('0')
     fee: Decimal = Decimal('0')
-    closed_pnl: Decimal = Decimal('0')
+    # None = unknown (payload carried no PnL); an explicit 0 stays known.
+    closed_pnl: Optional[Decimal] = None
     closed_size: Decimal = Decimal('0')  # Qty closed by this execution (Bybit closedSize)
     leaves_qty: Decimal = Decimal('0')  # Remaining unfilled quantity (Bybit leavesQty)
 

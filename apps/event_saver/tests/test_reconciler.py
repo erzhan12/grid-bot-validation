@@ -8,7 +8,15 @@ from unittest.mock import MagicMock
 from uuid import uuid4
 
 from bybit_adapter.rest_client import BybitRestClient
-from grid_db import DatabaseFactory
+from grid_db import (
+    BybitAccount,
+    DatabaseFactory,
+    DatabaseSettings,
+    PrivateExecution,
+    Run,
+    Strategy,
+    User,
+)
 
 from event_saver.reconciler import GapReconciler, _PRIVATE_EXECUTION_RECONCILE_MAX_PAGES
 
@@ -478,7 +486,7 @@ class TestReconcileExecutions:
 
         mock_client = MagicMock()
         mock_client.get_executions_all.return_value = (
-            [{"execId": "partial", "category": "linear", "execType": "Trade"}],
+            [{"execId": "partial", "execType": "Trade"}],
             True,
         )
 
@@ -592,7 +600,6 @@ class TestExecutionsConversion:
 
         executions = [
             {
-                "category": "linear",
                 "execType": "Trade",
                 "execId": "exec_1",
                 "orderId": "order_1",
@@ -629,7 +636,6 @@ class TestExecutionsConversion:
 
         executions = [
             {
-                "category": "linear",
                 "execType": "Trade",
                 "execId": "exec_1",
                 "orderId": "order_1",
@@ -652,37 +658,34 @@ class TestExecutionsConversion:
 
         assert len(models) == 0
 
-    def test_executions_filters_category(self, mock_db, mock_rest_client):
-        """Test that non-linear executions are filtered out."""
-        reconciler = GapReconciler(
-            db=mock_db,
-            rest_client=mock_rest_client,
+    def test_rest_backfill_accepts_documented_bybit_execution_shape(
+        self, mock_db, mock_rest_client
+    ):
+        """REST rows carry no per-item category or closedPnl (audit #270 F4).
+
+        Ported from cad63f4 ``test_rest_backfill_drops_documented_bybit_
+        execution_shape`` with inverted assertions: the category-free row
+        converts, and a closing row without PnL stays unknown (None).
+        """
+        row = {
+            "symbol": "LTCUSDT", "execId": "rest-1", "orderId": "order-1",
+            "orderLinkId": "open-1", "side": "Buy", "execPrice": "100",
+            "execQty": "1", "execFee": "0.02", "execType": "Trade",
+            "execTime": "1790481601000", "closedSize": "0",
+        }
+        reconciler = GapReconciler(db=mock_db, rest_client=mock_rest_client)
+        ids = dict(user_id=uuid4(), account_id=uuid4(), run_id=uuid4())
+
+        models = reconciler._executions_to_models(**ids, executions=[row])
+        assert len(models) == 1
+        assert models[0].exec_id == "rest-1"
+        assert models[0].raw_json == row
+
+        closing = reconciler._executions_to_models(
+            **ids, executions=[row | {"side": "Sell", "closedSize": "1"}]
         )
-
-        executions = [
-            {
-                "category": "spot",  # Not linear
-                "execType": "Trade",
-                "execId": "exec_1",
-                "orderId": "order_1",
-                "symbol": "BTCUSDT",
-                "side": "Buy",
-                "execPrice": "50000.00",
-                "execQty": "0.001",
-                "execFee": "0.01",
-                "closedPnl": "0",
-                "execTime": 1700000000000,
-            },
-        ]
-
-        models = reconciler._executions_to_models(
-            user_id=uuid4(),
-            account_id=uuid4(),
-            run_id=uuid4(),
-            executions=executions,
-        )
-
-        assert len(models) == 0
+        assert len(closing) == 1
+        assert closing[0].closed_pnl is None
 
     def test_executions_filters_exec_type(self, mock_db, mock_rest_client):
         """Test that non-Trade executions are filtered out."""
@@ -693,7 +696,6 @@ class TestExecutionsConversion:
 
         executions = [
             {
-                "category": "linear",
                 "execType": "Funding",  # Not Trade
                 "execId": "exec_1",
                 "orderId": "order_1",
@@ -736,3 +738,108 @@ class TestGetStats:
         assert stats["trades_reconciled"] == 100
         assert stats["executions_reconciled"] == 50
         assert stats["reconciliation_count"] == 10
+
+
+class TestDocumentedRestPayloadPersistence:
+    """Contract: documented Bybit envelope → adapter → reconciler → SQLite."""
+
+    @pytest.mark.asyncio
+    async def test_documented_rest_payload_is_persisted_with_unknown_pnl(self):
+        """Mock only the HTTP transport; NULL PnL survives to the DB row."""
+        db = DatabaseFactory(
+            DatabaseSettings(db_type="sqlite", db_name=":memory:")
+        )
+        db.create_tables()
+        try:
+            with db.get_session() as session:
+                user = User(username="u", email="u@example.invalid")
+                session.add(user)
+                session.flush()
+                account = BybitAccount(
+                    user_id=user.user_id, account_name="a",
+                    environment="testnet",
+                )
+                session.add(account)
+                session.flush()
+                strategy = Strategy(
+                    account_id=account.account_id,
+                    strategy_type="GridStrategy",
+                    symbol="LTCUSDT",
+                    config_json={},
+                )
+                session.add(strategy)
+                session.flush()
+                run = Run(
+                    user_id=user.user_id,
+                    account_id=account.account_id,
+                    strategy_id=strategy.strategy_id,
+                    run_type="recording",
+                    start_ts=datetime(2026, 9, 1, tzinfo=UTC),
+                )
+                session.add(run)
+                session.flush()
+                user_id, account_id, run_id = (
+                    user.user_id, account.account_id, run.run_id
+                )
+
+            gap_start = datetime(2026, 9, 27, 12, 0, 0, tzinfo=UTC)
+            gap_end = gap_start + timedelta(minutes=2)
+            exec_ms = int(
+                (gap_start + timedelta(seconds=30)).timestamp() * 1000
+            )
+            http = MagicMock()
+            http.get_executions.return_value = {
+                "retCode": 0,
+                "retMsg": "OK",
+                "result": {
+                    "category": "linear",
+                    "nextPageCursor": "",
+                    "list": [{
+                        "symbol": "LTCUSDT", "execId": "rest-1",
+                        "orderId": "order-1", "orderLinkId": "link-1",
+                        "side": "Sell", "execPrice": "100.5",
+                        "execQty": "0.2", "execFee": "0.011",
+                        "execType": "Trade", "execTime": str(exec_ms),
+                        "closedSize": "0.2",
+                    }],
+                },
+            }
+            reconciler = GapReconciler(
+                db=db,
+                rest_client=MagicMock(spec=BybitRestClient),
+                gap_threshold_seconds=5.0,
+            )
+            with unittest.mock.patch(
+                "bybit_adapter.rest_client.HTTP", return_value=http
+            ):
+                count = await reconciler.reconcile_executions(
+                    user_id=user_id,
+                    account_id=account_id,
+                    run_id=run_id,
+                    symbol="LTCUSDT",
+                    gap_start=gap_start,
+                    gap_end=gap_end,
+                    api_key="k",
+                    api_secret="s",
+                    testnet=True,
+                )
+
+            assert count == 1
+            with db.get_session() as session:
+                row = session.query(PrivateExecution).one()
+                assert row.exec_id == "rest-1"
+                assert row.order_id == "order-1"
+                assert row.order_link_id == "link-1"
+                assert row.symbol == "LTCUSDT"
+                assert row.raw_json["closedSize"] == "0.2"
+                assert row.run_id == str(run_id)
+                assert row.side == "Sell"
+                assert row.exec_price == Decimal("100.5")
+                assert row.exec_qty == Decimal("0.2")
+                assert row.exec_fee == Decimal("0.011")
+                assert row.closed_pnl is None
+                assert row.exchange_ts.replace(tzinfo=UTC) == (
+                    datetime.fromtimestamp(exec_ms / 1000, tz=UTC)
+                )
+        finally:
+            db.drop_tables()
