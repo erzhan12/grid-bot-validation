@@ -17,7 +17,12 @@ from unittest.mock import patch
 import pytest
 
 from bybit_adapter.ws_client import ConnectionState
-from grid_db import PrivateExecution, PublicTrade
+from grid_db import (
+    PrivateExecution,
+    PrivateStreamGap,
+    PublicTrade,
+    RecoveryStatus,
+)
 from recorder.recorder import Recorder
 
 
@@ -83,7 +88,7 @@ class FakePrivateWS:
         )
 
 
-def _make_fake_rest(*, trades=None, executions=None):
+def _make_fake_rest(*, trades=None, executions=None, executions_exc=None):
     """Build a BybitRestClient stand-in whose instances share canned data.
 
     Recorder.start() and GapReconciler.reconcile_executions each construct
@@ -114,6 +119,8 @@ def _make_fake_rest(*, trades=None, executions=None):
             if symbol != _TEST_SYMBOL:
                 raise ValueError(f"unexpected symbol {symbol!r}")
             calls["executions"] += 1
+            if executions_exc is not None:
+                raise executions_exc
             return (list(executions), False)
 
         def get_wallet_balance(self, account_type="UNIFIED"):
@@ -145,6 +152,13 @@ def _patched_network(fake_rest_cls) -> Generator[None, None, None]:
         patch("event_saver.reconciler.BybitRestClient", fake_rest_cls),
     ):
         yield
+
+
+def _gap_rows(db) -> list:
+    with db.get_session() as session:
+        rows = session.query(PrivateStreamGap).all()
+        session.expunge_all()
+        return rows
 
 
 def _count(db, model) -> int:
@@ -253,7 +267,9 @@ class TestRecorderDisconnectReconciliation:
         self, config_with_account, db, db_with_gridbot_seed,
         closed_size, expected_pnl,
     ):
-        gap_start = _FIXED_TS
+        # Recent: the collector's gap end is the real reconnect time, and
+        # Bybit caps the recovery window at 7 days.
+        gap_start = datetime.now(UTC) - timedelta(seconds=30)
         gap_end = gap_start + timedelta(seconds=30)
         fake_rest = _make_fake_rest(
             executions=[
@@ -278,6 +294,49 @@ class TestRecorderDisconnectReconciliation:
                     assert row.symbol == _TEST_SYMBOL
                     assert row.run_id == str(recorder._run_id)
                     assert row.closed_pnl == expected_pnl
+
+                await _wait_until(
+                    lambda: _gap_rows(db)
+                    and _gap_rows(db)[0].recovery_status != RecoveryStatus.PENDING,
+                    desc="gap outcome persisted",
+                )
+                (gap,) = _gap_rows(db)
+                assert gap.run_id == str(recorder._run_id)
+                assert gap.symbol == _TEST_SYMBOL
+                assert gap.gap_start.replace(tzinfo=UTC) == gap_start
+                assert gap.recovery_status == RecoveryStatus.RECOVERED
+                assert (gap.inserted, gap.duplicates) == (1, 0)
+            finally:
+                await recorder.stop()
+
+    async def test_failed_private_recovery_is_persisted_as_failed(
+        self, config_with_account, db, db_with_gridbot_seed
+    ):
+        """A REST failure leaves a FAILED gap row with a reason, not silence."""
+        # Recent: the collector's gap end is the real reconnect time, and
+        # Bybit caps the recovery window at 7 days.
+        gap_start = datetime.now(UTC) - timedelta(seconds=30)
+        fake_rest = _make_fake_rest(
+            executions_exc=ValueError("expected result.category='linear'")
+        )
+
+        with _patched_network(fake_rest):
+            recorder = Recorder(config=config_with_account, db=db)
+            await recorder.start()
+            try:
+                private_ws = recorder._private_collector._ws_client
+                private_ws.last_message_ts = gap_start
+                private_ws.alive = False
+                await recorder._private_collector._ws_health_check_once()
+                await _wait_until(
+                    lambda: _gap_rows(db)
+                    and _gap_rows(db)[0].recovery_status != RecoveryStatus.PENDING,
+                    desc="gap outcome persisted",
+                )
+                (gap,) = _gap_rows(db)
+                assert gap.recovery_status == RecoveryStatus.FAILED
+                assert "result.category" in gap.reason
+                assert _count(db, PrivateExecution) == 0
             finally:
                 await recorder.stop()
 

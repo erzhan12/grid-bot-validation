@@ -1,3 +1,14 @@
+# Feature 0110 Phase B1a — gap persistence + structured recovery result (#271)
+
+Plan: docs/features/0110_PLAN.md (B1 split into B1a/B1b/B1c)  |  Branch: feature/0110-b1a-recovery-persistence
+
+- [x] grid_db: RecoveryStatus enum, PrivateStreamGap model (CASCADE to runs), PrivateStreamGapRepository
+- [x] reconciler: ExecutionRecoveryResult; window [gap_start-5s, gap_end+5s]; 7-day guard; failed/truncated/skipped statuses
+- [x] recorder: pending gap row per symbol + outcome done-callback; EventSaver logs outcome
+- [x] prepare_session wipe clears gaps (CASCADE) test
+- [x] make test + make lint green
+- [ ] rules update (event-saver, grid-db, recorder) after review
+
 # Feature 0110 Phase A — REST execution recovery + unknown closed PnL (#271)
 
 Plan: docs/features/0110_PLAN.md (Phase A only; B1/B2 deferred)  |  Branch: feature/0110-rest-exec-recovery

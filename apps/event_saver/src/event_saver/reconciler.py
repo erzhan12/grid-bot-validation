@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from datetime import datetime, UTC, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Optional
@@ -15,12 +16,70 @@ from grid_db import (
     PublicTradeRepository,
     PrivateExecution,
     PrivateExecutionRepository,
+    RecoveryStatus,
 )
 
 
 logger = logging.getLogger(__name__)
 
 _PRIVATE_EXECUTION_RECONCILE_MAX_PAGES = 100
+# REST window = [gap_start - margin, gap_end + margin]: covers an execution
+# still in flight at either edge; exec_id dedup makes the overlap free.
+_RECOVERY_WINDOW_MARGIN = timedelta(seconds=5)
+# Bybit /v5/execution/list rejects endTime - startTime > 7 days.
+_BYBIT_MAX_EXECUTION_WINDOW = timedelta(days=7)
+
+
+def _is_trade_row(exec_data) -> bool:
+    """True for a REST execution row that recovery must persist."""
+    return isinstance(exec_data, dict) and exec_data.get("execType") == "Trade"
+
+
+def recovery_result_from_future(future) -> "ExecutionRecoveryResult":
+    """Map a finished recovery future to its outcome.
+
+    Cancelled or crashed recoveries become ``FAILED`` with a reason, so
+    callers never mistake them for an empty gap.
+
+    Args:
+        future: A done ``concurrent.futures.Future`` wrapping
+            :meth:`GapReconciler.reconcile_executions`.
+
+    Returns:
+        The recovery outcome.
+    """
+    if future.cancelled():
+        return ExecutionRecoveryResult(
+            RecoveryStatus.FAILED, reason="recovery cancelled"
+        )
+    if (exc := future.exception()) is not None:
+        return ExecutionRecoveryResult(
+            RecoveryStatus.FAILED, reason=f"recovery crashed: {exc}"
+        )
+    return future.result()
+
+
+@dataclass(frozen=True)
+class ExecutionRecoveryResult:
+    """Outcome of one symbol's REST execution recovery for a gap.
+
+    ``status`` is never ambiguous: an empty but complete query is
+    ``RECOVERED`` with zero counts; ``SKIPPED`` (gap below threshold) and
+    ``TRUNCATED`` (not persisted) carry a ``reason``; every error path is
+    ``FAILED`` with a ``reason``. ``FAILED`` may still carry non-zero counts
+    when a partially converted batch persisted its valid rows.
+
+    Attributes:
+        status: Final recovery status.
+        inserted: Rows inserted or enriched (``bulk_insert`` return).
+        duplicates: Rows already present, unchanged.
+        reason: Why the recovery was not ``RECOVERED``, else ``None``.
+    """
+
+    status: RecoveryStatus
+    inserted: int = 0
+    duplicates: int = 0
+    reason: Optional[str] = None
 
 
 def _rest_exec_pnl(exec_data: dict) -> Optional[Decimal]:
@@ -238,16 +297,16 @@ class GapReconciler:
         api_key: str,
         api_secret: str,
         testnet: bool,
-    ) -> int:
-        """Reconcile private executions during a gap period.
+    ) -> ExecutionRecoveryResult:
+        """Recover private executions missed during a gap via REST.
 
-        Queries REST API for executions in the gap period and inserts
-        any that are not already in the database.
+        Queries ``[gap_start - margin, gap_end + margin]`` and inserts the
+        executions not already in the database.
 
         Args:
             user_id: User ID for tagging.
             account_id: Account ID for tagging.
-            run_id: Optional run ID for tagging.
+            run_id: Run ID for tagging (required to persist).
             symbol: Trading symbol.
             gap_start: Start of gap period.
             gap_end: End of gap period.
@@ -256,112 +315,142 @@ class GapReconciler:
             testnet: Use testnet endpoints (from account environment).
 
         Returns:
-            Number of executions reconciled.
+            The recovery outcome (never raises): ``SKIPPED`` below the gap
+            threshold; ``TRUNCATED`` when pagination stopped at
+            ``max_pages`` (nothing persisted); ``FAILED`` for a missing
+            ``run_id``, a window over Bybit's limit, a REST/DB/conversion
+            error, or any Trade row dropped in conversion; else
+            ``RECOVERED``.
         """
         if not self.should_reconcile(gap_start, gap_end):
             logger.debug(f"Gap too small for execution reconciliation: {symbol}")
-            return 0
+            return ExecutionRecoveryResult(
+                RecoveryStatus.SKIPPED, reason="gap below reconcile threshold"
+            )
+        if run_id is None:
+            logger.warning(
+                "Cannot reconcile executions for %s without run_id", symbol
+            )
+            return ExecutionRecoveryResult(
+                RecoveryStatus.FAILED, reason="no run_id to persist under"
+            )
 
-        gap_seconds = (gap_end - gap_start).total_seconds()
+        query_start = gap_start - _RECOVERY_WINDOW_MARGIN
+        query_end = gap_end + _RECOVERY_WINDOW_MARGIN
+        if query_end - query_start > _BYBIT_MAX_EXECUTION_WINDOW:
+            reason = (
+                f"window {query_start} to {query_end} exceeds Bybit's "
+                f"{_BYBIT_MAX_EXECUTION_WINDOW.days} days"
+            )
+            logger.error("Execution reconciliation for %s: %s", symbol, reason)
+            return ExecutionRecoveryResult(RecoveryStatus.FAILED, reason=reason)
+
         logger.info(
             f"Reconciling executions for {symbol} account {account_id} "
-            f"(gap: {gap_seconds:.1f}s)"
+            f"(gap: {(gap_end - gap_start).total_seconds():.1f}s, "
+            f"query {query_start} to {query_end})"
         )
 
         try:
-            # Query DB for last persisted timestamp for this account
-            with self._db.get_session() as session:
-                repo = PrivateExecutionRepository(session)
-                last_persisted_ts = repo.get_last_execution_ts(str(account_id))
-
-            # Never let post-gap live writes move the REST window past the
-            # detected outage; duplicates are filtered by exec_id on insert.
-            if (
-                last_persisted_ts
-                and last_persisted_ts.timestamp() < gap_start.timestamp()
-            ):
-                reconcile_start = last_persisted_ts
-            else:
-                reconcile_start = gap_start
-
-            logger.debug(
-                f"Reconciliation window: {reconcile_start} to {gap_end} "
-                f"(last_persisted_ts: {last_persisted_ts})"
-            )
-
-            # Create authenticated REST client for this account
-            # (cannot use shared client with empty credentials)
+            # Authenticated client per account (the shared one has no keys).
             authenticated_client = BybitRestClient(
                 api_key=api_key,
                 api_secret=api_secret,
                 testnet=testnet,
             )
-
-            # Get executions from REST API (with pagination)
-            start_ms = int(reconcile_start.timestamp() * 1000)
-            end_ms = int(gap_end.timestamp() * 1000)
-
-            # Run synchronous REST call in thread to avoid blocking event loop
-            # Use get_executions_all to handle pagination automatically
             executions_data, truncated = await asyncio.to_thread(
                 authenticated_client.get_executions_all,
                 symbol=symbol,
-                start_time=start_ms,
-                end_time=end_ms,
+                start_time=int(query_start.timestamp() * 1000),
+                end_time=int(query_end.timestamp() * 1000),
                 max_pages=_PRIVATE_EXECUTION_RECONCILE_MAX_PAGES,
                 return_truncated=True,
             )
+        except Exception as e:
+            logger.error(
+                "Error reconciling executions for %s", symbol, exc_info=True
+            )
+            return ExecutionRecoveryResult(
+                RecoveryStatus.FAILED, reason=f"REST error: {e}"
+            )
 
-            if truncated:
-                logger.error(
-                    "Execution reconciliation for %s account %s was truncated "
-                    "after %d pages; refusing to persist a partial backfill for "
-                    "%s to %s",
-                    symbol,
-                    account_id,
-                    _PRIVATE_EXECUTION_RECONCILE_MAX_PAGES,
-                    datetime.fromtimestamp(start_ms / 1000, tz=UTC),
-                    datetime.fromtimestamp(end_ms / 1000, tz=UTC),
-                )
-                return 0
+        if truncated:
+            logger.error(
+                "Execution reconciliation for %s account %s was truncated "
+                "after %d pages; refusing to persist a partial backfill for "
+                "%s to %s",
+                symbol,
+                account_id,
+                _PRIVATE_EXECUTION_RECONCILE_MAX_PAGES,
+                query_start,
+                query_end,
+            )
+            return ExecutionRecoveryResult(
+                RecoveryStatus.TRUNCATED,
+                reason=(
+                    f"truncated after {_PRIVATE_EXECUTION_RECONCILE_MAX_PAGES} pages"
+                ),
+            )
 
-            if not executions_data:
-                logger.debug(f"No executions returned from REST API for {symbol}")
-                return 0
-
-            # Convert to models
+        try:
             models = self._executions_to_models(
                 user_id=user_id,
                 account_id=account_id,
                 run_id=run_id,
                 executions=executions_data,
             )
-
-            if not models:
-                return 0
-
-            # Bulk insert (database handles duplicates with unique constraint)
-            with self._db.get_session() as session:
-                repo = PrivateExecutionRepository(session)
-                count = repo.bulk_insert(models)
-
-                if count > 0:
-                    self._executions_reconciled += count
-                    self._reconciliation_count += 1
-                    skipped = len(models) - count
-                    logger.info(
-                        f"Reconciled {count} executions for {symbol} "
-                        f"(skipped {skipped} duplicates via unique constraint)"
-                    )
-
-            return count
-
-        # Known fail-open window: any failure (incl. a bad REST envelope)
-        # returns 0, indistinguishable from an empty gap. Phase B1's
-        # structured ExecutionRecoveryResult closes it (0110_PLAN.md).
+            # Rows recovery owes the DB: every Trade row, plus any malformed
+            # entry (non-dict, or no execType) not provably a non-Trade row.
+            trade_rows = sum(
+                1
+                for e in executions_data
+                if _is_trade_row(e)
+                or not isinstance(e, dict)
+                or "execType" not in e
+            )
         except Exception as e:
-            logger.error(f"Error reconciling executions for {symbol}: {e}")
-            return 0
+            logger.error(
+                "Error converting executions for %s", symbol, exc_info=True
+            )
+            return ExecutionRecoveryResult(
+                RecoveryStatus.FAILED, reason=f"conversion error: {e}"
+            )
+
+        inserted = 0
+        if models:
+            try:
+                with self._db.get_session() as session:
+                    inserted = PrivateExecutionRepository(session).bulk_insert(
+                        models
+                    )
+            except Exception as e:
+                logger.error(
+                    "Error persisting executions for %s", symbol, exc_info=True
+                )
+                return ExecutionRecoveryResult(
+                    RecoveryStatus.FAILED, reason=f"DB error: {e}"
+                )
+        duplicates = len(models) - inserted
+        if inserted > 0:
+            self._executions_reconciled += inserted
+            self._reconciliation_count += 1
+            logger.info(
+                f"Reconciled {inserted} executions for {symbol} "
+                f"(skipped {duplicates} duplicates via unique constraint)"
+            )
+
+        if len(models) < trade_rows:
+            reason = (
+                f"{trade_rows - len(models)} of {trade_rows} Trade rows failed "
+                f"conversion and were not persisted"
+            )
+            logger.error("Execution reconciliation for %s: %s", symbol, reason)
+            return ExecutionRecoveryResult(
+                RecoveryStatus.FAILED, inserted, duplicates, reason
+            )
+        return ExecutionRecoveryResult(
+            RecoveryStatus.RECOVERED, inserted, duplicates
+        )
 
     def _trades_to_models(
         self,
@@ -426,7 +515,7 @@ class GapReconciler:
             try:
                 # Category is validated on the REST envelope by
                 # BybitRestClient.get_executions — rows carry none.
-                if exec_data.get("execType") != "Trade":
+                if not _is_trade_row(exec_data):
                     continue
 
                 models.append(

@@ -4,12 +4,14 @@ import pytest
 import unittest.mock
 from datetime import datetime, UTC, timedelta
 from decimal import Decimal
+from concurrent.futures import Future
 from unittest.mock import MagicMock
 from uuid import uuid4
 
 from bybit_adapter.rest_client import BybitRestClient
 from grid_db import (
     BybitAccount,
+    RecoveryStatus,
     DatabaseFactory,
     DatabaseSettings,
     PrivateExecution,
@@ -18,7 +20,13 @@ from grid_db import (
     User,
 )
 
-from event_saver.reconciler import GapReconciler, _PRIVATE_EXECUTION_RECONCILE_MAX_PAGES
+from event_saver.reconciler import (
+    ExecutionRecoveryResult,
+    GapReconciler,
+    recovery_result_from_future,
+    _PRIVATE_EXECUTION_RECONCILE_MAX_PAGES,
+    _RECOVERY_WINDOW_MARGIN,
+)
 
 
 @pytest.fixture
@@ -326,25 +334,48 @@ class TestReconcilePublicTrades:
         assert count == 0
 
 
-class TestReconcileExecutions:
-    """Test execution reconciliation."""
+async def _run_exec_recovery(
+    reconciler,
+    *,
+    gap_start,
+    gap_end,
+    run_id="default",
+    rest_result=([], False),
+    rest_exc=None,
+    bulk_count=None,
+    bulk_exc=None,
+):
+    """Run reconcile_executions with the REST client and DB repo mocked.
 
-    @pytest.mark.asyncio
-    async def test_skips_small_gap(self, mock_db, mock_rest_client):
-        """Test that small gaps are skipped."""
-        reconciler = GapReconciler(
-            db=mock_db,
-            rest_client=mock_rest_client,
-            gap_threshold_seconds=5.0,
+    Returns ``(result, rest_client_mock, repo_mock)``.
+    """
+    repo = MagicMock()
+    if bulk_exc is not None:
+        repo.bulk_insert.side_effect = bulk_exc
+    else:
+        repo.bulk_insert.side_effect = lambda models: (
+            len(models) if bulk_count is None else bulk_count
         )
+    client = MagicMock()
+    if rest_exc is not None:
+        client.get_executions_all.side_effect = rest_exc
+    else:
+        client.get_executions_all.return_value = rest_result
 
-        gap_start = datetime.now(UTC)
-        gap_end = gap_start + timedelta(seconds=2)
+    async def _to_thread(func, *args, **kwargs):
+        return func(*args, **kwargs)
 
-        count = await reconciler.reconcile_executions(
+    with unittest.mock.patch(
+        "event_saver.reconciler.PrivateExecutionRepository", return_value=repo
+    ), unittest.mock.patch(
+        "event_saver.reconciler.asyncio.to_thread", side_effect=_to_thread
+    ), unittest.mock.patch(
+        "event_saver.reconciler.BybitRestClient", return_value=client
+    ):
+        result = await reconciler.reconcile_executions(
             user_id=uuid4(),
             account_id=uuid4(),
-            run_id=uuid4(),
+            run_id=uuid4() if run_id == "default" else run_id,
             symbol="BTCUSDT",
             gap_start=gap_start,
             gap_end=gap_end,
@@ -352,176 +383,260 @@ class TestReconcileExecutions:
             api_secret="secret",
             testnet=True,
         )
+    return result, client, repo
 
-        assert count == 0
-        mock_rest_client.get_executions.assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_calls_rest_api(self, mock_db, mock_rest_client):
-        """Test that REST API is called for valid gaps."""
-        reconciler = GapReconciler(
-            db=mock_db,
-            rest_client=mock_rest_client,
-            gap_threshold_seconds=5.0,
+def _rest_row(exec_id, price="50000"):
+    return {
+        "execType": "Trade", "execId": exec_id, "orderId": f"o-{exec_id}",
+        "orderLinkId": f"l-{exec_id}", "symbol": "BTCUSDT", "side": "Buy",
+        "execPrice": price, "execQty": "0.001", "execFee": "0.01",
+        "execTime": 1700000000000, "closedSize": "0",
+    }
+
+
+class TestRecoveryResultFromFuture:
+    """Finished recovery futures map to an outcome, never an exception."""
+
+    def test_result_passes_through(self):
+        """A completed recovery returns its own result."""
+        fut = Future()
+        expected = ExecutionRecoveryResult(RecoveryStatus.RECOVERED, 2, 1)
+        fut.set_result(expected)
+        assert recovery_result_from_future(fut) is expected
+
+    def test_crashed_recovery_is_failed(self):
+        """An exception becomes FAILED with the error in the reason."""
+        fut = Future()
+        fut.set_exception(RuntimeError("boom"))
+        result = recovery_result_from_future(fut)
+        assert result.status == RecoveryStatus.FAILED
+        assert "recovery crashed: boom" == result.reason
+
+    def test_cancelled_recovery_is_failed(self):
+        """A cancelled recovery (e.g. shutdown) becomes FAILED."""
+        fut = Future()
+        fut.cancel()
+        result = recovery_result_from_future(fut)
+        assert result.status == RecoveryStatus.FAILED
+        assert result.reason == "recovery cancelled"
+
+
+class TestReconcileExecutions:
+    """Execution recovery returns a structured, persistable outcome (0110 B1a)."""
+
+    _GAP_START = datetime(2026, 9, 1, 12, 0, 0, tzinfo=UTC)
+    _GAP_END = _GAP_START + timedelta(seconds=40)
+
+    def _reconciler(self, mock_db, mock_rest_client):
+        return GapReconciler(
+            db=mock_db, rest_client=mock_rest_client, gap_threshold_seconds=5.0
         )
 
-        gap_start = datetime.now(UTC)
-        gap_end = gap_start + timedelta(seconds=10)
+    async def test_small_gap_is_skipped(self, mock_db, mock_rest_client):
+        """A gap below the threshold is SKIPPED, never labelled recovered."""
+        result, client, _ = await _run_exec_recovery(
+            self._reconciler(mock_db, mock_rest_client),
+            gap_start=self._GAP_START,
+            gap_end=self._GAP_START + timedelta(seconds=2),
+        )
+        assert result.status == RecoveryStatus.SKIPPED
+        client.get_executions_all.assert_not_called()
 
-        # Mock repo to return None for last_execution_ts
-        mock_session = MagicMock()
-        mock_repo = MagicMock()
-        mock_repo.get_last_execution_ts.return_value = None
-        mock_db.get_session.return_value.__enter__.return_value = mock_session
-        mock_db.get_session.return_value.__exit__.return_value = None
+    async def test_query_window_brackets_the_gap(self, mock_db, mock_rest_client):
+        """REST window = [gap_start - margin, gap_end + margin], paginated."""
+        _, client, _ = await _run_exec_recovery(
+            self._reconciler(mock_db, mock_rest_client),
+            gap_start=self._GAP_START,
+            gap_end=self._GAP_END,
+        )
+        kwargs = client.get_executions_all.call_args.kwargs
+        margin = _RECOVERY_WINDOW_MARGIN
+        assert kwargs["start_time"] == int(
+            (self._GAP_START - margin).timestamp() * 1000
+        )
+        assert kwargs["end_time"] == int((self._GAP_END + margin).timestamp() * 1000)
+        assert kwargs["max_pages"] == _PRIVATE_EXECUTION_RECONCILE_MAX_PAGES
+        assert kwargs["return_truncated"] is True
 
-        # Mock asyncio.to_thread to execute the function synchronously
-        async def mock_to_thread(func, *args, **kwargs):
-            # Just call the function directly (synchronously)
-            return func(*args, **kwargs)
+    async def test_empty_history_is_recovered(self, mock_db, mock_rest_client):
+        """A complete query with no executions is a successful recovery."""
+        result, _, repo = await _run_exec_recovery(
+            self._reconciler(mock_db, mock_rest_client),
+            gap_start=self._GAP_START,
+            gap_end=self._GAP_END,
+        )
+        assert result.status == RecoveryStatus.RECOVERED
+        assert (result.inserted, result.duplicates) == (0, 0)
+        repo.bulk_insert.assert_not_called()
 
-        # Mock the BybitRestClient constructor
-        mock_client = MagicMock()
-        mock_client.get_executions_all.return_value = ([], False)
-
-        # Patch BybitRestClient constructor, PrivateExecutionRepository, and asyncio.to_thread
-        with unittest.mock.patch('event_saver.reconciler.PrivateExecutionRepository', return_value=mock_repo), \
-             unittest.mock.patch('event_saver.reconciler.asyncio.to_thread', side_effect=mock_to_thread), \
-             unittest.mock.patch('event_saver.reconciler.BybitRestClient', return_value=mock_client):
-
-            count = await reconciler.reconcile_executions(
-                user_id=uuid4(),
-                account_id=uuid4(),
-                run_id=uuid4(),
-                symbol="BTCUSDT",
-                gap_start=gap_start,
-                gap_end=gap_end,
-                api_key="test_key",
-                api_secret="test_secret",
-                testnet=True,
-            )
-
-        # Verify reconciliation completed (would return 0 for empty list)
-        assert count == 0
-        mock_client.get_executions_all.assert_called_once()
-        call_kwargs = mock_client.get_executions_all.call_args.kwargs
-        assert call_kwargs["max_pages"] == _PRIVATE_EXECUTION_RECONCILE_MAX_PAGES
-        assert call_kwargs["return_truncated"] is True
-
-    @pytest.mark.asyncio
-    async def test_reconcile_start_is_capped_at_gap_start(
+    async def test_inserted_and_duplicates_are_counted(
         self, mock_db, mock_rest_client
     ):
-        """Post-gap live writes must not cause the REST backfill to skip the gap."""
-        reconciler = GapReconciler(
-            db=mock_db,
-            rest_client=mock_rest_client,
-            gap_threshold_seconds=5.0,
+        """Rows the DB already had count as duplicates, not failures."""
+        rows = [_rest_row("e1"), _rest_row("e2"), _rest_row("e3")]
+        result, _, _ = await _run_exec_recovery(
+            self._reconciler(mock_db, mock_rest_client),
+            gap_start=self._GAP_START,
+            gap_end=self._GAP_END,
+            rest_result=(rows, False),
+            bulk_count=2,
         )
+        assert result.status == RecoveryStatus.RECOVERED
+        assert (result.inserted, result.duplicates) == (2, 1)
 
-        gap_start = datetime.now(UTC)
-        gap_end = gap_start + timedelta(seconds=10)
-
-        mock_session = MagicMock()
-        mock_repo = MagicMock()
-        mock_repo.get_last_execution_ts.return_value = gap_end + timedelta(seconds=30)
-        mock_db.get_session.return_value.__enter__.return_value = mock_session
-        mock_db.get_session.return_value.__exit__.return_value = None
-
-        async def mock_to_thread(func, *args, **kwargs):
-            return func(*args, **kwargs)
-
-        mock_client = MagicMock()
-        mock_client.get_executions_all.return_value = ([], False)
-
-        with unittest.mock.patch(
-            "event_saver.reconciler.PrivateExecutionRepository",
-            return_value=mock_repo,
-        ), unittest.mock.patch(
-            "event_saver.reconciler.asyncio.to_thread",
-            side_effect=mock_to_thread,
-        ), unittest.mock.patch(
-            "event_saver.reconciler.BybitRestClient",
-            return_value=mock_client,
-        ):
-            count = await reconciler.reconcile_executions(
-                user_id=uuid4(),
-                account_id=uuid4(),
-                run_id=uuid4(),
-                symbol="BTCUSDT",
-                gap_start=gap_start,
-                gap_end=gap_end,
-                api_key="test_key",
-                api_secret="test_secret",
-                testnet=True,
-            )
-
-        assert count == 0
-        call_kwargs = mock_client.get_executions_all.call_args.kwargs
-        assert call_kwargs["start_time"] == int(gap_start.timestamp() * 1000)
-        assert call_kwargs["end_time"] == int(gap_end.timestamp() * 1000)
-
-    @pytest.mark.asyncio
-    async def test_truncated_rest_response_is_not_persisted(
+    async def test_truncated_backfill_is_not_persisted(
         self, mock_db, mock_rest_client, caplog
     ):
-        """Test that truncated REST backfills are refused before DB writes."""
-        reconciler = GapReconciler(
-            db=mock_db,
-            rest_client=mock_rest_client,
-            gap_threshold_seconds=5.0,
-        )
-
-        gap_start = datetime.now(UTC)
-        gap_end = gap_start + timedelta(seconds=10)
-
-        mock_session = MagicMock()
-        mock_repo = MagicMock()
-        mock_repo.get_last_execution_ts.return_value = None
-        mock_db.get_session.return_value.__enter__.return_value = mock_session
-        mock_db.get_session.return_value.__exit__.return_value = None
-
-        async def mock_to_thread(func, *args, **kwargs):
-            return func(*args, **kwargs)
-
-        mock_client = MagicMock()
-        mock_client.get_executions_all.return_value = (
-            [{"execId": "partial", "execType": "Trade"}],
-            True,
-        )
-
-        conversion_spy = MagicMock(wraps=reconciler._executions_to_models)
+        """max_pages reached with a cursor outstanding → TRUNCATED, no writes."""
         with caplog.at_level("ERROR", logger="event_saver.reconciler"):
-            with unittest.mock.patch(
-                "event_saver.reconciler.PrivateExecutionRepository",
-                return_value=mock_repo,
-            ), unittest.mock.patch(
-                "event_saver.reconciler.asyncio.to_thread",
-                side_effect=mock_to_thread,
-            ), unittest.mock.patch(
-                "event_saver.reconciler.BybitRestClient",
-                return_value=mock_client,
-            ), unittest.mock.patch.object(
-                reconciler,
-                "_executions_to_models",
-                conversion_spy,
-            ):
-                count = await reconciler.reconcile_executions(
-                    user_id=uuid4(),
-                    account_id=uuid4(),
-                    run_id=uuid4(),
-                    symbol="BTCUSDT",
-                    gap_start=gap_start,
-                    gap_end=gap_end,
-                    api_key="test_key",
-                    api_secret="test_secret",
-                    testnet=True,
-                )
+            result, _, repo = await _run_exec_recovery(
+                self._reconciler(mock_db, mock_rest_client),
+                gap_start=self._GAP_START,
+                gap_end=self._GAP_END,
+                rest_result=([_rest_row("partial")], True),
+            )
+        assert result.status == RecoveryStatus.TRUNCATED
+        repo.bulk_insert.assert_not_called()
+        assert any("truncated" in r.message for r in caplog.records)
 
-        assert count == 0
-        conversion_spy.assert_not_called()
-        mock_repo.bulk_insert.assert_not_called()
-        assert any("truncated" in record.message for record in caplog.records)
+    async def test_rest_error_is_failed(self, mock_db, mock_rest_client):
+        """A REST error (e.g. bad envelope category) is FAILED, not empty."""
+        result, _, repo = await _run_exec_recovery(
+            self._reconciler(mock_db, mock_rest_client),
+            gap_start=self._GAP_START,
+            gap_end=self._GAP_END,
+            rest_exc=ValueError("expected result.category='linear'"),
+        )
+        assert result.status == RecoveryStatus.FAILED
+        assert "result.category" in result.reason
+        repo.bulk_insert.assert_not_called()
+
+    async def test_missing_run_id_is_failed(self, mock_db, mock_rest_client):
+        """Without a run_id nothing can be persisted: FAILED, no REST call."""
+        result, client, _ = await _run_exec_recovery(
+            self._reconciler(mock_db, mock_rest_client),
+            gap_start=self._GAP_START,
+            gap_end=self._GAP_END,
+            run_id=None,
+        )
+        assert result.status == RecoveryStatus.FAILED
+        assert "run_id" in result.reason
+        client.get_executions_all.assert_not_called()
+
+    async def test_window_over_seven_days_is_failed(
+        self, mock_db, mock_rest_client
+    ):
+        """Bybit caps endTime - startTime at 7 days: FAILED, no REST call."""
+        result, client, _ = await _run_exec_recovery(
+            self._reconciler(mock_db, mock_rest_client),
+            gap_start=self._GAP_START,
+            gap_end=self._GAP_START + timedelta(days=7),
+        )
+        assert result.status == RecoveryStatus.FAILED
+        assert "7 days" in result.reason
+        client.get_executions_all.assert_not_called()
+
+    async def test_row_conversion_error_is_failed_but_good_rows_kept(
+        self, mock_db, mock_rest_client
+    ):
+        """A dropped Trade row makes the recovery FAILED; valid rows persist."""
+        rows = [_rest_row("good"), _rest_row("bad", price="not-a-number")]
+        result, _, repo = await _run_exec_recovery(
+            self._reconciler(mock_db, mock_rest_client),
+            gap_start=self._GAP_START,
+            gap_end=self._GAP_END,
+            rest_result=(rows, False),
+        )
+        assert result.status == RecoveryStatus.FAILED
+        assert "1 of 2" in result.reason
+        (models,), _ = repo.bulk_insert.call_args
+        assert [m.exec_id for m in models] == ["good"]
+        assert result.inserted == 1
+
+    async def test_non_trade_rows_do_not_fail_recovery(
+        self, mock_db, mock_rest_client
+    ):
+        """Funding/settlement rows are filtered, not counted as dropped."""
+        rows = [_rest_row("e1"), {"execType": "Funding", "execId": "f1"}]
+        result, _, _ = await _run_exec_recovery(
+            self._reconciler(mock_db, mock_rest_client),
+            gap_start=self._GAP_START,
+            gap_end=self._GAP_END,
+            rest_result=(rows, False),
+        )
+        assert result.status == RecoveryStatus.RECOVERED
+        assert result.inserted == 1
+
+    async def test_window_of_exactly_seven_days_is_queried(
+        self, mock_db, mock_rest_client
+    ):
+        """The 7-day cap is inclusive: a window of exactly 7 days is queried."""
+        gap_end = (
+            self._GAP_START + timedelta(days=7) - 2 * _RECOVERY_WINDOW_MARGIN
+        )
+        result, client, _ = await _run_exec_recovery(
+            self._reconciler(mock_db, mock_rest_client),
+            gap_start=self._GAP_START,
+            gap_end=gap_end,
+        )
+        client.get_executions_all.assert_called_once()
+        assert result.status == RecoveryStatus.RECOVERED
+
+    async def test_malformed_row_is_failed_not_raised(
+        self, mock_db, mock_rest_client
+    ):
+        """A non-dict REST row is a dropped row: FAILED, valid rows kept."""
+        result, _, _ = await _run_exec_recovery(
+            self._reconciler(mock_db, mock_rest_client),
+            gap_start=self._GAP_START,
+            gap_end=self._GAP_END,
+            rest_result=([_rest_row("e1"), "garbage"], False),
+        )
+        assert result.status == RecoveryStatus.FAILED
+        assert "1 of 2" in result.reason
+        assert result.inserted == 1
+
+    async def test_row_without_exec_type_is_dropped_not_filtered(
+        self, mock_db, mock_rest_client
+    ):
+        """A dict with no execType is not provably non-Trade: FAILED."""
+        no_type = {k: v for k, v in _rest_row("e2").items() if k != "execType"}
+        result, _, _ = await _run_exec_recovery(
+            self._reconciler(mock_db, mock_rest_client),
+            gap_start=self._GAP_START,
+            gap_end=self._GAP_END,
+            rest_result=([_rest_row("e1"), no_type], False),
+        )
+        assert result.status == RecoveryStatus.FAILED
+        assert "1 of 2" in result.reason
+        assert result.inserted == 1
+
+    async def test_commit_error_is_failed(self, mock_db, mock_rest_client):
+        """A failure at session commit (context exit) is FAILED, not zero."""
+        mock_db.get_session.return_value.__exit__.side_effect = RuntimeError(
+            "commit failed"
+        )
+        result, _, _ = await _run_exec_recovery(
+            self._reconciler(mock_db, mock_rest_client),
+            gap_start=self._GAP_START,
+            gap_end=self._GAP_END,
+            rest_result=([_rest_row("e1")], False),
+        )
+        assert result.status == RecoveryStatus.FAILED
+        assert "commit failed" in result.reason
+
+    async def test_db_error_is_failed(self, mock_db, mock_rest_client):
+        """A commit failure is FAILED, never a silent zero."""
+        result, _, _ = await _run_exec_recovery(
+            self._reconciler(mock_db, mock_rest_client),
+            gap_start=self._GAP_START,
+            gap_end=self._GAP_END,
+            rest_result=([_rest_row("e1")], False),
+            bulk_exc=RuntimeError("database is locked"),
+        )
+        assert result.status == RecoveryStatus.FAILED
+        assert "database is locked" in result.reason
 
 
 class TestTradesConversion:
@@ -842,7 +957,7 @@ class TestDocumentedRestPayloadPersistence:
             with unittest.mock.patch(
                 "bybit_adapter.rest_client.HTTP", return_value=http
             ):
-                count = await reconciler.reconcile_executions(
+                result = await reconciler.reconcile_executions(
                     user_id=user_id,
                     account_id=account_id,
                     run_id=run_id,
@@ -854,7 +969,8 @@ class TestDocumentedRestPayloadPersistence:
                     testnet=True,
                 )
 
-            assert count == 1
+            assert result.status == RecoveryStatus.RECOVERED
+            assert result.inserted == 1
             with db.get_session() as session:
                 row = session.query(PrivateExecution).one()
                 assert row.exec_id == "rest-1"

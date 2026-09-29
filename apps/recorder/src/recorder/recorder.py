@@ -27,6 +27,7 @@ from grid_db import (
     PositionSnapshotRepository,
     WalletSnapshot,
     WalletSnapshotRepository,
+    PrivateStreamGapRepository,
 )
 from grid_db._decimal import WALLET_ACCOUNT_JSON_KEYS, decimal_or_zero
 from grid_db.identity import account_id_for, strategy_id_for, user_id_for
@@ -41,7 +42,7 @@ from event_saver.writers import (
     PositionWriter,
     WalletWriter,
 )
-from event_saver.reconciler import GapReconciler
+from event_saver.reconciler import GapReconciler, recovery_result_from_future
 
 from recorder.config import RecorderConfig
 from recorder.shared_db_parents import verify_shared_db_parents
@@ -955,7 +956,12 @@ class Recorder:
     def _handle_private_gap(
         self, gap_start: datetime, gap_end: datetime
     ) -> list[Future]:
-        """Reconcile private stream gap via REST API."""
+        """Reconcile private stream gap via REST API.
+
+        Also records one ``pending`` ``private_stream_gaps`` row per symbol
+        (best-effort) and stores each symbol's recovery outcome when its
+        future completes.
+        """
         # Count unconditionally (see _handle_public_gap comment).
         with self._gap_lock:
             self._gap_count += 1
@@ -973,6 +979,7 @@ class Recorder:
             and self._run_id
         ):
             for symbol in self._config.symbols:
+                gap_id = self._record_private_gap(symbol, gap_start, gap_end)
                 fut = asyncio.run_coroutine_threadsafe(
                     self._reconciler.reconcile_executions(
                         user_id=self._user_id,
@@ -990,8 +997,55 @@ class Recorder:
                 fut.add_done_callback(
                     self._log_future_error(f"private reconciliation ({symbol})")
                 )
+                if gap_id is not None:
+                    fut.add_done_callback(self._persist_gap_outcome(gap_id, symbol))
                 futures.append(fut)
         return futures
+
+    def _record_private_gap(
+        self, symbol: str, gap_start: datetime, gap_end: datetime
+    ) -> Optional[int]:
+        """Persist a ``pending`` private-stream gap row; its id or None.
+
+        Best-effort: a DB error is logged and recovery still runs — the
+        backfill matters more than its bookkeeping row.
+        """
+        try:
+            with self._db.get_session() as session:
+                gap = PrivateStreamGapRepository(session).add_gap(
+                    run_id=str(self._run_id),
+                    account_id=str(self._account_id),
+                    symbol=symbol,
+                    gap_start=gap_start,
+                    gap_end=gap_end,
+                )
+                return gap.id
+        except Exception:
+            logger.error(
+                "Failed to record private stream gap for %s", symbol,
+                exc_info=True,
+            )
+            return None
+
+    def _persist_gap_outcome(self, gap_id: int, symbol: str):
+        """Return a done-callback that stores a gap's recovery outcome."""
+        def _cb(future: Future) -> None:
+            result = recovery_result_from_future(future)
+            try:
+                with self._db.get_session() as session:
+                    PrivateStreamGapRepository(session).set_outcome(
+                        gap_id,
+                        status=result.status,
+                        inserted=result.inserted,
+                        duplicates=result.duplicates,
+                        reason=result.reason,
+                    )
+            except Exception:
+                logger.error(
+                    "Failed to persist gap outcome for %s (gap %s)",
+                    symbol, gap_id, exc_info=True,
+                )
+        return _cb
 
     async def _health_log_loop(self) -> None:
         """Periodically log health stats."""

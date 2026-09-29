@@ -8,8 +8,9 @@ from sqlalchemy.orm import Session
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 
+from grid_db.enums import RecoveryStatus
 from grid_db.models import (
-    PrivateExecution, Order,
+    PrivateExecution, Order, PrivateStreamGap,
 )
 from grid_db.repositories.base import BaseRepository
 
@@ -54,23 +55,6 @@ class PrivateExecutionRepository(BaseRepository[PrivateExecution]):
             .order_by(PrivateExecution.exchange_ts, PrivateExecution.exec_id)
             .all()
         )
-
-    def get_last_execution_ts(self, account_id: str) -> Optional[datetime]:
-        """Get timestamp of the last execution for an account.
-
-        Args:
-            account_id: The account ID.
-
-        Returns:
-            Timestamp of the last execution or None if no executions exist.
-        """
-        result = (
-            self.session.query(PrivateExecution.exchange_ts)
-            .filter(PrivateExecution.account_id == account_id)
-            .order_by(PrivateExecution.exchange_ts.desc())
-            .first()
-        )
-        return result[0] if result else None
 
     def exists_by_exec_id(self, exec_id: str) -> bool:
         """Check if an execution with the given exec_id exists.
@@ -380,3 +364,79 @@ class OrderRepository(BaseRepository[Order]):
         return result.rowcount if result.rowcount else 0
 
 
+_GAP_REASON_MAX_LEN = 500
+
+
+class PrivateStreamGapRepository(BaseRepository[PrivateStreamGap]):
+    """Private-stream gaps and their REST recovery outcomes (feature 0110)."""
+
+    def __init__(self, session: Session):
+        """Initialize repository.
+
+        Args:
+            session: SQLAlchemy session instance.
+        """
+        super().__init__(session, PrivateStreamGap)
+
+    def add_gap(
+        self,
+        run_id: str,
+        account_id: str,
+        symbol: str,
+        gap_start: datetime,
+        gap_end: Optional[datetime],
+    ) -> PrivateStreamGap:
+        """Record one symbol's gap with a ``pending`` recovery status.
+
+        Args:
+            run_id: Recording run the gap belongs to.
+            account_id: Account whose private stream dropped.
+            symbol: Symbol whose executions need recovery.
+            gap_start: Start of the outage.
+            gap_end: End of the outage (reconnect time).
+
+        Returns:
+            The flushed row (``id`` populated).
+        """
+        return self.create(
+            PrivateStreamGap(
+                run_id=str(run_id),
+                account_id=str(account_id),
+                symbol=symbol,
+                gap_start=gap_start,
+                gap_end=gap_end,
+                recovery_status=RecoveryStatus.PENDING,
+                inserted=0,
+                duplicates=0,
+            )
+        )
+
+    def set_outcome(
+        self,
+        gap_id: int,
+        status: RecoveryStatus,
+        inserted: int,
+        duplicates: int,
+        reason: Optional[str],
+    ) -> None:
+        """Store a gap's recovery outcome.
+
+        Args:
+            gap_id: Row id returned by :meth:`add_gap`.
+            status: Final recovery status.
+            inserted: Rows inserted or enriched.
+            duplicates: Rows already present, unchanged.
+            reason: Failure / skip reason, if any.
+
+        Raises:
+            ValueError: No gap row with ``gap_id``.
+        """
+        gap = self.session.get(PrivateStreamGap, gap_id)
+        if gap is None:
+            raise ValueError(f"private_stream_gaps row {gap_id} not found")
+        gap.recovery_status = status
+        gap.inserted = inserted
+        gap.duplicates = duplicates
+        # Bounded: raw exception text can be long (SQL + params).
+        gap.reason = reason[:_GAP_REASON_MAX_LEN] if reason else reason
+        self.session.flush()

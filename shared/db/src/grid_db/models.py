@@ -210,6 +210,9 @@ class Run(Base):
     orders: Mapped[List["Order"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
     )
+    private_stream_gaps: Mapped[List["PrivateStreamGap"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         Index("ix_runs_user_id", "user_id"),
@@ -303,6 +306,49 @@ class PrivateExecution(Base):
         Index("ix_private_executions_account_exchange_ts", "account_id", "exchange_ts"),
         Index("ix_private_executions_run_id", "run_id"),
         Index("ix_private_executions_exec_id", "exec_id", unique=True),
+    )
+
+
+class PrivateStreamGap(Base):
+    """A private WebSocket outage and its REST execution recovery (0110).
+
+    One row per (gap, symbol). ``recovery_status`` is a
+    :class:`grid_db.enums.RecoveryStatus` value; it starts ``pending`` and is
+    set once the recovery for that symbol finishes.
+    """
+
+    __tablename__ = "private_stream_gaps"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False
+    )
+    account_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    gap_start: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    gap_end: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    recovery_status: Mapped[str] = mapped_column(
+        String(12), nullable=False, default="pending"
+    )
+    inserted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    duplicates: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reason: Mapped[Optional[str]] = mapped_column(Text)
+
+    # Relationships
+    run: Mapped["Run"] = relationship(back_populates="private_stream_gaps")
+
+    __table_args__ = (
+        Index(
+            "ix_private_stream_gaps_run_account_symbol_start",
+            "run_id",
+            "account_id",
+            "symbol",
+            "gap_start",
+        ),
     )
 
 

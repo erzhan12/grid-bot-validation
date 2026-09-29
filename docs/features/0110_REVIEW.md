@@ -78,3 +78,28 @@ Verdict APPROVED, no P0. Triage:
 - `make test`: exit 0, merged coverage 91% (gridcore 94.8%).
 - `make lint`: all checks passed.
 - Shipped on PR #281 (feature/0110-rest-exec-recovery); merge awaits explicit user approval.
+
+---
+
+# 0110 Review — Phase B1a (gap persistence + structured recovery result)
+
+## Local staged review (review-fix-loop-staged, 2026-09-29)
+
+5 reviewers, 0 CRITICAL → Ready to commit (1/3). Warnings fixed: shared `_is_trade_row` filter and conversion inside the `try` (reconcile never raises); `exc_info` on error logs; single `recovery_result_from_future` for recorder + EventSaver; `ExecutionRecoveryResult` `Attributes:` docstring; tests for gap-row write failure, outcome-write failure, cancelled/crashed futures, EventSaver logging, non-Trade rows, the exact 7-day boundary. Info fixed: `reason` capped at 500 chars, missing-row `ValueError` test, FAILED enum comment, docstrings, PEP 8 spacing, repository-location note. Left: defensive `run_id is None` guard, redundant `str()` / explicit zero defaults.
+
+## External review (ext-code-review)
+
+Engines: codex (`gpt-5.6-sol`, high) + cursor. Rounds 3/4. Result: SUCCESS. Cursor dropped after two consecutive `resource_exhausted` failures (rounds 2–3).
+
+| Round | Engine | Sev | Finding | Verdict |
+|---|---|---|---|---|
+| 1 | codex | P2 | Non-dict REST rows silently filtered → `RECOVERED`. | ACCEPT — counted as dropped rows (`FAILED`, valid rows kept). |
+| 1 | codex | P3 | Commit-time failure (session exit) untested. | ACCEPT — `test_commit_error_is_failed`. |
+| 1 | cursor | P2 | Cancelled recovery stays `pending`: `_log_future_error`'s `future.exception()` raises and stops later callbacks. | REJECT — on Python 3.12 `concurrent.futures.CancelledError` subclasses `Exception` and `Future._invoke_callbacks` catches it and continues; pinned by `test_cancelled_recovery_is_persisted_failed_after_log_callback`. |
+| 2 | codex | P2 | (a) dict rows without `execType` filtered as non-Trade; (b) Trade rows missing `execId`/`symbol`/`execTime` stored with empty/epoch defaults. | (a) ACCEPT — counted as dropped. (b) REJECT — pre-existing conversion defaults (unchanged since before 0110); Bybit documents the fields as always present; out of scope. |
+| 2–3 | codex | P3 | All five statuses not persisted via a fresh session. | Accepted gap. |
+
+## Final verification (B1a)
+
+- `make test`: exit 0, merged coverage 91%.
+- `make lint`: all checks passed.

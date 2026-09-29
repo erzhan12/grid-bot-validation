@@ -22,6 +22,7 @@ from grid_db.repositories.market_data import (
 from grid_db.repositories.execution import (
     OrderRepository,
     PrivateExecutionRepository,
+    PrivateStreamGapRepository,
 )
 from grid_db.repositories.snapshots import (
     GridStateSnapshotRepository,
@@ -41,6 +42,7 @@ __all__ = [
     "TickerSnapshotRepository",
     "PrivateExecutionRepository",
     "OrderRepository",
+    "PrivateStreamGapRepository",
     "PositionSnapshotRepository",
     "WalletSnapshotRepository",
     "GridStateSnapshotRepository",

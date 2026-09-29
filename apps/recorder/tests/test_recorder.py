@@ -18,7 +18,8 @@ from gridcore.events import (
     PublicTradeEvent,
 )
 
-from grid_db import PublicTrade, Run
+from event_saver.reconciler import ExecutionRecoveryResult
+from grid_db import PublicTrade, RecoveryStatus, Run
 from recorder.config import RecorderConfig
 from recorder.recorder import Recorder
 
@@ -26,6 +27,19 @@ from recorder.recorder import Recorder
 # Match the placeholder UUIDs the recorder uses when self._config.account is None.
 TEST_RECORDER_USER_ID = UUID("00000000-0000-0000-0000-000000000001")
 TEST_RECORDER_ACCOUNT_ID = UUID("00000000-0000-0000-0000-000000000002")
+
+
+def _mock_collectors(mock_pub_cls, mock_priv_cls) -> None:
+    """Stub both collector classes with awaitable start/stop."""
+    mock_pub = MagicMock()
+    mock_pub.start = AsyncMock()
+    mock_pub.stop = AsyncMock()
+    mock_pub.get_connection_state.return_value = None
+    mock_pub_cls.return_value = mock_pub
+    mock_priv = MagicMock()
+    mock_priv.start = AsyncMock()
+    mock_priv.stop = AsyncMock()
+    mock_priv_cls.return_value = mock_priv
 
 
 async def await_future(fut: Union[Optional[Future], list[Future]]) -> None:
@@ -680,7 +694,11 @@ class TestRecorderHandlers:
         mock_priv_cls.return_value = mock_priv
 
         mock_reconciler = MagicMock()
-        mock_reconciler.reconcile_executions = AsyncMock(return_value=2)
+        mock_reconciler.reconcile_executions = AsyncMock(
+            return_value=ExecutionRecoveryResult(
+                status=RecoveryStatus.RECOVERED, inserted=2, duplicates=0
+            )
+        )
         mock_reconciler.get_stats.return_value = {}
         mock_reconciler_cls.return_value = mock_reconciler
 
@@ -708,6 +726,70 @@ class TestRecorderHandlers:
         )
 
         await recorder.stop()
+
+    @patch("recorder.recorder.PrivateStreamGapRepository")
+    @patch("recorder.recorder.GapReconciler")
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_gap_row_write_failure_still_runs_recovery(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls, mock_reconciler_cls,
+        mock_gap_repo_cls, config_with_account, db, db_with_gridbot_seed,
+        caplog,
+    ):
+        """A failed gap-row INSERT is logged; the REST backfill still runs."""
+        _mock_collectors(mock_pub_cls, mock_priv_cls)
+        mock_reconciler = MagicMock()
+        mock_reconciler.reconcile_executions = AsyncMock(
+            return_value=ExecutionRecoveryResult(RecoveryStatus.RECOVERED)
+        )
+        mock_reconciler.get_stats.return_value = {}
+        mock_reconciler_cls.return_value = mock_reconciler
+        mock_gap_repo_cls.return_value.add_gap.side_effect = RuntimeError("locked")
+
+        recorder = Recorder(config=config_with_account, db=db)
+        await recorder.start()
+        try:
+            with caplog.at_level("ERROR", logger="recorder.recorder"):
+                futs = recorder._handle_private_gap(
+                    datetime(2026, 1, 1, tzinfo=UTC),
+                    datetime(2026, 1, 1, 0, 0, 30, tzinfo=UTC),
+                )
+                await await_future(futs)
+            mock_reconciler.reconcile_executions.assert_awaited_once()
+            mock_gap_repo_cls.return_value.set_outcome.assert_not_called()
+            assert "Failed to record private stream gap" in caplog.text
+        finally:
+            await recorder.stop()
+
+    @patch("recorder.recorder.PrivateStreamGapRepository")
+    async def test_cancelled_recovery_is_persisted_failed_after_log_callback(
+        self, mock_gap_repo_cls, config_with_account, db
+    ):
+        """Cancel runs both callbacks in order; the gap is stored FAILED."""
+        recorder = Recorder(config=config_with_account, db=db)
+        fut = Future()
+        fut.add_done_callback(recorder._log_future_error("private reconciliation"))
+        fut.add_done_callback(recorder._persist_gap_outcome(7, "BTCUSDT"))
+        fut.cancel()
+        mock_gap_repo_cls.return_value.set_outcome.assert_called_once_with(
+            7,
+            status=RecoveryStatus.FAILED,
+            inserted=0,
+            duplicates=0,
+            reason="recovery cancelled",
+        )
+
+    async def test_gap_outcome_write_failure_is_logged_not_raised(
+        self, config_with_account, db, caplog
+    ):
+        """A failed outcome UPDATE (unknown gap id) is logged, never raised."""
+        recorder = Recorder(config=config_with_account, db=db)
+        fut = Future()
+        fut.set_result(ExecutionRecoveryResult(RecoveryStatus.RECOVERED))
+        with caplog.at_level("ERROR", logger="recorder.recorder"):
+            recorder._persist_gap_outcome(999999, "BTCUSDT")(fut)
+        assert "Failed to persist gap outcome" in caplog.text
 
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")

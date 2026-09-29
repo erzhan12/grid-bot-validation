@@ -12,7 +12,7 @@ from typing import Optional
 from uuid import UUID
 
 from bybit_adapter.rest_client import BybitRestClient
-from grid_db import DatabaseFactory, DatabaseSettings
+from grid_db import DatabaseFactory, DatabaseSettings, RecoveryStatus
 from gridcore.events import PublicTradeEvent, ExecutionEvent, TickerEvent
 
 from event_saver.config import EventSaverConfig
@@ -25,10 +25,27 @@ from event_saver.writers import (
     PositionWriter,
     WalletWriter,
 )
-from event_saver.reconciler import GapReconciler
+from event_saver.reconciler import GapReconciler, recovery_result_from_future
 
 
 logger = logging.getLogger(__name__)
+
+
+def _log_recovery_result(symbol: str):
+    """Done-callback logging a private-gap recovery outcome (no persistence)."""
+    def _cb(future) -> None:
+        result = recovery_result_from_future(future)
+        if result.status == RecoveryStatus.RECOVERED:
+            logger.info(
+                "Execution recovery for %s: %s (inserted=%d duplicates=%d)",
+                symbol, result.status, result.inserted, result.duplicates,
+            )
+        else:
+            logger.warning(
+                "Execution recovery for %s: %s (%s)",
+                symbol, result.status, result.reason,
+            )
+    return _cb
 
 
 class EventSaver:
@@ -439,7 +456,7 @@ class EventSaver:
             # Reconcile for each symbol
             testnet = context.environment == "testnet"
             for symbol in context.symbols or self._config.get_symbols():
-                asyncio.run_coroutine_threadsafe(
+                fut = asyncio.run_coroutine_threadsafe(
                     self._reconciler.reconcile_executions(
                         user_id=context.user_id,
                         account_id=context.account_id,
@@ -453,6 +470,7 @@ class EventSaver:
                     ),
                     self._event_loop
                 )
+                fut.add_done_callback(_log_recovery_result(symbol))
 
     def get_stats(self) -> dict:
         """Get statistics from all components.

@@ -20,8 +20,9 @@ from grid_db.models import (
     PositionSnapshot,
     WalletSnapshot,
     GridStateSnapshot,
+    PrivateStreamGap,
 )
-from grid_db.enums import RunType
+from grid_db.enums import RecoveryStatus, RunType
 from grid_db.data_quality import RecordedDataQualityError
 from grid_db.identity import (
     UUID_NAMESPACE,
@@ -41,6 +42,7 @@ from grid_db.repositories import (
     PublicTradeRepository,
     PrivateExecutionRepository,
     OrderRepository,
+    PrivateStreamGapRepository,
     PositionSnapshotRepository,
     WalletSnapshotRepository,
     GridStateSnapshotRepository,
@@ -68,6 +70,8 @@ __all__ = [
     "PositionSnapshot",
     "WalletSnapshot",
     "GridStateSnapshot",
+    "PrivateStreamGap",
+    "RecoveryStatus",
     # Repositories
     "BaseRepository",
     "UserRepository",
@@ -79,6 +83,7 @@ __all__ = [
     "PublicTradeRepository",
     "PrivateExecutionRepository",
     "OrderRepository",
+    "PrivateStreamGapRepository",
     "PositionSnapshotRepository",
     "WalletSnapshotRepository",
     "GridStateSnapshotRepository",

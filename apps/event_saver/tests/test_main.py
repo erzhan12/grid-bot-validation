@@ -1,12 +1,16 @@
 """Tests for EventSaver main orchestrator."""
 
 import asyncio
+from concurrent.futures import Future
+
 import pytest
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
-from event_saver.main import EventSaver
+from event_saver.main import EventSaver, _log_recovery_result
+from event_saver.reconciler import ExecutionRecoveryResult
+from grid_db import RecoveryStatus
 from event_saver.config import EventSaverConfig
 from event_saver.collectors import AccountContext
 from gridcore.events import TickerEvent, PublicTradeEvent, ExecutionEvent, OrderUpdateEvent, EventType
@@ -472,8 +476,27 @@ class TestGapHandling:
         with patch("event_saver.main.asyncio.run_coroutine_threadsafe") as mock_rcts:
             saver._handle_private_gap(account_context, gap_start, gap_end)
             assert mock_rcts.call_count == 1  # One symbol: BTCUSDT
+            mock_rcts.return_value.add_done_callback.assert_called_once()
             coro = mock_rcts.call_args[0][0]
             coro.close()
+
+    def test_recovery_result_logged_by_status(self, caplog):
+        """RECOVERED logs INFO; any other outcome (incl. crash) logs WARNING."""
+        ok, failed, crashed = Future(), Future(), Future()
+        ok.set_result(ExecutionRecoveryResult(RecoveryStatus.RECOVERED, 2, 1))
+        failed.set_result(
+            ExecutionRecoveryResult(RecoveryStatus.FAILED, reason="REST error: x")
+        )
+        crashed.set_exception(RuntimeError("boom"))
+
+        with caplog.at_level("INFO", logger="event_saver.main"):
+            for fut in (ok, failed, crashed):
+                _log_recovery_result("BTCUSDT")(fut)
+
+        levels = [(r.levelname, r.getMessage()) for r in caplog.records]
+        assert levels[0][0] == "INFO" and "inserted=2 duplicates=1" in levels[0][1]
+        assert levels[1][0] == "WARNING" and "REST error: x" in levels[1][1]
+        assert levels[2][0] == "WARNING" and "recovery crashed: boom" in levels[2][1]
 
     def test_handle_public_gap_noop_without_reconciler(self, saver):
         saver._reconciler = None
