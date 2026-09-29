@@ -27,7 +27,7 @@ Phase A deviations from plan (recorded in 0110_PLAN.md "Phase A implementation n
 - comparator CLI unchanged: existing logger.exception("Comparison failed") already surfaces the error
 - cycles not committed separately (no commit without explicit ask)
 
-Not committed — awaiting user review.
+Merged to main via PR #281 (4d3cdb0). Open: .claude/rules updates; recorder gap test REST shape; unknown_pnl_exec_ids scoping test; Phases B1/B2.
 
 # Feature 0093 — apps/importer (trad_save_history → replay-compatible SQLite)
 
@@ -104,3 +104,13 @@ Plan: docs/features/0102_PLAN.md | Issue: #246
   `get_executions_all` raises, and assert the recorder stays running and the
   error is logged via `_log_future_error`. Out of scope for #211 (the
   "marks run unhealthy" case is not current behavior).
+
+# Research P23 — Double ATR opening distance (2026-09-27)
+
+- [x] Freeze independent four-cell plan: results/double_atr_pilot_plan.md.
+- [x] Phase 1: causal closed-bar ATR policy; 11 focused tests passed.
+- [x] Phase 2: 8 calm/crash smokes, raw/compact log parity, fill-ledger checks;
+  P22 static reproduced; make lint passed.
+- [x] Phase 3: four full cells completed and independently reconciled;
+  results/double_atr_pilot_results.md. P23 stopped by frozen criteria:
+  double +0.2070% net / 29.1524% DD vs static +46.6494% / 33.1885%; no retuning.
