@@ -1,3 +1,14 @@
+# Feature 0110 Phase B1b — private WS readiness + silent-reconnect detection (#271)
+
+Plan: docs/features/0110_PLAN.md (B1b, detect-only)  |  Branch: feature/0110-b1b-collector-detect
+
+- [x] ws_client: opt-in ack tracking, wait_ready, socket_identity, is_authenticated (gridbot untouched)
+- [x] PrivateCollector: readiness at start and after reset, identity/auth health, gap start = last healthy − 75 s
+- [x] not ready at start logs ERROR (no raise); not ready after reset keeps the gap open for the next probe
+- [x] set_outcome scoped by run_id; reconciler warns per dropped REST row
+- [x] make test + make lint green
+- [x] rules update (bybit-adapter, event-saver, grid-db)
+
 # Feature 0110 Phase B1a — gap persistence + structured recovery result (#271)
 
 Plan: docs/features/0110_PLAN.md (B1 split into B1a/B1b/B1c)  |  Branch: feature/0110-b1a-recovery-persistence

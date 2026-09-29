@@ -774,11 +774,28 @@ class TestRecorderHandlers:
         fut.cancel()
         mock_gap_repo_cls.return_value.set_outcome.assert_called_once_with(
             7,
+            run_id=str(recorder._run_id),
             status=RecoveryStatus.FAILED,
             inserted=0,
             duplicates=0,
             reason="recovery cancelled",
         )
+
+    @patch("recorder.recorder.PrivateStreamGapRepository")
+    async def test_gap_outcome_uses_run_id_of_the_gap_row(
+        self, mock_gap_repo_cls, config_with_account, db
+    ):
+        """The outcome is scoped to the run the gap row was written under,
+        captured when the callback is built, not when it fires."""
+        recorder = Recorder(config=config_with_account, db=db)
+        row_run_id = str(recorder._run_id)
+        cb = recorder._persist_gap_outcome(7, "BTCUSDT")
+        recorder._run_id = "another-run"
+        fut = Future()
+        fut.set_result(ExecutionRecoveryResult(RecoveryStatus.RECOVERED))
+        cb(fut)
+        call = mock_gap_repo_cls.return_value.set_outcome.call_args
+        assert call.kwargs["run_id"] == row_run_id
 
     async def test_gap_outcome_write_failure_is_logged_not_raised(
         self, config_with_account, db, caplog

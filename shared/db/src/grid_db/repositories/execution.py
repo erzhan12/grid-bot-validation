@@ -414,6 +414,8 @@ class PrivateStreamGapRepository(BaseRepository[PrivateStreamGap]):
     def set_outcome(
         self,
         gap_id: int,
+        *,
+        run_id: str,
         status: RecoveryStatus,
         inserted: int,
         duplicates: int,
@@ -423,17 +425,27 @@ class PrivateStreamGapRepository(BaseRepository[PrivateStreamGap]):
 
         Args:
             gap_id: Row id returned by :meth:`add_gap`.
+            run_id: Run the gap belongs to (tenant scope for the lookup).
             status: Final recovery status.
             inserted: Rows inserted or enriched.
             duplicates: Rows already present, unchanged.
             reason: Failure / skip reason, if any.
 
         Raises:
-            ValueError: No gap row with ``gap_id``.
+            ValueError: No gap row with ``gap_id`` under ``run_id``.
         """
-        gap = self.session.get(PrivateStreamGap, gap_id)
+        gap = (
+            self.session.query(PrivateStreamGap)
+            .filter(
+                PrivateStreamGap.id == gap_id,
+                PrivateStreamGap.run_id == str(run_id),
+            )
+            .one_or_none()
+        )
         if gap is None:
-            raise ValueError(f"private_stream_gaps row {gap_id} not found")
+            raise ValueError(
+                f"private_stream_gaps row {gap_id} not found for run {run_id}"
+            )
         gap.recovery_status = status
         gap.inserted = inserted
         gap.duplicates = duplicates

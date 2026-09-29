@@ -103,3 +103,28 @@ Engines: codex (`gpt-5.6-sol`, high) + cursor. Rounds 3/4. Result: SUCCESS. Curs
 
 - `make test`: exit 0, merged coverage 91%.
 - `make lint`: all checks passed.
+
+## Phase B1b — local staged review (review-fix-loop-staged, 2026-09-29)
+
+5 reviewers, 0 CRITICAL → Ready to commit (1/3). Warnings fixed: four pre-B1b dead-socket tests built a collector with `_ready=False` and never reached the liveness check (now `_mark_ready`, plus an assertion that `is_socket_alive` runs); new tests for `reset()` re-installing ack tracking, a `success: false` ack, an ack arriving mid-wait, the baseline read before the wait, and not-ready-at-start dated from the connect time; the gap outcome uses the `run_id` captured when the callback is built; `_is_malformed_row` helper; `_READY_WAIT_SLACK`; stale docstrings. pybit 5.13.0 internals checked and pinned in `bybit-adapter.md`. Bybit's private subscribe ack `req_id`: docs ambiguous; gocryptotrader matches `/v5/private` acks by `req_id` (only `/v5/trade` omits it). Documented, not changed: a never-ready socket resets every probe with no backoff; `connect()` still on the loop (B1c); `_is_ready` reads without the lock (race unreachable today).
+
+## Phase B1b — external review (ext-code-review)
+
+Engines: codex (`gpt-5.6-sol`, high) + cursor (`grok-4.7-high`). Rounds 2/4. Result: SUCCESS.
+
+| Round | Engine | Sev | Finding | Verdict |
+|---|---|---|---|---|
+| 1 | codex | P2 | `stop()` awaits the health task, which can sit in `_confirm_ready` for up to 6 s; the plan's blocked-auth shutdown test is missing. | ACCEPT — `_confirm_ready` races `_ws_health_stop_event` and abandons the wait thread; not-ready ERROR skipped when stopping; `test_auth_wait_keeps_shutdown_responsive` (RED 4.9 s → GREEN). The test times `stop()` because `stop()` swallows `CancelledError`, so a `wait_for` would hide the delay. |
+| 1 | cursor | — | NO P1/P2. | — |
+| 1 | cursor | P3 | The `start()` wait is not ended by `stop()`. | ACCEPT (docs) — docstring says the start wait is bounded by the timeout only. |
+| 1 | cursor | P3 | `wait_ready` docstring line > 88 chars. | ACCEPT — re-wrapped. |
+| 1 | cursor | P3 | Unauthenticated / never-ready tests assert only `reset()`. | Accepted gap (gap path covered by other tests). |
+| 2 | codex | — | NO P1/P2, no P3. | — |
+| 2 | cursor | P3 | `set(self._acked_req_ids)` can raise while pybit adds. | REJECT — CPython copies a set in one step under the GIL. |
+| 2 | cursor | P3 | Conversion-error drop warning untested. | REJECT — `test_row_conversion_error_is_failed_but_good_rows_kept` asserts `execId='bad'` in the log. |
+| 2 | cursor | P3 | Gap-start test never runs a second probe after the baseline retake. | Accepted gap. |
+
+## Final verification (B1b)
+
+- `make test`: exit 0, merged coverage 92%.
+- `make lint`: all checks passed.

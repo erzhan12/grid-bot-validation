@@ -23,6 +23,7 @@ from grid_db import (
     PublicTrade,
     RecoveryStatus,
 )
+from event_saver.collectors.private_collector import _LIVENESS_MARGIN
 from recorder.recorder import Recorder
 
 
@@ -80,6 +81,19 @@ class FakePrivateWS:
 
     def reset(self) -> None:
         self.alive = True
+        self._identity = object()  # a real reset builds a new pybit socket
+
+    # Feature 0110 B1b readiness surface: always ready, stable identity.
+    _identity: object = object()
+
+    def wait_ready(self, timeout: float) -> bool:
+        return True
+
+    def socket_identity(self) -> object:
+        return self._identity
+
+    def is_authenticated(self) -> bool:
+        return True
 
     def get_connection_state(self) -> ConnectionState:
         return ConnectionState(
@@ -282,7 +296,10 @@ class TestRecorderDisconnectReconciliation:
             await recorder.start()
             try:
                 private_ws = recorder._private_collector._ws_client
-                private_ws.last_message_ts = gap_start
+                # 0110 B1b: gap start = last healthy probe − liveness margin.
+                recorder._private_collector._last_healthy_ts = (
+                    gap_start + _LIVENESS_MARGIN
+                )
                 private_ws.alive = False
                 await recorder._private_collector._ws_health_check_once()
                 assert recorder._gap_count == 1
@@ -325,7 +342,10 @@ class TestRecorderDisconnectReconciliation:
             await recorder.start()
             try:
                 private_ws = recorder._private_collector._ws_client
-                private_ws.last_message_ts = gap_start
+                # 0110 B1b: gap start = last healthy probe − liveness margin.
+                recorder._private_collector._last_healthy_ts = (
+                    gap_start + _LIVENESS_MARGIN
+                )
                 private_ws.alive = False
                 await recorder._private_collector._ws_health_check_once()
                 await _wait_until(

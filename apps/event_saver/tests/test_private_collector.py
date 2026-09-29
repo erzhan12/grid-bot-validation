@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import threading
+import time
 import pytest
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
@@ -12,6 +13,8 @@ from bybit_adapter.ws_client import ConnectionState
 from event_saver.collectors.private_collector import (
     PrivateCollector,
     AccountContext,
+    _LIVENESS_MARGIN,
+    _PRIVATE_READY_TIMEOUT,
     _run_in_daemon_thread,
 )
 from gridcore.events import ExecutionEvent, OrderUpdateEvent
@@ -200,15 +203,20 @@ class TestLifecycle:
         )
         mock_ws = MagicMock()
         mock_ws.is_socket_alive.return_value = False
+        _mark_ready(collector, mock_ws)
         mock_ws.get_connection_state.return_value = ConnectionState(
             last_message_ts=disconnected_at,
             is_connected=True,
         )
         collector._running = True
         collector._ws_client = mock_ws
+        # 0110 B1b: gap start is the last healthy probe minus the liveness
+        # margin, not the last message time.
+        collector._last_healthy_ts = disconnected_at + _LIVENESS_MARGIN
 
         await collector._ws_health_check_once()
 
+        mock_ws.is_socket_alive.assert_called()  # reached the liveness check
         mock_ws.reset.assert_called_once()
         on_gap.assert_called_once()
         assert on_gap.call_args[0][0] == disconnected_at
@@ -235,6 +243,7 @@ class TestLifecycle:
 
         mock_ws = MagicMock()
         mock_ws.is_socket_alive.return_value = False
+        _mark_ready(collector, mock_ws)
         mock_ws.get_connection_state.return_value = ConnectionState(
             last_message_ts=disconnected_at,
             is_connected=True,
@@ -523,6 +532,7 @@ class TestWsResetTimeout:
 
         mock_ws = MagicMock()
         mock_ws.is_socket_alive.return_value = False
+        _mark_ready(collector, mock_ws)
         mock_ws.get_connection_state.return_value = ConnectionState(
             last_message_ts=disconnected_at,
             is_connected=True,
@@ -565,6 +575,7 @@ class TestWsResetTimeout:
 
         mock_ws = MagicMock()
         mock_ws.is_socket_alive.return_value = False
+        _mark_ready(collector, mock_ws)
         mock_ws.get_connection_state.return_value = ConnectionState(
             last_message_ts=disconnected_at,
             is_connected=True,
@@ -762,3 +773,225 @@ class TestRunInDaemonThread:
         gate.set()
         worker.join(timeout=2.0)
         assert worker.is_alive() is False
+
+
+# ---------------------------------------------------------------------------
+# Readiness, silent reconnects and gap start (feature 0110 B1b)
+# ---------------------------------------------------------------------------
+
+_LAST_HEALTHY = datetime(2026, 9, 1, 12, 0, 0, tzinfo=UTC)
+
+
+def _mark_ready(collector, ws):
+    """Put a collector in the confirmed-ready state on ``ws``, so a health
+    probe gets past the readiness check to the socket checks."""
+    baseline = object()
+    ws.is_authenticated.return_value = True
+    ws.socket_identity.return_value = baseline
+    collector._identity_baseline = baseline
+    collector._ready = True
+
+
+def _probe_collector(context, on_gap, *, alive=True, authed=True, ready=True):
+    """Collector mid-run with a healthy baseline; knobs make it unhealthy."""
+    collector = PrivateCollector(context=context, on_gap_detected=on_gap)
+    ws = MagicMock()
+    baseline = object()
+    ws.is_socket_alive.return_value = alive
+    ws.is_authenticated.return_value = authed
+    ws.socket_identity.return_value = baseline
+    ws.wait_ready.return_value = ready
+    collector._running = True
+    collector._ws_client = ws
+    collector._identity_baseline = baseline
+    collector._ready = True
+    collector._last_healthy_ts = _LAST_HEALTHY
+    return collector, ws
+
+
+def _swap_identity_on_reset(ws):
+    """A real reset() builds a new pybit socket: give it a new identity."""
+    ws.reset.side_effect = lambda: setattr(
+        ws.socket_identity, "return_value", object()
+    )
+
+
+class TestPrivateReadinessAndGapStart:
+    @pytest.mark.asyncio
+    async def test_start_confirms_ready_with_ack_tracking(self, collector):
+        """start() builds a tracking client and waits for readiness."""
+        with patch(
+            "event_saver.collectors.private_collector.PrivateWebSocketClient"
+        ) as MockWS:
+            ws = MockWS.return_value
+            ws.wait_ready.return_value = True
+            await collector.start()
+            try:
+                assert MockWS.call_args.kwargs["track_subscription_acks"] is True
+                ws.wait_ready.assert_called_once_with(_PRIVATE_READY_TIMEOUT)
+                assert collector._ready is True
+                assert collector._identity_baseline is ws.socket_identity()
+                assert collector._last_healthy_ts is not None
+            finally:
+                await collector.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_ready_timeout_logs_and_does_not_raise(
+        self, collector, caplog
+    ):
+        """Not ready at start: ERROR, keep running, first probe resets."""
+        with patch(
+            "event_saver.collectors.private_collector.PrivateWebSocketClient"
+        ) as MockWS:
+            MockWS.return_value.wait_ready.return_value = False
+            with caplog.at_level(
+                logging.ERROR, logger="event_saver.collectors.private_collector"
+            ):
+                await collector.start()
+            try:
+                assert collector.is_running() is True
+                assert collector._ready is False
+                assert "not ready" in caplog.text
+            finally:
+                await collector.stop()
+
+    @pytest.mark.asyncio
+    async def test_quiet_healthy_probe_advances_last_healthy(self, context, on_gap):
+        """A healthy socket with no messages is healthy; no gap, no reset."""
+        collector, ws = _probe_collector(context, on_gap)
+        await collector._ws_health_check_once()
+        ws.reset.assert_not_called()
+        on_gap.assert_not_called()
+        ws.get_connection_state.assert_not_called()  # message age unused
+        assert collector._last_healthy_ts > _LAST_HEALTHY
+
+    @pytest.mark.asyncio
+    async def test_silent_pybit_reconnect_is_a_gap(self, context, on_gap):
+        """Alive socket but a new pybit WebSocketApp: reset and report gap."""
+        collector, ws = _probe_collector(context, on_gap)
+        ws.socket_identity.return_value = object()  # pybit reconnected
+        await collector._ws_health_check_once()
+        ws.reset.assert_called_once()
+        on_gap.assert_called_once()
+        assert on_gap.call_args[0][0] == _LAST_HEALTHY - _LIVENESS_MARGIN
+
+    @pytest.mark.asyncio
+    async def test_unauthenticated_socket_is_unhealthy(self, context, on_gap):
+        """Alive but not authenticated is treated like a dead socket."""
+        collector, ws = _probe_collector(context, on_gap, authed=False)
+        await collector._ws_health_check_once()
+        ws.reset.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_never_ready_socket_is_unhealthy(self, context, on_gap):
+        """A socket not confirmed ready at start is reset by the probe."""
+        collector, ws = _probe_collector(context, on_gap)
+        collector._ready = False
+        await collector._ws_health_check_once()
+        ws.reset.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_gap_start_is_last_healthy_minus_margin(self, context, on_gap):
+        """Gap start comes from the last healthy probe, not message age."""
+        collector, ws = _probe_collector(context, on_gap, alive=False)
+        ws.get_connection_state.return_value = ConnectionState(
+            last_message_ts=datetime(2026, 8, 1, tzinfo=UTC), is_connected=True
+        )
+        _swap_identity_on_reset(ws)
+        await collector._ws_health_check_once()
+        start, end = on_gap.call_args[0]
+        assert start == _LAST_HEALTHY - _LIVENESS_MARGIN
+        assert end > start
+        # the new socket becomes the baseline; next probe is healthy
+        assert collector._identity_baseline is ws.socket_identity()
+
+    @pytest.mark.asyncio
+    async def test_ready_failure_after_reset_keeps_gap_open(
+        self, context, on_gap
+    ):
+        """Reset but not ready: no gap reported yet; the next probe retries
+        and reports the gap from the ORIGINAL last-healthy time."""
+        collector, ws = _probe_collector(context, on_gap, alive=False)
+        _swap_identity_on_reset(ws)
+        ws.wait_ready.return_value = False
+        await collector._ws_health_check_once()
+        on_gap.assert_not_called()
+        assert collector._last_healthy_ts == _LAST_HEALTHY
+        assert collector._ready is False
+
+        ws.is_socket_alive.return_value = True
+        ws.wait_ready.return_value = True
+        await collector._ws_health_check_once()
+        assert ws.reset.call_count == 2
+        on_gap.assert_called_once()
+        assert on_gap.call_args[0][0] == _LAST_HEALTHY - _LIVENESS_MARGIN
+        assert collector._ready is True
+
+    @pytest.mark.asyncio
+    async def test_identity_baseline_is_read_before_waiting(self, context, on_gap):
+        """A pybit reconnect during wait_ready must not become the baseline:
+        the next probe sees the swap and reports a gap."""
+        collector, ws = _probe_collector(context, on_gap)
+        before = ws.socket_identity.return_value
+        collector._ready = False
+
+        def _reconnect_during_wait(timeout):
+            ws.socket_identity.return_value = object()
+            return True
+
+        ws.wait_ready.side_effect = _reconnect_during_wait
+        assert await collector._confirm_ready() is True
+        assert collector._identity_baseline is before
+
+        ws.wait_ready.side_effect = None
+        _swap_identity_on_reset(ws)
+        await collector._ws_health_check_once()
+        ws.reset.assert_called_once()
+        on_gap.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_not_ready_at_start_gap_dates_from_connect(self, collector, on_gap):
+        """Not ready at start: the first probe resets and dates the gap from
+        the connect time minus the liveness margin."""
+        with patch(
+            "event_saver.collectors.private_collector.PrivateWebSocketClient"
+        ) as MockWS:
+            ws = MockWS.return_value
+            ws.wait_ready.return_value = False
+            await collector.start()
+            try:
+                connected_at = collector._last_healthy_ts
+                ws.wait_ready.return_value = True
+                _swap_identity_on_reset(ws)
+                await collector._ws_health_check_once()
+                ws.reset.assert_called_once()
+                on_gap.assert_called_once()
+                assert on_gap.call_args[0][0] == connected_at - _LIVENESS_MARGIN
+            finally:
+                await collector.stop()
+
+    @pytest.mark.asyncio
+    async def test_auth_wait_keeps_shutdown_responsive(
+        self, context, on_gap, caplog
+    ):
+        """stop() during a post-reset readiness wait returns at once: the
+        wait runs off the loop and is abandoned, and no gap is reported."""
+        collector, ws = _probe_collector(context, on_gap, alive=False)
+        _swap_identity_on_reset(ws)
+        gate = threading.Event()
+        ws.wait_ready.side_effect = lambda timeout: gate.wait(timeout)
+        collector._ws_health_stop_event = asyncio.Event()
+        collector._ws_health_task = asyncio.create_task(
+            collector._ws_health_check_once()
+        )
+        try:
+            await asyncio.sleep(0.1)  # probe is now parked in wait_ready
+            started = time.monotonic()
+            await collector.stop()
+            # stop() swallows CancelledError, so time it instead of wait_for.
+            assert time.monotonic() - started < 1.0
+            on_gap.assert_not_called()
+            assert "not ready after reset" not in caplog.text
+            assert collector._ready is False
+        finally:
+            gate.set()

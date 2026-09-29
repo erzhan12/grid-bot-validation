@@ -5,7 +5,7 @@ import contextlib
 import logging
 import threading
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Optional
 from uuid import UUID
 
@@ -19,6 +19,16 @@ logger = logging.getLogger(__name__)
 _PRIVATE_WS_HEALTH_CHECK_INTERVAL = 10.0
 _PRIVATE_WS_RESET_TIMEOUT = 30.0
 _PRIVATE_WS_DISCONNECT_TIMEOUT = 5.0
+# Feature 0110 B1b: how long connect/reset waits for auth + subscription acks.
+_PRIVATE_READY_TIMEOUT = 5.0
+# Extra time the event loop gives the wait_ready thread past its own deadline.
+_READY_WAIT_SLACK = 1.0
+# A half-open socket still reads "connected" until pybit's ping times out:
+# websocket-client's first ping goes out ~2x ping_interval (20 s) after
+# open and the timeout (10 s) is only checked after the next select, so
+# detection can take ~2x20 + 2x10 = 60 s; +15 s slack. A gap therefore
+# starts this long before the last healthy probe.
+_LIVENESS_MARGIN = timedelta(seconds=75)
 
 
 def _run_in_daemon_thread(
@@ -143,11 +153,13 @@ class PrivateCollector:
             on_position: Callback for position snapshots (raw dict).
             on_wallet: Callback for wallet snapshots (raw dict).
             on_gap_detected: Callback when gap is detected (start, end).
-            ws_health_check_interval: TCP socket health-check interval in seconds.
+            ws_health_check_interval: Private socket health-check interval in
+                seconds.
             ws_reset_timeout: Bound on the blocking ``client.reset()`` call from
-                the TCP health loop. On timeout the worker is abandoned and
+                the health loop. On timeout the worker is abandoned and
                 ``_handle_reconnect`` is skipped (no REST reconciliation on an
-                unconfirmed reset).
+                unconfirmed reset). A reset whose new socket is not ready also
+                skips it; the next probe retries.
             ws_disconnect_timeout: Bound on ``client.disconnect()`` during
                 ``stop()`` so shutdown stays responsive when pybit is wedged.
         """
@@ -175,11 +187,19 @@ class PrivateCollector:
         self._ws_health_task: Optional[asyncio.Task[None]] = None
         self._ws_health_stop_event: Optional[asyncio.Event] = None
         self._ws_reset_abandoned = False
+        # Feature 0110 B1b: identity of the pybit socket last confirmed
+        # ready, whether it is ready, and the last healthy probe time.
+        self._identity_baseline: object = None
+        self._ready = False
+        self._last_healthy_ts: Optional[datetime] = None
 
     async def start(self) -> None:
         """Start collecting private data for this account.
 
-        Connects to authenticated WebSocket and subscribes to streams.
+        Connects to the authenticated WebSocket, subscribes to streams and
+        waits up to ``_PRIVATE_READY_TIMEOUT`` for auth plus every
+        subscription ack. Not ready in time is logged at ERROR and does not
+        raise: the first health probe resets the socket.
         """
         if self._running:
             logger.warning(f"PrivateCollector already running for account {self.context.account_id}")
@@ -203,12 +223,24 @@ class PrivateCollector:
             on_disconnect=self._handle_disconnect,
             on_reconnect=self._handle_reconnect,
             message_gap_watchdog_enabled=False,
+            track_subscription_acks=True,
         )
         # Fresh client; defensively clear any abandoned-flag inherited from a
         # previous timed-out stop() so this collector is not crippled.
         self._ws_reset_abandoned = False
 
         self._ws_client.connect()
+        # Gap start before readiness is confirmed: the connect time.
+        self._last_healthy_ts = datetime.now(UTC)
+        if not await self._confirm_ready():
+            # Not fatal until feature 0110 B1c moves the startup snapshot:
+            # the first health probe treats "not ready" as unhealthy.
+            logger.error(
+                "Private WebSocket not ready within %.1fs for account %s; "
+                "the health probe will reset it",
+                _PRIVATE_READY_TIMEOUT,
+                self.context.account_id,
+            )
         self._ws_health_stop_event = asyncio.Event()
         self._ws_health_task = asyncio.create_task(self._ws_health_check_loop())
         logger.info(f"PrivateCollector started for account {self.context.account_id}")
@@ -272,7 +304,7 @@ class PrivateCollector:
         return None
 
     async def _ws_health_check_loop(self) -> None:
-        """Reset dead private sockets and trigger REST reconciliation."""
+        """Reset unhealthy private sockets and trigger REST reconciliation."""
         while self._running:
             stop_event = self._ws_health_stop_event
             if stop_event is None:
@@ -288,7 +320,11 @@ class PrivateCollector:
             await self._ws_health_check_once()
 
     async def _ws_health_check_once(self) -> None:
-        """Perform one TCP-level private WebSocket health check."""
+        """Perform one private WebSocket health check.
+
+        Unhealthy means not confirmed ready, a dead TCP socket, lost auth, or
+        a different pybit socket than the ready one (a silent reconnect).
+        """
         client = self._ws_client
         if not self._running or client is None:
             return
@@ -302,19 +338,22 @@ class PrivateCollector:
             return
 
         try:
-            if client.is_socket_alive():
+            if self._is_healthy(client):
+                self._last_healthy_ts = datetime.now(UTC)
                 return
 
-            state = client.get_connection_state()
+            # Conservative gap start: the last healthy probe minus the time
+            # a half-open socket can still look alive (not message age — a
+            # healthy private stream can be quiet for days).
             disconnected_at = (
-                state.last_message_ts
-                or state.disconnected_at
-                or datetime.now(UTC)
-            )
+                self._last_healthy_ts or datetime.now(UTC)
+            ) - _LIVENESS_MARGIN
             self._handle_disconnect(disconnected_at)
 
             logger.warning(
-                "Private WebSocket socket dead for account %s; resetting",
+                "Private WebSocket unhealthy for account %s "
+                "(socket dead, silently reconnected, unauthenticated or "
+                "never ready); resetting",
                 self.context.account_id,
             )
             try:
@@ -333,6 +372,16 @@ class PrivateCollector:
                 )
                 return
             self._ws_reset_abandoned = False
+            if not await self._confirm_ready():
+                # Gap stays unreported; the next probe resets again and
+                # reports it from the same (unchanged) last-healthy time.
+                if self._running:  # not a stop() ending the wait
+                    logger.error(
+                        "Private WebSocket not ready after reset for "
+                        "account %s",
+                        self.context.account_id,
+                    )
+                return
             self._handle_reconnect(disconnected_at, datetime.now(UTC))
         except Exception as e:
             logger.error(
@@ -341,6 +390,56 @@ class PrivateCollector:
                 e,
                 exc_info=True,
             )
+
+    def _is_healthy(self, client: PrivateWebSocketClient) -> bool:
+        """Alive, confirmed ready, authenticated, and the same pybit socket."""
+        return (
+            self._ready
+            and client.is_socket_alive()
+            and client.is_authenticated()
+            and client.socket_identity() is self._identity_baseline
+        )
+
+    async def _confirm_ready(self) -> bool:
+        """Wait (off the loop) for auth + acks; on success take the baseline.
+
+        The baseline identity is read BEFORE waiting, so a pybit silent
+        reconnect during the wait fails readiness and is caught by the
+        next probe. During a health probe ``stop()`` ends the wait at once
+        (not ready): the waiting thread holds no lock and is abandoned. The
+        wait in ``start()`` runs before the stop event exists and is bounded
+        by the timeout only.
+        """
+        client = self._ws_client
+        self._ready = False
+        baseline = client.socket_identity()
+        ready_wait = _run_in_daemon_thread(
+            lambda: client.wait_ready(_PRIVATE_READY_TIMEOUT), name="ws-ready"
+        )
+        waiters = {ready_wait}
+        stop_event = self._ws_health_stop_event
+        stopping = None
+        if stop_event is not None:
+            stopping = asyncio.ensure_future(stop_event.wait())
+            waiters.add(stopping)
+        try:
+            await asyncio.wait(
+                waiters,
+                timeout=_PRIVATE_READY_TIMEOUT + _READY_WAIT_SLACK,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            if stopping is not None:
+                stopping.cancel()
+        if not ready_wait.done():
+            ready_wait.cancel()
+            return False
+        ready = ready_wait.result()
+        if ready:
+            self._ready = True
+            self._identity_baseline = baseline
+            self._last_healthy_ts = datetime.now(UTC)
+        return bool(ready)
 
     def update_run_id(self, run_id: Optional[UUID]) -> None:
         """Update the run_id for subsequent events.

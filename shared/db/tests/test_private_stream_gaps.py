@@ -28,6 +28,7 @@ class TestPrivateStreamGapRepository:
         assert gap.recovery_status == RecoveryStatus.PENDING
         repo.set_outcome(
             gap.id,
+            run_id=sample_run.run_id,
             status=RecoveryStatus.RECOVERED,
             inserted=3,
             duplicates=1,
@@ -57,6 +58,7 @@ class TestPrivateStreamGapRepository:
         )
         repo.set_outcome(
             gap.id,
+            run_id=sample_run.run_id,
             status=RecoveryStatus.FAILED,
             inserted=0,
             duplicates=0,
@@ -99,17 +101,46 @@ class TestPrivateStreamGapRepository:
             gap_end=datetime(2026, 9, 1, 0, 1, tzinfo=UTC),
         )
         repo.set_outcome(
-            gap.id, status=status, inserted=0, duplicates=0, reason=None
+            gap.id,
+            run_id=sample_run.run_id,
+            status=status,
+            inserted=0,
+            duplicates=0,
+            reason=None,
         )
         session.commit()
         session.expire_all()
         assert session.get(PrivateStreamGap, gap.id).recovery_status == status
+
+    def test_set_outcome_is_scoped_by_run(
+        self, session, sample_account, sample_run
+    ):
+        """A gap id under another run is not found and is left untouched."""
+        repo = PrivateStreamGapRepository(session)
+        gap = repo.add_gap(
+            run_id=sample_run.run_id,
+            account_id=sample_account.account_id,
+            symbol="LTCUSDT",
+            gap_start=datetime(2026, 9, 1, tzinfo=UTC),
+            gap_end=datetime(2026, 9, 1, 0, 1, tzinfo=UTC),
+        )
+        with pytest.raises(ValueError, match="not found"):
+            repo.set_outcome(
+                gap.id,
+                run_id="some-other-run",
+                status=RecoveryStatus.FAILED,
+                inserted=0,
+                duplicates=0,
+                reason="x",
+            )
+        assert gap.recovery_status == RecoveryStatus.PENDING
 
     def test_set_outcome_on_missing_row_raises(self, session):
         """An unknown gap id is an error, not a silent no-op."""
         with pytest.raises(ValueError, match="not found"):
             PrivateStreamGapRepository(session).set_outcome(
                 999999,
+                run_id="no-such-run",
                 status=RecoveryStatus.FAILED,
                 inserted=0,
                 duplicates=0,
@@ -128,6 +159,7 @@ class TestPrivateStreamGapRepository:
         )
         repo.set_outcome(
             gap.id,
+            run_id=sample_run.run_id,
             status=RecoveryStatus.FAILED,
             inserted=0,
             duplicates=0,

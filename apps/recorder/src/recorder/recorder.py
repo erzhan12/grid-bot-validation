@@ -1031,12 +1031,15 @@ class Recorder:
         self, gap_id: int, symbol: str
     ) -> Callable[[Future], None]:
         """Return a done-callback that stores a gap's recovery outcome."""
+        run_id = str(self._run_id)  # the run the gap row was written under
+
         def _cb(future: Future) -> None:
             result = recovery_result_from_future(future)
             try:
                 with self._db.get_session() as session:
                     PrivateStreamGapRepository(session).set_outcome(
                         gap_id,
+                        run_id=run_id,
                         status=result.status,
                         inserted=result.inserted,
                         duplicates=result.duplicates,

@@ -5,6 +5,8 @@ from unittest.mock import MagicMock, patch
 import threading
 import time
 
+import pytest
+
 from bybit_adapter.ws_client import (
     PublicWebSocketClient,
     PrivateWebSocketClient,
@@ -881,3 +883,200 @@ class TestPrivateWebSocketClientSocketAliveAndReset:
         assert client.is_connected()
         assert len(ws_instances) == 2
         client.disconnect()
+
+
+class _FakePybitPrivateWS:
+    """Minimal stand-in for pybit's private WebSocket (feature 0110 B1b).
+
+    Mirrors the attributes the readiness check reads: ``auth`` (set by
+    pybit on a successful auth reply), ``subscriptions`` (req_id → sent
+    message, filled by each ``*_stream`` call), ``ws`` (the current
+    ``WebSocketApp``; pybit replaces it on a silent reconnect) and
+    ``_process_subscription_message`` (pybit's ack handler).
+    """
+
+    def __init__(self, *args, **kwargs):
+        self.auth = False
+        self.subscriptions: dict[str, str] = {}
+        self.ws = object()
+        self.acks_seen: list[dict] = []
+
+    def _subscribe(self, topic: str) -> None:
+        self.subscriptions[f"req-{topic}"] = topic
+
+    def execution_stream(self, callback):
+        self._subscribe("execution")
+
+    def order_stream(self, callback):
+        self._subscribe("order")
+
+    def _process_subscription_message(self, message: dict) -> None:
+        self.acks_seen.append(message)
+
+    def ack(self, topic: str) -> None:
+        # pybit dispatches acks through self., so an instance wrap sees them.
+        self._process_subscription_message(
+            {"success": True, "op": "subscribe", "req_id": f"req-{topic}"}
+        )
+
+    def is_connected(self) -> bool:
+        return True
+
+    def exit(self) -> None:
+        pass
+
+
+def _ready_client(track: bool = True) -> PrivateWebSocketClient:
+    return PrivateWebSocketClient(
+        api_key="k", api_secret="s", testnet=True,
+        on_execution=lambda x: None,
+        on_order=lambda x: None,
+        message_gap_watchdog_enabled=False,
+        track_subscription_acks=track,
+    )
+
+
+class TestPrivateReadiness:
+    """wait_ready / socket identity for the recorder's collector (0110 B1b)."""
+
+    @patch("bybit_adapter.ws_client.WebSocket", side_effect=_FakePybitPrivateWS)
+    def test_ack_tracking_off_by_default_leaves_pybit_untouched(self, _):
+        """gridbot's default client never wraps pybit's ack handler."""
+        client = PrivateWebSocketClient(
+            api_key="k", api_secret="s", testnet=True,
+            on_execution=lambda x: None,
+            message_gap_watchdog_enabled=False,
+        )
+        client.connect()
+        try:
+            assert "_process_subscription_message" not in vars(client._ws)
+        finally:
+            client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket", side_effect=_FakePybitPrivateWS)
+    def test_wait_ready_needs_auth_and_every_ack(self, _):
+        """Ready only once authenticated AND every subscription acked."""
+        client = _ready_client()
+        client.connect()
+        try:
+            fake = client._ws
+            fake.auth = True
+            fake.ack("execution")
+            assert client.wait_ready(0.05) is False  # order not acked yet
+            fake.ack("order")
+            assert client.wait_ready(0.05) is True
+            assert len(fake.acks_seen) == 2  # original handler still runs
+        finally:
+            client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket", side_effect=_FakePybitPrivateWS)
+    def test_wait_ready_false_without_auth(self, _):
+        """All acks but no auth reply is not ready."""
+        client = _ready_client()
+        client.connect()
+        try:
+            client._ws.ack("execution")
+            client._ws.ack("order")
+            assert client.wait_ready(0.05) is False
+        finally:
+            client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket", side_effect=_FakePybitPrivateWS)
+    def test_wait_ready_false_after_silent_reconnect(self, _):
+        """Acks belong to the socket they arrived on; a swap voids them."""
+        client = _ready_client()
+        client.connect()
+        try:
+            fake = client._ws
+            fake.auth = True
+            fake.ack("execution")
+            fake.ack("order")
+            fake.ws = object()  # pybit reconnected under us
+            assert client.wait_ready(0.05) is False
+        finally:
+            client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket", side_effect=_FakePybitPrivateWS)
+    def test_wait_ready_requires_ack_tracking(self, _):
+        """wait_ready on an untracked client is a programming error."""
+        client = _ready_client(track=False)
+        client.connect()
+        try:
+            with pytest.raises(RuntimeError, match="track_subscription_acks"):
+                client.wait_ready(0.05)
+        finally:
+            client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket", side_effect=_FakePybitPrivateWS)
+    def test_socket_identity_and_auth_follow_pybit(self, _):
+        """socket_identity is pybit's current WebSocketApp; None when down."""
+        client = _ready_client()
+        client.connect()
+        fake = client._ws
+        first = client.socket_identity()
+        assert first is fake.ws
+        assert client.is_authenticated() is False
+        fake.auth = True
+        assert client.is_authenticated() is True
+        fake.ws = object()
+        assert client.socket_identity() is not first
+        client.disconnect()
+        assert client.socket_identity() is None
+        assert client.is_authenticated() is False
+
+    @patch("bybit_adapter.ws_client.WebSocket", side_effect=_FakePybitPrivateWS)
+    def test_rejected_ack_is_not_ready(self, _):
+        """A success=False ack (bad topic, missing permission) never counts."""
+        client = _ready_client()
+        client.connect()
+        try:
+            fake = client._ws
+            fake.auth = True
+            fake.ack("execution")
+            fake._process_subscription_message(
+                {"success": False, "op": "subscribe", "req_id": "req-order"}
+            )
+            assert client.wait_ready(0.05) is False
+            assert len(fake.acks_seen) == 2  # original handler still runs
+        finally:
+            client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket", side_effect=_FakePybitPrivateWS)
+    def test_reset_reinstalls_tracking_and_drops_old_acks(self, _):
+        """After reset() the new socket needs its own acks; old ones don't count."""
+        client = _ready_client()
+        client.connect()
+        try:
+            old = client._ws
+            old.auth = True
+            old.ack("execution")
+            old.ack("order")
+            assert client.wait_ready(0.05) is True
+
+            client.reset()
+            new = client._ws
+            assert new is not old
+            new.auth = True
+            assert client.wait_ready(0.05) is False
+            new.ack("execution")
+            new.ack("order")
+            assert client.wait_ready(0.05) is True
+        finally:
+            client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket", side_effect=_FakePybitPrivateWS)
+    def test_wait_ready_sees_ack_arriving_during_wait(self, _):
+        """wait_ready polls: an ack from pybit's thread mid-wait makes it ready."""
+        client = _ready_client()
+        client.connect()
+        fake = client._ws
+        timer = threading.Timer(0.1, lambda: fake.ack("order"))
+        try:
+            fake.auth = True
+            fake.ack("execution")
+            timer.start()
+            assert client.wait_ready(2.0) is True
+        finally:
+            timer.cancel()
+            timer.join()
+            client.disconnect()

@@ -14,6 +14,7 @@ from datetime import datetime, UTC
 from typing import Callable, Optional
 import logging
 import threading
+import time
 
 from pybit.unified_trading import WebSocket
 
@@ -28,6 +29,9 @@ CHANNEL_TYPE_PRIVATE = "private"
 # Heartbeat watchdog constants
 DEFAULT_HEARTBEAT_INTERVAL = 5.0  # Check every 5 seconds
 DEFAULT_DISCONNECT_THRESHOLD = 30.0  # Consider disconnected after 30s of no messages
+
+# PrivateWebSocketClient.wait_ready poll period (feature 0110 B1b)
+_READY_POLL_INTERVAL = 0.05
 
 
 @dataclass
@@ -388,18 +392,25 @@ class PrivateWebSocketClient:
     heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL
     disconnect_threshold: float = DEFAULT_DISCONNECT_THRESHOLD
     message_gap_watchdog_enabled: bool = True
+    # Feature 0110 B1b: record subscription acks so wait_ready() can confirm
+    # the stream is live. Off by default so gridbot's pybit object is untouched.
+    track_subscription_acks: bool = False
 
     _ws: Optional[WebSocket] = field(default=None, init=False, repr=False)
     _state: ConnectionState = field(default_factory=ConnectionState, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _heartbeat_thread: Optional[threading.Thread] = field(default=None, init=False, repr=False)
     _stop_heartbeat: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
+    _acked_req_ids: set[str] = field(default_factory=set, init=False, repr=False)
+    _ack_identity: object = field(default=None, init=False, repr=False)
 
     def connect(self) -> None:
         """Establish authenticated WebSocket connection and subscribe to streams.
 
         Subscribes to execution, order, position, and wallet streams based on
-        which callbacks are provided.
+        which callbacks are provided. With ``track_subscription_acks=True``
+        it first wraps the new pybit socket's ack handler (see
+        :meth:`wait_ready`).
         """
         with self._lock:
             if self._ws is not None:
@@ -416,6 +427,9 @@ class PrivateWebSocketClient:
                 trace_logging=False,
                 retries=0,
             )
+            if self.track_subscription_acks:
+                # Before any *_stream() call so no ack can arrive unobserved.
+                self._install_ack_tracking(self._ws)
 
             # Subscribe to streams based on provided callbacks
             if self.on_execution:
@@ -509,6 +523,87 @@ class PrivateWebSocketClient:
             except Exception as e:
                 logger.warning(f"is_socket_alive check raised: {e}")
                 return False
+
+    def _install_ack_tracking(self, ws: WebSocket) -> None:
+        """Wrap this pybit instance's ack handler to record acked req_ids.
+
+        pybit only logs subscription acks (``_process_subscription_message``,
+        dispatched via ``self.``), so an instance-level wrap sees every ack.
+        Acks are keyed to the ``WebSocketApp`` present at connect: pybit's
+        silent reconnect swaps ``ws.ws`` and resends the same req_ids.
+        """
+        acked: set[str] = set()
+        self._acked_req_ids = acked
+        self._ack_identity = getattr(ws, "ws", None)
+        original = ws._process_subscription_message
+
+        def _record_ack(message: dict) -> None:
+            if message.get("success") is True and message.get("req_id"):
+                acked.add(message["req_id"])
+            return original(message)
+
+        ws._process_subscription_message = _record_ack
+
+    def wait_ready(self, timeout: float) -> bool:
+        """Block until authenticated with every subscription acked.
+
+        Ready means: pybit reports ``auth``, every subscription sent in
+        :meth:`connect` has a positive ack, and pybit's ``WebSocketApp`` is
+        still the one present at connect (a silent reconnect voids the acks).
+        Waits outside ``self._lock`` (the message handlers take it). Call
+        from a worker thread, never an event loop.
+
+        Args:
+            timeout: Seconds to wait before giving up.
+
+        Returns:
+            True once ready, False on timeout.
+
+        Raises:
+            RuntimeError: The client was built without
+                ``track_subscription_acks=True``.
+        """
+        if not self.track_subscription_acks:
+            raise RuntimeError(
+                "wait_ready requires track_subscription_acks=True"
+            )
+        deadline = time.monotonic() + timeout
+        while True:
+            if self._is_ready():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_READY_POLL_INTERVAL)
+
+    def _is_ready(self) -> bool:
+        ws = self._ws
+        if ws is None or not getattr(ws, "auth", False):
+            return False
+        if getattr(ws, "ws", None) is not self._ack_identity:
+            return False
+        return set(ws.subscriptions) <= set(self._acked_req_ids)
+
+    def socket_identity(self) -> object:
+        """The current pybit ``WebSocketApp`` object, or None when not connected.
+
+        None only after :meth:`disconnect`; a dead or half-open socket still
+        returns its ``WebSocketApp``.
+
+        pybit replaces it on every internal reconnect, so a change between
+        two calls means the socket was silently re-established. Compare
+        with ``is``.
+        """
+        with self._lock:
+            if self._ws is None:
+                return None
+            return getattr(self._ws, "ws", None)
+
+    def is_authenticated(self) -> bool:
+        """Whether pybit has received a successful auth reply."""
+        with self._lock:
+            if self._ws is None:
+                return False
+            return bool(getattr(self._ws, "auth", False))
 
     def reset(self) -> None:
         """Force a full WS reset: disconnect and reconnect.

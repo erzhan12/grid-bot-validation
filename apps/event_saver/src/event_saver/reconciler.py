@@ -35,6 +35,18 @@ def _is_trade_row(exec_data) -> bool:
     return isinstance(exec_data, dict) and exec_data.get("execType") == "Trade"
 
 
+def _is_malformed_row(exec_data) -> bool:
+    """True for a REST row that is not provably a non-Trade row."""
+    return not isinstance(exec_data, dict) or "execType" not in exec_data
+
+
+def _row_label(exec_data) -> str:
+    """Name a dropped REST row in a log line: its execId, else a short repr."""
+    if isinstance(exec_data, dict) and exec_data.get("execId"):
+        return f"execId={exec_data['execId']!r}"
+    return repr(exec_data)[:200]
+
+
 def recovery_result_from_future(future) -> "ExecutionRecoveryResult":
     """Map a finished recovery future to its outcome.
 
@@ -409,9 +421,7 @@ class GapReconciler:
             trade_rows = sum(
                 1
                 for e in executions_data
-                if _is_trade_row(e)
-                or not isinstance(e, dict)
-                or "execType" not in e
+                if _is_trade_row(e) or _is_malformed_row(e)
             )
         except Exception as e:
             logger.error(
@@ -525,6 +535,11 @@ class GapReconciler:
                 # Category is validated on the REST envelope by
                 # BybitRestClient.get_executions — rows carry none.
                 if not _is_trade_row(exec_data):
+                    if _is_malformed_row(exec_data):
+                        logger.warning(
+                            "Dropping malformed REST execution row: %s",
+                            _row_label(exec_data),
+                        )
                     continue
 
                 models.append(
@@ -547,7 +562,11 @@ class GapReconciler:
                     )
                 )
             except Exception as e:
-                logger.warning(f"Error converting execution to model: {e}")
+                logger.warning(
+                    "Dropping REST execution row %s: conversion error: %s",
+                    _row_label(exec_data),
+                    e,
+                )
                 continue
         return models
 

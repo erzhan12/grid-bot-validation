@@ -564,16 +564,18 @@ class TestReconcileExecutions:
         assert (result.inserted, result.duplicates) == (1, 1)
 
     async def test_row_conversion_error_is_failed_but_good_rows_kept(
-        self, mock_db, mock_rest_client
+        self, mock_db, mock_rest_client, caplog
     ):
         """A dropped Trade row makes the recovery FAILED; valid rows persist."""
         rows = [_rest_row("good"), _rest_row("bad", price="not-a-number")]
-        result, _, repo = await _run_exec_recovery(
-            self._reconciler(mock_db, mock_rest_client),
-            gap_start=self._GAP_START,
-            gap_end=self._GAP_END,
-            rest_result=(rows, False),
-        )
+        with caplog.at_level("WARNING", logger="event_saver.reconciler"):
+            result, _, repo = await _run_exec_recovery(
+                self._reconciler(mock_db, mock_rest_client),
+                gap_start=self._GAP_START,
+                gap_end=self._GAP_END,
+                rest_result=(rows, False),
+            )
+        assert "execId='bad'" in caplog.text  # dropped row named
         assert result.status == RecoveryStatus.FAILED
         assert "1 of 2" in result.reason
         (models,), _ = repo.bulk_insert.call_args
@@ -610,30 +612,35 @@ class TestReconcileExecutions:
         assert result.status == RecoveryStatus.RECOVERED
 
     async def test_malformed_row_is_failed_not_raised(
-        self, mock_db, mock_rest_client
+        self, mock_db, mock_rest_client, caplog
     ):
         """A non-dict REST row is a dropped row: FAILED, valid rows kept."""
-        result, _, _ = await _run_exec_recovery(
-            self._reconciler(mock_db, mock_rest_client),
-            gap_start=self._GAP_START,
-            gap_end=self._GAP_END,
-            rest_result=([_rest_row("e1"), "garbage"], False),
-        )
+        with caplog.at_level("WARNING", logger="event_saver.reconciler"):
+            result, _, _ = await _run_exec_recovery(
+                self._reconciler(mock_db, mock_rest_client),
+                gap_start=self._GAP_START,
+                gap_end=self._GAP_END,
+                rest_result=([_rest_row("e1"), "garbage"], False),
+            )
+        assert "'garbage'" in caplog.text  # non-dict row named by repr
         assert result.status == RecoveryStatus.FAILED
         assert "1 of 2" in result.reason
         assert result.inserted == 1
 
     async def test_row_without_exec_type_is_dropped_not_filtered(
-        self, mock_db, mock_rest_client
+        self, mock_db, mock_rest_client, caplog
     ):
-        """A dict with no execType is not provably non-Trade: FAILED."""
+        """A dict with no execType is not provably non-Trade: FAILED, and the
+        dropped row is named in a WARNING so it can be recovered by hand."""
         no_type = {k: v for k, v in _rest_row("e2").items() if k != "execType"}
-        result, _, _ = await _run_exec_recovery(
-            self._reconciler(mock_db, mock_rest_client),
-            gap_start=self._GAP_START,
-            gap_end=self._GAP_END,
-            rest_result=([_rest_row("e1"), no_type], False),
-        )
+        with caplog.at_level("WARNING", logger="event_saver.reconciler"):
+            result, _, _ = await _run_exec_recovery(
+                self._reconciler(mock_db, mock_rest_client),
+                gap_start=self._GAP_START,
+                gap_end=self._GAP_END,
+                rest_result=([_rest_row("e1"), no_type], False),
+            )
+        assert "execId='e2'" in caplog.text
         assert result.status == RecoveryStatus.FAILED
         assert "1 of 2" in result.reason
         assert result.inserted == 1
