@@ -23,6 +23,9 @@ _PRIVATE_WS_DISCONNECT_TIMEOUT = 5.0
 _PRIVATE_READY_TIMEOUT = 5.0
 # Extra time the event loop gives the wait_ready thread past its own deadline.
 _READY_WAIT_SLACK = 1.0
+# Resets in a row that end not ready before the socket is kept on liveness
+# checks only (e.g. one topic rejected: the others still deliver data).
+_MAX_UNREADY_RESETS = 3
 # A half-open socket still reads "connected" until pybit's ping times out:
 # websocket-client's first ping goes out ~2x ping_interval (20 s) after
 # open and the timeout (10 s) is only checked after the next select, so
@@ -192,6 +195,8 @@ class PrivateCollector:
         self._identity_baseline: object = None
         self._ready = False
         self._last_healthy_ts: Optional[datetime] = None
+        self._connected_at: Optional[datetime] = None
+        self._unready_resets = 0
 
     async def start(self) -> None:
         """Start collecting private data for this account.
@@ -230,9 +235,11 @@ class PrivateCollector:
         self._ws_reset_abandoned = False
 
         self._ws_client.connect()
-        # Gap start before readiness is confirmed: the connect time.
-        self._last_healthy_ts = datetime.now(UTC)
-        if not await self._confirm_ready():
+        # Gap start before readiness is confirmed: the connect time. A gap
+        # never starts before it (no pre-run executions under this run).
+        self._connected_at = self._last_healthy_ts = datetime.now(UTC)
+        self._unready_resets = 0
+        if not await self._confirm_ready(self._ws_client):
             # Not fatal until feature 0110 B1c moves the startup snapshot:
             # the first health probe treats "not ready" as unhealthy.
             logger.error(
@@ -348,11 +355,13 @@ class PrivateCollector:
             disconnected_at = (
                 self._last_healthy_ts or datetime.now(UTC)
             ) - _LIVENESS_MARGIN
+            if self._connected_at is not None:
+                disconnected_at = max(disconnected_at, self._connected_at)
 
             if (
                 not self._ready
                 and client.is_socket_alive()
-                and await self._confirm_ready()
+                and await self._confirm_ready(client)
             ):
                 # Acks landed after the ready timeout: keep this socket (a
                 # reset would restart the clock) and recover the unready
@@ -390,10 +399,13 @@ class PrivateCollector:
                 )
                 return
             self._ws_reset_abandoned = False
-            if not await self._confirm_ready():
-                # Gap stays unreported; the next probe resets again and
-                # reports it from the same (unchanged) last-healthy time.
-                if self._running:  # not a stop() ending the wait
+            if not await self._confirm_ready(client):
+                if not self._running:  # stop() ended the wait
+                    return
+                self._unready_resets += 1
+                if self._unready_resets < _MAX_UNREADY_RESETS:
+                    # Gap stays unreported; the next probe retries and
+                    # reports it from the same (unchanged) last-healthy time.
                     unready_for = datetime.now(UTC) - (
                         disconnected_at + _LIVENESS_MARGIN
                     )
@@ -403,7 +415,20 @@ class PrivateCollector:
                         self.context.account_id,
                         unready_for.total_seconds(),
                     )
-                return
+                    return
+                # Resetting again would only tear down whatever the stream
+                # still delivers: keep the socket, report the gap so REST
+                # backfill runs.
+                logger.error(
+                    "Private WebSocket for account %s still not ready after "
+                    "%d resets; keeping it on liveness checks only",
+                    self.context.account_id,
+                    self._unready_resets,
+                )
+                self._unready_resets = 0
+                self._ready = True
+                self._identity_baseline = client.socket_identity()
+                self._last_healthy_ts = datetime.now(UTC)
             self._handle_reconnect(disconnected_at, datetime.now(UTC))
         except Exception as e:
             logger.error(
@@ -422,7 +447,7 @@ class PrivateCollector:
             and client.socket_identity() is self._identity_baseline
         )
 
-    async def _confirm_ready(self) -> bool:
+    async def _confirm_ready(self, client: PrivateWebSocketClient) -> bool:
         """Wait (off the loop) for auth + acks; on success take the baseline.
 
         The baseline identity is read BEFORE waiting, so a pybit silent
@@ -432,7 +457,6 @@ class PrivateCollector:
         wait in ``start()`` runs before the stop event exists and is bounded
         by the timeout only.
         """
-        client = self._ws_client
         self._ready = False
         baseline = client.socket_identity()
         ready_wait = _run_in_daemon_thread(
@@ -468,6 +492,7 @@ class PrivateCollector:
             ready = False
         if ready:
             self._ready = True
+            self._unready_resets = 0
             self._identity_baseline = baseline
             self._last_healthy_ts = datetime.now(UTC)
         return bool(ready)

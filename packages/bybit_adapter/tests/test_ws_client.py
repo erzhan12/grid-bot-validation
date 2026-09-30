@@ -1096,3 +1096,22 @@ class TestPrivateReadiness:
             assert client.wait_ready(0.05) is True
         finally:
             client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket", side_effect=_FakePybitPrivateWS)
+    def test_mixed_acks_match_strictly_by_req_id(self, _):
+        """Once any ack carries a req_id, an unkeyed ack cannot stand in for
+        an un-acked subscription."""
+        client = _ready_client()
+        client.connect()
+        try:
+            fake = client._ws
+            fake.auth = True
+            fake.ack("execution")
+            fake._process_subscription_message(
+                {"success": True, "op": "subscribe"}
+            )
+            assert client.wait_ready(0.05) is False  # order never acked
+            fake.ack("order")
+            assert client.wait_ready(0.05) is True
+        finally:
+            client.disconnect()

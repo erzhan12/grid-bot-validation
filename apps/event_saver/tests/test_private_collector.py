@@ -14,6 +14,7 @@ from event_saver.collectors.private_collector import (
     PrivateCollector,
     AccountContext,
     _LIVENESS_MARGIN,
+    _MAX_UNREADY_RESETS,
     _PRIVATE_READY_TIMEOUT,
     _run_in_daemon_thread,
 )
@@ -891,6 +892,31 @@ class TestPrivateReadinessAndGapStart:
         ws.reset.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_degrades_to_liveness_after_repeated_unready_resets(
+        self, context, on_gap, caplog
+    ):
+        """A socket that never becomes ready (e.g. one rejected topic) is
+        reset at most _MAX_UNREADY_RESETS times, then kept on liveness-only
+        health with the gap reported so REST backfill runs."""
+        collector, ws = _probe_collector(context, on_gap, alive=False)
+        _swap_identity_on_reset(ws)
+        ws.wait_ready.return_value = False
+        with caplog.at_level(
+            logging.ERROR, logger="event_saver.collectors.private_collector"
+        ):
+            for _ in range(_MAX_UNREADY_RESETS):
+                await collector._ws_health_check_once()
+                ws.is_socket_alive.return_value = True
+        assert ws.reset.call_count == _MAX_UNREADY_RESETS
+        on_gap.assert_called_once()
+        assert on_gap.call_args[0][0] == _LAST_HEALTHY - _LIVENESS_MARGIN
+        assert "liveness checks only" in caplog.text
+        assert collector._ready is True
+
+        await collector._ws_health_check_once()  # now healthy: no reset
+        assert ws.reset.call_count == _MAX_UNREADY_RESETS
+
+    @pytest.mark.asyncio
     async def test_late_ready_socket_is_not_reset(self, context, on_gap):
         """Acks that land after the ready timeout make the SAME socket ready
         on the next probe: no reset, and the unready stretch is a gap."""
@@ -979,7 +1005,7 @@ class TestPrivateReadinessAndGapStart:
             return True
 
         ws.wait_ready.side_effect = _reconnect_during_wait
-        assert await collector._confirm_ready() is True
+        assert await collector._confirm_ready(ws) is True
         assert collector._identity_baseline is before
 
         ws.wait_ready.side_effect = None
@@ -991,7 +1017,7 @@ class TestPrivateReadinessAndGapStart:
     @pytest.mark.asyncio
     async def test_not_ready_at_start_gap_dates_from_connect(self, collector, on_gap):
         """Not ready at start, ready by the first probe: the socket is kept
-        and the gap dates from the connect time minus the liveness margin."""
+        and the gap starts at the connect time (never before the run)."""
         with patch(
             "event_saver.collectors.private_collector.PrivateWebSocketClient"
         ) as MockWS:
@@ -1004,7 +1030,7 @@ class TestPrivateReadinessAndGapStart:
                 await collector._ws_health_check_once()
                 ws.reset.assert_not_called()
                 on_gap.assert_called_once()
-                assert on_gap.call_args[0][0] == connected_at - _LIVENESS_MARGIN
+                assert on_gap.call_args[0][0] == connected_at
             finally:
                 await collector.stop()
 

@@ -6,7 +6,7 @@ from datetime import datetime, UTC
 from decimal import Decimal
 from typing import Optional, Union
 from unittest.mock import AsyncMock, MagicMock, patch
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -788,6 +788,7 @@ class TestRecorderHandlers:
         """The outcome is scoped to the run the gap row was written under,
         captured when the callback is built, not when it fires."""
         recorder = Recorder(config=config_with_account, db=db)
+        recorder._run_id = uuid4()
         row_run_id = str(recorder._run_id)
         cb = recorder._persist_gap_outcome(7, "BTCUSDT")
         recorder._run_id = "another-run"

@@ -295,7 +295,9 @@ class TestRecorderDisconnectReconciliation:
             await recorder.start()
             try:
                 private_ws = recorder._private_collector._ws_client
-                # 0110 B1b: gap start = last healthy probe − liveness margin.
+                # 0110 B1b: gap start = last healthy probe − liveness margin,
+                # never before the collector connected.
+                recorder._private_collector._connected_at = gap_start
                 recorder._private_collector._last_healthy_ts = (
                     gap_start + _LIVENESS_MARGIN
                 )
@@ -341,7 +343,9 @@ class TestRecorderDisconnectReconciliation:
             await recorder.start()
             try:
                 private_ws = recorder._private_collector._ws_client
-                # 0110 B1b: gap start = last healthy probe − liveness margin.
+                # 0110 B1b: gap start = last healthy probe − liveness margin,
+                # never before the collector connected.
+                recorder._private_collector._connected_at = gap_start
                 recorder._private_collector._last_healthy_ts = (
                     gap_start + _LIVENESS_MARGIN
                 )

@@ -401,7 +401,10 @@ class PrivateWebSocketClient:
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _heartbeat_thread: Optional[threading.Thread] = field(default=None, init=False, repr=False)
     _stop_heartbeat: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
-    _acked_req_ids: set[object] = field(default_factory=set, init=False, repr=False)
+    _acked_req_ids: set[str] = field(default_factory=set, init=False, repr=False)
+    _unkeyed_acks: list[int] = field(
+        default_factory=lambda: [0], init=False, repr=False
+    )
     _ack_identity: object = field(default=None, init=False, repr=False)
 
     def connect(self) -> None:
@@ -532,16 +535,21 @@ class PrivateWebSocketClient:
         Acks are keyed to the ``WebSocketApp`` present at connect: pybit's
         silent reconnect swaps ``ws.ws`` and resends the same req_ids.
         """
-        acked: set[object] = set()
+        acked: set[str] = set()
+        unkeyed = [0]
         self._acked_req_ids = acked
+        self._unkeyed_acks = unkeyed
         self._ack_identity = getattr(ws, "ws", None)
         original = ws._process_subscription_message
 
         def _record_ack(message: dict) -> None:
             if message.get("success") is True:
-                # Bybit echoes req_id on /v5/private; an ack without one is
-                # still counted, so an unexpected shape cannot block readiness.
-                acked.add(message.get("req_id") or object())
+                if message.get("req_id"):
+                    acked.add(message["req_id"])
+                else:
+                    # Bybit echoes req_id on /v5/private; count an ack without
+                    # one so an unexpected shape cannot block readiness.
+                    unkeyed[0] += 1
             return original(message)
 
         ws._process_subscription_message = _record_ack
@@ -585,7 +593,9 @@ class PrivateWebSocketClient:
             return False
         subs = set(ws.subscriptions)
         acked = set(self._acked_req_ids)
-        return subs <= acked or len(acked) >= len(subs)
+        if acked:  # acks carry req_id: match every subscription strictly
+            return subs <= acked
+        return self._unkeyed_acks[0] >= len(subs)
 
     def socket_identity(self) -> object:
         """The current pybit ``WebSocketApp`` object, or None when not connected.
