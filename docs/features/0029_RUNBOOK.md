@@ -273,6 +273,11 @@ The script (post-Feature 0053):
    connect or private auth/subscribe — zero wallet/position rows, or auth
    failure) or a 60s timeout, the script kills the recorder, prints an
    ERROR, and exits non-zero — no `Recorder PID:` tail (Feature 0055).
+   Since 0110 B1c-2 the private stream is subscribed BEFORE the REST
+   snapshot, so the two overlap for a few seconds: a WS row can precede
+   the t=0 REST row, and a fill during the snapshot's REST calls is in
+   both. Choose `seed.at_ts` a few seconds AFTER the `RECORDER_SNAPSHOT_OK`
+   line, never inside the snapshot window.
 
 If the DB file does not yet exist (first Phase 4 run on a clean
 machine), the SQL wipe step is a no-op; `prepare_recorder_session`

@@ -11,6 +11,16 @@ Plan: docs/features/0110_PLAN.md (B1 step 8 + step 1 startup part)  |  Branch: f
 - [x] make test + make lint green
 - [x] rules update (event-saver, recorder, grid-db) + plan as-built notes
 
+## Follow-ups
+- PR #287 review P2: standalone EventSaver drops an account whose private
+  collector did not start, and nothing calls add_account() again, so a
+  transient start failure disables that account for the process lifetime
+  (before B1c-2 the health probe recovered it). Retry the start (bounded)
+  before dropping, or keep a retry loop for skipped accounts.
+- PR #287 review P3: EventSaver.add_account() registers only after
+  start() returns, so two concurrent calls for the same account can open
+  two sockets. Reserve the slot before awaiting the start.
+
 # Feature 0110 Phase B1c-1 — private-stream coverage: sessions, open gaps, checkpoint (#271)
 
 Plan: docs/features/0110_PLAN.md (B1 steps 3-5, 7; B1c split: B1c-1 coverage, B1c-2 startup)  |  Branch: feature/0110-b1c1-coverage

@@ -476,3 +476,19 @@ class TestPublicStartBound:
             while not ws.disconnect.called and time.monotonic() < deadline:
                 await asyncio.sleep(0.01)
             ws.disconnect.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_timeout_error_from_connect_is_a_connect_failure(
+        self, collector
+    ):
+        """A TimeoutError raised BY connect() (e.g. socket.timeout) is a
+        connect failure with its cause, not the start bound."""
+        with patch(
+            "event_saver.collectors.public_collector.PublicWebSocketClient"
+        ) as MockWS:
+            MockWS.return_value.connect.side_effect = TimeoutError("handshake")
+            with pytest.raises(CollectorStartError, match="failed") as excinfo:
+                await collector.start()
+            assert isinstance(excinfo.value.__cause__, TimeoutError)
+            MockWS.return_value.disconnect.assert_called_once()
+            assert collector.is_running() is False

@@ -277,12 +277,20 @@ class PrivateCollector:
                 return False, None
             return ready, baseline
 
+        start_fut = _run_in_daemon_thread(_connect_and_wait, name="ws-start")
         try:
             ready, baseline = await asyncio.wait_for(
-                _run_in_daemon_thread(_connect_and_wait, name="ws-start"),
-                timeout=_PRIVATE_START_TIMEOUT + _READY_WAIT_SLACK,
+                start_fut, timeout=_PRIVATE_START_TIMEOUT + _READY_WAIT_SLACK
             )
         except (TimeoutError, asyncio.CancelledError) as exc:
+            if isinstance(exc, TimeoutError) and not start_fut.cancelled():
+                # The worker itself raised TimeoutError (e.g. socket.timeout):
+                # a start failure with a cause, not the bound.
+                await self._abort_start(client)
+                raise CollectorStartError(
+                    f"Private WebSocket start failed for account {account}: "
+                    f"{exc!r}"
+                ) from exc
             # The worker is normally parked inside pybit holding the client
             # lock: disconnect() would block on it. Abandon the (daemon)
             # thread; it disconnects by itself if connect() ever returns.
@@ -328,6 +336,7 @@ class PrivateCollector:
                 "Private WS disconnect after a failed start did not complete "
                 "for account %s",
                 self.context.account_id,
+                exc_info=True,
             )
 
     async def stop(self) -> None:

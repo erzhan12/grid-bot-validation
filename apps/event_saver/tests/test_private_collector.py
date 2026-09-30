@@ -1077,6 +1077,23 @@ class TestPrivateReadinessAndGapStart:
             assert collector.is_running() is False
 
     @pytest.mark.asyncio
+    async def test_start_timeout_error_from_the_worker_is_a_start_failure(
+        self, collector
+    ):
+        """A TimeoutError raised BY connect() / wait_ready (e.g.
+        socket.timeout) is a start failure with its cause, not the bound."""
+        with patch(
+            "event_saver.collectors.private_collector.PrivateWebSocketClient"
+        ) as MockWS:
+            ws = MockWS.return_value
+            ws.connect.side_effect = TimeoutError("handshake")
+            with pytest.raises(CollectorStartError, match="failed") as excinfo:
+                await collector.start()
+            assert isinstance(excinfo.value.__cause__, TimeoutError)
+            ws.disconnect.assert_called_once()
+            assert collector.is_running() is False
+
+    @pytest.mark.asyncio
     async def test_start_failure_with_hung_disconnect_still_raises_start_error(
         self, context
     ):

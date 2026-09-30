@@ -275,6 +275,7 @@ class TestStart:
             ready.start.assert_awaited_once()
             assert str(account_context.account_id) in caplog.text
             assert "not ready" in caplog.text
+            assert "until add_account() is called again" in caplog.text
             # The skipped account is dropped, so it is not counted as
             # collecting and add_account() can retry it.
             assert set(saver._private_collectors) == {other.account_id}

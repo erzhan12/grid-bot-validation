@@ -4,7 +4,7 @@ import asyncio
 import contextlib
 import logging
 from datetime import datetime
-from typing import Callable, Optional
+from typing import Callable, NoReturn, Optional
 
 from bybit_adapter.ws_client import PublicWebSocketClient, ConnectionState
 from bybit_adapter.normalizer import BybitNormalizer
@@ -126,12 +126,14 @@ class PublicCollector:
                 # late instead of leaving a live, unowned socket.
                 client.disconnect()
 
+        connect_fut = run_in_daemon_thread(_connect, name="public-ws-connect")
         try:
-            await asyncio.wait_for(
-                run_in_daemon_thread(_connect, name="public-ws-connect"),
-                timeout=_PUBLIC_CONNECT_TIMEOUT,
-            )
+            await asyncio.wait_for(connect_fut, timeout=_PUBLIC_CONNECT_TIMEOUT)
         except (TimeoutError, asyncio.CancelledError) as exc:
+            if isinstance(exc, TimeoutError) and not connect_fut.cancelled():
+                # connect() itself raised TimeoutError (e.g. socket.timeout):
+                # a connect failure with a cause, not the bound.
+                await self._fail_start(client, exc)
             # The (daemon) worker is normally parked inside pybit holding the
             # client lock: abandon it without disconnect() (stop() must not
             # touch this client either); it disconnects by itself if
@@ -148,26 +150,34 @@ class PublicCollector:
                 f"{_PUBLIC_CONNECT_TIMEOUT:.1f}s"
             ) from None
         except Exception as exc:
-            # connect() raised and has returned: close whatever it opened.
-            # State first: a cancellation during the disconnect must still
-            # leave the collector stopped.
-            self._ws_client = None
-            self._running = False
-            try:
-                await asyncio.wait_for(
-                    run_in_daemon_thread(
-                        client.disconnect, name="public-ws-disconnect"
-                    ),
-                    timeout=_PUBLIC_DISCONNECT_TIMEOUT,
-                )
-            except Exception:
-                logger.warning(
-                    "Public WS disconnect after a failed start did not complete"
-                )
-            raise CollectorStartError(
-                f"Public WebSocket connect failed: {exc}"
-            ) from exc
+            await self._fail_start(client, exc)
         logger.info("PublicCollector started")
+
+    async def _fail_start(
+        self, client: PublicWebSocketClient, exc: BaseException
+    ) -> NoReturn:
+        """connect() raised and has returned: close what it opened, raise.
+
+        Raises:
+            CollectorStartError: always, with ``exc`` as the cause.
+        """
+        # State first: a cancellation during the disconnect must still leave
+        # the collector stopped.
+        self._ws_client = None
+        self._running = False
+        try:
+            await asyncio.wait_for(
+                run_in_daemon_thread(client.disconnect, name="public-ws-disconnect"),
+                timeout=_PUBLIC_DISCONNECT_TIMEOUT,
+            )
+        except Exception:
+            logger.warning(
+                "Public WS disconnect after a failed start did not complete",
+                exc_info=True,
+            )
+        raise CollectorStartError(
+            f"Public WebSocket connect failed: {exc!r}"
+        ) from exc
 
     async def stop(self) -> None:
         """Stop collecting and disconnect.

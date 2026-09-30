@@ -1218,3 +1218,23 @@ class TestStartupOrder:
             assert len(sentinels) == 1
         finally:
             await recorder.stop(error=True)
+
+    async def test_empty_symbols_emits_the_sentinel(
+        self, config_with_account, db, caplog
+    ):
+        """Every exit path of the start emits the launcher sentinel, also
+        the config checks before the writers."""
+        recorder = Recorder(
+            config=config_with_account.model_copy(update={"symbols": []}), db=db
+        )
+        with caplog.at_level("WARNING", logger="recorder.recorder"):
+            with pytest.raises(ValueError, match="symbols"):
+                await recorder.start()
+        try:
+            sentinels = [
+                r for r in caplog.records
+                if r.message == "RECORDER_SNAPSHOT_INCOMPLETE"
+            ]
+            assert len(sentinels) == 1
+        finally:
+            await recorder.stop(error=True)

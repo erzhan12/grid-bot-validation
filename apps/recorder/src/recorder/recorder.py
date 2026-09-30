@@ -164,39 +164,37 @@ class Recorder:
             self._open_gap_failures = 0
             self._pending_gap_writes = []
 
-            if not self._config.symbols:
-                raise ValueError("symbols must not be empty")
-
             logger.info("Starting Recorder...")
             self._start_time = datetime.now(UTC)
             self._event_loop = asyncio.get_running_loop()
-
-            # Initialize REST client for reconciliation (public endpoints only;
-            # empty credentials are intentional — no auth needed).
-            rest_client = BybitRestClient(
-                api_key="",
-                api_secret="",
-                testnet=self._config.testnet,
-            )
-
-            # Initialize reconciler
-            self._reconciler = GapReconciler(
-                db=self._db,
-                rest_client=rest_client,
-                gap_threshold_seconds=self._config.gap_threshold_seconds,
-            )
 
             # 0110 B1c-2: collectors first. The run only starts on a connected
             # public stream and a confirmed (authenticated, subscribed) private
             # session; otherwise the launcher sentinel is emitted and the
             # start fails.
             try:
+                if not self._config.symbols:
+                    raise ValueError("symbols must not be empty")
+
+                # REST client for reconciliation (public endpoints only;
+                # empty credentials are intentional — no auth needed).
+                rest_client = BybitRestClient(
+                    api_key="",
+                    api_secret="",
+                    testnet=self._config.testnet,
+                )
+                self._reconciler = GapReconciler(
+                    db=self._db,
+                    rest_client=rest_client,
+                    gap_threshold_seconds=self._config.gap_threshold_seconds,
+                )
                 await self._init_writers()
                 await self._init_collectors()
             except BaseException as e:
-                # Any failure here (writers, run seeding, collectors) ends
-                # the start, a cancellation (shutdown signal) included; every
-                # exit path must emit a launcher sentinel (feature 0055).
+                # Any failure here (config, clients, writers, run seeding,
+                # collectors) ends the start, a cancellation (shutdown
+                # signal) included; every exit path must emit a launcher
+                # sentinel (feature 0055).
                 logger.error(
                     "Recorder start aborted: %s", str(e) or type(e).__name__
                 )
@@ -208,11 +206,12 @@ class Recorder:
             # account would otherwise leave the seed-aware replay loader
             # returning NULL for wallet/positions/orders even though state
             # existed live. It runs AFTER the private session is confirmed
-            # (0110 B1c-2), so the anchor lies inside the session and nothing
-            # between the snapshot and the subscription can be missed.
-            # Failures here are logged but DO NOT abort recorder start (the WS
-            # stream still gets captured; Phase 4's pre-check will refuse to
-            # seed from a run missing the initial snapshot).
+            # (0110 B1c-2), so the anchor lies inside the session. The method
+            # handles each REST call's failure itself (logged, sentinel
+            # INCOMPLETE, the start goes on: the WS stream still gets
+            # captured and Phase 4's pre-check refuses to seed from a run
+            # missing the initial snapshot). Anything that still escapes it,
+            # a cancellation included, emits the sentinel and ends the start.
             if self._config.account:
                 try:
                     await self._write_initial_rest_snapshot()

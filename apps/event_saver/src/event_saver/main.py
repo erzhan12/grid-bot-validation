@@ -270,8 +270,9 @@ class EventSaver:
                 await collector.start()
             except CollectorStartError as e:
                 logger.error(
-                    "Private collector for account %s did not start; "
-                    "skipping it: %s",
+                    "Private collector for account %s did not start; its "
+                    "private data will not be collected until add_account() "
+                    "is called again: %s",
                     account_id,
                     e,
                 )
