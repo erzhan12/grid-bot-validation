@@ -29,6 +29,7 @@ from grid_db import (
     WalletSnapshotRepository,
     PrivateStreamGapRepository,
     PrivateStreamSessionRepository,
+    RowNotFoundError,
 )
 from grid_db._decimal import WALLET_ACCOUNT_JSON_KEYS, decimal_or_zero
 from grid_db.identity import account_id_for, strategy_id_for, user_id_for
@@ -51,6 +52,11 @@ from recorder.shared_db_parents import verify_shared_db_parents
 
 
 logger = logging.getLogger(__name__)
+
+# Probes in a row that may skip the socket reset because the open-gap rows
+# could not be written. Past this the reset goes ahead: orders, positions and
+# wallet have no REST backfill, so a dead socket must not stay un-reset.
+_MAX_OPEN_GAP_FAILURES = 3
 
 
 class Recorder:
@@ -103,6 +109,7 @@ class Recorder:
         self._private_write_lost = False
         self._private_session_id: Optional[int] = None
         self._open_gap_ids: dict[str, int] = {}
+        self._open_gap_failures = 0
         self._pending_gap_writes: list[tuple[Callable[[], object], str]] = []
         self._run_id: Optional[UUID] = None
         self._health_check_complete = asyncio.Event()
@@ -136,6 +143,7 @@ class Recorder:
                 self._private_write_lost = False
             self._private_session_id = None
             self._open_gap_ids = {}
+            self._open_gap_failures = 0
             self._pending_gap_writes = []
 
             if not self._config.symbols:
@@ -910,12 +918,28 @@ class Recorder:
                 self._private_write_lost = True
             self._pending_futures.discard(fut)
         if first_loss:
-            # The event never reached a writer and has no gap row: coverage
-            # cannot be certified past it for the rest of this run.
-            logger.error(
-                "Private WS write failed; the private stream checkpoint stops "
-                "advancing for this run"
-            )
+            # The event never reached a writer: record a gap for it on the
+            # loop; the latch blocks the checkpoint until that has run.
+            logger.error("Private WS write failed; recording a gap for it")
+            loop = self._event_loop
+            if loop is not None:
+                try:
+                    loop.call_soon_threadsafe(self._record_lost_write_gap)
+                except RuntimeError:
+                    pass  # loop closed: the recorder is stopping
+
+    def _record_lost_write_gap(self) -> None:
+        """Turn a lost private write into a gap, then release the latch.
+
+        Runs on the event loop. The gap covers the liveness margin before
+        now; REST recovery runs for executions as for any gap. If an outage
+        gap is already open it covers this moment, so nothing is added.
+        """
+        now = datetime.now(UTC)
+        with self._pending_lock:
+            self._private_write_lost = False
+        if not self._open_gap_ids:
+            self._handle_private_gap(now - _LIVENESS_MARGIN, now)
 
     def _open_private_session(self, connected_at: datetime) -> None:
         """Write the private-stream session row; its checkpoint starts here.
@@ -961,12 +985,14 @@ class Recorder:
             barrier_ts = datetime.now(UTC)
             pending = list(self._pending_futures)
         if pending:
+            # shield: a cancelled checkpoint (collector timeout / stop) must
+            # not cancel the writes themselves.
             results = await asyncio.gather(
-                *(asyncio.wrap_future(f) for f in pending),
+                *(asyncio.shield(asyncio.wrap_future(f)) for f in pending),
                 return_exceptions=True,
             )
             if any(isinstance(r, BaseException) for r in results):
-                return  # _forget_pending latches _private_write_lost
+                return  # _forget_pending records a gap for the lost write
         if self._private_write_lost or not gap_writes_done:
             return
         if self._open_gap_ids:
@@ -1071,7 +1097,9 @@ class Recorder:
         One transaction for all symbols; the ids are kept only after it
         commits. A symbol that already holds an open row is skipped (the
         collector calls this again on every probe until the gap closes).
-        DB errors propagate: the collector then skips the reset this probe.
+        DB errors propagate, so the collector skips the reset this probe —
+        but only ``_MAX_OPEN_GAP_FAILURES`` probes in a row; after that it
+        returns normally and the gap is recorded at reconnect instead.
         """
         if not (self._config.account and self._run_id):
             return
@@ -1083,18 +1111,33 @@ class Recorder:
         ]
         if not missing:
             return
-        with self._db.get_session() as session:
-            repo = PrivateStreamGapRepository(session)
-            opened = {
-                symbol: repo.add_gap(
-                    run_id=str(self._run_id),
-                    account_id=str(self._account_id),
-                    symbol=symbol,
-                    gap_start=gap_start,
-                    gap_end=None,
-                ).id
-                for symbol in missing
-            }
+        try:
+            with self._db.get_session() as session:
+                repo = PrivateStreamGapRepository(session)
+                opened = {
+                    symbol: repo.add_gap(
+                        run_id=str(self._run_id),
+                        account_id=str(self._account_id),
+                        symbol=symbol,
+                        gap_start=gap_start,
+                        gap_end=None,
+                    ).id
+                    for symbol in missing
+                }
+        except Exception:
+            self._open_gap_failures += 1
+            if self._open_gap_failures < _MAX_OPEN_GAP_FAILURES:
+                raise
+            if self._open_gap_failures == _MAX_OPEN_GAP_FAILURES:
+                logger.error(
+                    "Could not open private gap rows in %d probes; letting "
+                    "the socket reset anyway (the gap is recorded at "
+                    "reconnect)",
+                    self._open_gap_failures,
+                    exc_info=True,
+                )
+            return
+        self._open_gap_failures = 0
         self._open_gap_ids.update(opened)
 
     def _handle_private_gap(
@@ -1115,6 +1158,7 @@ class Recorder:
             f"({gap_start} to {gap_end})"
         )
 
+        self._open_gap_failures = 0  # this outage is over
         self._retry_pending_gap_writes()
         futures: list[Future] = []
         if (
@@ -1235,12 +1279,12 @@ class Recorder:
 
         Queued writes are retried by every checkpoint attempt and every
         private gap; the checkpoint does not advance until the queue is
-        empty. A missing row (``ValueError``) cannot be fixed by retrying and
-        is dropped. A retry that fails again logs one line, no traceback.
+        empty. A missing row (``RowNotFoundError``) cannot be fixed by
+        retrying and is dropped. A retry that fails again logs one line, no traceback.
         """
         try:
             write()
-        except ValueError:
+        except RowNotFoundError:
             logger.error("Failed to persist %s: row not found", label, exc_info=True)
         except Exception as exc:
             if retry:

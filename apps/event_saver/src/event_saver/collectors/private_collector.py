@@ -23,6 +23,8 @@ _PRIVATE_WS_DISCONNECT_TIMEOUT = 5.0
 _PRIVATE_READY_TIMEOUT = 5.0
 # Extra time the event loop gives the wait_ready thread past its own deadline.
 _READY_WAIT_SLACK = 1.0
+# Bound on the owner's on_healthy_probe (coverage checkpoint) per probe.
+_HEALTHY_PROBE_TIMEOUT = 10.0
 # Resets in a row that end not ready before the socket is kept on liveness
 # checks only (e.g. one topic rejected: the others still deliver data).
 _MAX_UNREADY_RESETS = 3
@@ -388,15 +390,8 @@ class PrivateCollector:
                     self._handle_reconnect(degraded_at, self._last_healthy_ts)
                     return
                 self._last_healthy_ts = datetime.now(UTC)
-                if self._on_healthy_probe is not None:
-                    try:
-                        await self._on_healthy_probe()
-                    except Exception:
-                        logger.error(
-                            "Private stream checkpoint failed for account %s",
-                            self.context.account_id,
-                            exc_info=True,
-                        )
+                if self._on_healthy_probe is not None and self._running:
+                    await self._run_checkpoint()
                 return
 
             disconnected_at = self._gap_start()
@@ -486,6 +481,55 @@ class PrivateCollector:
                 exc_info=True,
             )
 
+    async def _wait_unless_stopped(
+        self, fut: "asyncio.Future[Any]", timeout: float
+    ) -> bool:
+        """Wait for ``fut``; False if ``timeout`` passed or stop() came first.
+
+        Races ``_ws_health_stop_event`` so shutdown never waits out a slow
+        reply. The caller cancels ``fut`` when this returns False.
+        """
+        waiters = {fut}
+        stop_event = self._ws_health_stop_event
+        stopping = None
+        if stop_event is not None:
+            stopping = asyncio.ensure_future(stop_event.wait())
+            waiters.add(stopping)
+        try:
+            await asyncio.wait(
+                waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            if stopping is not None:
+                stopping.cancel()
+        return fut.done()
+
+    async def _run_checkpoint(self) -> None:
+        """Await the owner's ``on_healthy_probe``, bounded and stop-aware.
+
+        A slow or failing checkpoint only means it does not advance this
+        probe; the socket stays healthy.
+        """
+        task = asyncio.ensure_future(self._on_healthy_probe())
+        if not await self._wait_unless_stopped(task, _HEALTHY_PROBE_TIMEOUT):
+            task.cancel()
+            if self._running:  # a timeout, not stop()
+                logger.warning(
+                    "Private stream checkpoint timed out after %.1fs for "
+                    "account %s; not advanced",
+                    _HEALTHY_PROBE_TIMEOUT,
+                    self.context.account_id,
+                )
+            return
+        try:
+            task.result()
+        except Exception:
+            logger.error(
+                "Private stream checkpoint failed for account %s",
+                self.context.account_id,
+                exc_info=True,
+            )
+
     def _gap_start(self) -> datetime:
         """Conservative gap start for an outage detected now.
 
@@ -522,22 +566,9 @@ class PrivateCollector:
         ready_wait = _run_in_daemon_thread(
             lambda: client.wait_ready(_PRIVATE_READY_TIMEOUT), name="ws-ready"
         )
-        waiters = {ready_wait}
-        stop_event = self._ws_health_stop_event
-        stopping = None
-        if stop_event is not None:
-            stopping = asyncio.ensure_future(stop_event.wait())
-            waiters.add(stopping)
-        try:
-            await asyncio.wait(
-                waiters,
-                timeout=_PRIVATE_READY_TIMEOUT + _READY_WAIT_SLACK,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-        finally:
-            if stopping is not None:
-                stopping.cancel()
-        if not ready_wait.done():
+        if not await self._wait_unless_stopped(
+            ready_wait, _PRIVATE_READY_TIMEOUT + _READY_WAIT_SLACK
+        ):
             ready_wait.cancel()
             return False
         try:

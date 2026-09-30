@@ -12,7 +12,7 @@ from grid_db.enums import RecoveryStatus
 from grid_db.models import (
     PrivateExecution, Order, PrivateStreamGap, PrivateStreamSession,
 )
-from grid_db.repositories.base import BaseRepository
+from grid_db.repositories.base import BaseRepository, RowNotFoundError
 
 
 class PrivateExecutionRepository(BaseRepository[PrivateExecution]):
@@ -440,7 +440,7 @@ class PrivateStreamGapRepository(BaseRepository[PrivateStreamGap]):
             reason: Failure / skip reason, if any.
 
         Raises:
-            ValueError: No gap row with ``gap_id`` under ``run_id``.
+            RowNotFoundError: No gap row with ``gap_id`` under ``run_id``.
         """
         gap = self._get_in_run(gap_id, run_id)
         gap.recovery_status = status
@@ -459,7 +459,7 @@ class PrivateStreamGapRepository(BaseRepository[PrivateStreamGap]):
             gap_end: Reconnect time.
 
         Raises:
-            ValueError: No gap row with ``gap_id`` under ``run_id``.
+            RowNotFoundError: No gap row with ``gap_id`` under ``run_id``.
         """
         gap = self._get_in_run(gap_id, run_id)
         gap.gap_end = gap_end
@@ -475,7 +475,7 @@ class PrivateStreamGapRepository(BaseRepository[PrivateStreamGap]):
             .one_or_none()
         )
         if gap is None:
-            raise ValueError(
+            raise RowNotFoundError(
                 f"private_stream_gaps row {gap_id} not found for run {run_id}"
             )
         return gap
@@ -525,7 +525,8 @@ class PrivateStreamSessionRepository(BaseRepository[PrivateStreamSession]):
             ts: New checkpoint time.
 
         Raises:
-            ValueError: No session row with ``session_id`` under ``run_id``.
+            RowNotFoundError: No session row with ``session_id`` under
+                ``run_id``.
         """
         row = (
             self.session.query(PrivateStreamSession)
@@ -536,7 +537,7 @@ class PrivateStreamSessionRepository(BaseRepository[PrivateStreamSession]):
             .one_or_none()
         )
         if row is None:
-            raise ValueError(
+            raise RowNotFoundError(
                 f"private_stream_sessions row {session_id} not found for run "
                 f"{run_id}"
             )

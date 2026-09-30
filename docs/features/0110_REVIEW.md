@@ -169,3 +169,15 @@ Engines: codex (`gpt-5.6-sol`, high) + cursor (`grok-4.7-high`). Rounds 3/4. Res
 
 - `make test`: exit 0, merged coverage 92%.
 - `make lint`: all checks passed.
+
+## PR #286 claude-review (round 1, on 2c983af)
+
+| Sev | Finding | Verdict |
+|---|---|---|
+| P1 | `on_healthy_probe` was awaited unbounded and did not race the stop event, so `stop()` could hang on a slow checkpoint. | ACCEPT — `_run_checkpoint`: bounded by `_HEALTHY_PROBE_TIMEOUT`, races `_ws_health_stop_event` (shared `_wait_unless_stopped`), skipped when not running; the recorder shields the writes it awaits. |
+| P1 | A DB error opening the gap row skipped the reset on every probe, so a dead socket could stay un-reset (orders / positions / wallet have no REST backfill). | ACCEPT — at most 3 probes in a row; then the reset goes ahead. Not queued as an open row (nothing would close it): the gap is recorded at reconnect. |
+| P2 | One lost write froze the checkpoint for the rest of the run. | ACCEPT — the lost write is recorded as a gap and the latch released. |
+| P2 | `_try_gap_write` dropped any `ValueError`. | ACCEPT — `grid_db.RowNotFoundError`; other `ValueError`s are retried. |
+| P3 | A retried fallback row stays `pending`. | Deferred (`tasks/todo.md`); it under-claims coverage. |
+| P3 | Rule text for `wait_ready(0)`. | ACCEPT. |
+

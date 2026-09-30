@@ -16,9 +16,9 @@ Plan: docs/features/0110_PLAN.md (B1 steps 3-5, 7; B1c split: B1c-1 coverage, B1
   (collector normalizer / callback errors, an order with no `run_id`) are
   logged but invisible to the coverage checkpoint. Count them on the
   collector / writers and block the checkpoint (or open a gap) when any occur.
-- 0110 B1c-1 local review: `_private_checkpoint` awaits pending writes with
-  no timeout; bound it (skip the advance on timeout) like the other health
-  loop waits.
+- PR #286 review P3: a fallback gap row inserted on retry keeps
+  `recovery_status='pending'` although its recovery finished; carry the
+  outcome into the retried insert.
 
 # Feature 0110 Phase B1b — private WS readiness + silent-reconnect detection (#271)
 

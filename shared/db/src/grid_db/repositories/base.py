@@ -10,6 +10,14 @@ from grid_db.models import Base
 T = TypeVar("T", bound=Base)
 
 
+class RowNotFoundError(ValueError):
+    """A repository update targeted a row that does not exist (in scope).
+
+    A ``ValueError`` subclass so callers can tell "row gone" (retrying will
+    not help) from other value errors.
+    """
+
+
 class BaseRepository(Generic[T]):
     """Base repository with common CRUD operations.
 

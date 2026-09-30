@@ -1241,3 +1241,52 @@ class TestPrivateCoverageHooks:
 
         await collector._ws_health_check_once()
         on_healthy_probe.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_wait_keeps_shutdown_responsive(
+        self, context, on_gap
+    ):
+        """stop() during a parked on_healthy_probe returns at once."""
+        gate = asyncio.Event()
+
+        async def _parked():
+            await gate.wait()
+
+        collector, ws = _probe_collector(context, on_gap, on_healthy_probe=_parked)
+        collector._ws_health_stop_event = asyncio.Event()
+        collector._ws_health_task = asyncio.create_task(
+            collector._ws_health_check_once()
+        )
+        try:
+            await asyncio.sleep(0.1)  # probe is now parked in the checkpoint
+            started = time.monotonic()
+            await collector.stop()
+            # stop() swallows CancelledError, so time it instead of wait_for.
+            assert time.monotonic() - started < 1.0
+        finally:
+            gate.set()
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_timeout_is_logged_and_probe_continues(
+        self, context, on_gap, caplog
+    ):
+        """A checkpoint slower than its bound is abandoned with a WARNING;
+        the socket stays healthy."""
+        gate = asyncio.Event()
+
+        async def _parked():
+            await gate.wait()
+
+        collector, ws = _probe_collector(context, on_gap, on_healthy_probe=_parked)
+        try:
+            with patch(
+                "event_saver.collectors.private_collector._HEALTHY_PROBE_TIMEOUT",
+                0.05,
+            ), caplog.at_level(
+                logging.WARNING, logger="event_saver.collectors.private_collector"
+            ):
+                await collector._ws_health_check_once()
+            assert "checkpoint timed out" in caplog.text
+            ws.reset.assert_not_called()
+        finally:
+            gate.set()

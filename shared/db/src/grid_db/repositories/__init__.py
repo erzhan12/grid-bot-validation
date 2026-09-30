@@ -8,6 +8,7 @@ both ``from grid_db import XRepository`` and
 """
 
 from grid_db.repositories.base import BaseRepository, T
+from grid_db.repositories.base import RowNotFoundError
 from grid_db.repositories.identity import (
     ApiCredentialRepository,
     BybitAccountRepository,
@@ -33,6 +34,7 @@ from grid_db.repositories.snapshots import (
 
 __all__ = [
     "BaseRepository",
+    "RowNotFoundError",
     "T",
     "UserRepository",
     "BybitAccountRepository",

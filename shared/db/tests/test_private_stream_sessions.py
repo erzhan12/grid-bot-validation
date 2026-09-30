@@ -9,6 +9,7 @@ from grid_db import (
     PrivateStreamGapRepository,
     PrivateStreamSession,
     PrivateStreamSessionRepository,
+    RowNotFoundError,
 )
 
 _T0 = datetime(2026, 9, 1, 12, 0, 0, tzinfo=UTC)
@@ -124,3 +125,17 @@ class TestOpenGaps:
         with pytest.raises(ValueError, match="not found"):
             repo.close_gap(gap.id, run_id="other-run", gap_end=_T0)
         assert gap.gap_end is None
+
+
+def test_missing_rows_raise_row_not_found(session, sample_account, sample_run):
+    """Both repositories raise RowNotFoundError (a ValueError) for a
+    missing / wrong-run row, so callers can tell it from other errors."""
+    with pytest.raises(RowNotFoundError):
+        PrivateStreamGapRepository(session).close_gap(
+            999999, run_id=sample_run.run_id, gap_end=_T0
+        )
+    with pytest.raises(RowNotFoundError):
+        PrivateStreamSessionRepository(session).advance_checkpoint(
+            999999, run_id=sample_run.run_id, ts=_T0
+        )
+    assert issubclass(RowNotFoundError, ValueError)

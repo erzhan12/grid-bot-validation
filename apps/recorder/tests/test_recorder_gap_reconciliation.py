@@ -28,6 +28,7 @@ from grid_db import (
     PrivateStreamSessionRepository,
     PublicTrade,
     RecoveryStatus,
+    RowNotFoundError,
 )
 from event_saver.collectors.private_collector import _LIVENESS_MARGIN
 from recorder.recorder import Recorder
@@ -655,11 +656,12 @@ class TestPrivateStreamCoverage:
             finally:
                 await recorder.stop()
 
-    async def test_lost_private_write_stops_checkpoint(
+    async def test_lost_private_write_is_recorded_as_a_gap(
         self, config_with_account, db, db_with_gridbot_seed, caplog
     ):
-        """A private write that fails never reached a writer and has no gap
-        row, so the checkpoint stops advancing for the run."""
+        """A private write that fails never reached a writer: a gap row is
+        recorded for it (and REST recovery runs), then the checkpoint
+        resumes — one lost write does not freeze the whole run."""
 
         async def _failing_write():
             raise RuntimeError("writer gone")
@@ -672,9 +674,13 @@ class TestPrivateStreamCoverage:
                 fut = recorder._submit_private(_failing_write(), "execution write")
                 with pytest.raises(RuntimeError):
                     await asyncio.wrap_future(fut)
+                await _wait_until(lambda: _gap_rows(db), desc="lost-write gap")
+                (gap,) = _gap_rows(db)
+                assert gap.gap_end is not None
+                assert "Private WS write failed" in caplog.text
+                assert recorder._private_write_lost is False
                 await recorder._private_checkpoint()
-                assert _session_row(db).last_checkpoint_ts == start
-                assert "checkpoint stops advancing" in caplog.text
+                assert _session_row(db).last_checkpoint_ts > start
             finally:
                 await recorder.stop()
 
@@ -686,7 +692,7 @@ class TestPrivateStreamCoverage:
         gap_start = datetime.now(UTC) - timedelta(seconds=30)
 
         def _missing(self, gap_id, **kwargs):
-            raise ValueError(f"private_stream_gaps row {gap_id} not found")
+            raise RowNotFoundError(f"private_stream_gaps row {gap_id} not found")
 
         with _patched_network(_make_fake_rest()):
             recorder = Recorder(config=config_with_account, db=db)
@@ -1013,3 +1019,60 @@ class TestPrivateStreamCoverage:
                 assert recorder._private_session_id is not None
             finally:
                 await recorder.stop()
+
+    async def test_open_gap_failure_stops_blocking_the_reset(
+        self, config_with_account, db, db_with_gridbot_seed
+    ):
+        """A DB error opening the gap row skips the reset only a bounded
+        number of probes: orders, positions and wallet have no REST backfill,
+        so a dead socket must not stay un-reset. The checkpoint still waits
+        for the gap row."""
+        gap_start = datetime.now(UTC) - timedelta(seconds=30)
+        real_add = PrivateStreamGapRepository.add_gap
+        failing = {"on": True}
+
+        def _add(self, *args, **kwargs):
+            if failing["on"]:
+                raise RuntimeError("database is locked")
+            return real_add(self, *args, **kwargs)
+
+        with _patched_network(_make_fake_rest()):
+            recorder = Recorder(config=config_with_account, db=db)
+            await recorder.start()
+            try:
+                start = _backdate_session(db)
+                resets = []
+                recorder._private_collector._ws_client.on_reset = (
+                    lambda: resets.append(1)
+                )
+                with patch.object(PrivateStreamGapRepository, "add_gap", _add):
+                    for expected in (0, 0, 1):
+                        await _dead_socket_probe(recorder, gap_start)
+                        assert len(resets) == expected
+                    await recorder._private_checkpoint()
+                    assert _session_row(db).last_checkpoint_ts == start
+                    assert _gap_rows(db) == []
+                    failing["on"] = False
+                    await recorder._private_checkpoint()
+                (gap,) = _gap_rows(db)
+                assert gap.gap_end is not None
+                assert _session_row(db).last_checkpoint_ts > start
+            finally:
+                await recorder.stop()
+
+    async def test_other_value_errors_in_gap_writes_are_retried(
+        self, config_with_account, db
+    ):
+        """Only a missing row is dropped; any other ValueError is queued."""
+        recorder = Recorder(config=config_with_account, db=db)
+
+        def _bad():
+            raise ValueError("could not coerce value")
+
+        def _gone():
+            raise RowNotFoundError("private_stream_gaps row 1 not found")
+
+        recorder._try_gap_write(_bad, "gap close")
+        recorder._try_gap_write(_gone, "gap close")
+        assert [label for _, label in recorder._pending_gap_writes] == ["gap close"]
+        assert recorder._pending_gap_writes[0][0] is _bad
