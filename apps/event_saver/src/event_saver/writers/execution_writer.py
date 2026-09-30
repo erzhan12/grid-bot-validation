@@ -77,15 +77,21 @@ class ExecutionWriter:
             if len(self._buffer) >= self._batch_size:
                 await self._flush_internal()
 
-    async def flush(self) -> None:
-        """Force flush buffered events to database."""
-        async with self._lock:
-            await self._flush_internal()
+    async def flush(self) -> bool:
+        """Force flush buffered events to database.
 
-    async def _flush_internal(self) -> None:
+        Returns:
+            True if nothing is left to retry (persisted, or empty); False on
+            a DB error (the batch stays buffered for the next flush). Events
+            dropped before insert are logged, not retried, and still True.
+        """
+        async with self._lock:
+            return await self._flush_internal()
+
+    async def _flush_internal(self) -> bool:
         """Internal flush without lock (must be called with lock held)."""
         if not self._buffer:
-            return
+            return True
 
         events = list(self._buffer)
         self._buffer.clear()
@@ -112,6 +118,8 @@ class ExecutionWriter:
             logger.error(f"Error flushing executions to database: {e}")
             # Re-add events to buffer for retry
             self._buffer.extendleft(reversed(events))
+            return False
+        return True
 
     async def start_auto_flush(self) -> None:
         """Start background task for periodic flushing."""

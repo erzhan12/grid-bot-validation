@@ -81,15 +81,21 @@ class OrderWriter:
             if len(self._buffer) >= self._batch_size:
                 await self._flush_internal()
 
-    async def flush(self) -> None:
-        """Flush all buffered orders to database."""
-        async with self._lock:
-            await self._flush_internal()
+    async def flush(self) -> bool:
+        """Flush all buffered orders to database.
 
-    async def _flush_internal(self) -> None:
+        Returns:
+            True if nothing is left to retry (persisted, or empty); False on
+            a DB error (the batch stays buffered for the next flush). Events
+            dropped before insert are logged, not retried, and still True.
+        """
+        async with self._lock:
+            return await self._flush_internal()
+
+    async def _flush_internal(self) -> bool:
         """Internal flush (must be called with lock held)."""
         if not self._buffer:
-            return
+            return True
 
         items: list[tuple[UUID, OrderUpdateEvent]] = []
         while self._buffer:
@@ -135,7 +141,7 @@ class OrderWriter:
                 continue
 
         if not models:
-            return
+            return True
 
         # Bulk insert
         try:
@@ -154,6 +160,8 @@ class OrderWriter:
             logger.error(f"Error flushing orders to database: {e}")
             # Re-queue events for retry on transient DB errors (preserve order)
             self._buffer.extendleft(reversed(retry_items))
+            return False
+        return True
 
     async def _auto_flush_loop(self) -> None:
         """Background task to flush buffer periodically."""

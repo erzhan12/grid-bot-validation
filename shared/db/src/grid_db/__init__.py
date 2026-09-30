@@ -21,6 +21,7 @@ from grid_db.models import (
     WalletSnapshot,
     GridStateSnapshot,
     PrivateStreamGap,
+    PrivateStreamSession,
 )
 from grid_db.enums import RecoveryStatus, RunType
 from grid_db.data_quality import RecordedDataQualityError
@@ -43,6 +44,7 @@ from grid_db.repositories import (
     PrivateExecutionRepository,
     OrderRepository,
     PrivateStreamGapRepository,
+    PrivateStreamSessionRepository,
     PositionSnapshotRepository,
     WalletSnapshotRepository,
     GridStateSnapshotRepository,
@@ -71,6 +73,7 @@ __all__ = [
     "WalletSnapshot",
     "GridStateSnapshot",
     "PrivateStreamGap",
+    "PrivateStreamSession",
     "RecoveryStatus",
     # Repositories
     "BaseRepository",
@@ -84,6 +87,7 @@ __all__ = [
     "PrivateExecutionRepository",
     "OrderRepository",
     "PrivateStreamGapRepository",
+    "PrivateStreamSessionRepository",
     "PositionSnapshotRepository",
     "WalletSnapshotRepository",
     "GridStateSnapshotRepository",

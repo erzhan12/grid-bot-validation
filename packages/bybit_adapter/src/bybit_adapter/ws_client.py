@@ -561,7 +561,8 @@ class PrivateWebSocketClient:
         :meth:`connect` has a positive ack, and pybit's ``WebSocketApp`` is
         still the one present at connect (a silent reconnect voids the acks).
         Waits outside ``self._lock`` (the message handlers take it). Call
-        from a worker thread, never an event loop.
+        from a worker thread, never an event loop — except with
+        ``timeout=0``, which is a single check with no sleep.
 
         Args:
             timeout: Seconds to wait before giving up.

@@ -1,3 +1,25 @@
+# Feature 0110 Phase B1c-1 — private-stream coverage: sessions, open gaps, checkpoint (#271)
+
+Plan: docs/features/0110_PLAN.md (B1 steps 3-5, 7; B1c split: B1c-1 coverage, B1c-2 startup)  |  Branch: feature/0110-b1c1-coverage
+
+- [x] grid_db: `private_stream_sessions` model + repository (open, advance checkpoint never backward); gap `close_gap`
+- [x] writers: execution/order/position/wallet `flush()` returns bool (empty → True, DB error → False, requeue kept)
+- [x] collector: owner `on_disconnect(gap_start)` before reset (raise → skip reset); async `on_healthy_probe` (not while liveness-only); `is_degraded()`
+- [x] recorder: open gap rows per symbol on disconnect (one txn), close on reconnect, retry failed close/outcome writes
+- [x] recorder: pending-future registry + checkpoint barrier (await futures, retry writes, flush writers, publish barrier − 75 s)
+- [x] recorder: session row after private start; `private_ws.degraded` in Health stats
+- [x] make test + make lint green
+- [x] rules update (grid-db, event-saver, recorder) + plan as-built notes
+
+## Follow-ups
+- 0110 B1c-1 local review: events dropped before a writer's buffer
+  (collector normalizer / callback errors, an order with no `run_id`) are
+  logged but invisible to the coverage checkpoint. Count them on the
+  collector / writers and block the checkpoint (or open a gap) when any occur.
+- 0110 B1c-1 local review: `_private_checkpoint` awaits pending writes with
+  no timeout; bound it (skip the advance on timeout) like the other health
+  loop waits.
+
 # Feature 0110 Phase B1b — private WS readiness + silent-reconnect detection (#271)
 
 Plan: docs/features/0110_PLAN.md (B1b, detect-only)  |  Branch: feature/0110-b1b-collector-detect

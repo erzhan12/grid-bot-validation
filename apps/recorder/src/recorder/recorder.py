@@ -28,12 +28,14 @@ from grid_db import (
     WalletSnapshot,
     WalletSnapshotRepository,
     PrivateStreamGapRepository,
+    PrivateStreamSessionRepository,
 )
 from grid_db._decimal import WALLET_ACCOUNT_JSON_KEYS, decimal_or_zero
 from grid_db.identity import account_id_for, strategy_id_for, user_id_for
 from gridcore.events import PublicTradeEvent, ExecutionEvent, OrderUpdateEvent, TickerEvent
 
 from event_saver.collectors import PublicCollector, PrivateCollector, AccountContext
+from event_saver.collectors.private_collector import _LIVENESS_MARGIN
 from event_saver.writers import (
     TradeWriter,
     TickerWriter,
@@ -92,6 +94,16 @@ class Recorder:
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._gap_count = 0
         self._gap_lock = threading.Lock()
+        # Feature 0110 B1c-1 private-stream coverage. Private WS writes are
+        # registered under _pending_lock (pybit thread) so a checkpoint
+        # barrier sees every write submitted before it. The rest is touched
+        # on the event loop only.
+        self._pending_lock = threading.Lock()
+        self._pending_futures: set[Future] = set()
+        self._private_write_lost = False
+        self._private_session_id: Optional[int] = None
+        self._open_gap_ids: dict[str, int] = {}
+        self._pending_gap_writes: list[tuple[Callable[[], object], str]] = []
         self._run_id: Optional[UUID] = None
         self._health_check_complete = asyncio.Event()
 
@@ -118,6 +130,13 @@ class Recorder:
 
         try:
             self._shutdown_event.clear()
+            # A restart is a new run: drop the previous run's coverage state.
+            with self._pending_lock:
+                self._pending_futures.clear()
+                self._private_write_lost = False
+            self._private_session_id = None
+            self._open_gap_ids = {}
+            self._pending_gap_writes = []
 
             if not self._config.symbols:
                 raise ValueError("symbols must not be empty")
@@ -249,8 +268,11 @@ class Recorder:
                     self._account_id, msg
                 ),
                 on_gap_detected=self._handle_private_gap,
+                on_disconnect=self._handle_private_disconnect,
+                on_healthy_probe=self._private_checkpoint,
             )
             await self._private_collector.start()
+            self._open_private_session(datetime.now(UTC))
 
     async def _write_initial_rest_snapshot(self) -> None:
         """Write a one-shot REST snapshot as the t=0 row of the recording.
@@ -864,6 +886,108 @@ class Recorder:
                 logger.error("%s failed: %s", label, exc)
         return _cb
 
+    def _submit_private(self, coro, label: str) -> Future:
+        """Schedule a private WS write and register it for the checkpoint.
+
+        Creation and registration share ``_pending_lock`` with the barrier in
+        :meth:`_private_checkpoint`, so a write submitted before the barrier
+        is always awaited by it.
+        """
+        with self._pending_lock:
+            fut = asyncio.run_coroutine_threadsafe(coro, self._event_loop)
+            self._pending_futures.add(fut)
+        fut.add_done_callback(self._forget_pending)
+        fut.add_done_callback(self._log_future_error(label))
+        return fut
+
+    def _forget_pending(self, fut: Future) -> None:
+        failed = fut.cancelled() or fut.exception() is not None
+        with self._pending_lock:
+            # Latch inside the lock: the checkpoint barrier copies the
+            # registry under it, so it sees either the future or the latch.
+            first_loss = failed and not self._private_write_lost
+            if failed:
+                self._private_write_lost = True
+            self._pending_futures.discard(fut)
+        if first_loss:
+            # The event never reached a writer and has no gap row: coverage
+            # cannot be certified past it for the rest of this run.
+            logger.error(
+                "Private WS write failed; the private stream checkpoint stops "
+                "advancing for this run"
+            )
+
+    def _open_private_session(self, connected_at: datetime) -> None:
+        """Write the private-stream session row; its checkpoint starts here.
+
+        Best-effort: without a session no checkpoint is published, so the
+        run simply never certifies private coverage.
+        """
+        if self._run_id is None:
+            return
+        try:
+            with self._db.get_session() as session:
+                row = PrivateStreamSessionRepository(session).open_session(
+                    run_id=str(self._run_id),
+                    account_id=str(self._account_id),
+                    connected_at=connected_at,
+                )
+                session_id = row.id
+        except Exception:
+            logger.error(
+                "Failed to open private stream session; private coverage "
+                "will not be certified",
+                exc_info=True,
+            )
+            return
+        self._private_session_id = session_id
+
+    async def _private_checkpoint(self) -> None:
+        """Advance the coverage checkpoint (collector ``on_healthy_probe``).
+
+        Barrier: retry failed gap writes; take ``barrier_ts`` and copy the
+        registered private writes under ``_pending_lock``; await them; flush
+        the execution, order, position and wallet writers. Only if all of
+        that succeeded, no write was lost and no gap row is open, is
+        ``last_checkpoint_ts`` moved to ``barrier_ts - _LIVENESS_MARGIN`` (a
+        half-open socket can look healthy that long, so a probe cannot
+        certify an undetected loss).
+        """
+        # Always retry, even when nothing can be published below.
+        gap_writes_done = self._retry_pending_gap_writes()
+        if self._private_session_id is None or self._run_id is None:
+            return
+        with self._pending_lock:
+            barrier_ts = datetime.now(UTC)
+            pending = list(self._pending_futures)
+        if pending:
+            results = await asyncio.gather(
+                *(asyncio.wrap_future(f) for f in pending),
+                return_exceptions=True,
+            )
+            if any(isinstance(r, BaseException) for r in results):
+                return  # _forget_pending latches _private_write_lost
+        if self._private_write_lost or not gap_writes_done:
+            return
+        if self._open_gap_ids:
+            return  # an outage is open: nothing to certify until it closes
+        for writer in (
+            self._execution_writer,
+            self._order_writer,
+            self._position_writer,
+            self._wallet_writer,
+        ):
+            if writer is not None and not await writer.flush():
+                return  # the writer logged the DB error; retry next probe
+        if self._pending_gap_writes:
+            return  # an outcome write failed while we were awaiting
+        with self._db.get_session() as session:
+            PrivateStreamSessionRepository(session).advance_checkpoint(
+                self._private_session_id,
+                run_id=str(self._run_id),
+                ts=barrier_ts - _LIVENESS_MARGIN,
+            )
+
     def _handle_ticker(self, event: TickerEvent) -> Optional[Future]:
         """Route ticker event to writer."""
         if self._ticker_writer and self._event_loop:
@@ -889,45 +1013,33 @@ class Recorder:
     def _handle_execution(self, event: ExecutionEvent) -> Optional[Future]:
         """Route execution event to writer."""
         if self._execution_writer and self._event_loop:
-            fut = asyncio.run_coroutine_threadsafe(
-                self._execution_writer.write([event]),
-                self._event_loop,
+            return self._submit_private(
+                self._execution_writer.write([event]), "execution write"
             )
-            fut.add_done_callback(self._log_future_error("execution write"))
-            return fut
         return None
 
     def _handle_order(self, account_id: UUID, event: OrderUpdateEvent) -> Optional[Future]:
         """Route order event to writer."""
         if self._order_writer and self._event_loop:
-            fut = asyncio.run_coroutine_threadsafe(
-                self._order_writer.write(account_id, [event]),
-                self._event_loop,
+            return self._submit_private(
+                self._order_writer.write(account_id, [event]), "order write"
             )
-            fut.add_done_callback(self._log_future_error("order write"))
-            return fut
         return None
 
     def _handle_position(self, account_id: UUID, message: dict) -> Optional[Future]:
         """Route position snapshot to writer."""
         if self._position_writer and self._event_loop:
-            fut = asyncio.run_coroutine_threadsafe(
-                self._position_writer.write(account_id, [message]),
-                self._event_loop,
+            return self._submit_private(
+                self._position_writer.write(account_id, [message]), "position write"
             )
-            fut.add_done_callback(self._log_future_error("position write"))
-            return fut
         return None
 
     def _handle_wallet(self, account_id: UUID, message: dict) -> Optional[Future]:
         """Route wallet snapshot to writer."""
         if self._wallet_writer and self._event_loop:
-            fut = asyncio.run_coroutine_threadsafe(
-                self._wallet_writer.write(account_id, [message]),
-                self._event_loop,
+            return self._submit_private(
+                self._wallet_writer.write(account_id, [message]), "wallet write"
             )
-            fut.add_done_callback(self._log_future_error("wallet write"))
-            return fut
         return None
 
     def _handle_public_gap(
@@ -953,14 +1065,46 @@ class Recorder:
             return fut
         return None
 
+    def _handle_private_disconnect(self, gap_start: datetime) -> None:
+        """Open one gap row per symbol before the collector resets the socket.
+
+        One transaction for all symbols; the ids are kept only after it
+        commits. A symbol that already holds an open row is skipped (the
+        collector calls this again on every probe until the gap closes).
+        DB errors propagate: the collector then skips the reset this probe.
+        """
+        if not (self._config.account and self._run_id):
+            return
+        # dict.fromkeys: a symbol listed twice in the config gets one row.
+        missing = [
+            s
+            for s in dict.fromkeys(self._config.symbols)
+            if s not in self._open_gap_ids
+        ]
+        if not missing:
+            return
+        with self._db.get_session() as session:
+            repo = PrivateStreamGapRepository(session)
+            opened = {
+                symbol: repo.add_gap(
+                    run_id=str(self._run_id),
+                    account_id=str(self._account_id),
+                    symbol=symbol,
+                    gap_start=gap_start,
+                    gap_end=None,
+                ).id
+                for symbol in missing
+            }
+        self._open_gap_ids.update(opened)
+
     def _handle_private_gap(
         self, gap_start: datetime, gap_end: datetime
     ) -> list[Future]:
         """Reconcile private stream gap via REST API.
 
-        Also records one ``pending`` ``private_stream_gaps`` row per symbol
-        (best-effort) and stores each symbol's recovery outcome when its
-        future completes.
+        Closes each symbol's open gap row (or, when none was opened - late
+        readiness on the same socket - records the gap closed), then stores
+        each symbol's recovery outcome when its future completes.
         """
         # Count unconditionally (see _handle_public_gap comment).
         with self._gap_lock:
@@ -971,6 +1115,7 @@ class Recorder:
             f"({gap_start} to {gap_end})"
         )
 
+        self._retry_pending_gap_writes()
         futures: list[Future] = []
         if (
             self._reconciler
@@ -978,8 +1123,18 @@ class Recorder:
             and self._config.account
             and self._run_id
         ):
-            for symbol in self._config.symbols:
-                gap_id = self._record_private_gap(symbol, gap_start, gap_end)
+            for symbol in dict.fromkeys(self._config.symbols):
+                # Forget the open id now, even if the close write fails: a
+                # queued close must only ever touch this outage's row, and
+                # the next outage must open its own.
+                gap_id = self._open_gap_ids.pop(symbol, None)
+                if gap_id is not None:
+                    self._try_gap_write(
+                        self._close_gap_write(gap_id, gap_end),
+                        f"gap close for {symbol} (gap {gap_id})",
+                    )
+                else:
+                    gap_id = self._record_private_gap(symbol, gap_start, gap_end)
                 fut = asyncio.run_coroutine_threadsafe(
                     self._reconciler.reconcile_executions(
                         user_id=self._user_id,
@@ -1005,26 +1160,36 @@ class Recorder:
     def _record_private_gap(
         self, symbol: str, gap_start: datetime, gap_end: datetime
     ) -> Optional[int]:
-        """Persist a ``pending`` private-stream gap row; its id or None.
+        """Persist an already-closed gap row; its id, or None on a DB error.
 
-        Best-effort: a DB error is logged and recovery still runs — the
-        backfill matters more than its bookkeeping row.
+        Fallback for a symbol with no open row (late readiness: the socket
+        was never reset, so no row was opened at disconnect). On a DB error
+        recovery still runs — the backfill matters more than its bookkeeping
+        row — and the insert is queued, so the checkpoint waits for the row
+        (its outcome then stays ``pending``).
         """
-        try:
+        run_id = str(self._run_id)
+        account_id = str(self._account_id)
+
+        def _add() -> int:
             with self._db.get_session() as session:
-                gap = PrivateStreamGapRepository(session).add_gap(
-                    run_id=str(self._run_id),
-                    account_id=str(self._account_id),
+                return PrivateStreamGapRepository(session).add_gap(
+                    run_id=run_id,
+                    account_id=account_id,
                     symbol=symbol,
                     gap_start=gap_start,
                     gap_end=gap_end,
-                )
-                return gap.id
+                ).id
+
+        try:
+            return _add()
         except Exception:
             logger.error(
-                "Failed to record private stream gap for %s", symbol,
+                "Failed to record private stream gap for %s; retrying before "
+                "the next checkpoint", symbol,
                 exc_info=True,
             )
+            self._pending_gap_writes.append((_add, f"gap row for {symbol}"))
             return None
 
     def _persist_gap_outcome(
@@ -1035,7 +1200,8 @@ class Recorder:
 
         def _cb(future: Future) -> None:
             result = recovery_result_from_future(future)
-            try:
+
+            def _write() -> None:
                 with self._db.get_session() as session:
                     PrivateStreamGapRepository(session).set_outcome(
                         gap_id,
@@ -1045,12 +1211,54 @@ class Recorder:
                         duplicates=result.duplicates,
                         reason=result.reason,
                     )
-            except Exception:
-                logger.error(
-                    "Failed to persist gap outcome for %s (gap %s)",
-                    symbol, gap_id, exc_info=True,
-                )
+
+            self._try_gap_write(_write, f"gap outcome for {symbol} (gap {gap_id})")
         return _cb
+
+    def _close_gap_write(
+        self, gap_id: int, gap_end: datetime
+    ) -> Callable[[], None]:
+        """A write that closes the gap row ``gap_id`` at ``gap_end``."""
+        run_id = str(self._run_id)
+
+        def _write() -> None:
+            with self._db.get_session() as session:
+                PrivateStreamGapRepository(session).close_gap(
+                    gap_id, run_id=run_id, gap_end=gap_end
+                )
+        return _write
+
+    def _try_gap_write(
+        self, write: Callable[[], object], label: str, *, retry: bool = False
+    ) -> None:
+        """Run a gap bookkeeping write; queue it for retry on a DB error.
+
+        Queued writes are retried by every checkpoint attempt and every
+        private gap; the checkpoint does not advance until the queue is
+        empty. A missing row (``ValueError``) cannot be fixed by retrying and
+        is dropped. A retry that fails again logs one line, no traceback.
+        """
+        try:
+            write()
+        except ValueError:
+            logger.error("Failed to persist %s: row not found", label, exc_info=True)
+        except Exception as exc:
+            if retry:
+                logger.warning("Still failing to persist %s: %s", label, exc)
+            else:
+                logger.error(
+                    "Failed to persist %s; retrying before the next checkpoint",
+                    label,
+                    exc_info=True,
+                )
+            self._pending_gap_writes.append((write, label))
+
+    def _retry_pending_gap_writes(self) -> bool:
+        """Retry queued gap writes; True when none remain."""
+        writes, self._pending_gap_writes = self._pending_gap_writes, []
+        for write, label in writes:
+            self._try_gap_write(write, label, retry=True)
+        return not self._pending_gap_writes
 
     async def _health_log_loop(self) -> None:
         """Periodically log health stats."""
@@ -1080,6 +1288,12 @@ class Recorder:
             "uptime_seconds": round(uptime, 1),
             "gaps_detected": gap_count,
         }
+
+        # 0110 B1c-1: kept on liveness checks only = coverage not certified.
+        if self._private_collector:
+            stats["private_ws"] = {
+                "degraded": self._private_collector.is_degraded()
+            }
 
         # Public WS connection state
         if self._public_collector:

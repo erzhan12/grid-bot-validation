@@ -417,14 +417,16 @@ class TestExecutionWriter:
             mock_repo = MockRepo.return_value
             mock_repo.bulk_insert.side_effect = Exception("db down")
 
-            await writer.flush()
+            assert await writer.flush() is False
             assert len(writer._buffer) == 5
 
             mock_repo.bulk_insert.side_effect = None
             mock_repo.bulk_insert.return_value = 5
 
-            await writer.flush()
+            assert await writer.flush() is True
             assert len(writer._buffer) == 0
+            assert await writer.flush() is True  # empty buffer
+
 
     @pytest.mark.asyncio
     async def test_start_stop_auto_flush(self, mock_db):
@@ -720,16 +722,17 @@ class TestOrderWriter:
             mock_repo.bulk_insert.side_effect = Exception("db down")
 
             # First flush fails -> item should be re-queued
-            await writer.flush()
+            assert await writer.flush() is False
             assert len(writer._buffer) == 1
 
             # Second flush succeeds -> buffer cleared
             mock_repo.bulk_insert.side_effect = None
             mock_repo.bulk_insert.return_value = 1
 
-            await writer.flush()
+            assert await writer.flush() is True
             assert len(writer._buffer) == 0
             assert mock_repo.bulk_insert.call_count == 2
+            assert await writer.flush() is True  # empty buffer
 
 
 class TestPositionWriter:
@@ -1007,14 +1010,16 @@ class TestPositionWriter:
             mock_repo = MockRepo.return_value
             mock_repo.bulk_insert.side_effect = Exception("db down")
 
-            await writer.flush()
+            assert await writer.flush() is False
             assert len(writer._buffer) == 1
 
             mock_repo.bulk_insert.side_effect = None
             mock_repo.bulk_insert.return_value = 1
 
-            await writer.flush()
+            assert await writer.flush() is True
             assert len(writer._buffer) == 0
+            assert await writer.flush() is True  # empty buffer
+
 
     @pytest.mark.asyncio
     async def test_parses_0034_telemetry_fields(self, mock_db):
@@ -1319,14 +1324,15 @@ class TestWalletWriter:
             mock_repo = MockRepo.return_value
             mock_repo.bulk_insert.side_effect = Exception("db down")
 
-            await writer.flush()
+            assert await writer.flush() is False
             assert len(writer._buffer) == 1
 
             mock_repo.bulk_insert.side_effect = None
             mock_repo.bulk_insert.return_value = 1
 
-            await writer.flush()
+            assert await writer.flush() is True
             assert len(writer._buffer) == 0
+            assert await writer.flush() is True  # empty buffer
 
     def test_decimal_or_zero_helper(self):
         """0036: helper maps None/'' to Decimal('0'), passes real values through."""

@@ -23,6 +23,7 @@ from grid_db.repositories.execution import (
     OrderRepository,
     PrivateExecutionRepository,
     PrivateStreamGapRepository,
+    PrivateStreamSessionRepository,
 )
 from grid_db.repositories.snapshots import (
     GridStateSnapshotRepository,
@@ -43,6 +44,7 @@ __all__ = [
     "PrivateExecutionRepository",
     "OrderRepository",
     "PrivateStreamGapRepository",
+    "PrivateStreamSessionRepository",
     "PositionSnapshotRepository",
     "WalletSnapshotRepository",
     "GridStateSnapshotRepository",

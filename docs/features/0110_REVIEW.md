@@ -128,3 +128,44 @@ Engines: codex (`gpt-5.6-sol`, high) + cursor (`grok-4.7-high`). Rounds 2/4. Res
 
 - `make test`: exit 0, merged coverage 92%.
 - `make lint`: all checks passed.
+
+## Phase B1c-1 — local staged review (review-fix-loop-staged, 2026-09-30)
+
+5 reviewers, 2 iterations. 2 CRITICAL found and fixed → Ready to commit.
+
+| Sev | Finding | Fix |
+|---|---|---|
+| CRITICAL | A close-gap write that failed stayed queued with the row's id still marked open; a second outage reused the row, and the queued close then replayed its older `gap_end` over it — the checkpoint advanced across an outage. Found by two reviewers, reproduced by one. | `_handle_private_gap` forgets the open id at once, so each outage owns its row (`test_stale_close_retry_does_not_touch_later_outage`). |
+| CRITICAL | Healthy probes on a liveness-only socket still stamped the last-healthy time, so after recovery the gap started only 75 s back and the degraded stretch was certified. | Those probes stamp nothing (`test_liveness_only_period_is_not_certified_on_recovery`). |
+| WARNING | Queued gap writes were retried only when the checkpoint got that far (not while degraded / after a lost write). | Retried at the top of every checkpoint attempt and on every private gap. |
+| WARNING | The fallback gap row (late readiness) was best-effort: a DB error left the stretch certified with no row. | The failed insert is queued. |
+| WARNING | A traceback on every retry while the DB is down. | First failure logs the traceback, retries one WARNING line. |
+| WARNING | Test gaps: healthy-probe wiring, disconnect idempotency, multi-symbol all-or-nothing, outcome-write retry, session-open failure, barrier ordering, degraded stats. | Tests added. |
+| WARNING | Stale rule text, `RULES.md` index, "confirmed session" wording, `add_gap` / `flush()` docstrings. | Fixed. |
+
+Also added: the checkpoint refuses to advance while any gap row is open and re-checks the retry queue right before publishing. Second pass: no CRITICAL / WARNING. Deferred to `tasks/todo.md`: events dropped before a writer's buffer are invisible to the checkpoint; the checkpoint awaits pending writes with no timeout.
+
+## Phase B1c-1 — external review (ext-code-review)
+
+Engines: codex (`gpt-5.6-sol`, high) + cursor (`grok-4.7-high`). Rounds 3/4. Result: SUCCESS.
+
+| Round | Engine | Sev | Finding | Verdict |
+|---|---|---|---|---|
+| 1 | codex | P1 | `_forget_pending` set the write-lost latch after releasing `_pending_lock`; a barrier in between saw neither the future nor the latch. | ACCEPT — latch set inside the lock (`test_lost_write_latch_is_set_before_the_future_is_forgotten`). |
+| 1 | codex | P2 | Duplicate configured symbols opened two rows and kept one id. | ACCEPT — symbols de-duplicated in the open/close paths (`test_duplicate_config_symbols_open_one_row`). |
+| 1 | codex | P3 | Session round-trip test name overstated ("survive reopen"). | ACCEPT — renamed. |
+| 1 | codex | P3 | Extract the coverage state machine out of `Recorder`. | REJECT — refactor beyond this change. |
+| 1 | cursor | — | NO P1/P2, no P3. | — |
+| 2 | codex | P2 | A close that finds no row is dropped, so the outage is absent and gets certified. | REJECT — a gap row can only disappear through the `runs` CASCADE, which also deletes the session row; `advance_checkpoint` then raises and nothing is published. |
+| 2 | codex | P2 | Liveness-only could never end on the same socket when acks landed late. | ACCEPT — one non-blocking `wait_ready(0)` per healthy probe; the degraded stretch is reported as a gap (`test_late_acks_clear_liveness_only_on_the_same_socket`). |
+| 2 | codex | P2 | Coverage state survived `stop()` → `start()`. | ACCEPT — reset in `start()` (`test_restart_resets_coverage_state`). |
+| 2 | codex | P3 | Flush-failure test covered one writer. | ACCEPT — parametrized over the four. |
+| 2 | cursor | P3 | A previous run's future failing after a restart re-latches write-lost; barrier test asserts only the execution handler. | Accepted gaps. |
+| 2 | cursor | P3 | Over-long docstring line. | ACCEPT — wrapped. |
+| 3 | codex | — | NO P1/P2 FINDINGS. | — |
+| 3 | cursor | P3 | `wait_ready` docstring forbids the event loop, but the collector calls `wait_ready(0)` there. | ACCEPT — docstring notes the zero-timeout case. |
+
+## Final verification (B1c-1)
+
+- `make test`: exit 0, merged coverage 92%.
+- `make lint`: all checks passed.

@@ -6,7 +6,7 @@ import logging
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 from uuid import UUID
 
 from bybit_adapter.ws_client import PrivateWebSocketClient, ConnectionState
@@ -143,6 +143,8 @@ class PrivateCollector:
         on_position: Optional[Callable[[dict], None]] = None,
         on_wallet: Optional[Callable[[dict], None]] = None,
         on_gap_detected: Optional[Callable[[datetime, datetime], None]] = None,
+        on_disconnect: Optional[Callable[[datetime], None]] = None,
+        on_healthy_probe: Optional[Callable[[], Awaitable[None]]] = None,
         ws_health_check_interval: float = _PRIVATE_WS_HEALTH_CHECK_INTERVAL,
         ws_reset_timeout: float = _PRIVATE_WS_RESET_TIMEOUT,
         ws_disconnect_timeout: float = _PRIVATE_WS_DISCONNECT_TIMEOUT,
@@ -156,6 +158,13 @@ class PrivateCollector:
             on_position: Callback for position snapshots (raw dict).
             on_wallet: Callback for wallet snapshots (raw dict).
             on_gap_detected: Callback when gap is detected (start, end).
+            on_disconnect: Called with the gap start when the socket is found
+                unhealthy, BEFORE it is reset. If it raises, the reset is
+                skipped this probe and retried on the next one (so the owner's
+                open-gap record always exists before recovery work).
+            on_healthy_probe: Awaited on each healthy probe of a confirmed
+                ready socket (never while kept on liveness checks only); the
+                owner advances its coverage checkpoint here.
             ws_health_check_interval: Private socket health-check interval in
                 seconds.
             ws_reset_timeout: Bound on the blocking ``client.reset()`` call from
@@ -172,6 +181,8 @@ class PrivateCollector:
         self._on_position = on_position
         self._on_wallet = on_wallet
         self._on_gap_detected = on_gap_detected
+        self._on_disconnect = on_disconnect
+        self._on_healthy_probe = on_healthy_probe
 
         # Set up normalizer with multi-tenant context
         normalizer_context = NormalizerContext(
@@ -197,6 +208,9 @@ class PrivateCollector:
         self._last_healthy_ts: Optional[datetime] = None
         self._connected_at: Optional[datetime] = None
         self._unready_resets = 0
+        # Kept on liveness checks only after _MAX_UNREADY_RESETS: healthy
+        # probes no longer certify coverage (a topic may never be acked).
+        self._liveness_only = False
 
     async def start(self) -> None:
         """Start collecting private data for this account.
@@ -240,7 +254,7 @@ class PrivateCollector:
         self._connected_at = self._last_healthy_ts = datetime.now(UTC)
         self._unready_resets = 0
         if not await self._confirm_ready(self._ws_client):
-            # Not fatal until feature 0110 B1c moves the startup snapshot:
+            # Not fatal until feature 0110 B1c-2 moves the startup snapshot:
             # the first health probe treats "not ready" as unhealthy.
             logger.error(
                 "Private WebSocket not ready within %.1fs for account %s; "
@@ -304,6 +318,15 @@ class PrivateCollector:
         """Check if collector is running."""
         return self._running
 
+    def is_degraded(self) -> bool:
+        """True while the socket is kept on liveness checks only.
+
+        Set after ``_MAX_UNREADY_RESETS`` resets that never became ready;
+        cleared by the next confirmed readiness. While set, healthy probes do
+        not call ``on_healthy_probe`` (coverage is not certified).
+        """
+        return self._liveness_only
+
     def get_connection_state(self) -> Optional[ConnectionState]:
         """Get current WebSocket connection state."""
         if self._ws_client:
@@ -346,17 +369,37 @@ class PrivateCollector:
 
         try:
             if self._is_healthy(client):
+                if self._liveness_only:
+                    # Not certified: leave the last-healthy time at the
+                    # moment it degraded, so the next gap reaches back over
+                    # the whole liveness-only stretch.
+                    if not client.wait_ready(0):  # single check, no wait
+                        return
+                    # Acks landed on this socket after all: certified again;
+                    # recover the liveness-only stretch as a gap.
+                    degraded_at = self._gap_start()
+                    self._liveness_only = False
+                    self._last_healthy_ts = datetime.now(UTC)
+                    logger.info(
+                        "Private WebSocket for account %s is ready again "
+                        "(was on liveness checks only)",
+                        self.context.account_id,
+                    )
+                    self._handle_reconnect(degraded_at, self._last_healthy_ts)
+                    return
                 self._last_healthy_ts = datetime.now(UTC)
+                if self._on_healthy_probe is not None:
+                    try:
+                        await self._on_healthy_probe()
+                    except Exception:
+                        logger.error(
+                            "Private stream checkpoint failed for account %s",
+                            self.context.account_id,
+                            exc_info=True,
+                        )
                 return
 
-            # Conservative gap start: the last healthy probe minus the time
-            # a half-open socket can still look alive (not message age — a
-            # healthy private stream can be quiet for days).
-            disconnected_at = (
-                self._last_healthy_ts or datetime.now(UTC)
-            ) - _LIVENESS_MARGIN
-            if self._connected_at is not None:
-                disconnected_at = max(disconnected_at, self._connected_at)
+            disconnected_at = self._gap_start()
 
             if (
                 not self._ready
@@ -376,6 +419,10 @@ class PrivateCollector:
                 return
 
             self._handle_disconnect(disconnected_at)
+            if self._on_disconnect is not None:
+                # Raises → the outer except logs it and this probe skips the
+                # reset; the next probe retries with the same gap start.
+                self._on_disconnect(disconnected_at)
 
             logger.warning(
                 "Private WebSocket unhealthy for account %s "
@@ -426,6 +473,7 @@ class PrivateCollector:
                     self._unready_resets,
                 )
                 self._unready_resets = 0
+                self._liveness_only = True
                 self._ready = True
                 self._identity_baseline = client.socket_identity()
                 self._last_healthy_ts = datetime.now(UTC)
@@ -437,6 +485,18 @@ class PrivateCollector:
                 e,
                 exc_info=True,
             )
+
+    def _gap_start(self) -> datetime:
+        """Conservative gap start for an outage detected now.
+
+        The last healthy probe minus the time a half-open socket can still
+        look alive (not message age — a healthy private stream can be quiet
+        for days), never before the collector connected.
+        """
+        start = (self._last_healthy_ts or datetime.now(UTC)) - _LIVENESS_MARGIN
+        if self._connected_at is not None:
+            start = max(start, self._connected_at)
+        return start
 
     def _is_healthy(self, client: PrivateWebSocketClient) -> bool:
         """Alive, confirmed ready, authenticated, and the same pybit socket."""
@@ -492,6 +552,7 @@ class PrivateCollector:
             ready = False
         if ready:
             self._ready = True
+            self._liveness_only = False
             self._unready_resets = 0
             self._identity_baseline = baseline
             self._last_healthy_ts = datetime.now(UTC)

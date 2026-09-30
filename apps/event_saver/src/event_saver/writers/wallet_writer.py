@@ -125,15 +125,21 @@ class WalletWriter:
             if len(self._buffer) >= self._batch_size:
                 await self._flush_internal()
 
-    async def flush(self) -> None:
-        """Force flush buffered snapshots to database."""
-        async with self._lock:
-            await self._flush_internal()
+    async def flush(self) -> bool:
+        """Force flush buffered snapshots to database.
 
-    async def _flush_internal(self) -> None:
+        Returns:
+            True if nothing is left to retry (persisted, or empty); False on
+            a DB error (the batch stays buffered for the next flush). Events
+            dropped before insert are logged, not retried, and still True.
+        """
+        async with self._lock:
+            return await self._flush_internal()
+
+    async def _flush_internal(self) -> bool:
         """Internal flush without lock (must be called with lock held)."""
         if not self._buffer:
-            return
+            return True
 
         snapshots = list(self._buffer)
         self._buffer.clear()
@@ -153,6 +159,8 @@ class WalletWriter:
             logger.error(f"Error flushing wallet snapshots to database: {e}")
             # Re-add snapshots to buffer for retry
             self._buffer.extendleft(reversed(snapshots))
+            return False
+        return True
 
     async def start_auto_flush(self) -> None:
         """Start background task for periodic flushing."""

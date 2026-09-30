@@ -14,6 +14,7 @@ from grid_db import (
     DatabaseFactory,
     DatabaseSettings,
     PrivateStreamGapRepository,
+    PrivateStreamSessionRepository,
     Run,
     Strategy,
     User,
@@ -182,7 +183,8 @@ def test_wipe_uses_expanded_database_url(tmp_path, monkeypatch):
 
 
 def test_recording_wipe_clears_private_stream_gaps(tmp_path):
-    """The FK-on `DELETE FROM runs` cascades to private_stream_gaps (0110)."""
+    """The FK-on `DELETE FROM runs` cascades to private_stream_gaps and
+    private_stream_sessions (0110)."""
     db_path = tmp_path / "gaps.db"
     factory = _factory(db_path)
     factory.create_tables()
@@ -204,6 +206,11 @@ def test_recording_wipe_clears_private_stream_gaps(tmp_path):
             gap_start=datetime(2026, 9, 1, tzinfo=UTC),
             gap_end=datetime(2026, 9, 1, 0, 1, tzinfo=UTC),
         )
+        PrivateStreamSessionRepository(session).open_session(
+            run_id=run.run_id,
+            account_id=account_id_for("mainnet_live"),
+            connected_at=datetime(2026, 9, 1, tzinfo=UTC),
+        )
 
     recorder_yaml = tmp_path / "recorder.yaml"
     _write_recorder_yaml(recorder_yaml, db_path=db_path)
@@ -214,7 +221,11 @@ def test_recording_wipe_clears_private_stream_gaps(tmp_path):
 
     with factory.engine.connect() as conn:
         n = conn.execute(text("SELECT COUNT(*) FROM private_stream_gaps")).scalar_one()
+        sessions = conn.execute(
+            text("SELECT COUNT(*) FROM private_stream_sessions")
+        ).scalar_one()
     assert n == 0
+    assert sessions == 0
 
 
 def test_wipe_succeeds_on_existing_empty_schemaless_file(tmp_path):

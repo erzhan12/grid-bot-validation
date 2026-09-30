@@ -1,6 +1,6 @@
 """Execution repositories (split from repositories.py, feature 0081 / issue #184)."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Optional, List
 
 from sqlalchemy import func, tuple_, insert
@@ -10,7 +10,7 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 
 from grid_db.enums import RecoveryStatus
 from grid_db.models import (
-    PrivateExecution, Order, PrivateStreamGap,
+    PrivateExecution, Order, PrivateStreamGap, PrivateStreamSession,
 )
 from grid_db.repositories.base import BaseRepository
 
@@ -367,6 +367,13 @@ class OrderRepository(BaseRepository[Order]):
 _GAP_REASON_MAX_LEN = 500
 
 
+def _naive_utc(ts: datetime) -> datetime:
+    """``ts`` as naive UTC; a naive value is taken to be UTC already."""
+    if ts.tzinfo is None:
+        return ts
+    return ts.astimezone(UTC).replace(tzinfo=None)
+
+
 class PrivateStreamGapRepository(BaseRepository[PrivateStreamGap]):
     """Private-stream gaps and their REST recovery outcomes (feature 0110)."""
 
@@ -393,7 +400,8 @@ class PrivateStreamGapRepository(BaseRepository[PrivateStreamGap]):
             account_id: Account whose private stream dropped.
             symbol: Symbol whose executions need recovery.
             gap_start: Start of the outage.
-            gap_end: End of the outage (reconnect time).
+            gap_end: End of the outage (reconnect time), or None to open the
+                gap; :meth:`close_gap` sets it later.
 
         Returns:
             The flushed row (``id`` populated).
@@ -434,6 +442,30 @@ class PrivateStreamGapRepository(BaseRepository[PrivateStreamGap]):
         Raises:
             ValueError: No gap row with ``gap_id`` under ``run_id``.
         """
+        gap = self._get_in_run(gap_id, run_id)
+        gap.recovery_status = status
+        gap.inserted = inserted
+        gap.duplicates = duplicates
+        # Bounded: raw exception text can be long (SQL + params).
+        gap.reason = reason[:_GAP_REASON_MAX_LEN] if reason else reason
+        self.session.flush()
+
+    def close_gap(self, gap_id: int, *, run_id: str, gap_end: datetime) -> None:
+        """Set the end of a gap opened with ``gap_end=None``.
+
+        Args:
+            gap_id: Row id returned by :meth:`add_gap`.
+            run_id: Run the gap belongs to (tenant scope for the lookup).
+            gap_end: Reconnect time.
+
+        Raises:
+            ValueError: No gap row with ``gap_id`` under ``run_id``.
+        """
+        gap = self._get_in_run(gap_id, run_id)
+        gap.gap_end = gap_end
+        self.session.flush()
+
+    def _get_in_run(self, gap_id: int, run_id: str) -> PrivateStreamGap:
         gap = (
             self.session.query(PrivateStreamGap)
             .filter(
@@ -446,9 +478,69 @@ class PrivateStreamGapRepository(BaseRepository[PrivateStreamGap]):
             raise ValueError(
                 f"private_stream_gaps row {gap_id} not found for run {run_id}"
             )
-        gap.recovery_status = status
-        gap.inserted = inserted
-        gap.duplicates = duplicates
-        # Bounded: raw exception text can be long (SQL + params).
-        gap.reason = reason[:_GAP_REASON_MAX_LEN] if reason else reason
-        self.session.flush()
+        return gap
+
+
+class PrivateStreamSessionRepository(BaseRepository[PrivateStreamSession]):
+    """Private-stream sessions and their coverage checkpoints (feature 0110)."""
+
+    def __init__(self, session: Session):
+        """Initialize repository.
+
+        Args:
+            session: SQLAlchemy session instance.
+        """
+        super().__init__(session, PrivateStreamSession)
+
+    def open_session(
+        self, run_id: str, account_id: str, connected_at: datetime
+    ) -> PrivateStreamSession:
+        """Record a confirmed session; its checkpoint starts at ``connected_at``.
+
+        Args:
+            run_id: Recording run the session belongs to.
+            account_id: Account whose private stream connected.
+            connected_at: Time the private collector was started.
+
+        Returns:
+            The flushed row (``id`` populated).
+        """
+        return self.create(
+            PrivateStreamSession(
+                run_id=str(run_id),
+                account_id=str(account_id),
+                connected_at=connected_at,
+                last_checkpoint_ts=connected_at,
+            )
+        )
+
+    def advance_checkpoint(
+        self, session_id: int, *, run_id: str, ts: datetime
+    ) -> None:
+        """Move the checkpoint to ``ts``; an older ``ts`` is ignored.
+
+        Args:
+            session_id: Row id returned by :meth:`open_session`.
+            run_id: Run the session belongs to (tenant scope for the lookup).
+            ts: New checkpoint time.
+
+        Raises:
+            ValueError: No session row with ``session_id`` under ``run_id``.
+        """
+        row = (
+            self.session.query(PrivateStreamSession)
+            .filter(
+                PrivateStreamSession.id == session_id,
+                PrivateStreamSession.run_id == str(run_id),
+            )
+            .one_or_none()
+        )
+        if row is None:
+            raise ValueError(
+                f"private_stream_sessions row {session_id} not found for run "
+                f"{run_id}"
+            )
+        # SQLite returns naive (UTC) datetimes; compare on naive UTC.
+        if _naive_utc(ts) > _naive_utc(row.last_checkpoint_ts):
+            row.last_checkpoint_ts = ts
+            self.session.flush()

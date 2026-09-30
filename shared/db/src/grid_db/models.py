@@ -213,6 +213,9 @@ class Run(Base):
     private_stream_gaps: Mapped[List["PrivateStreamGap"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
     )
+    private_stream_sessions: Mapped[List["PrivateStreamSession"]] = relationship(
+        back_populates="run", cascade="all, delete-orphan"
+    )
 
     __table_args__ = (
         Index("ix_runs_user_id", "user_id"),
@@ -312,7 +315,9 @@ class PrivateExecution(Base):
 class PrivateStreamGap(Base):
     """A private WebSocket outage and its REST execution recovery (0110).
 
-    One row per (gap, symbol). ``recovery_status`` is a
+    One row per (gap, symbol). ``gap_end`` is NULL while the gap is open:
+    from the disconnect until the reconnect is confirmed, or for good if the
+    reset timed out or the recorder stopped. ``recovery_status`` is a
     :class:`grid_db.enums.RecoveryStatus` value; it starts ``pending`` and is
     set once the recovery for that symbol finishes. No unique constraint:
     the recorder writes exactly one row per detected gap per symbol, and a
@@ -351,6 +356,41 @@ class PrivateStreamGap(Base):
             "symbol",
             "gap_start",
         ),
+    )
+
+
+class PrivateStreamSession(Base):
+    """A private WebSocket session and its coverage checkpoint (0110).
+
+    ``last_checkpoint_ts`` is the time up to which every private event the
+    session received is committed, less the liveness margin; it only moves
+    forward. Coverage is ``[connected_at, last_checkpoint_ts]`` minus the
+    run's ``private_stream_gaps``.
+    """
+
+    __tablename__ = "private_stream_sessions"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False
+    )
+    account_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    connected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    last_checkpoint_ts: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+
+    # Relationships
+    run: Mapped["Run"] = relationship(back_populates="private_stream_sessions")
+
+    __table_args__ = (
+        Index("ix_private_stream_sessions_run_account", "run_id", "account_id"),
     )
 
 

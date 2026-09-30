@@ -7,7 +7,7 @@ import threading
 import time
 import pytest
 from datetime import UTC, datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 from bybit_adapter.ws_client import ConnectionState
@@ -794,9 +794,11 @@ def _mark_ready(collector, ws):
     collector._ready = True
 
 
-def _probe_collector(context, on_gap, *, alive=True, authed=True, ready=True):
+def _probe_collector(
+    context, on_gap, *, alive=True, authed=True, ready=True, **hooks
+):
     """Collector mid-run with a healthy baseline; knobs make it unhealthy."""
-    collector = PrivateCollector(context=context, on_gap_detected=on_gap)
+    collector = PrivateCollector(context=context, on_gap_detected=on_gap, **hooks)
     ws = MagicMock()
     baseline = object()
     ws.is_socket_alive.return_value = alive
@@ -1085,3 +1087,157 @@ class TestPrivateReadinessAndGapStart:
                 assert int(match.group(1)) >= 0
             finally:
                 await collector.stop()
+
+
+# ---------------------------------------------------------------------------
+# Owner coverage hooks (feature 0110 B1c-1)
+# ---------------------------------------------------------------------------
+
+
+class TestPrivateCoverageHooks:
+    @pytest.mark.asyncio
+    async def test_gap_opened_before_reset(self, context, on_gap):
+        """on_disconnect(gap_start) runs before reset(), then the gap closes."""
+        calls = []
+        on_disconnect = MagicMock(side_effect=lambda ts: calls.append(("open", ts)))
+        collector, ws = _probe_collector(
+            context, on_gap, alive=False, on_disconnect=on_disconnect
+        )
+        ws.reset.side_effect = lambda: (
+            calls.append(("reset", None)),
+            setattr(ws.socket_identity, "return_value", object()),
+        )
+        await collector._ws_health_check_once()
+        assert calls == [
+            ("open", _LAST_HEALTHY - _LIVENESS_MARGIN),
+            ("reset", None),
+        ]
+        on_gap.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_open_gap_failure_skips_reset(self, context, on_gap):
+        """A failed gap-open write blocks this probe's reset; the next retries."""
+        on_disconnect = MagicMock(side_effect=RuntimeError("db down"))
+        collector, ws = _probe_collector(
+            context, on_gap, alive=False, on_disconnect=on_disconnect
+        )
+        _swap_identity_on_reset(ws)
+        await collector._ws_health_check_once()
+        ws.reset.assert_not_called()
+        on_gap.assert_not_called()
+
+        on_disconnect.side_effect = None
+        await collector._ws_health_check_once()
+        ws.reset.assert_called_once()
+        on_gap.assert_called_once()
+        assert on_disconnect.call_args_list[1].args[0] == (
+            _LAST_HEALTHY - _LIVENESS_MARGIN
+        )
+
+    @pytest.mark.asyncio
+    async def test_healthy_probe_awaits_owner_checkpoint(self, context, on_gap):
+        """Each healthy probe awaits the owner's checkpoint callback."""
+        on_healthy_probe = AsyncMock()
+        collector, ws = _probe_collector(
+            context, on_gap, on_healthy_probe=on_healthy_probe
+        )
+        await collector._ws_health_check_once()
+        on_healthy_probe.assert_awaited_once()
+        ws.reset.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_checkpoint_error_is_logged_not_unhealthy(
+        self, context, on_gap, caplog
+    ):
+        """A failing checkpoint callback is logged; the socket stays healthy."""
+        collector, ws = _probe_collector(
+            context,
+            on_gap,
+            on_healthy_probe=AsyncMock(side_effect=RuntimeError("flush failed")),
+        )
+        with caplog.at_level(
+            logging.ERROR, logger="event_saver.collectors.private_collector"
+        ):
+            await collector._ws_health_check_once()
+        assert "checkpoint failed" in caplog.text
+        assert collector._last_healthy_ts > _LAST_HEALTHY
+        ws.reset.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_checkpoint_while_liveness_only(self, context, on_gap):
+        """A socket kept on liveness-only never advances the checkpoint, and
+        is_degraded() says so until readiness is confirmed again."""
+        on_healthy_probe = AsyncMock()
+        collector, ws = _probe_collector(
+            context, on_gap, alive=False, on_healthy_probe=on_healthy_probe
+        )
+        _swap_identity_on_reset(ws)
+        ws.wait_ready.return_value = False
+        for _ in range(_MAX_UNREADY_RESETS):
+            await collector._ws_health_check_once()
+            ws.is_socket_alive.return_value = True
+        assert collector.is_degraded() is True
+
+        await collector._ws_health_check_once()  # healthy on liveness only
+        on_healthy_probe.assert_not_awaited()
+
+        ws.wait_ready.return_value = True
+        assert await collector._confirm_ready(ws) is True
+        assert collector.is_degraded() is False
+        await collector._ws_health_check_once()
+        on_healthy_probe.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_liveness_only_period_is_not_certified_on_recovery(
+        self, context, on_gap
+    ):
+        """Healthy probes while liveness-only do not move the last-healthy
+        time, so a later outage's gap reaches back over the whole degraded
+        stretch (a topic may never have been acked during it)."""
+        collector, ws = _probe_collector(context, on_gap, alive=False)
+        _swap_identity_on_reset(ws)
+        ws.wait_ready.return_value = False
+        for _ in range(_MAX_UNREADY_RESETS):
+            await collector._ws_health_check_once()
+            ws.is_socket_alive.return_value = True
+        degraded_at = collector._last_healthy_ts
+
+        await collector._ws_health_check_once()  # healthy, liveness only
+        assert collector._last_healthy_ts == degraded_at
+
+        ws.is_socket_alive.return_value = False  # later outage, then ready
+        ws.wait_ready.return_value = True
+        await collector._ws_health_check_once()
+        assert on_gap.call_args[0][0] == degraded_at - _LIVENESS_MARGIN
+        assert collector.is_degraded() is False
+
+    @pytest.mark.asyncio
+    async def test_late_acks_clear_liveness_only_on_the_same_socket(
+        self, context, on_gap
+    ):
+        """Acks that land while liveness-only end it on the next healthy
+        probe: no reset, the degraded stretch is reported as a gap, and
+        checkpoints resume."""
+        on_healthy_probe = AsyncMock()
+        collector, ws = _probe_collector(
+            context, on_gap, alive=False, on_healthy_probe=on_healthy_probe
+        )
+        _swap_identity_on_reset(ws)
+        ws.wait_ready.return_value = False
+        for _ in range(_MAX_UNREADY_RESETS):
+            await collector._ws_health_check_once()
+            ws.is_socket_alive.return_value = True
+        degraded_at = collector._last_healthy_ts
+        resets = ws.reset.call_count
+        gaps = on_gap.call_count
+
+        ws.wait_ready.return_value = True  # acks landed
+        await collector._ws_health_check_once()
+        assert collector.is_degraded() is False
+        assert ws.reset.call_count == resets
+        assert on_gap.call_count == gaps + 1
+        assert on_gap.call_args[0][0] == degraded_at - _LIVENESS_MARGIN
+        ws.wait_ready.assert_called_with(0)  # non-blocking re-check
+
+        await collector._ws_health_check_once()
+        on_healthy_probe.assert_awaited_once()
