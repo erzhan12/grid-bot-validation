@@ -267,10 +267,11 @@ The script (post-Feature 0053):
 4. Leaves the SQLite `-wal` / `-shm` sidecars intact (no file-level
    deletes; only row-level DELETEs).
 5. Removes `/tmp/recorder.log`.
-6. Starts a fresh recorder in the background, waits up to 15s for the
+6. Starts a fresh recorder in the background, waits up to 60s for the
    `RECORDER_SNAPSHOT_OK` sentinel, and prints PID + next-step commands.
-   On `RECORDER_SNAPSHOT_INCOMPLETE` (zero wallet/position rows or auth
-   failure) or a 15s timeout, the script kills the recorder, prints an
+   On `RECORDER_SNAPSHOT_INCOMPLETE` (a collector did not start — public
+   connect or private auth/subscribe — zero wallet/position rows, or auth
+   failure) or a 60s timeout, the script kills the recorder, prints an
    ERROR, and exits non-zero — no `Recorder PID:` tail (Feature 0055).
 
 If the DB file does not yet exist (first Phase 4 run on a clean
@@ -611,7 +612,7 @@ record.
 - [ ] Stop live, close positions, cancel orders
 - [ ] `mv db/grid_anchor.json db/grid_anchor.json.bak.*`
 - [ ] Create `apps/recorder/conf/recorder_ltcusdt.yaml` with private creds
-- [ ] Start recorder (`start_recorder.sh` — includes identity bootstrap); script exits 0 and log contains `RECORDER_SNAPSHOT_OK` (Feature 0055: non-zero exit on incomplete snapshot or 15s timeout)
+- [ ] Start recorder (`start_recorder.sh` — includes identity bootstrap); script exits 0 and log contains `RECORDER_SNAPSHOT_OK` (Feature 0055: non-zero exit on incomplete snapshot or 60s timeout)
 - [ ] Start gridbot; record `START_TS`, compute `SEED_AT_TS = START_TS + 60s`
 - [ ] Accumulate ≥30 trades (~30–60 min on LTCUSDT)
 - [ ] Stop both; capture `RUN_ID`, `ACCOUNT_ID`, `END_TS`; copy `grid_anchor.json`

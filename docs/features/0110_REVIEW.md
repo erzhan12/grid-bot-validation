@@ -192,3 +192,43 @@ Engines: codex (`gpt-5.6-sol`, high) + cursor (`grok-4.7-high`). Rounds 3/4. Res
 | P3 | "3 probes" wording is off by one. | ACCEPT — reset skipped on at most 2 probes. |
 | P3 | `start()` did not reset `_liveness_only`. | ACCEPT. |
 
+## Phase B1c-2 — local staged review (review-fix-loop-staged, 2026-09-30)
+
+5 reviewers, 1 iteration, 0 CRITICAL in code → Ready to commit. The testing reviewer ran 18 mutations; one survivor was an untested guard (`_open_gap_start` was never cleared when an outage closed — now cleared and tested).
+
+| Sev | Finding | Fix |
+|---|---|---|
+| WARNING | `PublicCollector.start()` wrapped only a timeout; any other `connect()` error escaped, left `_running=True` and the recorder emitted no sentinel (3 reviewers). | Any collector start failure is a `CollectorStartError`; `Recorder.start()` emits the sentinel for any exception, with the cause. |
+| WARNING | The abandon check ran only right after `connect()`; a timeout during the readiness wait left a live, unowned socket. | Re-checked after the readiness wait (later replaced by `StartHandoff`, see below). |
+| WARNING | `EventSaver.add_account()` registered the collector before starting it, so a failed start could not be retried; a skipped account stayed registered. | Registered only after a successful start; a skipped account is dropped. |
+| WARNING | A 30 s launcher wait would kill a healthy but slow start (collectors up to ~21 s, then three REST calls at 10 s). | 60 s. |
+| WARNING | Pre-existing, window widened: a backgrounded recorder ignores SIGINT until `run_until_shutdown`, so the launcher's kill did nothing during the start. | `recorder.main` installs the handlers before `start()`. |
+| WARNING | Stale docs (runbook 15 s, 0039 rule file reference, sentinel paragraph, plan note contradiction) and 12 test gaps. | Fixed / tests added. |
+
+Documented, not changed: an abandoned connect worker spins in pybit's retry loop until the endpoint answers; a WS row can precede the REST t=0 row and a fill during the snapshot is recorded twice; `PublicCollector.stop()` disconnects on the loop (pre-existing).
+
+## Phase B1c-2 — external review (ext-code-review)
+
+Engines: codex (`gpt-5.6-sol`, high) + cursor (`grok-4.7-high`). Rounds 4/4 (the limit). Every valid finding is fixed; the two from codex round 4 were fixed after the last round and have not been re-reviewed by an engine.
+
+| Round | Engine | Sev | Finding | Verdict |
+|---|---|---|---|---|
+| 1 | codex, cursor | P1 | Cancelling `start()` (the new signal path) skipped the collectors' cleanup; `PublicCollector.stop()` then blocked on the lock the parked `connect()` holds. | ACCEPT — a cancelled start is handled like a timeout in both collectors. |
+| 1 | codex | P2 | A cancelled start emitted no launcher sentinel. | ACCEPT. |
+| 1 | codex | P2 | A `connect()` that raised part-way left its socket open. | ACCEPT — bounded disconnect. |
+| 1 | codex | P3 | Stale rule line about lost writes; no cancellation / second-start tests. | ACCEPT. |
+| 2 | codex | P2 | Writer init / run seeding failures emitted no sentinel. | ACCEPT — inside the sentinel guard. |
+| 2 | codex, cursor | P2 | A cancel during the cleanup disconnect left `_running` / `_ws_client` set. | ACCEPT — state reset before the disconnect is awaited. |
+| 2 | codex | P2 | Race between the worker's last abandon check and the owner giving up. | ACCEPT — `StartHandoff` (one lock): exactly one side closes the socket. |
+| 2 | codex | P3 | Order test stubs the REST snapshot; launcher tests assert on script text. | Accepted gaps. |
+| 3 | codex | P2 | A worker that raised after the owner gave up closed nothing. | ACCEPT. |
+| 3 | codex | P2 | A signal landing as `start()` finished was lost. | ACCEPT — `Recorder.request_shutdown()`; handlers stay installed until `run_until_shutdown` replaces them. |
+| 3 | cursor | — | NO P1/P2. P3: blank cause in the aborted-start log on cancellation; rule wording. | ACCEPT. P3 "EventSaver stays `_running` after a public start failure" — pre-existing, not changed. |
+| 4 | codex | P2 | Inverse handoff race: a worker that raises just before the owner gives up is closed by neither. | ACCEPT — the worker calls `finish()` whether it returns or raises. |
+| 4 | codex | P2 | An exception escaping the REST snapshot emitted no sentinel. | ACCEPT. |
+| 4 | cursor | — | NO P1/P2. P3: a second signal during the emergency stop only requests shutdown (cannot interrupt a stuck synchronous public disconnect). | Accepted gap (pre-existing disconnect). |
+
+## Final verification (B1c-2)
+
+- `make test`: exit 0, merged coverage 92%.
+- `make lint`: all checks passed.

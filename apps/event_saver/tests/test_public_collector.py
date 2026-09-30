@@ -1,9 +1,14 @@
 """Tests for PublicCollector."""
 
+import asyncio
+import threading
+import time
+
 import pytest
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
+from event_saver.collectors import CollectorStartError
 from event_saver.collectors.public_collector import PublicCollector
 from gridcore.events import TickerEvent, PublicTradeEvent
 
@@ -245,3 +250,229 @@ class TestDisconnectReconnect:
         col = PublicCollector(symbols=["BTCUSDT"], on_gap_detected=None)
         col._handle_reconnect(datetime(2025, 1, 1), datetime(2025, 1, 1))
         # No error
+
+
+class TestPublicStartBound:
+    @pytest.mark.asyncio
+    async def test_connect_runs_off_the_event_loop(self, collector):
+        """connect() is a blocking pybit call: it runs on a worker thread."""
+        with patch(
+            "event_saver.collectors.public_collector.PublicWebSocketClient"
+        ) as MockWS:
+            seen = []
+            MockWS.return_value.connect.side_effect = lambda: seen.append(
+                threading.current_thread() is threading.main_thread()
+            )
+            await collector.start()
+            try:
+                assert seen == [False]
+                assert collector.is_running() is True
+            finally:
+                await collector.stop()
+
+    @pytest.mark.asyncio
+    async def test_connect_timeout_raises(self, collector):
+        """A connect() that never returns is abandoned at the bound and
+        start() raises instead of hanging the owner's startup."""
+        gate = threading.Event()
+        try:
+            with patch(
+                "event_saver.collectors.public_collector.PublicWebSocketClient"
+            ) as MockWS, patch(
+                "event_saver.collectors.public_collector._PUBLIC_CONNECT_TIMEOUT",
+                0.05,
+            ):
+                MockWS.return_value.connect.side_effect = lambda: gate.wait(5)
+                started = time.monotonic()
+                ws = MockWS.return_value
+                with pytest.raises(CollectorStartError, match="timed out"):
+                    await collector.start()
+                assert time.monotonic() - started < 1.0
+                assert collector.is_running() is False
+                assert collector._ws_client is None
+                ws.disconnect.assert_not_called()
+
+                # A connect that succeeds after the bound is closed by the
+                # abandoned worker, not left as a live unowned socket.
+                gate.set()
+                deadline = time.monotonic() + 2.0
+                while not ws.disconnect.called and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                ws.disconnect.assert_called_once()
+        finally:
+            gate.set()
+
+    @pytest.mark.asyncio
+    async def test_connect_error_raises_collector_start_error(self, collector):
+        """connect() raising is a start failure like a timeout: the owner
+        gets CollectorStartError and the collector is left not running."""
+        with patch(
+            "event_saver.collectors.public_collector.PublicWebSocketClient"
+        ) as MockWS:
+            MockWS.return_value.connect.side_effect = RuntimeError("dns failure")
+            with pytest.raises(CollectorStartError) as excinfo:
+                await collector.start()
+            assert isinstance(excinfo.value.__cause__, RuntimeError)
+            assert collector.is_running() is False
+            assert collector._ws_client is None
+            # whatever connect() opened before raising is closed
+            MockWS.return_value.disconnect.assert_called_once()
+
+            # a second start() on the same collector works
+            MockWS.return_value.connect.side_effect = None
+            await collector.start()
+            try:
+                assert collector.is_running() is True
+            finally:
+                await collector.stop()
+
+    @pytest.mark.asyncio
+    async def test_worker_done_but_owner_timed_out_closes_the_socket(
+        self, collector
+    ):
+        """connect() can return just as the owner times out and drops the
+        client: the owner must then close the socket itself."""
+        import event_saver.collectors.public_collector as module
+
+        real = module.run_in_daemon_thread
+
+        def _lost_result(fn, *, name=None):
+            if name != "public-ws-connect":
+                return real(fn, name=name)
+            fn()  # the worker completes ...
+            return asyncio.get_running_loop().create_future()  # ... unseen
+
+        with patch(
+            "event_saver.collectors.public_collector.PublicWebSocketClient"
+        ) as MockWS, patch.object(
+            module, "run_in_daemon_thread", _lost_result
+        ), patch.object(module, "_PUBLIC_CONNECT_TIMEOUT", 0.05):
+            ws = MockWS.return_value
+            with pytest.raises(CollectorStartError, match="timed out"):
+                await collector.start()
+            deadline = time.monotonic() + 2.0
+            while not ws.disconnect.called and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            ws.disconnect.assert_called_once()
+            assert collector.is_running() is False
+
+    @pytest.mark.asyncio
+    async def test_cancelled_start_leaves_a_stoppable_collector(self, collector):
+        """A start cancelled while connect() is parked (a shutdown signal)
+        must not leave the stuck client behind: stop() would block on the
+        lock connect() holds. The worker closes the socket if it ever
+        connects."""
+        gate = threading.Event()
+        try:
+            with patch(
+                "event_saver.collectors.public_collector.PublicWebSocketClient"
+            ) as MockWS:
+                ws = MockWS.return_value
+                ws.connect.side_effect = lambda: gate.wait(5)
+                task = asyncio.create_task(collector.start())
+                await asyncio.sleep(0.05)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert collector.is_running() is False
+                assert collector._ws_client is None
+                await collector.stop()  # no-op, must not touch the client
+                ws.disconnect.assert_not_called()
+
+                gate.set()
+                deadline = time.monotonic() + 2.0
+                while not ws.disconnect.called and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                ws.disconnect.assert_called_once()
+        finally:
+            gate.set()
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_the_cleanup_disconnect_leaves_it_stopped(
+        self, collector
+    ):
+        """A cancellation that lands while a failed start is disconnecting
+        must still leave the collector stopped, so stop() does not call
+        disconnect() again on a client whose lock is held."""
+        gate = threading.Event()
+        try:
+            with patch(
+                "event_saver.collectors.public_collector.PublicWebSocketClient"
+            ) as MockWS:
+                ws = MockWS.return_value
+                ws.connect.side_effect = RuntimeError("dns failure")
+                ws.disconnect.side_effect = lambda: gate.wait(5)
+                task = asyncio.create_task(collector.start())
+                await asyncio.sleep(0.1)  # parked in the cleanup disconnect
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert collector.is_running() is False
+                assert collector._ws_client is None
+                await collector.stop()  # no-op
+                assert ws.disconnect.call_count == 1
+        finally:
+            gate.set()
+
+    @pytest.mark.asyncio
+    async def test_abandoned_worker_that_then_fails_still_closes_the_socket(
+        self, collector
+    ):
+        """After the owner gave up, a connect() that raises has nobody to
+        report to: the worker must close whatever it opened."""
+        gate = threading.Event()
+
+        def _late_failure():
+            gate.wait(5)
+            raise RuntimeError("subscribe failed")
+
+        try:
+            with patch(
+                "event_saver.collectors.public_collector.PublicWebSocketClient"
+            ) as MockWS, patch(
+                "event_saver.collectors.public_collector._PUBLIC_CONNECT_TIMEOUT",
+                0.05,
+            ):
+                ws = MockWS.return_value
+                ws.connect.side_effect = _late_failure
+                with pytest.raises(CollectorStartError, match="timed out"):
+                    await collector.start()
+                ws.disconnect.assert_not_called()
+                gate.set()
+                deadline = time.monotonic() + 2.0
+                while not ws.disconnect.called and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                ws.disconnect.assert_called_once()
+        finally:
+            gate.set()
+
+    @pytest.mark.asyncio
+    async def test_worker_failed_but_owner_timed_out_closes_the_socket(
+        self, collector
+    ):
+        """connect() can RAISE just as the owner times out and never sees
+        the error: the owner must then close the socket itself."""
+        import event_saver.collectors.public_collector as module
+
+        real = module.run_in_daemon_thread
+
+        def _lost_error(fn, *, name=None):
+            if name != "public-ws-connect":
+                return real(fn, name=name)
+            with pytest.raises(RuntimeError):
+                fn()  # the worker fails ...
+            return asyncio.get_running_loop().create_future()  # ... unseen
+
+        with patch(
+            "event_saver.collectors.public_collector.PublicWebSocketClient"
+        ) as MockWS, patch.object(
+            module, "run_in_daemon_thread", _lost_error
+        ), patch.object(module, "_PUBLIC_CONNECT_TIMEOUT", 0.05):
+            ws = MockWS.return_value
+            ws.connect.side_effect = RuntimeError("subscribe failed")
+            with pytest.raises(CollectorStartError, match="timed out"):
+                await collector.start()
+            deadline = time.monotonic() + 2.0
+            while not ws.disconnect.called and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            ws.disconnect.assert_called_once()

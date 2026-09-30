@@ -10,13 +10,15 @@ from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
-from bybit_adapter.ws_client import ConnectionState
+from bybit_adapter.ws_client import ConnectionState, PrivateWebSocketClient
 from event_saver.collectors.private_collector import (
     PrivateCollector,
     AccountContext,
-    _LIVENESS_MARGIN,
+    LIVENESS_MARGIN,
     _MAX_UNREADY_RESETS,
     _PRIVATE_READY_TIMEOUT,
+    _PRIVATE_START_TIMEOUT,
+    CollectorStartError,
     _run_in_daemon_thread,
 )
 from gridcore.events import ExecutionEvent, OrderUpdateEvent
@@ -146,7 +148,11 @@ class TestLifecycle:
         # test_ws_client.py::test_private_watchdog_disabled_skips_heartbeat_thread
         # but goes through the recorder's collector path so a regression in
         # private_collector.py is caught here too.
-        with patch("bybit_adapter.ws_client.WebSocket") as MockWebSocket:
+        # The mocked pybit socket never acks, so readiness is stubbed (0110
+        # B1c-2: start() raises when the socket is not ready).
+        with patch("bybit_adapter.ws_client.WebSocket") as MockWebSocket, patch.object(
+            PrivateWebSocketClient, "wait_ready", return_value=True
+        ):
             mock_ws = MagicMock()
             MockWebSocket.return_value = mock_ws
 
@@ -214,7 +220,7 @@ class TestLifecycle:
         collector._ws_client = mock_ws
         # 0110 B1b: gap start is the last healthy probe minus the liveness
         # margin, not the last message time.
-        collector._last_healthy_ts = disconnected_at + _LIVENESS_MARGIN
+        collector._last_healthy_ts = disconnected_at + LIVENESS_MARGIN
 
         await collector._ws_health_check_once()
 
@@ -712,7 +718,7 @@ class TestRunInDaemonThread:
             done.set()
 
         with patch(
-            "event_saver.collectors.private_collector.threading.Thread",
+            "event_saver.collectors._startup.threading.Thread",
             side_effect=fake_thread,
         ):
             fut = _run_in_daemon_thread(fn)
@@ -823,16 +829,26 @@ def _swap_identity_on_reset(ws):
 class TestPrivateReadinessAndGapStart:
     @pytest.mark.asyncio
     async def test_start_confirms_ready_with_ack_tracking(self, collector):
-        """start() builds a tracking client and waits for readiness."""
+        """start() connects a tracking client off the loop, then waits for
+        readiness within what is left of the start bound."""
         with patch(
             "event_saver.collectors.private_collector.PrivateWebSocketClient"
         ) as MockWS:
             ws = MockWS.return_value
-            ws.wait_ready.return_value = True
+            order = []
+            ws.connect.side_effect = lambda: order.append(
+                ("connect", threading.current_thread() is threading.main_thread())
+            )
+            ws.wait_ready.side_effect = lambda timeout: (
+                order.append(("wait_ready", timeout)) or True
+            )
             await collector.start()
             try:
                 assert MockWS.call_args.kwargs["track_subscription_acks"] is True
-                ws.wait_ready.assert_called_once_with(_PRIVATE_READY_TIMEOUT)
+                assert order[0] == ("connect", False)  # off the event loop
+                assert order[1][0] == "wait_ready"
+                # what is LEFT of the bound after connect(), not the bound
+                assert 0 < order[1][1] < _PRIVATE_START_TIMEOUT
                 assert collector._ready is True
                 assert collector._identity_baseline is ws.socket_identity()
                 assert collector._last_healthy_ts is not None
@@ -840,25 +856,313 @@ class TestPrivateReadinessAndGapStart:
                 await collector.stop()
 
     @pytest.mark.asyncio
-    async def test_start_ready_timeout_logs_and_does_not_raise(
-        self, collector, caplog
-    ):
-        """Not ready at start: ERROR, keep running, first probe resets."""
+    async def test_start_not_ready_disconnects_and_raises(self, collector):
+        """Not ready within the start bound: disconnect and raise; the
+        collector is not running and has no health task."""
         with patch(
             "event_saver.collectors.private_collector.PrivateWebSocketClient"
         ) as MockWS:
-            MockWS.return_value.wait_ready.return_value = False
-            with caplog.at_level(
-                logging.ERROR, logger="event_saver.collectors.private_collector"
-            ):
+            ws = MockWS.return_value
+            ws.wait_ready.return_value = False
+            with pytest.raises(CollectorStartError, match="not ready"):
                 await collector.start()
+            ws.disconnect.assert_called_once()
+            assert collector.is_running() is False
+            assert collector._ws_client is None
+            assert collector._ws_health_task is None
+
+            # a second start() on the same collector works
+            ws.wait_ready.return_value = True
+            await collector.start()
             try:
                 assert collector.is_running() is True
-                assert collector._ready is False
-                assert "not ready" in caplog.text
+                assert collector._ready is True
             finally:
                 await collector.stop()
 
+    @pytest.mark.asyncio
+    async def test_worker_done_but_owner_timed_out_closes_the_socket(
+        self, collector
+    ):
+        """The worker can finish (socket live and ready) just as the owner
+        times out and drops the client: the owner must then close the socket
+        itself, or it stays live with nobody owning it."""
+        import event_saver.collectors.private_collector as module
+
+        real = module._run_in_daemon_thread
+
+        def _lost_result(fn, *, name=None):
+            if name != "ws-start":
+                return real(fn, name=name)
+            fn()  # the worker completes ...
+            return asyncio.get_running_loop().create_future()  # ... unseen
+
+        with patch(
+            "event_saver.collectors.private_collector.PrivateWebSocketClient"
+        ) as MockWS, patch.object(
+            module, "_run_in_daemon_thread", _lost_result
+        ), patch.object(module, "_PRIVATE_START_TIMEOUT", 0.05), patch.object(
+            module, "_READY_WAIT_SLACK", 0.05
+        ):
+            ws = MockWS.return_value
+            with pytest.raises(CollectorStartError, match="timed out"):
+                await collector.start()
+            deadline = time.monotonic() + 2.0
+            while not ws.disconnect.called and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            ws.disconnect.assert_called_once()
+            assert collector.is_running() is False
+
+    @pytest.mark.asyncio
+    async def test_worker_failed_but_owner_timed_out_closes_the_socket(
+        self, collector
+    ):
+        """The worker can RAISE (socket possibly half open) just as the
+        owner times out and never sees the error: the owner must then close
+        the socket itself."""
+        import event_saver.collectors.private_collector as module
+
+        real = module._run_in_daemon_thread
+
+        def _lost_error(fn, *, name=None):
+            if name != "ws-start":
+                return real(fn, name=name)
+            with pytest.raises(AttributeError):
+                fn()  # the worker fails ...
+            return asyncio.get_running_loop().create_future()  # ... unseen
+
+        with patch(
+            "event_saver.collectors.private_collector.PrivateWebSocketClient"
+        ) as MockWS, patch.object(
+            module, "_run_in_daemon_thread", _lost_error
+        ), patch.object(module, "_PRIVATE_START_TIMEOUT", 0.05), patch.object(
+            module, "_READY_WAIT_SLACK", 0.05
+        ):
+            ws = MockWS.return_value
+            ws.wait_ready.side_effect = AttributeError("subscriptions")
+            with pytest.raises(CollectorStartError, match="timed out"):
+                await collector.start()
+            deadline = time.monotonic() + 2.0
+            while not ws.disconnect.called and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            ws.disconnect.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_cancel_during_the_cleanup_disconnect_leaves_it_stopped(
+        self, context
+    ):
+        """A cancellation that lands while the failed start is disconnecting
+        must still leave the collector stopped (a later start() must work)."""
+        gate = threading.Event()
+        collector = PrivateCollector(context=context, ws_disconnect_timeout=5)
+        try:
+            with patch(
+                "event_saver.collectors.private_collector.PrivateWebSocketClient"
+            ) as MockWS:
+                ws = MockWS.return_value
+                ws.wait_ready.return_value = False
+                ws.disconnect.side_effect = lambda: gate.wait(5)
+                task = asyncio.create_task(collector.start())
+                await asyncio.sleep(0.1)  # parked in the cleanup disconnect
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert collector.is_running() is False
+                assert collector._ws_client is None
+        finally:
+            gate.set()
+
+    @pytest.mark.asyncio
+    async def test_abandoned_worker_that_then_fails_still_closes_the_socket(
+        self, collector
+    ):
+        """After the owner gave up, a worker whose readiness check raises
+        has nobody to report to: it must close the socket itself."""
+        gate = threading.Event()
+
+        def _late_failure(timeout):
+            gate.wait(5)
+            raise AttributeError("subscriptions")
+
+        try:
+            with patch(
+                "event_saver.collectors.private_collector.PrivateWebSocketClient"
+            ) as MockWS, patch(
+                "event_saver.collectors.private_collector._PRIVATE_START_TIMEOUT",
+                0.05,
+            ), patch(
+                "event_saver.collectors.private_collector._READY_WAIT_SLACK", 0.05
+            ):
+                ws = MockWS.return_value
+                ws.wait_ready.side_effect = _late_failure
+                with pytest.raises(CollectorStartError, match="timed out"):
+                    await collector.start()
+                ws.disconnect.assert_not_called()
+                gate.set()
+                deadline = time.monotonic() + 2.0
+                while not ws.disconnect.called and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                ws.disconnect.assert_called_once()
+        finally:
+            gate.set()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_start_abandons_the_connect_worker(self, collector):
+        """A start cancelled while connect() is parked (a shutdown signal)
+        leaves the collector stopped without the stuck client; the worker
+        closes the socket if it ever connects."""
+        gate = threading.Event()
+        try:
+            with patch(
+                "event_saver.collectors.private_collector.PrivateWebSocketClient"
+            ) as MockWS:
+                ws = MockWS.return_value
+                ws.connect.side_effect = lambda: gate.wait(5)
+                task = asyncio.create_task(collector.start())
+                await asyncio.sleep(0.05)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert collector.is_running() is False
+                assert collector._ws_client is None
+                ws.disconnect.assert_not_called()
+
+                gate.set()
+                deadline = time.monotonic() + 2.0
+                while not ws.disconnect.called and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                ws.disconnect.assert_called_once()
+                ws.wait_ready.assert_not_called()
+        finally:
+            gate.set()
+
+    @pytest.mark.asyncio
+    async def test_start_baseline_is_read_before_the_readiness_wait(
+        self, collector
+    ):
+        """A pybit reconnect during the start readiness wait must not become
+        the baseline: the first probe then sees the swap."""
+        with patch(
+            "event_saver.collectors.private_collector.PrivateWebSocketClient"
+        ) as MockWS:
+            ws = MockWS.return_value
+            before = ws.socket_identity.return_value
+
+            def _reconnect_during_wait(timeout):
+                ws.socket_identity.return_value = object()
+                return True
+
+            ws.wait_ready.side_effect = _reconnect_during_wait
+            await collector.start()
+            try:
+                assert collector._identity_baseline is before
+            finally:
+                await collector.stop()
+
+    @pytest.mark.asyncio
+    async def test_start_connect_error_raises_collector_start_error(
+        self, collector
+    ):
+        """connect() raising at start: disconnect (bounded) and raise."""
+        with patch(
+            "event_saver.collectors.private_collector.PrivateWebSocketClient"
+        ) as MockWS:
+            ws = MockWS.return_value
+            ws.connect.side_effect = RuntimeError("dns failure")
+            with pytest.raises(CollectorStartError) as excinfo:
+                await collector.start()
+            assert isinstance(excinfo.value.__cause__, RuntimeError)
+            ws.wait_ready.assert_not_called()
+            ws.disconnect.assert_called_once()
+            assert collector.is_running() is False
+
+    @pytest.mark.asyncio
+    async def test_start_failure_with_hung_disconnect_still_raises_start_error(
+        self, context
+    ):
+        """The disconnect after a failed start is bounded: if it hangs, the
+        owner still gets CollectorStartError (not a TimeoutError that would
+        skip the recorder's sentinel) and the collector is left stopped."""
+        gate = threading.Event()
+        collector = PrivateCollector(context=context, ws_disconnect_timeout=0.05)
+        try:
+            with patch(
+                "event_saver.collectors.private_collector.PrivateWebSocketClient"
+            ) as MockWS:
+                ws = MockWS.return_value
+                ws.wait_ready.return_value = False
+                ws.disconnect.side_effect = lambda: gate.wait(5)
+                with pytest.raises(CollectorStartError, match="not ready"):
+                    await collector.start()
+                assert collector.is_running() is False
+                assert collector._ws_client is None
+        finally:
+            gate.set()
+
+    @pytest.mark.asyncio
+    async def test_abandoned_start_disconnects_even_after_the_readiness_wait(
+        self, collector
+    ):
+        """start() can give up while the worker is already past connect()
+        and inside the readiness wait: the worker must still close the
+        socket when that wait returns."""
+        gate = threading.Event()
+        try:
+            with patch(
+                "event_saver.collectors.private_collector.PrivateWebSocketClient"
+            ) as MockWS, patch(
+                "event_saver.collectors.private_collector._PRIVATE_START_TIMEOUT",
+                0.05,
+            ), patch(
+                "event_saver.collectors.private_collector._READY_WAIT_SLACK", 0.05
+            ):
+                ws = MockWS.return_value
+                ws.wait_ready.side_effect = lambda timeout: gate.wait(5) or True
+                with pytest.raises(CollectorStartError, match="timed out"):
+                    await collector.start()
+                ws.disconnect.assert_not_called()
+                gate.set()
+                deadline = time.monotonic() + 2.0
+                while not ws.disconnect.called and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                ws.disconnect.assert_called_once()
+        finally:
+            gate.set()
+
+    @pytest.mark.asyncio
+    async def test_start_connect_timeout_abandons_and_raises(self, collector):
+        """A connect() that never returns is abandoned at the start bound:
+        no disconnect (pybit still holds the client lock), and it raises."""
+        gate = threading.Event()
+        try:
+            with patch(
+                "event_saver.collectors.private_collector.PrivateWebSocketClient"
+            ) as MockWS, patch(
+                "event_saver.collectors.private_collector._PRIVATE_START_TIMEOUT",
+                0.05,
+            ), patch(
+                "event_saver.collectors.private_collector._READY_WAIT_SLACK", 0.05
+            ):
+                ws = MockWS.return_value
+                ws.connect.side_effect = lambda: gate.wait(5)
+                started = time.monotonic()
+                with pytest.raises(CollectorStartError, match="timed out"):
+                    await collector.start()
+                assert time.monotonic() - started < 1.0
+                ws.disconnect.assert_not_called()
+                assert collector.is_running() is False
+
+                # pybit retries forever, so the abandoned connect() can still
+                # succeed later: that socket must be closed, not left feeding
+                # a collector that is not running.
+                gate.set()
+                deadline = time.monotonic() + 2.0
+                while not ws.disconnect.called and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                ws.disconnect.assert_called_once()
+                ws.wait_ready.assert_not_called()
+        finally:
+            gate.set()
     @pytest.mark.asyncio
     async def test_quiet_healthy_probe_advances_last_healthy(self, context, on_gap):
         """A healthy socket with no messages is healthy; no gap, no reset."""
@@ -877,7 +1181,7 @@ class TestPrivateReadinessAndGapStart:
         await collector._ws_health_check_once()
         ws.reset.assert_called_once()
         on_gap.assert_called_once()
-        assert on_gap.call_args[0][0] == _LAST_HEALTHY - _LIVENESS_MARGIN
+        assert on_gap.call_args[0][0] == _LAST_HEALTHY - LIVENESS_MARGIN
 
     @pytest.mark.asyncio
     async def test_unauthenticated_socket_is_unhealthy(self, context, on_gap):
@@ -912,7 +1216,7 @@ class TestPrivateReadinessAndGapStart:
                 ws.is_socket_alive.return_value = True
         assert ws.reset.call_count == _MAX_UNREADY_RESETS
         on_gap.assert_called_once()
-        assert on_gap.call_args[0][0] == _LAST_HEALTHY - _LIVENESS_MARGIN
+        assert on_gap.call_args[0][0] == _LAST_HEALTHY - LIVENESS_MARGIN
         assert "liveness checks only" in caplog.text
         assert collector._ready is True
 
@@ -928,32 +1232,25 @@ class TestPrivateReadinessAndGapStart:
         await collector._ws_health_check_once()
         ws.reset.assert_not_called()
         on_gap.assert_called_once()
-        assert on_gap.call_args[0][0] == _LAST_HEALTHY - _LIVENESS_MARGIN
+        assert on_gap.call_args[0][0] == _LAST_HEALTHY - LIVENESS_MARGIN
         assert collector._ready is True
 
     @pytest.mark.asyncio
-    async def test_readiness_error_is_not_ready_not_raised(
-        self, collector, caplog
+    async def test_start_readiness_error_raises_collector_start_error(
+        self, collector
     ):
-        """wait_ready raising (e.g. a pybit internals change) logs an ERROR
-        and counts as not ready; start() does not propagate it."""
+        """wait_ready raising (e.g. a pybit internals change) at start is a
+        start failure like any other: disconnect and CollectorStartError."""
         with patch(
             "event_saver.collectors.private_collector.PrivateWebSocketClient"
         ) as MockWS:
-            MockWS.return_value.wait_ready.side_effect = AttributeError(
-                "subscriptions"
-            )
-            with caplog.at_level(
-                logging.ERROR, logger="event_saver.collectors.private_collector"
-            ):
+            ws = MockWS.return_value
+            ws.wait_ready.side_effect = AttributeError("subscriptions")
+            with pytest.raises(CollectorStartError) as excinfo:
                 await collector.start()
-            try:
-                assert collector.is_running() is True
-                assert collector._ready is False
-                assert "readiness check failed" in caplog.text
-            finally:
-                await collector.stop()
-
+            assert isinstance(excinfo.value.__cause__, AttributeError)
+            ws.disconnect.assert_called_once()
+            assert collector.is_running() is False
     @pytest.mark.asyncio
     async def test_gap_start_is_last_healthy_minus_margin(self, context, on_gap):
         """Gap start comes from the last healthy probe, not message age."""
@@ -963,8 +1260,10 @@ class TestPrivateReadinessAndGapStart:
         )
         _swap_identity_on_reset(ws)
         await collector._ws_health_check_once()
+        # the post-reset wait keeps its own, shorter bound
+        ws.wait_ready.assert_called_once_with(_PRIVATE_READY_TIMEOUT)
         start, end = on_gap.call_args[0]
-        assert start == _LAST_HEALTHY - _LIVENESS_MARGIN
+        assert start == _LAST_HEALTHY - LIVENESS_MARGIN
         assert end > start
         # the new socket becomes the baseline; next probe is healthy
         assert collector._identity_baseline is ws.socket_identity()
@@ -992,7 +1291,7 @@ class TestPrivateReadinessAndGapStart:
         await collector._ws_health_check_once()
         assert ws.reset.call_count == 1  # late-ready: the new socket is kept
         on_gap.assert_called_once()
-        assert on_gap.call_args[0][0] == _LAST_HEALTHY - _LIVENESS_MARGIN
+        assert on_gap.call_args[0][0] == _LAST_HEALTHY - LIVENESS_MARGIN
         assert collector._ready is True
 
     @pytest.mark.asyncio
@@ -1018,25 +1317,16 @@ class TestPrivateReadinessAndGapStart:
         on_gap.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_not_ready_at_start_gap_dates_from_connect(self, collector, on_gap):
-        """Not ready at start, ready by the first probe: the socket is kept
-        and the gap starts at the connect time (never before the run)."""
-        with patch(
-            "event_saver.collectors.private_collector.PrivateWebSocketClient"
-        ) as MockWS:
-            ws = MockWS.return_value
-            ws.wait_ready.return_value = False
-            await collector.start()
-            try:
-                connected_at = collector._last_healthy_ts
-                ws.wait_ready.return_value = True
-                await collector._ws_health_check_once()
-                ws.reset.assert_not_called()
-                on_gap.assert_called_once()
-                assert on_gap.call_args[0][0] == connected_at
-            finally:
-                await collector.stop()
-
+    async def test_gap_never_starts_before_connect(self, context, on_gap):
+        """A gap computed soon after connect starts at the connect time, not
+        75 s before it (no pre-run executions under this run)."""
+        collector, ws = _probe_collector(context, on_gap)
+        collector._ready = False
+        collector._connected_at = _LAST_HEALTHY
+        await collector._ws_health_check_once()  # late-ready path
+        ws.reset.assert_not_called()
+        on_gap.assert_called_once()
+        assert on_gap.call_args[0][0] == _LAST_HEALTHY
     @pytest.mark.asyncio
     async def test_auth_wait_keeps_shutdown_responsive(
         self, context, on_gap, caplog
@@ -1064,30 +1354,23 @@ class TestPrivateReadinessAndGapStart:
             gate.set()
 
     @pytest.mark.asyncio
-    async def test_unready_duration_is_not_negative_after_start(
-        self, collector, caplog
+    async def test_unready_duration_is_not_negative_near_connect(
+        self, context, on_gap, caplog
     ):
-        """Not ready at start and after the first reset: the logged unready
-        time counts from the connect time (the clamp must not skew it)."""
-        with patch(
-            "event_saver.collectors.private_collector.PrivateWebSocketClient"
-        ) as MockWS:
-            ws = MockWS.return_value
-            ws.wait_ready.return_value = False
-            await collector.start()
-            try:
-                _swap_identity_on_reset(ws)
-                with caplog.at_level(
-                    logging.ERROR,
-                    logger="event_saver.collectors.private_collector",
-                ):
-                    await collector._ws_health_check_once()
-                match = re.search(r"unready for (-?\d+)s", caplog.text)
-                assert match is not None
-                assert int(match.group(1)) >= 0
-            finally:
-                await collector.stop()
-
+        """Still not ready after a reset soon after connect: the logged
+        unready time counts from the last-healthy time (the connect-time
+        clamp must not skew it)."""
+        collector, ws = _probe_collector(context, on_gap, ready=False)
+        collector._ready = False
+        collector._connected_at = collector._last_healthy_ts = datetime.now(UTC)
+        _swap_identity_on_reset(ws)
+        with caplog.at_level(
+            logging.ERROR, logger="event_saver.collectors.private_collector"
+        ):
+            await collector._ws_health_check_once()
+        match = re.search(r"unready for (-?\d+)s", caplog.text)
+        assert match is not None
+        assert int(match.group(1)) >= 0
 
 # ---------------------------------------------------------------------------
 # Owner coverage hooks (feature 0110 B1c-1)
@@ -1109,7 +1392,7 @@ class TestPrivateCoverageHooks:
         )
         await collector._ws_health_check_once()
         assert calls == [
-            ("open", _LAST_HEALTHY - _LIVENESS_MARGIN),
+            ("open", _LAST_HEALTHY - LIVENESS_MARGIN),
             ("reset", None),
         ]
         on_gap.assert_called_once()
@@ -1131,7 +1414,7 @@ class TestPrivateCoverageHooks:
         ws.reset.assert_called_once()
         on_gap.assert_called_once()
         assert on_disconnect.call_args_list[1].args[0] == (
-            _LAST_HEALTHY - _LIVENESS_MARGIN
+            _LAST_HEALTHY - LIVENESS_MARGIN
         )
 
     @pytest.mark.asyncio
@@ -1208,7 +1491,7 @@ class TestPrivateCoverageHooks:
         ws.is_socket_alive.return_value = False  # later outage, then ready
         ws.wait_ready.return_value = True
         await collector._ws_health_check_once()
-        assert on_gap.call_args[0][0] == degraded_at - _LIVENESS_MARGIN
+        assert on_gap.call_args[0][0] == degraded_at - LIVENESS_MARGIN
         assert collector.is_degraded() is False
 
     @pytest.mark.asyncio
@@ -1236,7 +1519,7 @@ class TestPrivateCoverageHooks:
         assert collector.is_degraded() is False
         assert ws.reset.call_count == resets
         assert on_gap.call_count == gaps + 1
-        assert on_gap.call_args[0][0] == degraded_at - _LIVENESS_MARGIN
+        assert on_gap.call_args[0][0] == degraded_at - LIVENESS_MARGIN
         ws.wait_ready.assert_called_with(0)  # non-blocking re-check
 
         await collector._ws_health_check_once()
@@ -1297,8 +1580,7 @@ class TestPrivateCoverageHooks:
         collector._liveness_only = True
         with patch(
             "event_saver.collectors.private_collector.PrivateWebSocketClient"
-        ) as MockWS:
-            MockWS.return_value.wait_ready.return_value = False
+        ):
             await collector.start()
             try:
                 assert collector.is_degraded() is False

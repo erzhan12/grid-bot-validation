@@ -1,5 +1,7 @@
 """Collect public market data (ticker + trades) for multiple symbols."""
 
+import asyncio
+import contextlib
 import logging
 from datetime import datetime
 from typing import Callable, Optional
@@ -8,8 +10,19 @@ from bybit_adapter.ws_client import PublicWebSocketClient, ConnectionState
 from bybit_adapter.normalizer import BybitNormalizer
 from gridcore.events import TickerEvent, PublicTradeEvent
 
+from event_saver.collectors._startup import (
+    CollectorStartError,
+    StartHandoff,
+    disconnect_in_background,
+    run_in_daemon_thread,
+)
+
 
 logger = logging.getLogger(__name__)
+
+# Feature 0110 B1c-2: pybit's connect() blocks with no timeout of its own.
+_PUBLIC_CONNECT_TIMEOUT = 10.0
+_PUBLIC_DISCONNECT_TIMEOUT = 5.0
 
 
 class PublicCollector:
@@ -69,7 +82,14 @@ class PublicCollector:
     async def start(self) -> None:
         """Start collecting public data.
 
-        Connects to WebSocket and subscribes to configured streams.
+        Connects to WebSocket and subscribes to configured streams. The
+        blocking connect runs off the event loop, bounded by
+        ``_PUBLIC_CONNECT_TIMEOUT``.
+
+        Raises:
+            CollectorStartError: connect() did not return in time or raised;
+                the collector is left not running. A cancelled start also
+                leaves it not running (and re-raises the cancellation).
         """
         if self._running:
             logger.warning("PublicCollector already running")
@@ -87,7 +107,66 @@ class PublicCollector:
             on_reconnect=self._handle_reconnect,
         )
 
-        self._ws_client.connect()
+        client = self._ws_client
+        handoff = StartHandoff()
+
+        def _connect() -> None:
+            try:
+                client.connect()
+            except BaseException:
+                if not handoff.finish():
+                    # The owner gave up, so nobody is waiting for this
+                    # error: close what was opened before letting it go.
+                    # (If it gives up AFTER this, abandon() tells it to.)
+                    with contextlib.suppress(Exception):
+                        client.disconnect()
+                raise
+            if not handoff.finish():
+                # start() already gave up; close a connect that succeeded
+                # late instead of leaving a live, unowned socket.
+                client.disconnect()
+
+        try:
+            await asyncio.wait_for(
+                run_in_daemon_thread(_connect, name="public-ws-connect"),
+                timeout=_PUBLIC_CONNECT_TIMEOUT,
+            )
+        except (TimeoutError, asyncio.CancelledError) as exc:
+            # The (daemon) worker is normally parked inside pybit holding the
+            # client lock: abandon it without disconnect() (stop() must not
+            # touch this client either); it disconnects by itself if
+            # connect() ever returns. If it had already finished, the socket
+            # is ours to close.
+            if handoff.abandon():
+                disconnect_in_background(client, name="public-ws-disconnect")
+            self._ws_client = None
+            self._running = False
+            if isinstance(exc, asyncio.CancelledError):
+                raise  # start() was cancelled (shutdown signal)
+            raise CollectorStartError(
+                f"Public WebSocket connect timed out after "
+                f"{_PUBLIC_CONNECT_TIMEOUT:.1f}s"
+            ) from None
+        except Exception as exc:
+            # connect() raised and has returned: close whatever it opened.
+            # State first: a cancellation during the disconnect must still
+            # leave the collector stopped.
+            self._ws_client = None
+            self._running = False
+            try:
+                await asyncio.wait_for(
+                    run_in_daemon_thread(
+                        client.disconnect, name="public-ws-disconnect"
+                    ),
+                    timeout=_PUBLIC_DISCONNECT_TIMEOUT,
+                )
+            except Exception:
+                logger.warning(
+                    "Public WS disconnect after a failed start did not complete"
+                )
+            raise CollectorStartError(
+                f"Public WebSocket connect failed: {exc}"
+            ) from exc
         logger.info("PublicCollector started")
 
     async def stop(self) -> None:

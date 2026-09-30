@@ -12,7 +12,7 @@ from event_saver.main import EventSaver, _log_recovery_result
 from event_saver.reconciler import ExecutionRecoveryResult
 from grid_db import RecoveryStatus
 from event_saver.config import EventSaverConfig
-from event_saver.collectors import AccountContext
+from event_saver.collectors import AccountContext, CollectorStartError
 from gridcore.events import TickerEvent, PublicTradeEvent, ExecutionEvent, OrderUpdateEvent, EventType
 
 
@@ -224,6 +224,79 @@ class TestStart:
             await saver.start()
 
             mock_priv.start.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unready_account_is_skipped_others_start(
+        self, saver, account_context, caplog
+    ):
+        """An account whose private socket is not ready at start is logged
+        and skipped; the other accounts still start (0110 B1c-2)."""
+        other = AccountContext(
+            account_id=uuid4(),
+            user_id=uuid4(),
+            run_id=uuid4(),
+            api_key="k2",
+            api_secret="s2",
+            environment="testnet",
+            symbols=["BTCUSDT"],
+        )
+        await saver.add_account(account_context)
+        await saver.add_account(other)
+
+        with patch("event_saver.main.TradeWriter") as MockTW, \
+             patch("event_saver.main.TickerWriter") as MockTickW, \
+             patch("event_saver.main.ExecutionWriter") as MockEW, \
+             patch("event_saver.main.OrderWriter") as MockOW, \
+             patch("event_saver.main.PositionWriter") as MockPW, \
+             patch("event_saver.main.WalletWriter") as MockWW, \
+             patch("event_saver.main.PublicCollector") as MockPC, \
+             patch("event_saver.main.GapReconciler"), \
+             patch("event_saver.main.BybitRestClient"):
+
+            for mock_cls in [MockTW, MockTickW, MockEW, MockOW, MockPW, MockWW]:
+                instance = MagicMock()
+                instance.start_auto_flush = AsyncMock()
+                mock_cls.return_value = instance
+
+            pc_instance = MagicMock()
+            pc_instance.start = AsyncMock()
+            MockPC.return_value = pc_instance
+
+            unready = saver._private_collectors[account_context.account_id]
+            unready.start = AsyncMock(
+                side_effect=CollectorStartError("Private WebSocket not ready")
+            )
+            ready = saver._private_collectors[other.account_id]
+            ready.start = AsyncMock()
+
+            with caplog.at_level("ERROR", logger="event_saver.main"):
+                await saver.start()
+
+            ready.start.assert_awaited_once()
+            assert str(account_context.account_id) in caplog.text
+            assert "not ready" in caplog.text
+            # The skipped account is dropped, so it is not counted as
+            # collecting and add_account() can retry it.
+            assert set(saver._private_collectors) == {other.account_id}
+
+    @pytest.mark.asyncio
+    async def test_add_account_failure_on_running_saver_is_not_registered(
+        self, saver, account_context
+    ):
+        """add_account() on a running saver raises when the collector does
+        not start, and leaves the account unregistered so a retry works."""
+        saver._running = True
+        with patch("event_saver.main.PrivateCollector") as MockPC:
+            MockPC.return_value.start = AsyncMock(
+                side_effect=CollectorStartError("Private WebSocket not ready")
+            )
+            with pytest.raises(CollectorStartError):
+                await saver.add_account(account_context)
+            assert account_context.account_id not in saver._private_collectors
+
+            MockPC.return_value.start = AsyncMock()
+            await saver.add_account(account_context)
+            assert account_context.account_id in saver._private_collectors
 
 
 # ---------------------------------------------------------------------------

@@ -30,7 +30,7 @@ from grid_db import (
     RecoveryStatus,
     RowNotFoundError,
 )
-from event_saver.collectors.private_collector import _LIVENESS_MARGIN
+from event_saver.collectors import LIVENESS_MARGIN
 from recorder.recorder import Recorder
 
 
@@ -309,7 +309,7 @@ class TestRecorderDisconnectReconciliation:
                 # never before the collector connected.
                 recorder._private_collector._connected_at = gap_start
                 recorder._private_collector._last_healthy_ts = (
-                    gap_start + _LIVENESS_MARGIN
+                    gap_start + LIVENESS_MARGIN
                 )
                 private_ws.alive = False
                 await recorder._private_collector._ws_health_check_once()
@@ -357,7 +357,7 @@ class TestRecorderDisconnectReconciliation:
                 # never before the collector connected.
                 recorder._private_collector._connected_at = gap_start
                 recorder._private_collector._last_healthy_ts = (
-                    gap_start + _LIVENESS_MARGIN
+                    gap_start + LIVENESS_MARGIN
                 )
                 private_ws.alive = False
                 await recorder._private_collector._ws_health_check_once()
@@ -444,7 +444,7 @@ async def _dead_socket_probe(recorder, gap_start: datetime) -> None:
     """Run one probe on a dead socket whose last healthy time dates the gap."""
     collector = recorder._private_collector
     collector._connected_at = gap_start
-    collector._last_healthy_ts = gap_start + _LIVENESS_MARGIN
+    collector._last_healthy_ts = gap_start + LIVENESS_MARGIN
     collector._ws_client.alive = False
     await collector._ws_health_check_once()
 
@@ -588,8 +588,8 @@ class TestPrivateStreamCoverage:
                 checkpoint = _session_row(db).last_checkpoint_ts.replace(
                     tzinfo=UTC
                 )
-                assert before - _LIVENESS_MARGIN <= checkpoint
-                assert checkpoint <= after - _LIVENESS_MARGIN
+                assert before - LIVENESS_MARGIN <= checkpoint
+                assert checkpoint <= after - LIVENESS_MARGIN
             finally:
                 await recorder.stop()
 
@@ -934,7 +934,7 @@ class TestPrivateStreamCoverage:
                 checkpoint = _session_row(db).last_checkpoint_ts.replace(
                     tzinfo=UTC
                 )
-                assert checkpoint + _LIVENESS_MARGIN <= done - timedelta(
+                assert checkpoint + LIVENESS_MARGIN <= done - timedelta(
                     seconds=0.2
                 )
                 assert recorder._pending_futures == set()
@@ -1091,7 +1091,7 @@ class TestPrivateStreamCoverage:
                 recorder._private_write_lost_at = lost_at
                 recorder._record_lost_write_gap()  # the stalled callback
                 (gap,) = _gap_rows(db)
-                assert gap.gap_start.replace(tzinfo=UTC) == lost_at - _LIVENESS_MARGIN
+                assert gap.gap_start.replace(tzinfo=UTC) == lost_at - LIVENESS_MARGIN
                 assert recorder._private_write_lost is False
                 assert recorder._private_write_lost_at is None
             finally:
@@ -1111,3 +1111,137 @@ class TestPrivateStreamCoverage:
             recorder._record_lost_write_gap()
             assert recorder._private_write_lost is True
             assert _gap_rows(db) == []
+
+    async def test_lost_write_older_than_the_open_gap_gets_its_own_row(
+        self, config_with_account, db, db_with_gridbot_seed
+    ):
+        """An open outage gap covers a lost write only from its own start: a
+        loss before that needs a separate closed row up to the open gap."""
+        now = datetime.now(UTC)
+        open_start = now - timedelta(seconds=30)
+        lost_at = now - timedelta(seconds=200)
+        with _patched_network(_make_fake_rest()):
+            recorder = Recorder(config=config_with_account, db=db)
+            await recorder.start()
+            try:
+                recorder._handle_private_disconnect(open_start)
+                recorder._private_write_lost = True
+                recorder._private_write_lost_at = lost_at
+                recorder._record_lost_write_gap()
+
+                gaps = sorted(_gap_rows(db), key=lambda g: g.gap_start)
+                assert len(gaps) == 2
+                earlier, still_open = gaps
+                assert earlier.gap_start.replace(tzinfo=UTC) == (
+                    lost_at - LIVENESS_MARGIN
+                )
+                assert earlier.gap_end.replace(tzinfo=UTC) == open_start
+                assert still_open.gap_end is None  # the outage row is untouched
+                assert set(recorder._open_gap_ids) == {_TEST_SYMBOL}
+                assert recorder._private_write_lost is False
+            finally:
+                await recorder.stop()
+
+    async def test_lost_write_inside_the_open_gap_adds_no_row(
+        self, config_with_account, db, db_with_gridbot_seed
+    ):
+        """A loss already inside the open outage gap needs no row of its own."""
+        now = datetime.now(UTC)
+        with _patched_network(_make_fake_rest()):
+            recorder = Recorder(config=config_with_account, db=db)
+            await recorder.start()
+            try:
+                recorder._handle_private_disconnect(now - timedelta(seconds=300))
+                recorder._private_write_lost = True
+                recorder._private_write_lost_at = now
+                recorder._record_lost_write_gap()
+                (gap,) = _gap_rows(db)
+                assert gap.gap_end is None
+                assert recorder._private_write_lost is False
+            finally:
+                await recorder.stop()
+
+    async def test_open_gap_failure_count_survives_a_lost_write_gap(
+        self, config_with_account, db, db_with_gridbot_seed
+    ):
+        """Only a reconnect ends the outage: a lost-write gap must not reset
+        the counter that lets a dead socket be reset despite DB errors."""
+        with _patched_network(_make_fake_rest()):
+            recorder = Recorder(config=config_with_account, db=db)
+            await recorder.start()
+            try:
+                recorder._open_gap_failures = 2
+                recorder._private_write_lost = True
+                recorder._private_write_lost_at = datetime.now(UTC)
+                recorder._record_lost_write_gap()
+                assert recorder._open_gap_failures == 2
+
+                now = datetime.now(UTC)
+                recorder._handle_private_gap(now - timedelta(seconds=30), now)
+                assert recorder._open_gap_failures == 0
+            finally:
+                await recorder.stop()
+
+    async def test_open_gap_failures_after_the_third_are_logged(
+        self, config_with_account, db, db_with_gridbot_seed, caplog
+    ):
+        """Failures past the limit are not silent: one WARNING each with the
+        running count."""
+        gap_start = datetime.now(UTC) - timedelta(seconds=30)
+        with _patched_network(_make_fake_rest()):
+            recorder = Recorder(config=config_with_account, db=db)
+            await recorder.start()
+            try:
+                recorder._open_gap_failures = 3
+                with patch.object(
+                    PrivateStreamGapRepository,
+                    "add_gap",
+                    side_effect=RuntimeError("database is locked"),
+                ), caplog.at_level("WARNING", logger="recorder.recorder"):
+                    recorder._handle_private_disconnect(gap_start)
+                assert "Still cannot open private gap rows (4" in caplog.text
+            finally:
+                await recorder.stop()
+
+    async def test_lost_write_after_a_closed_outage_gets_its_own_row(
+        self, config_with_account, db, db_with_gridbot_seed
+    ):
+        """Once an outage has closed, its start must not make a later lost
+        write look covered."""
+        outage = datetime.now(UTC) - timedelta(seconds=600)
+        with _patched_network(_make_fake_rest()):
+            recorder = Recorder(config=config_with_account, db=db)
+            await recorder.start()
+            try:
+                await _dead_socket_probe(recorder, outage)  # opened and closed
+                assert recorder._open_gap_ids == {}
+                assert recorder._open_gap_start is None
+
+                recorder._private_write_lost = True
+                recorder._private_write_lost_at = datetime.now(UTC)
+                recorder._record_lost_write_gap()
+                assert len(_gap_rows(db)) == 2
+                assert recorder._private_write_lost is False
+            finally:
+                await recorder.stop()
+
+    async def test_lost_write_latch_keeps_the_loss_time_when_unrecorded(
+        self, config_with_account, db, db_with_gridbot_seed
+    ):
+        """When the gap cannot be recorded (stopping), the latch AND the
+        loss time stay, also when an open gap exists that does not cover
+        the loss."""
+        now = datetime.now(UTC)
+        lost_at = now - timedelta(seconds=500)
+        with _patched_network(_make_fake_rest()):
+            recorder = Recorder(config=config_with_account, db=db)
+            await recorder.start()
+            recorder._handle_private_disconnect(now - timedelta(seconds=30))
+            await recorder.stop()
+            rows_before = len(_gap_rows(db))
+            recorder._private_write_lost = True
+            recorder._private_write_lost_at = lost_at
+            recorder._record_lost_write_gap()
+            assert recorder._private_write_lost is True
+            assert recorder._private_write_lost_at == lost_at
+            assert len(_gap_rows(db)) == rows_before

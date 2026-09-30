@@ -9,6 +9,7 @@ Usage:
 import argparse
 import asyncio
 import logging
+import signal
 import sys
 from typing import Optional
 
@@ -19,6 +20,8 @@ from recorder.recorder import Recorder
 
 
 logger = logging.getLogger(__name__)
+
+_SHUTDOWN_SIGNALS = (signal.SIGTERM, signal.SIGINT)
 
 
 def setup_logging(debug: bool = False) -> None:
@@ -88,18 +91,49 @@ async def main(config_path: Optional[str] = None) -> int:
     # Create and run recorder
     recorder = Recorder(config=config, db=db)
 
+    # A signal during start() cancels it. Without this, SIGINT is ignored
+    # for a backgrounded (nohup) recorder until run_until_shutdown installs
+    # its handlers, and SIGTERM kills it with the run left "running" — so
+    # the launcher could not stop a recorder that is still starting.
+    loop = asyncio.get_running_loop()
+    start_task = asyncio.ensure_future(recorder.start())
+
+    def _on_signal() -> None:
+        if start_task.done():
+            # Too late to cancel the start, and run_until_shutdown has not
+            # installed its own handlers yet: pass the request on.
+            recorder.request_shutdown()
+        else:
+            start_task.cancel()
+
+    for sig in _SHUTDOWN_SIGNALS:
+        loop.add_signal_handler(sig, _on_signal)
     try:
-        await recorder.start()
+        await start_task
+        # run_until_shutdown replaces these handlers with its own; they are
+        # deliberately NOT removed in between (no window without a handler).
         await recorder.run_until_shutdown()
+    except asyncio.CancelledError:
+        logger.warning("Shutdown signal during recorder start")
+        await _emergency_stop(recorder)
+        return 2
     except Exception as e:
         logger.error(f"Recorder error: {e}")
-        try:
-            await recorder.stop(error=True)
-        except Exception as stop_err:
-            logger.error(f"Error during emergency stop: {stop_err}")
+        await _emergency_stop(recorder)
         return 2
+    finally:
+        for sig in _SHUTDOWN_SIGNALS:
+            loop.remove_signal_handler(sig)
 
     return 0
+
+
+async def _emergency_stop(recorder: Recorder) -> None:
+    """Stop a recorder whose start failed or was interrupted."""
+    try:
+        await recorder.stop(error=True)
+    except Exception as stop_err:
+        logger.error(f"Error during emergency stop: {stop_err}")
 
 
 def cli() -> None:

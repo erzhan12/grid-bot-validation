@@ -1,6 +1,9 @@
 """Tests for recorder CLI entry point."""
 
+import asyncio
 import logging
+import os
+import signal
 import sys
 
 import pytest
@@ -127,6 +130,76 @@ class TestMain:
 
         assert result == 2
         mock_recorder.stop.assert_awaited_once_with(error=True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
+    async def test_signal_during_start_stops_the_recorder(self, sig):
+        """A signal that arrives while start() is still running (the
+        launcher's kill on a sentinel timeout) cancels the start and runs
+        the error stop, instead of being ignored or killing the process
+        with the run left 'running'."""
+        mock_config = MagicMock()
+        mock_config.symbols = ["BTCUSDT"]
+        mock_config.testnet = True
+        mock_config.database_url = "sqlite:///test.db"
+        mock_config.account = None
+        mock_config.health_log_interval = 300.0
+
+        never = asyncio.Event()
+        mock_recorder = AsyncMock()
+        mock_recorder.start.side_effect = never.wait
+
+        with patch("recorder.main.load_config", return_value=mock_config), \
+             patch("recorder.main.Recorder", return_value=mock_recorder), \
+             patch("recorder.main.DatabaseFactory") as MockDB, \
+             patch("recorder.main.DatabaseSettings") as MockSettings:
+
+            MockDB.return_value = MagicMock()
+            MockSettings.return_value = MagicMock()
+            asyncio.get_running_loop().call_later(
+                0.05, os.kill, os.getpid(), sig
+            )
+            result = await asyncio.wait_for(main("test.yaml"), timeout=5)
+
+        assert result == 2
+        mock_recorder.stop.assert_awaited_once_with(error=True)
+        mock_recorder.run_until_shutdown.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_signal_as_start_finishes_is_not_lost(self):
+        """A signal that lands just as start() completes (too late to cancel
+        it, before run_until_shutdown has its own handlers) is passed on as
+        a shutdown request instead of being dropped."""
+        mock_config = MagicMock()
+        mock_config.symbols = ["BTCUSDT"]
+        mock_config.testnet = True
+        mock_config.database_url = "sqlite:///test.db"
+        mock_config.account = None
+        mock_config.health_log_interval = 300.0
+
+        mock_recorder = AsyncMock()
+        mock_recorder.request_shutdown = MagicMock()
+
+        async def _start():
+            os.kill(os.getpid(), signal.SIGINT)  # pending when start returns
+
+        async def _run_until_shutdown():
+            await asyncio.sleep(0.1)  # lets the loop deliver the signal
+
+        mock_recorder.start.side_effect = _start
+        mock_recorder.run_until_shutdown.side_effect = _run_until_shutdown
+
+        with patch("recorder.main.load_config", return_value=mock_config), \
+             patch("recorder.main.Recorder", return_value=mock_recorder), \
+             patch("recorder.main.DatabaseFactory") as MockDB, \
+             patch("recorder.main.DatabaseSettings") as MockSettings:
+
+            MockDB.return_value = MagicMock()
+            MockSettings.return_value = MagicMock()
+            result = await asyncio.wait_for(main("test.yaml"), timeout=5)
+
+        assert result == 0
+        mock_recorder.request_shutdown.assert_called_once()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("url", [

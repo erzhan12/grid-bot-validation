@@ -1,3 +1,16 @@
+# Feature 0110 Phase B1c-2 — confirmed startup (#271)
+
+Plan: docs/features/0110_PLAN.md (B1 step 8 + step 1 startup part)  |  Branch: feature/0110-b1c2-startup
+
+- [x] collectors: `CollectorStartError`; private `connect()` + `wait_ready` in one daemon thread, 10 s bound, not ready → disconnect + raise
+- [x] collectors: public `connect()` bounded the same way
+- [x] recorder: collectors first, session row + REST snapshot after a confirmed private start; start failure → `RECORDER_SNAPSHOT_INCOMPLETE` + raise
+- [x] EventSaver: a not-ready account is logged and skipped, the others start
+- [x] launcher: sentinel wait 15 → 60 s; signal handlers installed before `start()`
+- [x] #286 follow-ups: public `LIVENESS_MARGIN`; lost write older than an open gap; `_open_gap_failures` reset on reconnect only; WARNING for open-gap failures after the 3rd
+- [x] make test + make lint green
+- [x] rules update (event-saver, recorder, grid-db) + plan as-built notes
+
 # Feature 0110 Phase B1c-1 — private-stream coverage: sessions, open gaps, checkpoint (#271)
 
 Plan: docs/features/0110_PLAN.md (B1 steps 3-5, 7; B1c split: B1c-1 coverage, B1c-2 startup)  |  Branch: feature/0110-b1c1-coverage

@@ -116,6 +116,38 @@ class TestClassifierTimeout:
             f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
         )
         assert "no RECORDER_SNAPSHOT_OK/INCOMPLETE" in result.stderr
+        assert "after 60s" in result.stderr  # default wait (0110 B1c-2)
+
+    def test_timeout_message_reports_the_wait_passed_in(
+        self, tmp_path: Path
+    ) -> None:
+        """The launcher passes its wait; the diagnostic must not hard-code it."""
+        log = tmp_path / "recorder.log"
+        log.write_text("2026-05-27 16:00:00 INFO public ws connected\n")
+        script = f'''
+            source "{LIB_PATH}"
+            _classify_recorder_snapshot "{log}" 45
+        '''
+        result = subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, check=False
+        )
+        assert result.returncode == 2
+        assert "after 45s" in result.stderr
+
+    def test_incomplete_diagnostic_shows_a_collector_start_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """0110 B1c-2: when the sentinel comes from a collector that did not
+        start, the operator sees that line, not only the generic sentinel."""
+        log = tmp_path / "recorder.log"
+        log.write_text(
+            "2026-05-27 16:00:00 ERROR Recorder start aborted: a collector "
+            "did not start\n"
+            "2026-05-27 16:00:00 WARNING RECORDER_SNAPSHOT_INCOMPLETE\n"
+        )
+        result = _run_classifier(log)
+        assert result.returncode == 1
+        assert "Recorder start aborted" in result.stderr
 
 
 class TestClassifierRaceGuard:
@@ -343,3 +375,14 @@ class TestStartRecorderLauncherIntegration:
         assert "_stop_recorder_pattern" in content, (
             "start_recorder.sh must call _stop_recorder_pattern"
         )
+
+    def test_launcher_waits_60s_for_the_sentinel(self) -> None:
+        """0110 B1c-2: both collectors (up to ~21 s) now start before the
+        REST snapshot (three calls, 10 s each), so the launcher waits 60 s,
+        not 15, and passes that wait to the classifier."""
+        launcher = REPO_ROOT / "scripts" / "phase4" / "start_recorder.sh"
+        content = launcher.read_text()
+        assert "SNAPSHOT_WAIT_SECONDS=60" in content
+        assert 'seq 1 "$SNAPSHOT_WAIT_SECONDS"' in content
+        assert '_classify_recorder_snapshot "$LOG_FILE" "$SNAPSHOT_WAIT_SECONDS"' in content
+        assert "15s" not in content

@@ -35,8 +35,12 @@ from grid_db._decimal import WALLET_ACCOUNT_JSON_KEYS, decimal_or_zero
 from grid_db.identity import account_id_for, strategy_id_for, user_id_for
 from gridcore.events import PublicTradeEvent, ExecutionEvent, OrderUpdateEvent, TickerEvent
 
-from event_saver.collectors import PublicCollector, PrivateCollector, AccountContext
-from event_saver.collectors.private_collector import _LIVENESS_MARGIN
+from event_saver.collectors import (
+    LIVENESS_MARGIN,
+    AccountContext,
+    PrivateCollector,
+    PublicCollector,
+)
 from event_saver.writers import (
     TradeWriter,
     TickerWriter,
@@ -111,6 +115,7 @@ class Recorder:
         self._private_write_lost_at: Optional[datetime] = None
         self._private_session_id: Optional[int] = None
         self._open_gap_ids: dict[str, int] = {}
+        self._open_gap_start: Optional[datetime] = None
         self._open_gap_failures = 0
         self._pending_gap_writes: list[tuple[Callable[[], object], str]] = []
         self._run_id: Optional[UUID] = None
@@ -126,7 +131,16 @@ class Recorder:
         self._strategy_id: UUID = UUID("00000000-0000-0000-0000-000000000003")
 
     async def start(self) -> None:
-        """Start all recording components."""
+        """Start all recording components.
+
+        Order: writers, collectors (public, then private), the private
+        session row, the initial REST snapshot, the health loop.
+
+        Raises:
+            CollectorStartError: A collector did not come up within its
+                bound. ``RECORDER_SNAPSHOT_INCOMPLETE`` is logged first (as
+                for any other failure while starting the collectors).
+        """
         if self._running:
             logger.warning("Recorder already running")
             return
@@ -146,6 +160,7 @@ class Recorder:
                 self._private_write_lost_at = None
             self._private_session_id = None
             self._open_gap_ids = {}
+            self._open_gap_start = None
             self._open_gap_failures = 0
             self._pending_gap_writes = []
 
@@ -171,20 +186,41 @@ class Recorder:
                 gap_threshold_seconds=self._config.gap_threshold_seconds,
             )
 
-            await self._init_writers()
+            # 0110 B1c-2: collectors first. The run only starts on a connected
+            # public stream and a confirmed (authenticated, subscribed) private
+            # session; otherwise the launcher sentinel is emitted and the
+            # start fails.
+            try:
+                await self._init_writers()
+                await self._init_collectors()
+            except BaseException as e:
+                # Any failure here (writers, run seeding, collectors) ends
+                # the start, a cancellation (shutdown signal) included; every
+                # exit path must emit a launcher sentinel (feature 0055).
+                logger.error(
+                    "Recorder start aborted: %s", str(e) or type(e).__name__
+                )
+                logger.warning("RECORDER_SNAPSHOT_INCOMPLETE")
+                raise
 
             # 0029 Cross-cutting #4: write the t=0 row of the recording session
-            # via REST BEFORE the private collector subscribes. Bybit's private
-            # streams are event-driven, so a quiet account would otherwise leave
-            # the seed-aware replay loader returning NULL for wallet/positions/
-            # orders even though state existed live. Failures here are logged
-            # but DO NOT abort recorder start (the WS stream still gets captured;
-            # Phase 4's pre-check will refuse to seed from a run missing the
-            # initial snapshot).
+            # via REST. Bybit's private streams are event-driven, so a quiet
+            # account would otherwise leave the seed-aware replay loader
+            # returning NULL for wallet/positions/orders even though state
+            # existed live. It runs AFTER the private session is confirmed
+            # (0110 B1c-2), so the anchor lies inside the session and nothing
+            # between the snapshot and the subscription can be missed.
+            # Failures here are logged but DO NOT abort recorder start (the WS
+            # stream still gets captured; Phase 4's pre-check will refuse to
+            # seed from a run missing the initial snapshot).
             if self._config.account:
-                await self._write_initial_rest_snapshot()
-
-            await self._init_collectors()
+                try:
+                    await self._write_initial_rest_snapshot()
+                except BaseException:
+                    # Cancelled, or an error escaped, before the snapshot
+                    # emitted its own sentinel (that is its last statement).
+                    logger.warning("RECORDER_SNAPSHOT_INCOMPLETE")
+                    raise
 
             # Start health logging
             self._health_task = asyncio.create_task(self._health_log_loop())
@@ -322,11 +358,13 @@ class Recorder:
         - ``logger.info("RECORDER_SNAPSHOT_OK")`` — wallet_count > 0 AND
           position_count > 0; replay seed will succeed.
         - ``logger.warning("RECORDER_SNAPSHOT_INCOMPLETE")`` — auth-client
-          construction failure OR zero wallet/position rows.
+          construction failure OR zero wallet/position rows. (``start()``
+          emits the same sentinel when a collector does not start, in which
+          case this method is never reached.)
         ``scripts/phase4/start_recorder.sh`` waits for one of these sentinels
         and dispatches via ``scripts/phase4/lib/recorder_snapshot_check.sh``.
         Adding a new early ``return`` after the account guard without
-        emitting a sentinel will hang the shell wait loop until its 15s
+        emitting a sentinel will hang the shell wait loop until its 60s
         timeout. Never emit both sentinels in a single invocation — the
         classifier treats INCOMPLETE as terminal regardless of any later OK.
 
@@ -634,10 +672,12 @@ class Recorder:
         """REST-fetch open orders for configured symbols and write one row each.
 
         ``exchange_ts``/``local_ts`` are the snapshot timestamp (REST-call
-        wall-clock), NOT the order's ``createdTime``. This guarantees the
-        snapshot row sorts BEFORE any subsequent WS-stream rows for the same
-        ``order_id`` in this run, so the loader's MAX(exchange_ts) GROUP BY
-        order_id picks up a later WS state when one exists.
+        wall-clock), NOT the order's ``createdTime``. The snapshot row sorts
+        BEFORE any WS-stream row that arrives after it for the same
+        ``order_id``, so the loader's MAX(exchange_ts) GROUP BY order_id
+        picks up a later WS state when one exists. (Since 0110 B1c-2 the
+        private stream is subscribed first, so a WS row from the few seconds
+        before the snapshot can sort earlier.)
         """
         models: list[Order] = []
         for symbol in self._config.symbols:
@@ -765,13 +805,21 @@ class Recorder:
         stats = self.get_stats()
         logger.info(f"Recorder stopped. Final stats: {stats}")
 
+    def request_shutdown(self) -> None:
+        """Ask :meth:`run_until_shutdown` to stop the recorder.
+
+        Safe to call before ``run_until_shutdown`` is awaiting: the request
+        is kept and honoured as soon as it does.
+        """
+        self._shutdown_event.set()
+
     async def run_until_shutdown(self) -> None:
         """Run until SIGINT/SIGTERM received."""
         loop = asyncio.get_running_loop()
 
         def shutdown_handler():
             logger.info("Shutdown signal received")
-            self._shutdown_event.set()
+            self.request_shutdown()
 
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, shutdown_handler)
@@ -940,23 +988,30 @@ class Recorder:
 
         Runs on the event loop. The gap starts the liveness margin before
         the earliest unrecorded loss (not before "now": this callback can
-        run late); REST recovery runs for executions as for any gap. If an
-        outage gap is already open it covers the loss, so nothing is added.
-        If no gap can be recorded (the recorder is stopping) the latch stays
-        set, so the checkpoint stays blocked.
+        run late); REST recovery runs for executions as for any gap. An
+        open outage gap covers the loss from its own start, so only the
+        part before it (if any) is recorded. If a needed gap cannot be
+        recorded (the recorder is stopping) the latch stays set, so the
+        checkpoint stays blocked.
         """
         now = datetime.now(UTC)
-        covered = bool(self._open_gap_ids)
-        can_record = bool(self._reconciler and self._config.account and self._run_id)
-        if not (covered or can_record):
-            return
         with self._pending_lock:
             lost_at = self._private_write_lost_at or now
             # Released before recording: a later loss schedules its own gap.
             self._private_write_lost = False
             self._private_write_lost_at = None
-        if not covered:
-            self._handle_private_gap(min(lost_at, now) - _LIVENESS_MARGIN, now)
+        gap_start = min(lost_at, now) - LIVENESS_MARGIN
+        open_start = self._open_gap_start if self._open_gap_ids else None
+        if open_start is not None and gap_start >= open_start:
+            return  # inside the open outage gap
+        if not (self._reconciler and self._config.account and self._run_id):
+            with self._pending_lock:  # cannot record: keep the latch
+                self._private_write_lost = True
+                self._private_write_lost_at = min(
+                    self._private_write_lost_at or lost_at, lost_at
+                )
+            return
+        self._recover_private_gap(gap_start, open_start or now, close_open=False)
 
     def _open_private_session(self, connected_at: datetime) -> None:
         """Write the private-stream session row; its checkpoint starts here.
@@ -990,7 +1045,7 @@ class Recorder:
         registered private writes under ``_pending_lock``; await them; flush
         the execution, order, position and wallet writers. Only if all of
         that succeeded, no write was lost and no gap row is open, is
-        ``last_checkpoint_ts`` moved to ``barrier_ts - _LIVENESS_MARGIN`` (a
+        ``last_checkpoint_ts`` moved to ``barrier_ts - LIVENESS_MARGIN`` (a
         half-open socket can look healthy that long, so a probe cannot
         certify an undetected loss).
         """
@@ -1028,7 +1083,7 @@ class Recorder:
             PrivateStreamSessionRepository(session).advance_checkpoint(
                 self._private_session_id,
                 run_id=str(self._run_id),
-                ts=barrier_ts - _LIVENESS_MARGIN,
+                ts=barrier_ts - LIVENESS_MARGIN,
             )
 
     def _handle_ticker(self, event: TickerEvent) -> Optional[Future]:
@@ -1154,18 +1209,37 @@ class Recorder:
                     self._open_gap_failures,
                     exc_info=True,
                 )
+            else:
+                logger.warning(
+                    "Still cannot open private gap rows (%d failures in a row)",
+                    self._open_gap_failures,
+                )
             return
         self._open_gap_failures = 0
+        if not self._open_gap_ids:
+            self._open_gap_start = gap_start
         self._open_gap_ids.update(opened)
 
     def _handle_private_gap(
         self, gap_start: datetime, gap_end: datetime
     ) -> list[Future]:
-        """Reconcile private stream gap via REST API.
+        """Collector callback: the outage ``[gap_start, gap_end]`` is over.
 
-        Closes each symbol's open gap row (or, when none was opened - late
-        readiness on the same socket - records the gap closed), then stores
-        each symbol's recovery outcome when its future completes.
+        Closes the open gap rows and reconciles via REST.
+        """
+        self._open_gap_failures = 0  # this outage is over
+        return self._recover_private_gap(gap_start, gap_end, close_open=True)
+
+    def _recover_private_gap(
+        self, gap_start: datetime, gap_end: datetime, *, close_open: bool
+    ) -> list[Future]:
+        """Record a private stream gap and reconcile it via REST API.
+
+        With ``close_open`` each symbol's open gap row is closed (a symbol
+        with none - late readiness on the same socket - gets a closed row).
+        Without it the open rows are left alone and a separate closed row is
+        recorded (a lost write, not the end of an outage). Each symbol's
+        recovery outcome is stored when its future completes.
         """
         # Count unconditionally (see _handle_public_gap comment).
         with self._gap_lock:
@@ -1176,7 +1250,6 @@ class Recorder:
             f"({gap_start} to {gap_end})"
         )
 
-        self._open_gap_failures = 0  # this outage is over
         self._retry_pending_gap_writes()
         futures: list[Future] = []
         if (
@@ -1189,7 +1262,9 @@ class Recorder:
                 # Forget the open id now, even if the close write fails: a
                 # queued close must only ever touch this outage's row, and
                 # the next outage must open its own.
-                gap_id = self._open_gap_ids.pop(symbol, None)
+                gap_id = (
+                    self._open_gap_ids.pop(symbol, None) if close_open else None
+                )
                 if gap_id is not None:
                     self._try_gap_write(
                         self._close_gap_write(gap_id, gap_end),
@@ -1217,6 +1292,8 @@ class Recorder:
                 if gap_id is not None:
                     fut.add_done_callback(self._persist_gap_outcome(gap_id, symbol))
                 futures.append(fut)
+        if not self._open_gap_ids:
+            self._open_gap_start = None
         return futures
 
     def _record_private_gap(

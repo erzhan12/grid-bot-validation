@@ -17,7 +17,12 @@ from grid_db import DatabaseFactory, DatabaseSettings, RecoveryStatus
 from gridcore.events import PublicTradeEvent, ExecutionEvent, TickerEvent
 
 from event_saver.config import EventSaverConfig
-from event_saver.collectors import PublicCollector, PrivateCollector, AccountContext
+from event_saver.collectors import (
+    AccountContext,
+    CollectorStartError,
+    PrivateCollector,
+    PublicCollector,
+)
 from event_saver.writers import (
     TradeWriter,
     ExecutionWriter,
@@ -108,6 +113,11 @@ class EventSaver:
 
         Args:
             context: AccountContext with credentials and settings.
+
+        Raises:
+            CollectorStartError: EventSaver is running and the account's
+                private socket did not come up. The account is not
+                registered, so the call can be retried.
         """
         if context.account_id in self._private_collectors:
             logger.warning(f"Account {context.account_id} already added")
@@ -129,12 +139,14 @@ class EventSaver:
                 context, start, end
             ),
         )
-        self._private_collectors[context.account_id] = collector
-
         # If EventSaver is already running, start the collector immediately
-        # Otherwise, it will be started when start() is called
+        # Otherwise, it will be started when start() is called. Register it
+        # only once started, so a failed start can be retried.
         if self._running:
             await collector.start()
+        self._private_collectors[context.account_id] = collector
+
+        if self._running:
             logger.info(
                 f"Added and started account {context.account_id} for private data collection"
             )
@@ -161,7 +173,14 @@ class EventSaver:
             logger.info(f"Removed account {account_id} from private data collection")
 
     async def start(self) -> None:
-        """Start all data collection components."""
+        """Start all data collection components.
+
+        An account whose private collector does not start is logged and
+        dropped; the other accounts still start.
+
+        Raises:
+            CollectorStartError: The public collector did not start.
+        """
         if self._running:
             logger.warning("EventSaver already running")
             return
@@ -244,9 +263,21 @@ class EventSaver:
             )
             await self._public_collector.start()
 
-        # Start private collectors
-        for collector in self._private_collectors.values():
-            await collector.start()
+        # Start private collectors. One account's socket not coming up must
+        # not keep the others from recording (0110 B1c-2).
+        for account_id, collector in list(self._private_collectors.items()):
+            try:
+                await collector.start()
+            except CollectorStartError as e:
+                logger.error(
+                    "Private collector for account %s did not start; "
+                    "skipping it: %s",
+                    account_id,
+                    e,
+                )
+                # Not collecting: drop it so it is not counted and
+                # add_account() can retry it.
+                del self._private_collectors[account_id]
 
         logger.info(
             f"EventSaver started. "

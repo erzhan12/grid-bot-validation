@@ -21,6 +21,7 @@ from gridcore.events import (
 from event_saver.reconciler import ExecutionRecoveryResult
 from grid_db import PublicTrade, RecoveryStatus, Run
 from recorder.config import RecorderConfig
+from event_saver.collectors import CollectorStartError
 from recorder.recorder import Recorder
 
 # Local sentinels for fallback-mode tests (no account: block configured).
@@ -1016,3 +1017,204 @@ class TestRecorderRunPersistence:
             assert run is not None
             assert run.run_type == "recording"
             assert run.status == "completed"
+
+
+def _mock_collector(start=None):
+    collector = MagicMock()
+    collector.start = start or AsyncMock()
+    collector.stop = AsyncMock()
+    collector.get_connection_state.return_value = None
+    return collector
+
+
+class TestStartupOrder:
+    """Feature 0110 B1c-2: the run starts on a confirmed private session."""
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_rest_snapshot_runs_after_confirmed_private_session(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
+        config_with_account, db, db_with_gridbot_seed,
+    ):
+        """The t=0 REST snapshot is taken after the private collector has
+        started and the session row exists, so it lies inside the session."""
+        order = []
+        mock_pub_cls.return_value = _mock_collector(
+            AsyncMock(side_effect=lambda: order.append("public"))
+        )
+        mock_priv_cls.return_value = _mock_collector(
+            AsyncMock(side_effect=lambda: order.append("private"))
+        )
+        recorder = Recorder(config=config_with_account, db=db)
+
+        async def _snapshot():
+            order.append(("snapshot", recorder._private_session_id is not None))
+
+        with patch.object(recorder, "_write_initial_rest_snapshot", _snapshot):
+            await recorder.start()
+        try:
+            assert order == ["public", "private", ("snapshot", True)]
+        finally:
+            await recorder.stop()
+
+    @pytest.mark.parametrize("failing", ["public", "private"])
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_collector_start_failure_emits_incomplete_and_raises(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
+        config_with_account, db, db_with_gridbot_seed, caplog, failing,
+    ):
+        """A collector that does not come up ends the start: the launcher
+        sentinel is emitted, no session row and no REST snapshot are written,
+        and the error propagates."""
+        boom = AsyncMock(side_effect=CollectorStartError("socket not ready"))
+        mock_pub = _mock_collector(boom if failing == "public" else None)
+        mock_pub_cls.return_value = mock_pub
+        mock_priv_cls.return_value = _mock_collector(
+            boom if failing == "private" else None
+        )
+        recorder = Recorder(config=config_with_account, db=db)
+        snapshot = AsyncMock()
+        with patch.object(recorder, "_write_initial_rest_snapshot", snapshot):
+            with caplog.at_level("WARNING", logger="recorder.recorder"):
+                with pytest.raises(CollectorStartError):
+                    await recorder.start()
+        try:
+            sentinels = [
+                r for r in caplog.records
+                if r.message == "RECORDER_SNAPSHOT_INCOMPLETE"
+            ]
+            assert len(sentinels) == 1
+            # the launcher's classifier greps this line for the cause
+            assert "Recorder start aborted: socket not ready" in caplog.text
+            snapshot.assert_not_awaited()
+            assert recorder._private_session_id is None
+        finally:
+            await recorder.stop(error=True)
+        mock_pub.stop.assert_awaited_once()  # the started collector is stopped
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_any_collector_init_error_emits_the_sentinel(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
+        config_with_account, db, db_with_gridbot_seed, caplog,
+    ):
+        """Every exit path of the start emits one launcher sentinel, also an
+        unexpected error (not only CollectorStartError)."""
+        mock_pub_cls.side_effect = RuntimeError("constructor blew up")
+        recorder = Recorder(config=config_with_account, db=db)
+        with caplog.at_level("WARNING", logger="recorder.recorder"):
+            with pytest.raises(RuntimeError):
+                await recorder.start()
+        try:
+            sentinels = [
+                r for r in caplog.records
+                if r.message == "RECORDER_SNAPSHOT_INCOMPLETE"
+            ]
+            assert len(sentinels) == 1
+        finally:
+            await recorder.stop(error=True)
+
+    @pytest.mark.parametrize("stage", ["collectors", "snapshot"])
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_cancelled_start_emits_the_sentinel(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
+        config_with_account, db, db_with_gridbot_seed, caplog, stage,
+    ):
+        """A start cancelled by a shutdown signal still emits exactly one
+        launcher sentinel, whether it was in the collectors or in the REST
+        snapshot."""
+        never = asyncio.Event()
+
+        async def _parked():
+            await never.wait()
+
+        mock_pub_cls.return_value = _mock_collector(
+            AsyncMock(side_effect=_parked) if stage == "collectors" else None
+        )
+        mock_priv_cls.return_value = _mock_collector()
+        recorder = Recorder(config=config_with_account, db=db)
+        with patch.object(recorder, "_write_initial_rest_snapshot", _parked):
+            with caplog.at_level("WARNING", logger="recorder.recorder"):
+                task = asyncio.create_task(recorder.start())
+                await asyncio.sleep(0.1)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+        try:
+            sentinels = [
+                r for r in caplog.records
+                if r.message == "RECORDER_SNAPSHOT_INCOMPLETE"
+            ]
+            assert len(sentinels) == 1
+            if stage == "collectors":  # the cause is named, not blank
+                assert "Recorder start aborted: CancelledError" in caplog.text
+        finally:
+            await recorder.stop(error=True)
+
+    async def test_writer_init_failure_emits_the_sentinel(
+        self, config_with_account, db, db_with_gridbot_seed, caplog
+    ):
+        """A failure before the collectors (writers / run seeding) also emits
+        the launcher sentinel, so the launcher does not wait out its bound."""
+        recorder = Recorder(config=config_with_account, db=db)
+        with patch.object(
+            recorder, "_init_writers", AsyncMock(side_effect=RuntimeError("db"))
+        ):
+            with caplog.at_level("WARNING", logger="recorder.recorder"):
+                with pytest.raises(RuntimeError):
+                    await recorder.start()
+        try:
+            sentinels = [
+                r for r in caplog.records
+                if r.message == "RECORDER_SNAPSHOT_INCOMPLETE"
+            ]
+            assert len(sentinels) == 1
+        finally:
+            await recorder.stop(error=True)
+
+    async def test_request_shutdown_ends_run_until_shutdown(
+        self, basic_config, db
+    ):
+        """request_shutdown() is what a signal handler calls: it makes
+        run_until_shutdown() return and stop the recorder."""
+        recorder = Recorder(config=basic_config, db=db)
+        recorder.request_shutdown()
+        with patch.object(recorder, "stop", AsyncMock()) as stop:
+            await asyncio.wait_for(recorder.run_until_shutdown(), timeout=2)
+        stop.assert_awaited_once()
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_snapshot_error_emits_the_sentinel(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
+        config_with_account, db, db_with_gridbot_seed, caplog,
+    ):
+        """An exception escaping the REST snapshot also emits the launcher
+        sentinel, so the launcher does not wait out its bound on a recorder
+        that has already exited."""
+        mock_pub_cls.return_value = _mock_collector()
+        mock_priv_cls.return_value = _mock_collector()
+        recorder = Recorder(config=config_with_account, db=db)
+        with patch.object(
+            recorder,
+            "_write_initial_rest_snapshot",
+            AsyncMock(side_effect=RuntimeError("unexpected")),
+        ):
+            with caplog.at_level("WARNING", logger="recorder.recorder"):
+                with pytest.raises(RuntimeError):
+                    await recorder.start()
+        try:
+            sentinels = [
+                r for r in caplog.records
+                if r.message == "RECORDER_SNAPSHOT_INCOMPLETE"
+            ]
+            assert len(sentinels) == 1
+        finally:
+            await recorder.stop(error=True)

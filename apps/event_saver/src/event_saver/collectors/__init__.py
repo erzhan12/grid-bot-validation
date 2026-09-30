@@ -1,10 +1,17 @@
 """Data collectors for public and private WebSocket streams."""
 
 from event_saver.collectors.public_collector import PublicCollector
-from event_saver.collectors.private_collector import PrivateCollector, AccountContext
+from event_saver.collectors._startup import CollectorStartError
+from event_saver.collectors.private_collector import (
+    LIVENESS_MARGIN,
+    AccountContext,
+    PrivateCollector,
+)
 
 __all__ = [
     "PublicCollector",
     "PrivateCollector",
     "AccountContext",
+    "CollectorStartError",
+    "LIVENESS_MARGIN",
 ]

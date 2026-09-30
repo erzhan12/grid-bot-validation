@@ -3,7 +3,7 @@
 import asyncio
 import contextlib
 import logging
-import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Awaitable, Callable, Optional
@@ -13,14 +13,26 @@ from bybit_adapter.ws_client import PrivateWebSocketClient, ConnectionState
 from bybit_adapter.normalizer import BybitNormalizer, NormalizerContext
 from gridcore.events import ExecutionEvent, OrderUpdateEvent
 
+from event_saver.collectors._startup import (
+    CollectorStartError,
+    StartHandoff,
+    disconnect_in_background,
+    run_in_daemon_thread as _run_in_daemon_thread,
+)
+
 
 logger = logging.getLogger(__name__)
+
 
 _PRIVATE_WS_HEALTH_CHECK_INTERVAL = 10.0
 _PRIVATE_WS_RESET_TIMEOUT = 30.0
 _PRIVATE_WS_DISCONNECT_TIMEOUT = 5.0
-# Feature 0110 B1b: how long connect/reset waits for auth + subscription acks.
+# Feature 0110 B1b: how long a reset waits for auth + subscription acks.
 _PRIVATE_READY_TIMEOUT = 5.0
+# Feature 0110 B1c-2: bound on connect() + readiness together at start().
+# Longer than the post-reset wait: a refused start costs more than a few
+# seconds, and the Phase 4 launcher waits 60 s for the snapshot sentinel.
+_PRIVATE_START_TIMEOUT = 10.0
 # Extra time the event loop gives the wait_ready thread past its own deadline.
 _READY_WAIT_SLACK = 1.0
 # Bound on the owner's on_healthy_probe (coverage checkpoint) per probe.
@@ -32,52 +44,9 @@ _MAX_UNREADY_RESETS = 3
 # websocket-client's first ping goes out ~2x ping_interval (20 s) after
 # open and the timeout (10 s) is only checked after the next select, so
 # detection can take ~2x20 + 2x10 = 60 s; +15 s slack. A gap therefore
-# starts this long before the last healthy probe.
-_LIVENESS_MARGIN = timedelta(seconds=75)
-
-
-def _run_in_daemon_thread(
-    fn: Callable[[], Any], *, name: Optional[str] = None
-) -> "asyncio.Future[Any]":
-    """Run ``fn`` on a dedicated daemon thread; return a future bound to the loop.
-
-    Used to wrap blocking pybit calls (``reset`` / ``disconnect``) so they can
-    be bounded by ``asyncio.wait_for`` and **abandoned** on timeout without
-    leaking into ``concurrent.futures.thread._python_exit`` at interpreter
-    shutdown (which would join the worker and re-introduce the hang).
-
-    Cancellation-safety: if ``wait_for`` cancels the future before the thread
-    returns, the completer guards on ``fut.done()`` so a late-returning worker
-    does not raise ``InvalidStateError`` on the loop. If the loop has been
-    closed by the time the worker returns, ``call_soon_threadsafe`` raises
-    ``RuntimeError`` which we swallow — the daemon thread exits quietly.
-    """
-    loop = asyncio.get_running_loop()
-    fut: "asyncio.Future[Any]" = loop.create_future()
-
-    def _complete(result: Any = None, exc: Optional[BaseException] = None) -> None:
-        if fut.done():
-            return
-        if exc is not None:
-            fut.set_exception(exc)
-        else:
-            fut.set_result(result)
-
-    def _target() -> None:
-        try:
-            result = fn()
-            exc: Optional[BaseException] = None
-        except BaseException as e:  # noqa: BLE001 — route to future
-            result = None
-            exc = e
-        try:
-            loop.call_soon_threadsafe(_complete, result, exc)
-        except RuntimeError:
-            # Loop already closed; daemon thread just exits.
-            pass
-
-    threading.Thread(target=_target, name=name, daemon=True).start()
-    return fut
+# starts this long before the last healthy probe. Public: the recorder's
+# coverage checkpoint must lag by the same amount.
+LIVENESS_MARGIN = timedelta(seconds=75)
 
 
 @dataclass
@@ -218,9 +187,14 @@ class PrivateCollector:
         """Start collecting private data for this account.
 
         Connects to the authenticated WebSocket, subscribes to streams and
-        waits up to ``_PRIVATE_READY_TIMEOUT`` for auth plus every
-        subscription ack. Not ready in time is logged at ERROR and does not
-        raise: the first health probe resets the socket.
+        waits for auth plus every subscription ack — all off the event loop
+        and within ``_PRIVATE_START_TIMEOUT`` in total.
+
+        Raises:
+            CollectorStartError: Not connected and ready in time (or the
+                connect / readiness check raised). The socket is
+                disconnected where possible and the collector is left not
+                running.
         """
         if self._running:
             logger.warning(f"PrivateCollector already running for account {self.context.account_id}")
@@ -250,24 +224,111 @@ class PrivateCollector:
         # previous timed-out stop() so this collector is not crippled.
         self._ws_reset_abandoned = False
 
-        self._ws_client.connect()
-        # Gap start before readiness is confirmed: the connect time. A gap
-        # never starts before it (no pre-run executions under this run).
+        # A gap never starts before the connect time (no pre-run executions
+        # under this run).
         self._connected_at = self._last_healthy_ts = datetime.now(UTC)
         self._unready_resets = 0
         self._liveness_only = False
-        if not await self._confirm_ready(self._ws_client):
-            # Not fatal until feature 0110 B1c-2 moves the startup snapshot:
-            # the first health probe treats "not ready" as unhealthy.
-            logger.error(
-                "Private WebSocket not ready within %.1fs for account %s; "
-                "the health probe will reset it",
-                _PRIVATE_READY_TIMEOUT,
-                self.context.account_id,
-            )
+        self._ready = False
+        await self._connect_and_confirm(self._ws_client)
         self._ws_health_stop_event = asyncio.Event()
         self._ws_health_task = asyncio.create_task(self._ws_health_check_loop())
         logger.info(f"PrivateCollector started for account {self.context.account_id}")
+
+    async def _connect_and_confirm(self, client: PrivateWebSocketClient) -> None:
+        """Connect and wait for readiness off the loop, within one bound.
+
+        ``connect()`` is a blocking pybit call with no timeout of its own, so
+        it shares a worker thread and ``_PRIVATE_START_TIMEOUT`` with the
+        readiness wait. The identity baseline is read between the two, so a
+        pybit silent reconnect during the wait fails readiness.
+
+        Raises:
+            CollectorStartError: see :meth:`start`.
+        """
+        account = self.context.account_id
+
+        handoff = StartHandoff()
+
+        def _connect_and_wait() -> tuple[bool, object]:
+            deadline = time.monotonic() + _PRIVATE_START_TIMEOUT
+            try:
+                client.connect()
+                if handoff.abandoned():
+                    # start() already gave up; pybit retries forever, so
+                    # this connect can still succeed later. Close it rather
+                    # than leave a live socket feeding a collector that is
+                    # not running.
+                    client.disconnect()
+                    return False, None
+                baseline = client.socket_identity()
+                remaining = max(deadline - time.monotonic(), 0.0)
+                ready = client.wait_ready(remaining)
+            except BaseException:
+                if not handoff.finish():
+                    # The owner gave up, so nobody is waiting for this
+                    # error: close what was opened before letting it go.
+                    # (If it gives up AFTER this, abandon() tells it to.)
+                    with contextlib.suppress(Exception):
+                        client.disconnect()
+                raise
+            if not handoff.finish():  # gave up during the readiness wait
+                client.disconnect()
+                return False, None
+            return ready, baseline
+
+        try:
+            ready, baseline = await asyncio.wait_for(
+                _run_in_daemon_thread(_connect_and_wait, name="ws-start"),
+                timeout=_PRIVATE_START_TIMEOUT + _READY_WAIT_SLACK,
+            )
+        except (TimeoutError, asyncio.CancelledError) as exc:
+            # The worker is normally parked inside pybit holding the client
+            # lock: disconnect() would block on it. Abandon the (daemon)
+            # thread; it disconnects by itself if connect() ever returns.
+            # If it had already finished, the socket is ours to close.
+            if handoff.abandon():
+                disconnect_in_background(client, name="ws-disconnect")
+            self._ws_client = None
+            self._running = False
+            if isinstance(exc, asyncio.CancelledError):
+                raise  # start() was cancelled (shutdown signal)
+            raise CollectorStartError(
+                f"Private WebSocket start timed out after "
+                f"{_PRIVATE_START_TIMEOUT:.1f}s for account {account}"
+            ) from None
+        except Exception as exc:
+            await self._abort_start(client)
+            raise CollectorStartError(
+                f"Private WebSocket start failed for account {account}: {exc}"
+            ) from exc
+        if not ready:
+            await self._abort_start(client)
+            raise CollectorStartError(
+                f"Private WebSocket not ready within "
+                f"{_PRIVATE_START_TIMEOUT:.1f}s for account {account}"
+            )
+        self._ready = True
+        self._identity_baseline = baseline
+        self._last_healthy_ts = datetime.now(UTC)
+
+    async def _abort_start(self, client: PrivateWebSocketClient) -> None:
+        """Disconnect a client whose start failed; leave the collector stopped."""
+        # State first: a cancellation during the disconnect below must still
+        # leave the collector stopped.
+        self._ws_client = None
+        self._running = False
+        try:
+            await asyncio.wait_for(
+                _run_in_daemon_thread(client.disconnect, name="ws-disconnect"),
+                timeout=self._ws_disconnect_timeout,
+            )
+        except Exception:
+            logger.warning(
+                "Private WS disconnect after a failed start did not complete "
+                "for account %s",
+                self.context.account_id,
+            )
 
     async def stop(self) -> None:
         """Stop collecting for this account.
@@ -538,7 +599,7 @@ class PrivateCollector:
         look alive (not message age — a healthy private stream can be quiet
         for days), never before the collector connected.
         """
-        start = (self._last_healthy_ts or datetime.now(UTC)) - _LIVENESS_MARGIN
+        start = (self._last_healthy_ts or datetime.now(UTC)) - LIVENESS_MARGIN
         if self._connected_at is not None:
             start = max(start, self._connected_at)
         return start
@@ -557,10 +618,9 @@ class PrivateCollector:
 
         The baseline identity is read BEFORE waiting, so a pybit silent
         reconnect during the wait fails readiness and is caught by the
-        next probe. During a health probe ``stop()`` ends the wait at once
-        (not ready): the waiting thread holds no lock and is abandoned. The
-        wait in ``start()`` runs before the stop event exists and is bounded
-        by the timeout only.
+        next probe. ``stop()`` ends the wait at once (not ready): the waiting
+        thread holds no lock and is abandoned. Used after a reset and for a
+        late-readiness re-check; ``start()`` uses ``_connect_and_confirm``.
         """
         self._ready = False
         baseline = client.socket_identity()

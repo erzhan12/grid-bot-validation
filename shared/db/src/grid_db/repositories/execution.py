@@ -500,7 +500,7 @@ class PrivateStreamSessionRepository(BaseRepository[PrivateStreamSession]):
         Args:
             run_id: Recording run the session belongs to.
             account_id: Account whose private stream connected.
-            connected_at: Time the private collector was started.
+            connected_at: Time the private session was confirmed ready.
 
         Returns:
             The flushed row (``id`` populated).

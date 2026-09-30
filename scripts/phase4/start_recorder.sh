@@ -20,7 +20,7 @@
 #
 # Exit codes (feature 0055):
 #   0 — initial REST snapshot emitted RECORDER_SNAPSHOT_OK; recorder running.
-#   1 — RECORDER_SNAPSHOT_INCOMPLETE, 15s sentinel timeout, or any other
+#   1 — RECORDER_SNAPSHOT_INCOMPLETE, 60s sentinel timeout, or any other
 #       failure path (config not found, prepare_recorder_session failed,
 #       prior recorder did not stop, unexpected classifier rc).
 # Callers (cron, CI, wrappers) MUST treat any non-zero exit as "recorder not
@@ -74,11 +74,18 @@ disown $RECORDER_PID 2>/dev/null || true
 
 # Wait for a terminal snapshot sentinel. Recorder emits one of:
 #   RECORDER_SNAPSHOT_OK         — snapshot complete
-#   RECORDER_SNAPSHOT_INCOMPLETE — auth failed, zero wallet/position rows, etc.
+#   RECORDER_SNAPSHOT_INCOMPLETE — a collector did not start (public connect or
+#                                  private auth/subscribe), REST auth failed,
+#                                  zero wallet/position rows, etc.
 # Do NOT break on human-readable "Initial REST snapshot:" — that line is
 # emitted before the zero-count WARNING and would race the failure path.
+# Feature 0110 B1c-2: both collectors now start BEFORE the REST snapshot.
+# Worst case of a healthy start: public connect 10 s + private connect and
+# readiness 11 s + three REST calls at 10 s each + process start-up, so the
+# wait is 60 s (it was 15 s when the snapshot ran first).
+SNAPSHOT_WAIT_SECONDS=60
 echo "==> Waiting for initial REST snapshot..."
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+for _ in $(seq 1 "$SNAPSHOT_WAIT_SECONDS"); do
   if grep -aqE "RECORDER_SNAPSHOT_OK|RECORDER_SNAPSHOT_INCOMPLETE" "$LOG_FILE" 2>/dev/null; then
     break
   fi
@@ -87,7 +94,7 @@ done
 
 # Dispatch on classifier exit code (not stdout — it prints diagnostic lines).
 set +e
-_classify_recorder_snapshot "$LOG_FILE"
+_classify_recorder_snapshot "$LOG_FILE" "$SNAPSHOT_WAIT_SECONDS"
 _rc=$?
 set -e
 
@@ -98,7 +105,7 @@ case "$_rc" in
       echo "ERROR: recorder did not stop after 10s; manual intervention needed" >&2
       exit 1
     fi
-    echo "ERROR: recorder initial REST snapshot is incomplete (auth failure or zero wallet/position rows)." \
+    echo "ERROR: recorder initial REST snapshot is incomplete (a collector did not start, auth failure, or zero wallet/position rows)." \
          "See the classifier diagnostic above for the specific cause." \
          "Check API credentials and network. Recorder stopped." >&2
     exit 1
@@ -112,7 +119,7 @@ case "$_rc" in
     echo "Status:       scripts/phase4/status.sh"
     ;;
   2)
-    # Timeout — no sentinel after 15s. Classifier already printed diagnostics.
+    # Timeout — no sentinel after the wait. Classifier already printed diagnostics.
     # Kill the recorder so a retrying caller (cron/CI) does not race a second
     # one onto the same SQLite DB.
     echo "       Process is alive: $(ps -p $RECORDER_PID -o pid= 2>/dev/null && echo yes || echo no)" >&2
@@ -120,7 +127,7 @@ case "$_rc" in
       echo "ERROR: recorder did not stop after 10s; manual intervention needed" >&2
       exit 1
     fi
-    echo "ERROR: recorder initial REST snapshot timed out after 15s with no sentinel." \
+    echo "ERROR: recorder initial REST snapshot timed out after ${SNAPSHOT_WAIT_SECONDS}s with no sentinel." \
          "Recorder stopped." >&2
     exit 1
     ;;
