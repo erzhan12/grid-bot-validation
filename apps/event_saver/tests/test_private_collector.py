@@ -884,11 +884,46 @@ class TestPrivateReadinessAndGapStart:
 
     @pytest.mark.asyncio
     async def test_never_ready_socket_is_unhealthy(self, context, on_gap):
-        """A socket not confirmed ready at start is reset by the probe."""
-        collector, ws = _probe_collector(context, on_gap)
+        """A socket that is still not ready when re-checked is reset."""
+        collector, ws = _probe_collector(context, on_gap, ready=False)
         collector._ready = False
         await collector._ws_health_check_once()
         ws.reset.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_late_ready_socket_is_not_reset(self, context, on_gap):
+        """Acks that land after the ready timeout make the SAME socket ready
+        on the next probe: no reset, and the unready stretch is a gap."""
+        collector, ws = _probe_collector(context, on_gap)
+        collector._ready = False
+        await collector._ws_health_check_once()
+        ws.reset.assert_not_called()
+        on_gap.assert_called_once()
+        assert on_gap.call_args[0][0] == _LAST_HEALTHY - _LIVENESS_MARGIN
+        assert collector._ready is True
+
+    @pytest.mark.asyncio
+    async def test_readiness_error_is_not_ready_not_raised(
+        self, collector, caplog
+    ):
+        """wait_ready raising (e.g. a pybit internals change) logs an ERROR
+        and counts as not ready; start() does not propagate it."""
+        with patch(
+            "event_saver.collectors.private_collector.PrivateWebSocketClient"
+        ) as MockWS:
+            MockWS.return_value.wait_ready.side_effect = AttributeError(
+                "subscriptions"
+            )
+            with caplog.at_level(
+                logging.ERROR, logger="event_saver.collectors.private_collector"
+            ):
+                await collector.start()
+            try:
+                assert collector.is_running() is True
+                assert collector._ready is False
+                assert "readiness check failed" in caplog.text
+            finally:
+                await collector.stop()
 
     @pytest.mark.asyncio
     async def test_gap_start_is_last_healthy_minus_margin(self, context, on_gap):
@@ -907,14 +942,18 @@ class TestPrivateReadinessAndGapStart:
 
     @pytest.mark.asyncio
     async def test_ready_failure_after_reset_keeps_gap_open(
-        self, context, on_gap
+        self, context, on_gap, caplog
     ):
-        """Reset but not ready: no gap reported yet; the next probe retries
-        and reports the gap from the ORIGINAL last-healthy time."""
+        """Reset but not ready: no gap reported yet; the next probe finds the
+        new socket ready and reports the gap from the ORIGINAL start."""
         collector, ws = _probe_collector(context, on_gap, alive=False)
         _swap_identity_on_reset(ws)
         ws.wait_ready.return_value = False
-        await collector._ws_health_check_once()
+        with caplog.at_level(
+            logging.ERROR, logger="event_saver.collectors.private_collector"
+        ):
+            await collector._ws_health_check_once()
+        assert "unready for" in caplog.text
         on_gap.assert_not_called()
         assert collector._last_healthy_ts == _LAST_HEALTHY
         assert collector._ready is False
@@ -922,7 +961,7 @@ class TestPrivateReadinessAndGapStart:
         ws.is_socket_alive.return_value = True
         ws.wait_ready.return_value = True
         await collector._ws_health_check_once()
-        assert ws.reset.call_count == 2
+        assert ws.reset.call_count == 1  # late-ready: the new socket is kept
         on_gap.assert_called_once()
         assert on_gap.call_args[0][0] == _LAST_HEALTHY - _LIVENESS_MARGIN
         assert collector._ready is True
@@ -951,8 +990,8 @@ class TestPrivateReadinessAndGapStart:
 
     @pytest.mark.asyncio
     async def test_not_ready_at_start_gap_dates_from_connect(self, collector, on_gap):
-        """Not ready at start: the first probe resets and dates the gap from
-        the connect time minus the liveness margin."""
+        """Not ready at start, ready by the first probe: the socket is kept
+        and the gap dates from the connect time minus the liveness margin."""
         with patch(
             "event_saver.collectors.private_collector.PrivateWebSocketClient"
         ) as MockWS:
@@ -962,9 +1001,8 @@ class TestPrivateReadinessAndGapStart:
             try:
                 connected_at = collector._last_healthy_ts
                 ws.wait_ready.return_value = True
-                _swap_identity_on_reset(ws)
                 await collector._ws_health_check_once()
-                ws.reset.assert_called_once()
+                ws.reset.assert_not_called()
                 on_gap.assert_called_once()
                 assert on_gap.call_args[0][0] == connected_at - _LIVENESS_MARGIN
             finally:

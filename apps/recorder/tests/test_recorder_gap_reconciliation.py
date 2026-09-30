@@ -69,6 +69,7 @@ class FakePrivateWS:
         self.on_reconnect = kwargs.get("on_reconnect")
         self.alive = True
         self.last_message_ts = _FIXED_TS
+        self._identity = object()
 
     def connect(self) -> None:
         pass
@@ -84,8 +85,6 @@ class FakePrivateWS:
         self._identity = object()  # a real reset builds a new pybit socket
 
     # Feature 0110 B1b readiness surface: always ready, stable identity.
-    _identity: object = object()
-
     def wait_ready(self, timeout: float) -> bool:
         return True
 

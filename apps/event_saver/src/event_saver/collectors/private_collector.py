@@ -348,6 +348,24 @@ class PrivateCollector:
             disconnected_at = (
                 self._last_healthy_ts or datetime.now(UTC)
             ) - _LIVENESS_MARGIN
+
+            if (
+                not self._ready
+                and client.is_socket_alive()
+                and await self._confirm_ready()
+            ):
+                # Acks landed after the ready timeout: keep this socket (a
+                # reset would restart the clock) and recover the unready
+                # stretch as a gap.
+                logger.info(
+                    "Private WebSocket became ready late for account %s",
+                    self.context.account_id,
+                )
+                self._handle_reconnect(disconnected_at, datetime.now(UTC))
+                return
+            if not self._running:  # stop() ended the readiness wait
+                return
+
             self._handle_disconnect(disconnected_at)
 
             logger.warning(
@@ -376,10 +394,14 @@ class PrivateCollector:
                 # Gap stays unreported; the next probe resets again and
                 # reports it from the same (unchanged) last-healthy time.
                 if self._running:  # not a stop() ending the wait
+                    unready_for = datetime.now(UTC) - (
+                        disconnected_at + _LIVENESS_MARGIN
+                    )
                     logger.error(
                         "Private WebSocket not ready after reset for "
-                        "account %s",
+                        "account %s (unready for %.0fs)",
                         self.context.account_id,
+                        unready_for.total_seconds(),
                     )
                 return
             self._handle_reconnect(disconnected_at, datetime.now(UTC))
@@ -434,7 +456,16 @@ class PrivateCollector:
         if not ready_wait.done():
             ready_wait.cancel()
             return False
-        ready = ready_wait.result()
+        try:
+            ready = ready_wait.result()
+        except Exception:
+            # e.g. a pybit internals change: degrade to "not ready".
+            logger.error(
+                "Private WebSocket readiness check failed for account %s",
+                self.context.account_id,
+                exc_info=True,
+            )
+            ready = False
         if ready:
             self._ready = True
             self._identity_baseline = baseline

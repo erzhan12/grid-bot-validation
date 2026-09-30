@@ -401,7 +401,7 @@ class PrivateWebSocketClient:
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _heartbeat_thread: Optional[threading.Thread] = field(default=None, init=False, repr=False)
     _stop_heartbeat: threading.Event = field(default_factory=threading.Event, init=False, repr=False)
-    _acked_req_ids: set[str] = field(default_factory=set, init=False, repr=False)
+    _acked_req_ids: set[object] = field(default_factory=set, init=False, repr=False)
     _ack_identity: object = field(default=None, init=False, repr=False)
 
     def connect(self) -> None:
@@ -532,14 +532,16 @@ class PrivateWebSocketClient:
         Acks are keyed to the ``WebSocketApp`` present at connect: pybit's
         silent reconnect swaps ``ws.ws`` and resends the same req_ids.
         """
-        acked: set[str] = set()
+        acked: set[object] = set()
         self._acked_req_ids = acked
         self._ack_identity = getattr(ws, "ws", None)
         original = ws._process_subscription_message
 
         def _record_ack(message: dict) -> None:
-            if message.get("success") is True and message.get("req_id"):
-                acked.add(message["req_id"])
+            if message.get("success") is True:
+                # Bybit echoes req_id on /v5/private; an ack without one is
+                # still counted, so an unexpected shape cannot block readiness.
+                acked.add(message.get("req_id") or object())
             return original(message)
 
         ws._process_subscription_message = _record_ack
@@ -581,7 +583,9 @@ class PrivateWebSocketClient:
             return False
         if getattr(ws, "ws", None) is not self._ack_identity:
             return False
-        return set(ws.subscriptions) <= set(self._acked_req_ids)
+        subs = set(ws.subscriptions)
+        acked = set(self._acked_req_ids)
+        return subs <= acked or len(acked) >= len(subs)
 
     def socket_identity(self) -> object:
         """The current pybit ``WebSocketApp`` object, or None when not connected.

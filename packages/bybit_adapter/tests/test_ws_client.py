@@ -1080,3 +1080,19 @@ class TestPrivateReadiness:
             timer.cancel()
             timer.join()
             client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket", side_effect=_FakePybitPrivateWS)
+    def test_acks_without_req_id_are_counted(self, _):
+        """If Bybit's private ack omits req_id, positive acks are counted."""
+        client = _ready_client()
+        client.connect()
+        try:
+            fake = client._ws
+            fake.auth = True
+            no_id = {"success": True, "op": "subscribe"}
+            fake._process_subscription_message(dict(no_id))
+            assert client.wait_ready(0.05) is False  # 1 of 2 subscriptions
+            fake._process_subscription_message(dict(no_id))
+            assert client.wait_ready(0.05) is True
+        finally:
+            client.disconnect()
