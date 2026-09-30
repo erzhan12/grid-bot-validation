@@ -181,3 +181,14 @@ Engines: codex (`gpt-5.6-sol`, high) + cursor (`grok-4.7-high`). Rounds 3/4. Res
 | P3 | A retried fallback row stays `pending`. | Deferred (`tasks/todo.md`); it under-claims coverage. |
 | P3 | Rule text for `wait_ready(0)`. | ACCEPT. |
 
+## PR #286 claude-review (round 2, on 6b114cc) — APPROVED, no P0/P1
+
+| Sev | Finding | Verdict |
+|---|---|---|
+| P2 | The lost-write gap started at "now − 75 s" when the callback ran, which can be later than the loss. | ACCEPT — the earliest unrecorded loss time is kept under the lock and used as the anchor. |
+| P2 | The latch was released even when no gap could be recorded (stopping). | ACCEPT — it stays set in that case. |
+| P2 | Synchronous DB writes on the loop every healthy probe. | Deferred (`tasks/todo.md`). |
+| P3 | Public name for `_LIVENESS_MARGIN`. | Declined (as on #283). |
+| P3 | "3 probes" wording is off by one. | ACCEPT — reset skipped on at most 2 probes. |
+| P3 | `start()` did not reset `_liveness_only`. | ACCEPT. |
+

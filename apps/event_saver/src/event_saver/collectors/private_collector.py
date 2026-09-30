@@ -255,6 +255,7 @@ class PrivateCollector:
         # never starts before it (no pre-run executions under this run).
         self._connected_at = self._last_healthy_ts = datetime.now(UTC)
         self._unready_resets = 0
+        self._liveness_only = False
         if not await self._confirm_ready(self._ws_client):
             # Not fatal until feature 0110 B1c-2 moves the startup snapshot:
             # the first health probe treats "not ready" as unhealthy.

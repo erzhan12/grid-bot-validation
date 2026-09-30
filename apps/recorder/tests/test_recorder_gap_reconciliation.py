@@ -1076,3 +1076,38 @@ class TestPrivateStreamCoverage:
         recorder._try_gap_write(_gone, "gap close")
         assert [label for _, label in recorder._pending_gap_writes] == ["gap close"]
         assert recorder._pending_gap_writes[0][0] is _bad
+
+    async def test_lost_write_gap_starts_at_the_failure_time(
+        self, config_with_account, db, db_with_gridbot_seed
+    ):
+        """The gap is anchored on when the write failed, not on when the
+        loop got round to recording it."""
+        with _patched_network(_make_fake_rest()):
+            recorder = Recorder(config=config_with_account, db=db)
+            await recorder.start()
+            try:
+                lost_at = datetime.now(UTC) - timedelta(seconds=100)
+                recorder._private_write_lost = True
+                recorder._private_write_lost_at = lost_at
+                recorder._record_lost_write_gap()  # the stalled callback
+                (gap,) = _gap_rows(db)
+                assert gap.gap_start.replace(tzinfo=UTC) == lost_at - _LIVENESS_MARGIN
+                assert recorder._private_write_lost is False
+                assert recorder._private_write_lost_at is None
+            finally:
+                await recorder.stop()
+
+    async def test_lost_write_latch_stays_when_no_gap_can_be_recorded(
+        self, config_with_account, db, db_with_gridbot_seed
+    ):
+        """After stop() no gap can be recorded: the latch must stay set so a
+        checkpoint cannot certify the window."""
+        with _patched_network(_make_fake_rest()):
+            recorder = Recorder(config=config_with_account, db=db)
+            await recorder.start()
+            await recorder.stop()
+            recorder._private_write_lost = True
+            recorder._private_write_lost_at = datetime.now(UTC)
+            recorder._record_lost_write_gap()
+            assert recorder._private_write_lost is True
+            assert _gap_rows(db) == []

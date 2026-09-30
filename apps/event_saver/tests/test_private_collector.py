@@ -1290,3 +1290,17 @@ class TestPrivateCoverageHooks:
             ws.reset.assert_not_called()
         finally:
             gate.set()
+
+    @pytest.mark.asyncio
+    async def test_start_clears_liveness_only(self, collector):
+        """A collector restarted while degraded starts not degraded."""
+        collector._liveness_only = True
+        with patch(
+            "event_saver.collectors.private_collector.PrivateWebSocketClient"
+        ) as MockWS:
+            MockWS.return_value.wait_ready.return_value = False
+            await collector.start()
+            try:
+                assert collector.is_degraded() is False
+            finally:
+                await collector.stop()

@@ -53,9 +53,10 @@ from recorder.shared_db_parents import verify_shared_db_parents
 
 logger = logging.getLogger(__name__)
 
-# Probes in a row that may skip the socket reset because the open-gap rows
-# could not be written. Past this the reset goes ahead: orders, positions and
-# wallet have no REST backfill, so a dead socket must not stay un-reset.
+# Consecutive open-gap write failures at which the socket reset goes ahead
+# anyway (so the reset is skipped on at most this many minus one probes):
+# orders, positions and wallet have no REST backfill, so a dead socket must
+# not stay un-reset.
 _MAX_OPEN_GAP_FAILURES = 3
 
 
@@ -107,6 +108,7 @@ class Recorder:
         self._pending_lock = threading.Lock()
         self._pending_futures: set[Future] = set()
         self._private_write_lost = False
+        self._private_write_lost_at: Optional[datetime] = None
         self._private_session_id: Optional[int] = None
         self._open_gap_ids: dict[str, int] = {}
         self._open_gap_failures = 0
@@ -141,6 +143,7 @@ class Recorder:
             with self._pending_lock:
                 self._pending_futures.clear()
                 self._private_write_lost = False
+                self._private_write_lost_at = None
             self._private_session_id = None
             self._open_gap_ids = {}
             self._open_gap_failures = 0
@@ -916,6 +919,10 @@ class Recorder:
             first_loss = failed and not self._private_write_lost
             if failed:
                 self._private_write_lost = True
+                # Earliest loss not yet recorded as a gap.
+                self._private_write_lost_at = (
+                    self._private_write_lost_at or datetime.now(UTC)
+                )
             self._pending_futures.discard(fut)
         if first_loss:
             # The event never reached a writer: record a gap for it on the
@@ -931,15 +938,25 @@ class Recorder:
     def _record_lost_write_gap(self) -> None:
         """Turn a lost private write into a gap, then release the latch.
 
-        Runs on the event loop. The gap covers the liveness margin before
-        now; REST recovery runs for executions as for any gap. If an outage
-        gap is already open it covers this moment, so nothing is added.
+        Runs on the event loop. The gap starts the liveness margin before
+        the earliest unrecorded loss (not before "now": this callback can
+        run late); REST recovery runs for executions as for any gap. If an
+        outage gap is already open it covers the loss, so nothing is added.
+        If no gap can be recorded (the recorder is stopping) the latch stays
+        set, so the checkpoint stays blocked.
         """
         now = datetime.now(UTC)
+        covered = bool(self._open_gap_ids)
+        can_record = bool(self._reconciler and self._config.account and self._run_id)
+        if not (covered or can_record):
+            return
         with self._pending_lock:
+            lost_at = self._private_write_lost_at or now
+            # Released before recording: a later loss schedules its own gap.
             self._private_write_lost = False
-        if not self._open_gap_ids:
-            self._handle_private_gap(now - _LIVENESS_MARGIN, now)
+            self._private_write_lost_at = None
+        if not covered:
+            self._handle_private_gap(min(lost_at, now) - _LIVENESS_MARGIN, now)
 
     def _open_private_session(self, connected_at: datetime) -> None:
         """Write the private-stream session row; its checkpoint starts here.
@@ -1098,8 +1115,9 @@ class Recorder:
         commits. A symbol that already holds an open row is skipped (the
         collector calls this again on every probe until the gap closes).
         DB errors propagate, so the collector skips the reset this probe —
-        but only ``_MAX_OPEN_GAP_FAILURES`` probes in a row; after that it
-        returns normally and the gap is recorded at reconnect instead.
+        for at most ``_MAX_OPEN_GAP_FAILURES - 1`` (2) probes in a row; on
+        the next failure it returns normally, the reset goes ahead and the
+        gap is recorded at reconnect instead.
         """
         if not (self._config.account and self._run_id):
             return
