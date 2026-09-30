@@ -592,6 +592,8 @@ class PrivateWebSocketClient:
         if getattr(ws, "ws", None) is not self._ack_identity:
             return False
         subs = set(ws.subscriptions)
+        if not subs:  # subscribed to nothing: nothing to be ready for
+            return False
         acked = set(self._acked_req_ids)
         if acked:  # acks carry req_id: match every subscription strictly
             return subs <= acked

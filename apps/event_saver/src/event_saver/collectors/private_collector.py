@@ -407,7 +407,7 @@ class PrivateCollector:
                     # Gap stays unreported; the next probe retries and
                     # reports it from the same (unchanged) last-healthy time.
                     unready_for = datetime.now(UTC) - (
-                        disconnected_at + _LIVENESS_MARGIN
+                        self._last_healthy_ts or disconnected_at
                     )
                     logger.error(
                         "Private WebSocket not ready after reset for "

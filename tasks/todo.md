@@ -9,6 +9,16 @@ Plan: docs/features/0110_PLAN.md (B1b, detect-only)  |  Branch: feature/0110-b1b
 - [x] make test + make lint green
 - [x] rules update (bybit-adapter, event-saver, grid-db)
 
+## Follow-ups
+- PR #283 review P2: surface the liveness-only degraded state. Set a flag
+  when `_MAX_UNREADY_RESETS` is hit (cleared on a successful readiness),
+  expose it from `PrivateCollector`, and add it to `Recorder.get_stats()` so
+  the periodic Health line shows it. Today one ERROR is the only signal that
+  a topic (possibly `execution`) is never acked.
+- PR #283 review P3: back off on a persistently unauthenticated socket
+  (revoked/expired key). Each probe resets it and reports a ~90 s gap with a
+  REST recovery, indefinitely; skip the reset and throttle the ERROR instead.
+
 # Feature 0110 Phase B1a — gap persistence + structured recovery result (#271)
 
 Plan: docs/features/0110_PLAN.md (B1 split into B1a/B1b/B1c)  |  Branch: feature/0110-b1a-recovery-persistence

@@ -1115,3 +1115,18 @@ class TestPrivateReadiness:
             assert client.wait_ready(0.05) is True
         finally:
             client.disconnect()
+
+    @patch("bybit_adapter.ws_client.WebSocket", side_effect=_FakePybitPrivateWS)
+    def test_no_subscriptions_is_not_ready(self, _):
+        """A tracking client subscribed to nothing is never ready."""
+        client = PrivateWebSocketClient(
+            api_key="k", api_secret="s", testnet=True,
+            message_gap_watchdog_enabled=False,
+            track_subscription_acks=True,
+        )
+        client.connect()
+        try:
+            client._ws.auth = True
+            assert client.wait_ready(0.05) is False
+        finally:
+            client.disconnect()

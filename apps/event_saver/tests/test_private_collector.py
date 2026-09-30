@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import re
 import threading
 import time
 import pytest
@@ -1059,3 +1060,28 @@ class TestPrivateReadinessAndGapStart:
             assert collector._ready is False
         finally:
             gate.set()
+
+    @pytest.mark.asyncio
+    async def test_unready_duration_is_not_negative_after_start(
+        self, collector, caplog
+    ):
+        """Not ready at start and after the first reset: the logged unready
+        time counts from the connect time (the clamp must not skew it)."""
+        with patch(
+            "event_saver.collectors.private_collector.PrivateWebSocketClient"
+        ) as MockWS:
+            ws = MockWS.return_value
+            ws.wait_ready.return_value = False
+            await collector.start()
+            try:
+                _swap_identity_on_reset(ws)
+                with caplog.at_level(
+                    logging.ERROR,
+                    logger="event_saver.collectors.private_collector",
+                ):
+                    await collector._ws_health_check_once()
+                match = re.search(r"unready for (-?\d+)s", caplog.text)
+                assert match is not None
+                assert int(match.group(1)) >= 0
+            finally:
+                await collector.stop()
