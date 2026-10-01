@@ -368,8 +368,8 @@ class Recorder:
           will succeed.
         - ``logger.warning("RECORDER_SNAPSHOT_INCOMPLETE")`` — auth-client
           construction failure, zero wallet/position rows, OR a failed
-          position symbol (``get_positions`` raised, or an open row whose
-          leg is unknown — 0110 B2a). Positions always write two rows per
+          position symbol (``get_positions`` raised, an open row whose leg
+          is unknown, or a real row that failed conversion — 0110 B2a). Positions always write two rows per
           symbol, so ``position_count == 0`` now means no symbols or a
           failed insert; the failed-symbol count is the real
           position-dimension signal. An ``empty_response`` symbol
@@ -560,7 +560,8 @@ class Recorder:
 
         Returns:
             ``(rows_written, failed_symbols)`` — a symbol fails when
-            ``get_positions`` raised or an open row's leg is unknown.
+            ``get_positions`` raised, an open row's leg is unknown, or a
+            real row failed conversion.
         """
         snapshots: list[PositionSnapshot] = []
         failures = 0
@@ -621,6 +622,7 @@ class Recorder:
             else:
                 synthetic_default = "absent_side"
 
+            row_malformed = False
             for side in ("Buy", "Sell"):
                 pos = by_side.get(side)
                 synthetic = synthetic_default
@@ -695,6 +697,7 @@ class Recorder:
                             f"({symbol} {side}); writing zero-row: {e}"
                         )
                         synthetic = "malformed"
+                        row_malformed = True
                 # Absent (or malformed): write the contract zero-row.
                 snapshots.append(
                     PositionSnapshot(
@@ -719,6 +722,10 @@ class Recorder:
                         raw_json={"synthetic": synthetic},
                     )
                 )
+            # A real row that failed conversion may be an open leg: the
+            # symbol fails (counted once with an unresolved open row).
+            if row_malformed and not open_row_unresolved:
+                failures += 1
 
         if not snapshots:
             return 0, failures

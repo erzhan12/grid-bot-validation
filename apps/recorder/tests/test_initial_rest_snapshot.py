@@ -833,13 +833,21 @@ class TestSyntheticZeroRowMarkers:
     @patch("recorder.recorder.BybitRestClient")
     async def test_malformed_row_is_marked_malformed(
         self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
-        config_with_account, db, db_with_gridbot_seed,
+        config_with_account, db, db_with_gridbot_seed, caplog,
     ):
-        """A row that fails conversion becomes a malformed placeholder."""
+        """A row that fails conversion becomes a malformed placeholder and
+        fails the symbol (INCOMPLETE), since the leg may be open."""
+        import logging
+
         mock_pub_cls.return_value = _make_pub_mock()
         mock_priv_cls.return_value = _make_priv_mock()
         snapshot_client = _stub_rest_client(
-            wallet_response={"list": []},
+            wallet_response={
+                "list": [{
+                    "accountType": "UNIFIED",
+                    "coin": [{"coin": "USDT", "walletBalance": "10000"}],
+                }]
+            },
             positions_by_symbol={
                 "BTCUSDT": [
                     {"symbol": "BTCUSDT", "side": "Buy", "size": "not-a-number"}
@@ -850,11 +858,15 @@ class TestSyntheticZeroRowMarkers:
         mock_rest_cls.side_effect = [MagicMock(), snapshot_client]
 
         recorder = Recorder(config=config_with_account, db=db)
-        await recorder.start()
+        with caplog.at_level(logging.INFO, logger="recorder.recorder"):
+            await recorder.start()
         try:
             rows = self._rows(db, recorder)
             assert rows["Buy"] == (Decimal("0"), {"synthetic": "malformed"})
             assert rows["Sell"][1] == {"synthetic": "absent_side"}
+            messages = [r.message for r in caplog.records]
+            assert "RECORDER_SNAPSHOT_INCOMPLETE" in messages
+            assert "RECORDER_SNAPSHOT_OK" not in messages
         finally:
             await recorder.stop()
 

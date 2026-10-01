@@ -19,6 +19,21 @@ Plan: docs/features/0110_PLAN.md (B2 split: B2a writer side, B2b coverage gate, 
   rule as `event_saver.writers.leg_side`), update
   `test_skips_empty_symbol_or_side`, add a flat-leg-clears-slot test;
   needs its own plan, review and a VPS deploy.
+- PR #288 review P2 (comparator): `PositionComparator._pair_side` takes
+  the FIRST unclaimed live row inside the ±5 s window, not the nearest.
+  Live per-side streams carry rows the backtest never emits (Bybit pushes
+  on order create/amend/cancel, and since B2a flat-leg rows), so a
+  backtest row can claim an extra live row and leave its true match
+  unconsumed (spurious state_diverged, lost coverage). Pre-existing for
+  non-flat extra rows; consider nearest-in-time pairing plus an
+  asymmetric-stream test (live [open, flat, open] vs bt [open, open]).
+- PR #288 review P2 (B2c input): decide whether ALL configured symbols
+  returning `empty_response` should make the startup snapshot
+  INCOMPLETE (mis-scoped key) — today it is WARNING + OK.
+- PR #288 review P3: `PositionWriter` falls back from an empty
+  `updatedTime` straight to `local_ts`; it could try the frame
+  `creationTime` first like `wallet_writer._resolve_exchange_ts`
+  (V5 position frames carry `updatedTime`, so low value).
 
 # Feature 0110 Phase B1c-2 — confirmed startup (#271)
 

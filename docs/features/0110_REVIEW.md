@@ -299,3 +299,16 @@ All six findings applied inline.
 | P3 | `ORDER BY exchange_ts DESC, id DESC` may add a temp sort. | REJECT — `EXPLAIN QUERY PLAN` (in-memory schema) shows the same index search for both orderings, no temp B-tree: `id` is the rowid alias, implicitly last in every SQLite index. |
 
 `make test` exit 0 (92%), `make lint` clean.
+
+## PR #288 claude-review (round 4, on b3bf517) — APPROVED, no P0/P1
+
+| Sev | Finding | Verdict |
+|---|---|---|
+| P2 | A real row that fails conversion is `malformed` but the snapshot stays OK. | Fixed: the symbol fails → INCOMPLETE (counted once with an unresolved open row); test extended. |
+| P2 | All configured symbols `empty_response` (mis-scoped key) stays OK. | DEFERRED — design input for B2c, which owns `empty_response`; `tasks/todo.md`. |
+| P2 | Comparator `_pair_side` takes the first unclaimed live row in the window, so an extra live row (now incl. flat rows) can steal a backtest row's match. | DEFERRED — pre-existing for any extra live row (Bybit pushes on order create/amend/cancel); comparator pairing change belongs in its own PR; `tasks/todo.md`. |
+| P2 | Asymmetric-stream comparator test. | DEFERRED with the item above. |
+| P2 | Open a GitHub issue for the gridbot `side=""` hazard. | Not done — outside this PR; left to the user (rule + todo entries exist). |
+| P3 | Empty `updatedTime` could try frame `creationTime` before `local_ts`. | DEFERRED — V5 position frames carry `updatedTime`; `tasks/todo.md`. |
+
+`make test` exit 0 (92%), `make lint` clean.
