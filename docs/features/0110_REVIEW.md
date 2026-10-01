@@ -256,3 +256,18 @@ Engines: codex (`gpt-5.6-sol`) + cursor. Rounds 1/4.
 
 - `make test`: exit 0, merged coverage 92%.
 - `make lint`: all checks passed.
+
+## PR #288 claude-review (round 1, on 94f05e0) — APPROVED, no P0/P1
+
+All six findings applied inline.
+
+| Sev | Finding | Fix |
+|---|---|---|
+| P2 | A `get_positions` failure still produced `RECORDER_SNAPSHOT_OK`: its two placeholder rows counted as a position snapshot. | `_snapshot_positions` returns `(rows, fetch_failures)`; any failure → `RECORDER_SNAPSHOT_INCOMPLETE`, like a wallet failure. Test `test_position_fetch_failure_is_incomplete`. |
+| P2 | No reader-level test that a flat-leg row supersedes the pre-close row in the replay seed. | `test_flat_leg_row_supersedes_pre_close_row` (`test_snapshot_loader.py`). |
+| P2 | No comparator test with flat rows inside the live per-side stream. | `test_flat_rows_keep_stream_alignment` (`test_position_metrics.py`). |
+| P2 | A row whose leg `leg_side` cannot resolve was dropped silently before the leg became `absent_side`. | WARNING with raw `side` / `positionIdx`. Test `test_unresolved_side_row_is_logged`. |
+| P3 | No writer test for a missing `positionIdx` or `side=None`. | Two tests; both store `""`. |
+| P3 | Rule said nothing reads position `raw_json`; `scripts/research_0045_im_mm_distribution.py` does (falls back to leverage 1). | Reworded to "no application code" and named the script. |
+
+`make test` exit 0 (92%), `make lint` clean.

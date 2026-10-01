@@ -733,6 +733,33 @@ class TestLoadPositionSnapshots:
         assert short_seed.entry_price == Decimal("51000")
         assert short_seed.liquidation_price == Decimal("55000")
 
+    def test_flat_leg_row_supersedes_pre_close_row(
+        self, session, sample_account, sample_run, base_ts
+    ):
+        """0110 B2a: a hedge leg closing to flat is now a size-0 Buy row;
+        the seed takes it instead of the stale pre-close position."""
+        account_id = str(sample_account.account_id)
+
+        def row(side, ts, size, entry):
+            return PositionSnapshot(
+                run_id=sample_run.run_id, account_id=account_id,
+                symbol="BTCUSDT", exchange_ts=ts, local_ts=ts, side=side,
+                size=Decimal(size), entry_price=Decimal(entry),
+            )
+
+        PositionSnapshotRepository(session).bulk_insert([
+            row("Buy", base_ts, "1.5", "50000"),
+            row("Sell", base_ts, "0", "0"),
+            row("Buy", base_ts + timedelta(seconds=1), "0", "0"),
+        ])
+
+        long_seed, _ = load_position_snapshots(
+            session, sample_run.run_id, account_id, "BTCUSDT",
+            base_ts + timedelta(seconds=2),
+        )
+
+        assert long_seed.size == Decimal("0")
+
     def test_upl_and_mark_fields_pass_through(
         self, session, sample_account, sample_run, base_ts
     ):

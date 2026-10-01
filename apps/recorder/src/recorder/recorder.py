@@ -402,7 +402,7 @@ class Recorder:
         wallet_count = await self._snapshot_wallet(
             auth_client, run_id_str, account_id_str, snapshot_ts
         )
-        position_count = await self._snapshot_positions(
+        position_count, position_failures = await self._snapshot_positions(
             auth_client, run_id_str, account_id_str, snapshot_ts
         )
         order_count = await self._snapshot_open_orders(
@@ -419,11 +419,14 @@ class Recorder:
         # will refuse to seed from this run. Surface this loudly at recorder
         # start so an operator catches credential/permissions problems early
         # instead of finding out hours later when replay refuses. open_orders
-        # legitimately can be zero (clean account) — not warned on.
-        if wallet_count == 0 or position_count == 0:
+        # legitimately can be zero (clean account) — not warned on. A symbol
+        # whose get_positions raised (0110 B2a) counts as missing: its rows
+        # are only rest_failure placeholders.
+        if wallet_count == 0 or position_count == 0 or position_failures:
             logger.warning(
                 "Initial REST snapshot incomplete: "
-                f"wallet_rows={wallet_count}, position_rows={position_count} "
+                f"wallet_rows={wallet_count}, position_rows={position_count}, "
+                f"position_fetch_failures={position_failures} "
                 "(zero on either dimension means seed-aware replay from this "
                 "run_id will fail Phase 4 pre-check; check API credentials / "
                 "permissions / category=linear settleCoin=USDT scope)"
@@ -523,7 +526,7 @@ class Recorder:
         run_id: str,
         account_id: str,
         snapshot_ts: datetime,
-    ) -> int:
+    ) -> tuple[int, int]:
         """REST-fetch positions and write BOTH sides per configured symbol.
 
         Contract: ALWAYS exactly two rows per symbol (Buy + Sell). When the
@@ -531,8 +534,12 @@ class Recorder:
         is marked in ``raw_json`` with why it was synthesised (0110 B2a):
         ``{"synthetic": "rest_failure" | "malformed" | "absent_side"}``, so a
         reader can tell a flat leg from a failed or incomplete fetch.
+
+        Returns:
+            ``(rows_written, symbols_whose_fetch_failed)``.
         """
         snapshots: list[PositionSnapshot] = []
+        fetch_failures = 0
         for symbol in self._config.symbols:
             fetch_failed = False
             try:
@@ -546,6 +553,7 @@ class Recorder:
                 # transient REST failure.
                 positions = []
                 fetch_failed = True
+                fetch_failures += 1
 
             # Index by side for O(1) lookup.
             by_side: dict[str, dict] = {}
@@ -555,6 +563,12 @@ class Recorder:
                 side = leg_side(pos)
                 if side in ("Buy", "Sell"):
                     by_side[side] = pos
+                else:
+                    logger.warning(
+                        f"Initial snapshot: position row for {symbol} skipped, "
+                        f"side could not be resolved (side={pos.get('side')!r}, "
+                        f"positionIdx={pos.get('positionIdx')!r})"
+                    )
 
             for side in ("Buy", "Sell"):
                 pos = by_side.get(side)
@@ -656,14 +670,14 @@ class Recorder:
                 )
 
         if not snapshots:
-            return 0
+            return 0, fetch_failures
 
         try:
             await asyncio.to_thread(self._bulk_insert_position_snapshots, snapshots)
         except Exception as e:
             logger.error(f"Initial snapshot: position bulk_insert failed: {e}")
-            return 0
-        return len(snapshots)
+            return 0, fetch_failures
+        return len(snapshots), fetch_failures
 
     def _bulk_insert_position_snapshots(self, snapshots: list[PositionSnapshot]) -> None:
         with self._db.get_session() as session:

@@ -1253,6 +1253,20 @@ class TestPositionWriterFlatLegSide:
         assert writer._buffer[0].side == ""
 
     @pytest.mark.asyncio
+    async def test_missing_position_idx_keeps_empty_side(self, mock_db):
+        """No positionIdx key at all: the side stays empty."""
+        writer = PositionWriter(db=mock_db, batch_size=100)
+        await writer.write(uuid4(), self._msg())
+        assert writer._buffer[0].side == ""
+
+    @pytest.mark.asyncio
+    async def test_none_side_is_stored_as_empty(self, mock_db):
+        """side=None never reaches the non-nullable column."""
+        writer = PositionWriter(db=mock_db, batch_size=100)
+        await writer.write(uuid4(), self._msg(side=None))
+        assert writer._buffer[0].side == ""
+
+    @pytest.mark.asyncio
     async def test_explicit_side_is_never_overridden(self, mock_db):
         """A non-empty side from Bybit wins over positionIdx."""
         writer = PositionWriter(db=mock_db, batch_size=100)
