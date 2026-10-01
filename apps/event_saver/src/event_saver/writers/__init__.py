@@ -4,7 +4,7 @@ from event_saver.writers.trade_writer import TradeWriter
 from event_saver.writers.execution_writer import ExecutionWriter
 from event_saver.writers.ticker_writer import TickerWriter
 from event_saver.writers.order_writer import OrderWriter
-from event_saver.writers.position_writer import PositionWriter
+from event_saver.writers.position_writer import PositionWriter, leg_side
 from event_saver.writers.wallet_writer import WalletWriter
 
 __all__ = [
@@ -14,4 +14,5 @@ __all__ = [
     "OrderWriter",
     "PositionWriter",
     "WalletWriter",
+    "leg_side",
 ]

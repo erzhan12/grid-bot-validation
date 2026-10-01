@@ -1200,8 +1200,12 @@ class ReplayEngine:
     ) -> None:
         """Phase 4 pre-check (lives in engine per Phase 3 plan).
 
-        Confirms the recorder's initial REST snapshot landed for both
-        wallet and position dimensions before ``at_ts``. ``orders`` is
+        Confirms the run has wallet and position rows at least
+        ``_SEED_PRE_CHECK_MARGIN`` before ``at_ts``. It is a coarse guard,
+        not proof that the initial REST snapshot landed: since the recorder
+        subscribes before the REST snapshot (0110 B1c-2), ``MIN(exchange_ts)``
+        can be a WS row from the seconds before the REST t=0 row. Pick
+        ``at_ts`` a few seconds after ``RECORDER_SNAPSHOT_OK``. ``orders`` is
         intentionally excluded — a clean account legitimately has zero
         open orders at recorder start, so a strict ``MIN`` requirement
         would falsely reject a valid happy path.

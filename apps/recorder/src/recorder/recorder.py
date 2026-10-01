@@ -48,6 +48,7 @@ from event_saver.writers import (
     OrderWriter,
     PositionWriter,
     WalletWriter,
+    leg_side,
 )
 from event_saver.reconciler import GapReconciler, recovery_result_from_future
 
@@ -526,10 +527,14 @@ class Recorder:
         """REST-fetch positions and write BOTH sides per configured symbol.
 
         Contract: ALWAYS exactly two rows per symbol (Buy + Sell). When the
-        REST response omits a side, write a zero-size row for it.
+        REST response omits a side, write a zero-size row for it. A zero-row
+        is marked in ``raw_json`` with why it was synthesised (0110 B2a):
+        ``{"synthetic": "rest_failure" | "malformed" | "absent_side"}``, so a
+        reader can tell a flat leg from a failed or incomplete fetch.
         """
         snapshots: list[PositionSnapshot] = []
         for symbol in self._config.symbols:
+            fetch_failed = False
             try:
                 positions = await asyncio.to_thread(client.get_positions, symbol)
             except Exception as e:
@@ -540,18 +545,20 @@ class Recorder:
                 # "exactly one side missing" check doesn't fire on a
                 # transient REST failure.
                 positions = []
+                fetch_failed = True
 
             # Index by side for O(1) lookup.
             by_side: dict[str, dict] = {}
             for pos in positions:
                 if pos.get("symbol") != symbol:
                     continue
-                side = pos.get("side")
+                side = leg_side(pos)
                 if side in ("Buy", "Sell"):
                     by_side[side] = pos
 
             for side in ("Buy", "Sell"):
                 pos = by_side.get(side)
+                synthetic = "rest_failure" if fetch_failed else "absent_side"
                 if pos is not None:
                     try:
                         snapshots.append(
@@ -622,6 +629,7 @@ class Recorder:
                             f"Initial snapshot: malformed position row "
                             f"({symbol} {side}); writing zero-row: {e}"
                         )
+                        synthetic = "malformed"
                 # Absent (or malformed): write the contract zero-row.
                 snapshots.append(
                     PositionSnapshot(
@@ -643,7 +651,7 @@ class Recorder:
                         cum_realised_pnl=None,
                         cur_realised_pnl=None,
                         position_value=None,  # 0059: zero-row stays NULL.
-                        raw_json=None,
+                        raw_json={"synthetic": synthetic},
                     )
                 )
 

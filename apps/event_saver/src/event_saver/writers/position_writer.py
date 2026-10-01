@@ -14,6 +14,23 @@ from grid_db import DatabaseFactory, PositionSnapshot, PositionSnapshotRepositor
 logger = logging.getLogger(__name__)
 
 
+# Hedge-mode positionIdx → leg side (1 = long, 2 = short).
+_HEDGE_IDX_SIDE = {"1": "Buy", "2": "Sell"}
+
+
+def leg_side(pos: dict) -> str:
+    """Side of a position row; a flat hedge leg's side comes from positionIdx.
+
+    Bybit sends ``side=""`` for an empty position (WS and REST), but in hedge
+    mode the leg is still known from ``positionIdx``. One-way mode (``positionIdx`` 0)
+    has no leg, so its flat row keeps the empty side (0110 B2a).
+    """
+    side = pos.get("side", "")
+    if side:
+        return side
+    return _HEDGE_IDX_SIDE.get(str(pos.get("positionIdx", "")), "")
+
+
 class PositionWriter:
     """Buffers and bulk-inserts position snapshots.
 
@@ -218,7 +235,7 @@ class PositionWriter:
                             symbol=pos.get("symbol", ""),
                             exchange_ts=exchange_ts,
                             local_ts=local_ts,
-                            side=pos.get("side", ""),
+                            side=leg_side(pos),
                             size=Decimal(str(pos.get("size", "0"))),
                             entry_price=Decimal(str(pos.get("entryPrice", "0"))),
                             liq_price=(

@@ -1,3 +1,13 @@
+# Feature 0110 Phase B2a — recorder position-data fitness (#271)
+
+Plan: docs/features/0110_PLAN.md (B2 split: B2a writer side, B2b coverage gate, B2c anchor fitness)  |  Branch: feature/0110-b2a-position-fitness
+
+- [x] recorder: startup zero-rows carry `raw_json={"synthetic": "rest_failure" | "malformed" | "absent_side"}`
+- [x] PositionWriter: `side=""` (flat hedge leg) → side from `positionIdx` (1 → Buy, 2 → Sell)
+- [x] replay: `_seed_pre_check` docstring + `replay.md` — MIN(exchange_ts) may be a WS row since B1c-2
+- [x] make test + make lint green
+- [x] rules update (recorder, event-saver, replay) + plan as-built notes
+
 # Feature 0110 Phase B1c-2 — confirmed startup (#271)
 
 Plan: docs/features/0110_PLAN.md (B1 step 8 + step 1 startup part)  |  Branch: feature/0110-b1c2-startup

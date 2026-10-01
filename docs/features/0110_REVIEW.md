@@ -232,3 +232,27 @@ Engines: codex (`gpt-5.6-sol`, high) + cursor (`grok-4.7-high`). Rounds 4/4 (the
 
 - `make test`: exit 0, merged coverage 92%.
 - `make lint`: all checks passed.
+
+## Phase B2a — local staged review (review-fix-loop-staged, 2026-10-01)
+
+5 reviewers, 1 iteration, 0 CRITICAL → Ready to commit.
+
+| Sev | Finding | Fix |
+|---|---|---|
+| WARNING | Rule/plan claim "the only snapshot `raw_json` reader is the wallet collateral path" missed live-check `shared_wallet.py` (also wallet-only). | Reworded: nothing reads position `raw_json`; wallet readers listed. |
+| WARNING | No multi-symbol test mixing failure types. | Not added: `fetch_failed` resets per symbol and `synthetic` per side. |
+| INFO | `leg_side` imported from the submodule while the writers come from the package. | Exported from `event_saver.writers`. |
+
+## Phase B2a — external review (ext-code-review)
+
+Engines: codex (`gpt-5.6-sol`) + cursor. Rounds 1/4.
+
+| Round | Engine | Sev | Finding | Verdict |
+|---|---|---|---|---|
+| 1 | codex | P2 | Malformed handling starts after side indexing: a non-dict row aborts startup; a row with unusable `side`/`positionIdx` is ignored and labelled `absent_side`. | REJECT — the non-dict crash is pre-existing (`pos.get("symbol")` before B2a) and pybit returns dicts; by Bybit's contract `side` is `""` only for an empty position and hedge `positionIdx` is 1/2, so such a row is flat and `absent_side` ("known flat") stays true. |
+| 1 | cursor | — | NO P1/P2; verified every per-side reader (replay seed, ground_truth, comparator, `get_latest_before`) with flat legs stored as `Buy`/`Sell` size 0. P3: `_rows` collapses duplicate sides; size/NULL telemetry asserted only on the malformed case; no `side=None` / missing `positionIdx` writer case. | `_rows` now asserts exactly one Buy + one Sell row. Others accepted gaps. |
+
+## Final verification (B2a)
+
+- `make test`: exit 0, merged coverage 92%.
+- `make lint`: all checks passed.

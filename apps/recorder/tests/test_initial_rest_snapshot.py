@@ -14,6 +14,7 @@ Contract (from docs/features/0029_PLAN.md "Initial-snapshot row contract"):
 - REST failures must NOT abort recorder start.
 """
 
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -751,3 +752,139 @@ class TestInitialRestSnapshot:
             assert sell_row.position_value is None
 
         await recorder.stop()
+
+
+class TestSyntheticZeroRowMarkers:
+    """0110 B2a: a contract zero-row says why it is synthetic, so a reader
+    can tell a genuinely flat leg from a failed or incomplete fetch."""
+
+    @staticmethod
+    def _rows(db, recorder):
+        with db.get_session() as session:
+            rows = (
+                session.query(PositionSnapshot)
+                .filter(PositionSnapshot.run_id == str(recorder._run_id))
+                .filter(PositionSnapshot.symbol == "BTCUSDT")
+                .all()
+            )
+            assert sorted(r.side for r in rows) == ["Buy", "Sell"]
+            return {r.side: (r.size, r.raw_json) for r in rows}
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_rest_failure_marks_both_zero_rows(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
+        config_with_account, db, db_with_gridbot_seed,
+    ):
+        """get_positions raising → both legs are rest_failure placeholders."""
+        mock_pub_cls.return_value = _make_pub_mock()
+        mock_priv_cls.return_value = _make_priv_mock()
+        snapshot_client = _stub_rest_client(
+            wallet_response={"list": []},
+            positions_by_symbol={},
+            open_orders_by_symbol={"BTCUSDT": []},
+        )
+        snapshot_client.get_positions.side_effect = RuntimeError("timeout")
+        mock_rest_cls.side_effect = [MagicMock(), snapshot_client]
+
+        recorder = Recorder(config=config_with_account, db=db)
+        await recorder.start()
+        try:
+            rows = self._rows(db, recorder)
+            assert rows["Buy"][1] == {"synthetic": "rest_failure"}
+            assert rows["Sell"][1] == {"synthetic": "rest_failure"}
+        finally:
+            await recorder.stop()
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_absent_side_marks_only_the_missing_leg(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
+        config_with_account, db, db_with_gridbot_seed,
+    ):
+        """A side the successful response omits is absent_side; the real
+        row keeps Bybit's payload."""
+        mock_pub_cls.return_value = _make_pub_mock()
+        mock_priv_cls.return_value = _make_priv_mock()
+        buy = {
+            "symbol": "BTCUSDT", "side": "Buy", "size": "0.5",
+            "entryPrice": "50000", "unrealisedPnl": "1.5",
+        }
+        snapshot_client = _stub_rest_client(
+            wallet_response={"list": []},
+            positions_by_symbol={"BTCUSDT": [buy]},
+            open_orders_by_symbol={"BTCUSDT": []},
+        )
+        mock_rest_cls.side_effect = [MagicMock(), snapshot_client]
+
+        recorder = Recorder(config=config_with_account, db=db)
+        await recorder.start()
+        try:
+            rows = self._rows(db, recorder)
+            assert rows["Sell"][1] == {"synthetic": "absent_side"}
+            assert rows["Buy"][1] == buy
+        finally:
+            await recorder.stop()
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_malformed_row_is_marked_malformed(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
+        config_with_account, db, db_with_gridbot_seed,
+    ):
+        """A row that fails conversion becomes a malformed placeholder."""
+        mock_pub_cls.return_value = _make_pub_mock()
+        mock_priv_cls.return_value = _make_priv_mock()
+        snapshot_client = _stub_rest_client(
+            wallet_response={"list": []},
+            positions_by_symbol={
+                "BTCUSDT": [
+                    {"symbol": "BTCUSDT", "side": "Buy", "size": "not-a-number"}
+                ]
+            },
+            open_orders_by_symbol={"BTCUSDT": []},
+        )
+        mock_rest_cls.side_effect = [MagicMock(), snapshot_client]
+
+        recorder = Recorder(config=config_with_account, db=db)
+        await recorder.start()
+        try:
+            rows = self._rows(db, recorder)
+            assert rows["Buy"] == (Decimal("0"), {"synthetic": "malformed"})
+            assert rows["Sell"][1] == {"synthetic": "absent_side"}
+        finally:
+            await recorder.stop()
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_flat_hedge_leg_with_empty_side_keeps_its_row(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
+        config_with_account, db, db_with_gridbot_seed,
+    ):
+        """REST reports a flat hedge leg with side="": the leg comes from
+        positionIdx and the row keeps Bybit's payload (not absent_side)."""
+        mock_pub_cls.return_value = _make_pub_mock()
+        mock_priv_cls.return_value = _make_priv_mock()
+        flat_short = {
+            "symbol": "BTCUSDT", "side": "", "size": "0",
+            "positionIdx": 2, "avgPrice": "0", "unrealisedPnl": "",
+        }
+        snapshot_client = _stub_rest_client(
+            wallet_response={"list": []},
+            positions_by_symbol={"BTCUSDT": [flat_short]},
+            open_orders_by_symbol={"BTCUSDT": []},
+        )
+        mock_rest_cls.side_effect = [MagicMock(), snapshot_client]
+
+        recorder = Recorder(config=config_with_account, db=db)
+        await recorder.start()
+        try:
+            rows = self._rows(db, recorder)
+            assert rows["Sell"] == (Decimal("0"), flat_short)
+            assert rows["Buy"][1] == {"synthetic": "absent_side"}
+        finally:
+            await recorder.stop()

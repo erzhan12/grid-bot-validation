@@ -1216,6 +1216,52 @@ class TestPositionWriter:
         assert snap.position_value is None
 
 
+class TestPositionWriterFlatLegSide:
+    """0110 B2a: Bybit sends side="" for an empty position; in hedge mode
+    the leg is still known from positionIdx (1 = Buy/long, 2 = Sell/short)."""
+
+    @staticmethod
+    def _msg(**fields):
+        pos = {
+            "symbol": "LTCUSDT",
+            "side": "",
+            "size": "0",
+            "entryPrice": "0",
+            "updatedTime": "1700000000000",
+        }
+        pos.update(fields)
+        return [{"data": [pos]}]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "position_idx, expected",
+        [(1, "Buy"), (2, "Sell"), ("1", "Buy"), ("2", "Sell")],
+    )
+    async def test_flat_hedge_leg_side_from_position_idx(
+        self, mock_db, position_idx, expected
+    ):
+        """A flat hedge leg is stored under its own side."""
+        writer = PositionWriter(db=mock_db, batch_size=100)
+        await writer.write(uuid4(), self._msg(positionIdx=position_idx))
+        assert writer._buffer[0].side == expected
+
+    @pytest.mark.asyncio
+    async def test_one_way_flat_position_keeps_empty_side(self, mock_db):
+        """positionIdx 0 (one-way mode) has no leg: the side stays empty."""
+        writer = PositionWriter(db=mock_db, batch_size=100)
+        await writer.write(uuid4(), self._msg(positionIdx=0))
+        assert writer._buffer[0].side == ""
+
+    @pytest.mark.asyncio
+    async def test_explicit_side_is_never_overridden(self, mock_db):
+        """A non-empty side from Bybit wins over positionIdx."""
+        writer = PositionWriter(db=mock_db, batch_size=100)
+        await writer.write(
+            uuid4(), self._msg(side="Sell", size="1", positionIdx=1)
+        )
+        assert writer._buffer[0].side == "Sell"
+
+
 class TestWalletWriter:
     """Test WalletWriter buffering and bulk insert."""
 
