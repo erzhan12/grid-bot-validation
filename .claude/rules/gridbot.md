@@ -160,6 +160,7 @@ Two-layer: Runner logs + re-raises → Orchestrator catches + sends Telegram ale
 - Retry queue needs `_dispatch_intent()` closure to route Cancel vs Place correctly
 - `asyncio.CancelledError` is `BaseException` — passes through `except Exception`
 - Snapshot mutable dicts with `list(d.items())` before async iteration
+- **Known hazard (open, found in PR #288 review)**: `position_fetcher.on_position_message` and the REST fallback in `_fetch_one_account` skip rows with `side == ""`. Bybit sends `side=""` for a hedge leg that closed to flat, so the WS cache keeps the pre-close dict and `runner.on_position_update` builds size / ratio / liq / C1 notional from a position that no longer exists until the leg reopens. Intended fix: resolve the leg from `positionIdx` like `event_saver.writers.leg_side` (separate PR; `tasks/todo.md` Follow-ups).
 
 ### Reconciliation & order-adoption invariants (Phase E)
 

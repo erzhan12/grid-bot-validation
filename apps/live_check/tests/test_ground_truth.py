@@ -40,7 +40,7 @@ def _insert_exec(db, *, exec_id, ts, symbol="LTCUSDT", side="Buy",
 
 
 def _insert_position(db, account_id, *, ts, side, unrealised,
-                     symbol="LTCUSDT", source="live"):
+                     symbol="LTCUSDT", source="live", size="0.2"):
     with db.get_session() as session:
         session.add(PositionSnapshot(
             run_id=RUN_ID,
@@ -49,7 +49,7 @@ def _insert_position(db, account_id, *, ts, side, unrealised,
             exchange_ts=ts,
             local_ts=ts,
             side=side,
-            size=Decimal("0.2"),
+            size=Decimal(size),
             entry_price=Decimal("80"),
             unrealised_pnl=(
                 Decimal(unrealised) if unrealised is not None else None
@@ -215,6 +215,20 @@ class TestNetUnrealised:
                 s, RUN_ID, acc, "LTCUSDT", ts + timedelta(minutes=10)
             )
         assert net == Decimal("2.0")
+
+    def test_flat_leg_row_drops_the_closed_leg(self, db, seeded_run_account, ts):
+        """0110 B2a: a leg that closed to flat is a later size-0 row, so only
+        the open leg contributes (not the stale pre-close unrealised)."""
+        acc = seeded_run_account.account_id
+        _insert_position(db, acc, ts=ts, side="Buy", unrealised="1.5")
+        _insert_position(db, acc, ts=ts, side="Sell", unrealised="-0.4")
+        _insert_position(db, acc, ts=ts + timedelta(minutes=1), side="Buy",
+                         unrealised=None, size="0")
+        with db.get_readonly_session() as s:
+            net = ground_truth.net_unrealised_per_pair(
+                s, RUN_ID, acc, "LTCUSDT", ts + timedelta(minutes=2)
+            )
+        assert net == Decimal("-0.4")
 
     def test_null_unrealised_coerces_to_zero(self, db, seeded_run_account, ts):
         """NULL unrealised_pnl on a leg counts as 0, not a crash."""

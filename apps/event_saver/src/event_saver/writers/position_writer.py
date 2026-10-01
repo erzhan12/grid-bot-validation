@@ -222,11 +222,15 @@ class PositionWriter:
             data = msg.get("data", [])
             for pos in data:
                 try:
-                    # Parse timestamp
-                    updated_time_ms = int(pos.get("updatedTime", 0))
-                    exchange_ts = datetime.fromtimestamp(
-                        updated_time_ms / 1000, tz=UTC
-                    )
+                    # Parse timestamp; a missing or empty updatedTime falls
+                    # back to local_ts, never the 1970 epoch (pitfalls 14/15).
+                    updated_time = pos.get("updatedTime")
+                    if updated_time in (None, "", 0, "0"):
+                        exchange_ts = local_ts
+                    else:
+                        exchange_ts = datetime.fromtimestamp(
+                            int(updated_time) / 1000, tz=UTC
+                        )
 
                     snapshots.append(
                         PositionSnapshot(

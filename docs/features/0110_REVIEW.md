@@ -286,3 +286,16 @@ All six findings applied inline.
 | P3 | One-way flat row logged a WARNING on every start. | Fixed: flat unresolvable row → INFO. |
 
 `make test` exit 0 (92%), `make lint` clean.
+
+## PR #288 claude-review (round 3, on aee9c25) — APPROVED, no P0/P1
+
+| Sev | Finding | Verdict |
+|---|---|---|
+| P2 | `PositionWriter` `int(pos.get("updatedTime", 0))` drops a row with `updatedTime=""` (and a missing key gives the 1970 epoch). | Fixed: missing / empty / 0 → `local_ts`. Test with `updatedTime=""`, `size=""`, `positionIdx=2`. |
+| P2 | No live-check test that a flat-leg row drops the closed leg from `net_unrealised_per_pair`. | Added `test_flat_leg_row_drops_the_closed_leg`. |
+| P2 | Gridbot hazard tracked only in `tasks/todo.md`; open a GitHub issue + rule entry. | Rule entry added under `gridbot.md` Key Pitfalls. Issue NOT opened (outside this PR's scope) — left to the user. |
+| P3 | `_is_flat_position_row` caught `Exception`. | Narrowed to `(InvalidOperation, ValueError, TypeError)`. |
+| P3 | Sentinel docstring: position_count==0 is no longer the scope signal; `empty_response` stays OK. | Docstring updated. |
+| P3 | `ORDER BY exchange_ts DESC, id DESC` may add a temp sort. | REJECT — `EXPLAIN QUERY PLAN` (in-memory schema) shows the same index search for both orderings, no temp B-tree: `id` is the rowid alias, implicitly last in every SQLite index. |
+
+`make test` exit 0 (92%), `make lint` clean.

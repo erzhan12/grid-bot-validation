@@ -10,7 +10,7 @@ import signal
 import threading
 from concurrent.futures import Future
 from datetime import datetime, UTC
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Callable, Optional
 from uuid import UUID, uuid4
 
@@ -69,7 +69,7 @@ def _is_flat_position_row(pos: dict) -> bool:
     """True when a REST position row's size is zero (``""`` counts as 0)."""
     try:
         return Decimal(str(pos.get("size") or "0")) == 0
-    except Exception:
+    except (InvalidOperation, ValueError, TypeError):
         return False
 
 
@@ -369,7 +369,13 @@ class Recorder:
         - ``logger.warning("RECORDER_SNAPSHOT_INCOMPLETE")`` — auth-client
           construction failure, zero wallet/position rows, OR a failed
           position symbol (``get_positions`` raised, or an open row whose
-          leg is unknown — 0110 B2a). (``start()``
+          leg is unknown — 0110 B2a). Positions always write two rows per
+          symbol, so ``position_count == 0`` now means no symbols or a
+          failed insert; the failed-symbol count is the real
+          position-dimension signal. An ``empty_response`` symbol
+          (successful fetch, no row for it) deliberately stays OK with
+          synthetic flat legs, so replay seeds it flat; B2c decides how to
+          treat it (``.claude/rules/recorder.md``). (``start()``
           emits the same sentinel when a collector does not start, in which
           case this method is never reached.)
         ``scripts/phase4/start_recorder.sh`` waits for one of these sentinels

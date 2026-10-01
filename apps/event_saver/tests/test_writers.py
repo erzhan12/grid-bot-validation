@@ -1266,6 +1266,20 @@ class TestPositionWriterFlatLegSide:
         assert writer._buffer[0].entry_price == Decimal("0")
 
     @pytest.mark.asyncio
+    async def test_flat_leg_with_empty_updated_time_is_kept(self, mock_db):
+        """updatedTime="" falls back to local_ts (never the 1970 epoch);
+        the flat leg is buffered, not dropped."""
+        writer = PositionWriter(db=mock_db, batch_size=100)
+        await writer.write(
+            uuid4(), self._msg(updatedTime="", size="", positionIdx=2)
+        )
+        assert len(writer._buffer) == 1
+        snap = writer._buffer[0]
+        assert snap.side == "Sell"
+        assert snap.size == Decimal("0")
+        assert snap.exchange_ts == snap.local_ts
+
+    @pytest.mark.asyncio
     async def test_missing_position_idx_keeps_empty_side(self, mock_db):
         """No positionIdx key at all: the side stays empty."""
         writer = PositionWriter(db=mock_db, batch_size=100)
