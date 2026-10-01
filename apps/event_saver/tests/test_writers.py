@@ -1253,6 +1253,19 @@ class TestPositionWriterFlatLegSide:
         assert writer._buffer[0].side == ""
 
     @pytest.mark.asyncio
+    async def test_flat_leg_with_empty_numerics_is_kept(self, mock_db):
+        """size="" / entryPrice="" (pitfall 14) on a flat leg is stored as
+        a size-0 row, not dropped by Decimal("")."""
+        writer = PositionWriter(db=mock_db, batch_size=100)
+        await writer.write(
+            uuid4(), self._msg(size="", entryPrice="", positionIdx=2)
+        )
+        assert len(writer._buffer) == 1
+        assert writer._buffer[0].side == "Sell"
+        assert writer._buffer[0].size == Decimal("0")
+        assert writer._buffer[0].entry_price == Decimal("0")
+
+    @pytest.mark.asyncio
     async def test_missing_position_idx_keeps_empty_side(self, mock_db):
         """No positionIdx key at all: the side stays empty."""
         writer = PositionWriter(db=mock_db, batch_size=100)

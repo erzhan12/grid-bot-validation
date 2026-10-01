@@ -129,7 +129,10 @@ class PositionSnapshotRepository(BaseRepository[PositionSnapshot]):
         )
         if source is not None:
             query = query.filter(PositionSnapshot.source == source)
-        return query.order_by(PositionSnapshot.exchange_ts.desc()).first()
+        # id breaks exchange_ts ties (one Bybit updatedTime on several rows).
+        return query.order_by(
+            PositionSnapshot.exchange_ts.desc(), PositionSnapshot.id.desc()
+        ).first()
 
 
 class WalletSnapshotRepository(BaseRepository[WalletSnapshot]):

@@ -931,12 +931,12 @@ class TestSyntheticZeroRowMarkers:
     @patch("recorder.recorder.PrivateCollector")
     @patch("recorder.recorder.PublicCollector")
     @patch("recorder.recorder.BybitRestClient")
-    async def test_unresolved_side_row_is_logged(
+    async def test_unresolved_flat_row_is_logged_at_info(
         self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
         config_with_account, db, db_with_gridbot_seed, caplog,
     ):
-        """A row for the symbol whose leg cannot be resolved is not dropped
-        silently: it is logged before both legs become absent_side."""
+        """A flat row whose leg cannot be resolved (one-way mode) is logged
+        at INFO, not WARNING; both legs are known flat (absent_side)."""
         import logging
 
         mock_pub_cls.return_value = _make_pub_mock()
@@ -953,7 +953,7 @@ class TestSyntheticZeroRowMarkers:
         mock_rest_cls.side_effect = [MagicMock(), snapshot_client]
 
         recorder = Recorder(config=config_with_account, db=db)
-        with caplog.at_level(logging.WARNING, logger="recorder.recorder"):
+        with caplog.at_level(logging.INFO, logger="recorder.recorder"):
             await recorder.start()
         try:
             unresolved = [
@@ -961,10 +961,98 @@ class TestSyntheticZeroRowMarkers:
                 if "side could not be resolved" in r.message
             ]
             assert len(unresolved) == 1
+            assert unresolved[0].levelno == logging.INFO
             assert "BTCUSDT" in unresolved[0].message
             assert "positionIdx=0" in unresolved[0].message
             rows = self._rows(db, recorder)
             assert rows["Buy"][1] == {"synthetic": "absent_side"}
             assert rows["Sell"][1] == {"synthetic": "absent_side"}
+        finally:
+            await recorder.stop()
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_unresolved_open_row_is_malformed_and_incomplete(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
+        config_with_account, db, db_with_gridbot_seed, caplog,
+    ):
+        """A non-flat row whose leg cannot be resolved: the missing legs are
+        malformed (not known flat) and the snapshot is INCOMPLETE."""
+        import logging
+
+        mock_pub_cls.return_value = _make_pub_mock()
+        mock_priv_cls.return_value = _make_priv_mock()
+        snapshot_client = _stub_rest_client(
+            wallet_response={
+                "list": [{
+                    "accountType": "UNIFIED",
+                    "coin": [{"coin": "USDT", "walletBalance": "10000"}],
+                }]
+            },
+            positions_by_symbol={
+                "BTCUSDT": [{"symbol": "BTCUSDT", "side": "", "size": "0.5"}]
+            },
+            open_orders_by_symbol={"BTCUSDT": []},
+        )
+        mock_rest_cls.side_effect = [MagicMock(), snapshot_client]
+
+        recorder = Recorder(config=config_with_account, db=db)
+        with caplog.at_level(logging.INFO, logger="recorder.recorder"):
+            await recorder.start()
+        try:
+            unresolved = [
+                r for r in caplog.records
+                if "side could not be resolved" in r.message
+            ]
+            assert [r.levelno for r in unresolved] == [logging.WARNING]
+            messages = [r.message for r in caplog.records]
+            assert "RECORDER_SNAPSHOT_INCOMPLETE" in messages
+            assert "RECORDER_SNAPSHOT_OK" not in messages
+            rows = self._rows(db, recorder)
+            assert rows["Buy"][1] == {"synthetic": "malformed"}
+            assert rows["Sell"][1] == {"synthetic": "malformed"}
+        finally:
+            await recorder.stop()
+
+    @patch("recorder.recorder.PrivateCollector")
+    @patch("recorder.recorder.PublicCollector")
+    @patch("recorder.recorder.BybitRestClient")
+    async def test_empty_response_is_marked_and_warned(
+        self, mock_rest_cls, mock_pub_cls, mock_priv_cls,
+        config_with_account, db, db_with_gridbot_seed, caplog,
+    ):
+        """A successful fetch with no row for the symbol (e.g. wrong scope)
+        marks both legs empty_response and warns; it is not INCOMPLETE."""
+        import logging
+
+        mock_pub_cls.return_value = _make_pub_mock()
+        mock_priv_cls.return_value = _make_priv_mock()
+        snapshot_client = _stub_rest_client(
+            wallet_response={
+                "list": [{
+                    "accountType": "UNIFIED",
+                    "coin": [{"coin": "USDT", "walletBalance": "10000"}],
+                }]
+            },
+            positions_by_symbol={"BTCUSDT": []},
+            open_orders_by_symbol={"BTCUSDT": []},
+        )
+        mock_rest_cls.side_effect = [MagicMock(), snapshot_client]
+
+        recorder = Recorder(config=config_with_account, db=db)
+        with caplog.at_level(logging.INFO, logger="recorder.recorder"):
+            await recorder.start()
+        try:
+            empty = [
+                r for r in caplog.records
+                if "returned no position row" in r.message
+            ]
+            assert [r.levelno for r in empty] == [logging.WARNING]
+            assert "BTCUSDT" in empty[0].message
+            assert "RECORDER_SNAPSHOT_OK" in [r.message for r in caplog.records]
+            rows = self._rows(db, recorder)
+            assert rows["Buy"][1] == {"synthetic": "empty_response"}
+            assert rows["Sell"][1] == {"synthetic": "empty_response"}
         finally:
             await recorder.stop()

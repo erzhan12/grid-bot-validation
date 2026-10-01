@@ -236,8 +236,8 @@ class PositionWriter:
                             exchange_ts=exchange_ts,
                             local_ts=local_ts,
                             side=leg_side(pos),
-                            size=Decimal(str(pos.get("size", "0"))),
-                            entry_price=Decimal(str(pos.get("entryPrice", "0"))),
+                            size=Decimal(str(pos.get("size") or "0")),
+                            entry_price=Decimal(str(pos.get("entryPrice") or "0")),
                             liq_price=(
                                 Decimal(str(pos.get("liqPrice")))
                                 if pos.get("liqPrice")

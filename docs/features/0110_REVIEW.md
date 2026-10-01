@@ -271,3 +271,18 @@ All six findings applied inline.
 | P3 | Rule said nothing reads position `raw_json`; `scripts/research_0045_im_mm_distribution.py` does (falls back to leverage 1). | Reworded to "no application code" and named the script. |
 
 `make test` exit 0 (92%), `make lint` clean.
+
+## PR #288 claude-review (round 2, on 5c7a5cc) — APPROVED, one P1 (pre-existing, out of scope)
+
+| Sev | Finding | Verdict |
+|---|---|---|
+| P1 | Live `gridbot.position_fetcher` skips `side=""` rows, so a flat hedge leg's WS cache slot keeps the pre-close dict and the runner trades on it. | Valid (verified in code), pre-existing, live-bot. DEFERRED to a separate PR — not folded into a recorder PR; `tasks/todo.md` Follow-ups. |
+| P2 | An unresolvable row was dropped and the legs became `absent_side` (known flat) with OK. | Fixed: an open unresolvable row → both synthesised legs `malformed`, symbol failed → INCOMPLETE. |
+| P2 | A successful fetch with no row for the symbol (wrong scope) became `absent_side` + OK. | Fixed: `empty_response` marker + WARNING; not INCOMPLETE (never-traded symbols); B2c decides. |
+| P2 | `PositionWriter` `Decimal(str(pos.get("size", "0")))` drops a row with `""` numerics (pitfall 14). | Fixed: `or "0"` for size / entryPrice; test with `size=""`, `entryPrice=""`, `positionIdx=2`. |
+| P3 | Comparator alignment test used full telemetry on flat rows. | Fixed: NULL telemetry; asserts `position_pairs_missing_telemetry == 1`. |
+| P3 | `get_latest_before` tie on `exchange_ts` undefined. | Fixed: `id` tiebreak + test. |
+| P3 | `_write_initial_rest_snapshot` docstring missed the new INCOMPLETE condition. | Fixed. |
+| P3 | One-way flat row logged a WARNING on every start. | Fixed: flat unresolvable row → INFO. |
+
+`make test` exit 0 (92%), `make lint` clean.

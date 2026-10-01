@@ -8,6 +8,18 @@ Plan: docs/features/0110_PLAN.md (B2 split: B2a writer side, B2b coverage gate, 
 - [x] make test + make lint green
 - [x] rules update (recorder, event-saver, replay) + plan as-built notes
 
+## Follow-ups
+- PR #288 review P1 (pre-existing, LIVE gridbot, out of scope for this
+  recorder PR): `gridbot.position_fetcher.on_position_message` (and the
+  REST fallback in `_fetch_one_account`) skip rows with `side == ""`.
+  Bybit sends `side=""` for a hedge leg that closed to flat, so the WS
+  cache keeps the pre-close dict and `runner.on_position_update` builds
+  size / position_ratio / liq / C1 notional from a position that no longer
+  exists until the leg reopens. Fix with positionIdx leg resolution (same
+  rule as `event_saver.writers.leg_side`), update
+  `test_skips_empty_symbol_or_side`, add a flat-leg-clears-slot test;
+  needs its own plan, review and a VPS deploy.
+
 # Feature 0110 Phase B1c-2 — confirmed startup (#271)
 
 Plan: docs/features/0110_PLAN.md (B1 step 8 + step 1 startup part)  |  Branch: feature/0110-b1c2-startup

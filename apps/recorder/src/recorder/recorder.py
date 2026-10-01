@@ -65,6 +65,14 @@ logger = logging.getLogger(__name__)
 _MAX_OPEN_GAP_FAILURES = 3
 
 
+def _is_flat_position_row(pos: dict) -> bool:
+    """True when a REST position row's size is zero (``""`` counts as 0)."""
+    try:
+        return Decimal(str(pos.get("size") or "0")) == 0
+    except Exception:
+        return False
+
+
 class Recorder:
     """Standalone data recorder for Bybit mainnet capture.
 
@@ -356,9 +364,12 @@ class Recorder:
         When a snapshot is attempted (i.e. ``self._config.account`` is set),
         every exit path of this method MUST emit exactly one of:
         - ``logger.info("RECORDER_SNAPSHOT_OK")`` — wallet_count > 0 AND
-          position_count > 0; replay seed will succeed.
+          position_count > 0 AND no failed position symbol; replay seed
+          will succeed.
         - ``logger.warning("RECORDER_SNAPSHOT_INCOMPLETE")`` — auth-client
-          construction failure OR zero wallet/position rows. (``start()``
+          construction failure, zero wallet/position rows, OR a failed
+          position symbol (``get_positions`` raised, or an open row whose
+          leg is unknown — 0110 B2a). (``start()``
           emits the same sentinel when a collector does not start, in which
           case this method is never reached.)
         ``scripts/phase4/start_recorder.sh`` waits for one of these sentinels
@@ -419,14 +430,14 @@ class Recorder:
         # will refuse to seed from this run. Surface this loudly at recorder
         # start so an operator catches credential/permissions problems early
         # instead of finding out hours later when replay refuses. open_orders
-        # legitimately can be zero (clean account) — not warned on. A symbol
-        # whose get_positions raised (0110 B2a) counts as missing: its rows
-        # are only rest_failure placeholders.
+        # legitimately can be zero (clean account) — not warned on. A failed
+        # symbol (0110 B2a: get_positions raised, or an open row's leg is
+        # unknown) counts as missing: its rows are only placeholders.
         if wallet_count == 0 or position_count == 0 or position_failures:
             logger.warning(
                 "Initial REST snapshot incomplete: "
                 f"wallet_rows={wallet_count}, position_rows={position_count}, "
-                f"position_fetch_failures={position_failures} "
+                f"position_failed_symbols={position_failures} "
                 "(zero on either dimension means seed-aware replay from this "
                 "run_id will fail Phase 4 pre-check; check API credentials / "
                 "permissions / category=linear settleCoin=USDT scope)"
@@ -535,11 +546,18 @@ class Recorder:
         ``{"synthetic": "rest_failure" | "malformed" | "absent_side"}``, so a
         reader can tell a flat leg from a failed or incomplete fetch.
 
+        ``empty_response`` marks both legs of a symbol a successful fetch
+        returned no row for (wrong scope, or never traded). A row whose leg
+        ``leg_side`` cannot resolve is skipped: if it is flat (one-way mode)
+        that is logged at INFO; if it is open, both synthesised legs are
+        ``malformed`` and the symbol counts as failed.
+
         Returns:
-            ``(rows_written, symbols_whose_fetch_failed)``.
+            ``(rows_written, failed_symbols)`` — a symbol fails when
+            ``get_positions`` raised or an open row's leg is unknown.
         """
         snapshots: list[PositionSnapshot] = []
-        fetch_failures = 0
+        failures = 0
         for symbol in self._config.symbols:
             fetch_failed = False
             try:
@@ -553,26 +571,53 @@ class Recorder:
                 # transient REST failure.
                 positions = []
                 fetch_failed = True
-                fetch_failures += 1
+                failures += 1
 
             # Index by side for O(1) lookup.
             by_side: dict[str, dict] = {}
+            symbol_rows = 0
+            open_row_unresolved = False
             for pos in positions:
                 if pos.get("symbol") != symbol:
                     continue
+                symbol_rows += 1
                 side = leg_side(pos)
                 if side in ("Buy", "Sell"):
                     by_side[side] = pos
+                    continue
+                unresolved = (
+                    f"Initial snapshot: position row for {symbol} skipped, "
+                    f"side could not be resolved (side={pos.get('side')!r}, "
+                    f"positionIdx={pos.get('positionIdx')!r}, "
+                    f"size={pos.get('size')!r})"
+                )
+                if _is_flat_position_row(pos):
+                    # Expected for a one-way account's empty position.
+                    logger.info(unresolved)
                 else:
-                    logger.warning(
-                        f"Initial snapshot: position row for {symbol} skipped, "
-                        f"side could not be resolved (side={pos.get('side')!r}, "
-                        f"positionIdx={pos.get('positionIdx')!r})"
-                    )
+                    logger.warning(unresolved)
+                    open_row_unresolved = True
+
+            if fetch_failed:
+                synthetic_default = "rest_failure"
+            elif open_row_unresolved:
+                # An open position exists but its leg is unknown: neither
+                # synthesised leg can be claimed flat.
+                synthetic_default = "malformed"
+                failures += 1
+            elif symbol_rows == 0:
+                logger.warning(
+                    f"Initial snapshot: get_positions({symbol}) returned no "
+                    "position row (check category=linear settleCoin=USDT "
+                    "scope / API-key permissions); legs marked empty_response"
+                )
+                synthetic_default = "empty_response"
+            else:
+                synthetic_default = "absent_side"
 
             for side in ("Buy", "Sell"):
                 pos = by_side.get(side)
-                synthetic = "rest_failure" if fetch_failed else "absent_side"
+                synthetic = synthetic_default
                 if pos is not None:
                     try:
                         snapshots.append(
@@ -670,14 +715,14 @@ class Recorder:
                 )
 
         if not snapshots:
-            return 0, fetch_failures
+            return 0, failures
 
         try:
             await asyncio.to_thread(self._bulk_insert_position_snapshots, snapshots)
         except Exception as e:
             logger.error(f"Initial snapshot: position bulk_insert failed: {e}")
-            return 0, fetch_failures
-        return len(snapshots), fetch_failures
+            return 0, failures
+        return len(snapshots), failures
 
     def _bulk_insert_position_snapshots(self, snapshots: list[PositionSnapshot]) -> None:
         with self._db.get_session() as session:

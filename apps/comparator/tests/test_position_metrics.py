@@ -727,20 +727,19 @@ class TestStateConsistencyFilter:
     def test_flat_rows_keep_stream_alignment(self, base_ts):
         """0110 B2a: flat hedge-leg rows now enter the live Buy stream;
         each backtest row still pairs with the live row of its state."""
-        sizes = [Decimal("1.0"), Decimal("0"), Decimal("1.0")]
-        live = [
-            _snap("Buy", base_ts + timedelta(seconds=2 * i), size=s,
-                  entry_price=Decimal("100") if s else Decimal("0"),
-                  source="live")
-            for i, s in enumerate(sizes)
-        ]
-        bt = [
-            _snap("Buy", base_ts + timedelta(seconds=2 * i), size=s,
-                  entry_price=Decimal("100") if s else Decimal("0"),
-                  source="backtest")
-            for i, s in enumerate(sizes)
-        ]
+        def stream(source):
+            open_, flat = Decimal("1.0"), Decimal("0")
+            return [
+                _snap("Buy", base_ts, size=open_, source=source),
+                # A flat row as the writers emit it: NULL telemetry.
+                _snap("Buy", base_ts + timedelta(seconds=2), size=flat,
+                      entry_price=flat, liq_price=None, position_im=None,
+                      position_mm=None, position_value=None, source=source),
+                _snap("Buy", base_ts + timedelta(seconds=4), size=open_,
+                      source=source),
+            ]
 
+        live, bt = stream("live"), stream("backtest")
         pairs = PositionComparator().pair_and_compare(live, bt)
 
         assert [p.live for p in pairs] == live
@@ -748,6 +747,7 @@ class TestStateConsistencyFilter:
         PositionComparator().fold_metrics_into(metrics, pairs)
         assert metrics.position_pairs_compared == 3
         assert metrics.position_pairs_state_diverged == 0
+        assert metrics.position_pairs_missing_telemetry == 1
 
     def test_size_diverged_pair_flagged(self, base_ts):
         """|live.size - bt.size| > tol → state_diverged=True, excluded."""

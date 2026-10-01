@@ -1534,6 +1534,33 @@ class TestSeedAwareReplayRepositoryMethods:
         assert got is not None
         assert got.size == Decimal("2.0")
 
+    def test_position_get_latest_before_tie_takes_later_insert(
+        self, session, sample_account, sample_run
+    ):
+        """0110 B2a: rows tied on exchange_ts (e.g. a pre-close and a flat
+        row with one Bybit updatedTime) resolve to the later insert."""
+        from grid_db import PositionSnapshotRepository, PositionSnapshot
+        from decimal import Decimal
+
+        repo = PositionSnapshotRepository(session)
+        ts = datetime(2026, 5, 7, 10, 0, 0, tzinfo=UTC)
+        for size in ("1.0", "0"):
+            repo.bulk_insert([
+                PositionSnapshot(
+                    run_id=sample_run.run_id,
+                    account_id=str(sample_account.account_id),
+                    symbol="BTCUSDT", exchange_ts=ts, local_ts=ts,
+                    side="Buy", size=Decimal(size), entry_price=Decimal("0"),
+                ),
+            ])
+
+        got = repo.get_latest_before(
+            sample_run.run_id, str(sample_account.account_id),
+            "BTCUSDT", "Buy", ts,
+        )
+        assert got is not None
+        assert got.size == Decimal("0")
+
     def test_position_get_latest_before_excludes_other_runs(
         self, session, sample_user, sample_account, sample_strategy, sample_run
     ):
