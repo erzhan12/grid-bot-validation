@@ -31,9 +31,14 @@ from grid_db import (
     WalletSnapshotRepository,
 )
 
+from replay.config import SeedConfig
+
 from live_check.window import Window, to_naive_utc
 
 _ZERO = Decimal("0")
+# The wallet coin replay seeds from: live-check's runner never overrides
+# SeedConfig.wallet_coin, so the coverage gate follows its default.
+_WALLET_SEED_COIN = SeedConfig.model_fields["wallet_coin"].default
 
 
 @dataclass(frozen=True)
@@ -311,18 +316,26 @@ def _coverage_tables_present(session: Session) -> bool:
 
 
 def _coverage_start(
-    session: Session, run_id: str, account_id: str, symbol: str, window: Window
+    session: Session,
+    run_id: str,
+    account_id: str,
+    symbol: str,
+    window: Window,
+    connected_at: Optional[datetime],
 ) -> datetime:
     """Earliest time the verdict depends on: window start or a seed row.
 
-    Replay seeds from the latest live position rows (Buy/Sell) and USDT wallet
+    Replay seeds from the latest live position rows (Buy/Sell) and wallet
     row at-or-before ``window.start`` (same lookups as
     ``replay.snapshot_loader``), so a gap after a seed row changes the seed.
     Anchored on ``local_ts`` (the recorder clock coverage is measured on): a
     push is a full snapshot as of receipt, while its ``exchange_ts`` (Bybit
-    ``updatedTime``) can predate the recorder start for a quiet leg.
+    ``updatedTime``) can predate the recorder start for a quiet leg. A seed
+    row before the run's first ``connected_at`` can only be a push received
+    while the recorder waited for its subscription acks (it stamps the
+    session after them), so its anchor is clamped to ``connected_at``.
     """
-    times = [window.start]
+    anchors = []
     positions = PositionSnapshotRepository(session)
     for side in ("Buy", "Sell"):
         row = positions.get_latest_before(
@@ -334,15 +347,16 @@ def _coverage_start(
             source="live",
         )
         if row is not None:
-            times.append(to_naive_utc(row.local_ts))
-    # "USDT" = replay's SeedConfig.wallet_coin default, which live-check's
-    # runner never overrides; keep the two in step.
+            anchors.append(to_naive_utc(row.local_ts))
     wallet = WalletSnapshotRepository(session).get_latest_before(
-        run_id, account_id, "USDT", window.start
+        run_id, account_id, _WALLET_SEED_COIN, window.start
     )
     if wallet is not None:
-        times.append(to_naive_utc(wallet.local_ts))
-    return min(times)
+        anchors.append(to_naive_utc(wallet.local_ts))
+    if connected_at is not None:
+        floor = to_naive_utc(connected_at)
+        anchors = [max(anchor, floor) for anchor in anchors]
+    return min([window.start, *anchors])
 
 
 def private_coverage_skip_reason(
@@ -373,7 +387,13 @@ def private_coverage_skip_reason(
     """
     if not _coverage_tables_present(session):
         return PRE_0110_REASON
-    start = _coverage_start(session, run_id, account_id, symbol, window)
+    sessions = PrivateStreamSessionRepository(session).list_for_run(
+        run_id, account_id
+    )
+    start = _coverage_start(
+        session, run_id, account_id, symbol, window,
+        sessions[0].connected_at if sessions else None,
+    )
     end = window.end
     # Gaps first: the recorder stops checkpointing while a gap is open, so
     # the session check would hide the gap's bounds and status. Gap rows are
@@ -403,11 +423,8 @@ def private_coverage_skip_reason(
         return (
             f"private-stream gap {to_naive_utc(first.gap_start)}–{gap_end} "
             f"(recovery {first.recovery_status}) overlaps {start}–{end}"
-            f"{hint}{more}"
+            f"{more}{hint}"
         )
-    sessions = PrivateStreamSessionRepository(session).list_for_run(
-        run_id, account_id
-    )
     if not sessions:
         return f"no private-stream session recorded for run {run_id}"
     if not any(

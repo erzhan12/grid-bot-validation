@@ -369,3 +369,18 @@ Engines: codex (`gpt-5.6-sol`) + cursor. Rounds 2/4 → SUCCESS.
 | P3 | `lag` config/YAML silent on the floor. | Field description + YAML comment. |
 
 `make test` exit 0 (92%), `make lint` clean.
+
+## PR #289 claude-review (round 3, on 82f04ac) — APPROVED, P1 = startup race
+
+| Sev | Finding | Verdict |
+|---|---|---|
+| P1 | The recorder stamps `connected_at` after the subscription acks; a push in that window has `local_ts` before the session and, as a seed row, SKIPs every window with no gap to explain it. | Fixed live-check side (no recorder redeploy): seed anchors are clamped up to the run's first `connected_at` — within a `run_id` a pre-session row can only come from that race. A window that itself starts before the session still SKIPs. `test_seed_row_before_session_skips` replaced by the race test + `test_window_before_session_still_skips`. |
+| P2 | Wallet coin hardcoded. | Fixed: taken from replay's `SeedConfig.wallet_coin` default. |
+| P2 | Move the constants to `grid_db` and drop the `event-saver` dependency. | DECLINED — live-check already loads pybit through replay/backtest (`import replay.engine, backtest.runner` → `pybit` in `sys.modules`), so the move buys nothing. |
+| P2 | No direct repository tests. | Added `TestPrivateStreamCoverageReads` (bounds, open gap, scope, ordering; sessions oldest-first + account scope). |
+| P2 | Check the strat symbol against the recorder's private symbol list. | DECLINED — a symbol not recorded privately has no executions, so it already SKIPs on the empty window; no false PASS. |
+| P2 | `_gate_skip_reason` unannotated. | Annotated + Google docstring. |
+| P3 | Count printed after the restart hint. | Swapped; test added. |
+| P3 | Memoise the table check. | Accepted gap (two cheap reads). |
+
+`make test` exit 0 (92%), `make lint` clean.

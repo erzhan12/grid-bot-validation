@@ -1486,6 +1486,73 @@ class TestWalletSnapshotRepository:
         assert rows[-1].wallet_balance == Decimal("2")
 
 
+class TestPrivateStreamCoverageReads:
+    """0110 B2b read side: list_overlapping / list_for_run."""
+
+    def _gap(self, session, run_id, account_id, start, end, symbol="BTCUSDT"):
+        from grid_db import PrivateStreamGapRepository
+
+        return PrivateStreamGapRepository(session).add_gap(
+            run_id, account_id, symbol, start, end
+        )
+
+    def test_list_overlapping_bounds_scope_and_order(
+        self, session, sample_user, sample_account, sample_strategy, sample_run
+    ):
+        """Inclusive bounds, open gaps, run/account/symbol scope, ordering."""
+        from datetime import timedelta
+        from grid_db import PrivateStreamGapRepository
+        from grid_db.models import Run
+
+        other_run = Run(
+            user_id=sample_user.user_id,
+            account_id=sample_account.account_id,
+            strategy_id=sample_strategy.strategy_id,
+            run_type="recording", status="running",
+            start_ts=datetime(2026, 5, 6, tzinfo=UTC),
+        )
+        session.add(other_run)
+        session.flush()
+
+        run, acc = sample_run.run_id, str(sample_account.account_id)
+        start = datetime(2026, 5, 7, 10, 0, 0, tzinfo=UTC)
+        end = start + timedelta(hours=1)
+        touch_start = self._gap(session, run, acc, start - timedelta(minutes=5),
+                                start)
+        touch_end = self._gap(session, run, acc, end, None)
+        same_start = self._gap(session, run, acc, start - timedelta(minutes=5),
+                               start + timedelta(minutes=1))
+        self._gap(session, run, acc, start - timedelta(minutes=9),
+                  start - timedelta(seconds=1))  # before
+        self._gap(session, run, acc, end + timedelta(seconds=1), None)  # after
+        self._gap(session, run, acc, start, end, symbol="ETHUSDT")
+        self._gap(session, run, "other-account", start, end)
+        self._gap(session, other_run.run_id, acc, start, end)
+
+        got = PrivateStreamGapRepository(session).list_overlapping(
+            run, acc, "BTCUSDT", start, end
+        )
+        assert [g.id for g in got] == [touch_start.id, same_start.id,
+                                       touch_end.id]
+
+    def test_list_for_run_oldest_first_and_account_scoped(
+        self, session, sample_account, sample_run
+    ):
+        """Sessions of one run/account, ordered by connected_at."""
+        from datetime import timedelta
+        from grid_db import PrivateStreamSessionRepository
+
+        repo = PrivateStreamSessionRepository(session)
+        acc = str(sample_account.account_id)
+        t0 = datetime(2026, 5, 7, 10, 0, 0, tzinfo=UTC)
+        later = repo.open_session(sample_run.run_id, acc, t0 + timedelta(hours=1))
+        earlier = repo.open_session(sample_run.run_id, acc, t0)
+        repo.open_session(sample_run.run_id, "other-account", t0)
+
+        got = repo.list_for_run(sample_run.run_id, acc)
+        assert [s.id for s in got] == [earlier.id, later.id]
+
+
 class TestSeedAwareReplayRepositoryMethods:
     """Feature 0029: get_latest_before / get_active_at on the three
     private-stream repositories. Run-scoped queries that the seed loader

@@ -18,8 +18,10 @@ import argparse
 import logging
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+
+from sqlalchemy.orm import Session
 
 from grid_db import (
     DatabaseFactory,
@@ -162,17 +164,32 @@ def _exit_code(outcomes: list[str]) -> int:
 
 
 def _gate_skip_reason(
-    session,
+    session: Session,
     strat: StratCheckConfig,
     run_id: str,
     account_id: str,
     window: Window,
-    lag,
-    threshold,
+    lag: timedelta,
+    threshold: timedelta,
     now: Optional[datetime] = None,
 ) -> Optional[str]:
-    """Pre-replay gate shared by every mode: ticker freshness, then private
-    coverage (0110 B2b). One helper so the modes cannot drift apart."""
+    """Pre-replay gate shared by every mode (one helper so they cannot drift).
+
+    Ticker freshness first, then private-stream coverage (0110 B2b).
+
+    Args:
+        session: Read-only session on the recorder DB.
+        strat: Strat being checked.
+        run_id: Recording run.
+        account_id: Account of the private stream.
+        window: Comparison window (naive UTC).
+        lag: Window end lag.
+        threshold: Ticker staleness threshold.
+        now: Injectable current time (tests).
+
+    Returns:
+        Human-readable skip reason, or None when the strat may be checked.
+    """
     return freshness_skip_reason(
         ground_truth.latest_ticker_ts(session, strat.symbol), lag, threshold,
         now=now,

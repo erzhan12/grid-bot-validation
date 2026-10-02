@@ -197,7 +197,17 @@ class TestGaps:
         _add_gap(db, acc, first, first + timedelta(minutes=1))
         reason = _reason(db, acc, _window(ts))
         assert first.isoformat(sep=" ") in reason
-        assert reason.endswith("(+1 more)")
+        assert "(+1 more)" in reason
+
+    def test_seed_stretch_hint_comes_after_count(self, db, acc, ts):
+        """Two seed-stretch gaps: the count precedes the restart hint."""
+        window = _window(ts)
+        _add_position(db, acc, "Sell", window.start - timedelta(minutes=30))
+        for minutes in (20, 10):
+            start = window.start - timedelta(minutes=minutes)
+            _add_gap(db, acc, start, start + timedelta(minutes=1))
+        reason = _reason(db, acc, window)
+        assert reason.index("(+1 more)") < reason.index("restart the recorder")
 
     def test_gap_inside_window_has_no_restart_hint(self, db, acc, ts):
         """A gap inside the window is an ordinary SKIP, no restart hint."""
@@ -292,12 +302,23 @@ class TestSeedAnchors:
         _add_wallet(db, acc, window.start - timedelta(minutes=30))
         assert _reason(db, acc, window) is not None
 
-    def test_seed_row_before_session_skips(self, db, acc, ts):
-        """A seed row older than the session's connect time is not covered."""
+    def test_seed_row_from_startup_race_is_clamped_to_connect(
+        self, db, acc, ts
+    ):
+        """The recorder stamps connected_at after the subscription acks, so a
+        push in that window lands just before the session row; within a run
+        it can come from nothing else, so its anchor is the connect time."""
         window = _window(ts)
-        _add_session(db, acc, window.start - timedelta(minutes=5),
-                     ts + timedelta(minutes=1))
+        connected = window.start - timedelta(minutes=5)
+        _add_session(db, acc, connected, ts + timedelta(minutes=1))
+        _add_position(db, acc, "Buy", connected - timedelta(milliseconds=300))
         assert _reason(db, acc, window) is None
+
+    def test_window_before_session_still_skips(self, db, acc, ts):
+        """The clamp applies to seed rows only, never to the window itself."""
+        window = _window(ts)
+        _add_session(db, acc, window.start + timedelta(minutes=1),
+                     ts + timedelta(minutes=1))
         _add_position(db, acc, "Buy", window.start - timedelta(minutes=30))
         assert "not covered" in _reason(db, acc, window)
 
