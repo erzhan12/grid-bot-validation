@@ -341,3 +341,17 @@ Engines: codex (`gpt-5.6-sol`) + cursor. Rounds 2/4 → SUCCESS.
 
 - `make test`: exit 0, merged coverage 92%.
 - `make lint`: all checks passed.
+
+## PR #289 claude-review (round 1, on fe0ba94) — APPROVED, one P1 (declined)
+
+| Sev | Finding | Verdict |
+|---|---|---|
+| P1 | Coverage interval should also reach back to active-order seed rows (`OrderRepository.get_active_at`). | DECLINED — the plan's Known limitations put replay's active-order seed completeness out of scope (#274); anchoring on far grid levels would stretch every interval toward run start. Recorded in `live-check.md` + plan notes. |
+| P2 | Gate expression duplicated in three entry points. | Fixed: one `main._gate_skip_reason` helper. |
+| P2 | Lag floor tested only for `run_single`. | Fixed: `run_shared_single`, `run_watch` and `main()` → `EXIT_FAIL` tests. |
+| P2 | Permanent-SKIP consequence of seed anchoring undocumented. | Fixed: rule + plan note (recover with a recorder restart). |
+| P3 | `"USDT"` wallet coin coupling to replay's `SeedConfig.wallet_coin`. | Comment added. |
+| P3 | `--lag` help silent on the floor. | Help text updated. |
+| P3 | `window.py` imports `event_saver.collectors` at module level. | Accepted gap (live-check already depends on gridbot/event_saver). |
+
+`make test` exit 0 (92%), `make lint` clean.

@@ -335,6 +335,8 @@ def _coverage_start(
         )
         if row is not None:
             times.append(to_naive_utc(row.local_ts))
+    # "USDT" = replay's SeedConfig.wallet_coin default, which live-check's
+    # runner never overrides; keep the two in step.
     wallet = WalletSnapshotRepository(session).get_latest_before(
         run_id, account_id, "USDT", window.start
     )

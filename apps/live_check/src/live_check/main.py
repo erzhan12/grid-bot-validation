@@ -161,6 +161,26 @@ def _exit_code(outcomes: list[str]) -> int:
     return EXIT_PASS
 
 
+def _gate_skip_reason(
+    session,
+    strat: StratCheckConfig,
+    run_id: str,
+    account_id: str,
+    window: Window,
+    lag,
+    threshold,
+    now: Optional[datetime] = None,
+) -> Optional[str]:
+    """Pre-replay gate shared by every mode: ticker freshness, then private
+    coverage (0110 B2b). One helper so the modes cannot drift apart."""
+    return freshness_skip_reason(
+        ground_truth.latest_ticker_ts(session, strat.symbol), lag, threshold,
+        now=now,
+    ) or ground_truth.private_coverage_skip_reason(
+        session, run_id, account_id, strat.symbol, window
+    )
+
+
 def run_single(config: LiveCheckConfig, args, db: DatabaseFactory) -> int:
     """--once / --per-fill / --curve: one window, one report, exit."""
     run_id, account_id, run_start = _resolve_run(db, config.run_id)
@@ -181,11 +201,8 @@ def run_single(config: LiveCheckConfig, args, db: DatabaseFactory) -> int:
     results = []
     for strat in config.strats:
         with db.get_readonly_session() as session:
-            ticker_ts = ground_truth.latest_ticker_ts(session, strat.symbol)
-            reason = freshness_skip_reason(
-                ticker_ts, lag, threshold
-            ) or ground_truth.private_coverage_skip_reason(
-                session, run_id, account_id, strat.symbol, window
+            reason = _gate_skip_reason(
+                session, strat, run_id, account_id, window, lag, threshold
             )
         if reason is not None:
             outcomes.append("skip")
@@ -246,12 +263,8 @@ def run_shared_single(config: LiveCheckConfig, args, db: DatabaseFactory) -> int
             for strat in config.strats
         }
         stale_reasons = {
-            strat.strat_id: freshness_skip_reason(
-                ground_truth.latest_ticker_ts(session, strat.symbol),
-                lag,
-                threshold,
-            ) or ground_truth.private_coverage_skip_reason(
-                session, run_id, account_id, strat.symbol, window
+            strat.strat_id: _gate_skip_reason(
+                session, strat, run_id, account_id, window, lag, threshold
             )
             for strat in config.strats
         }
@@ -352,11 +365,9 @@ def watch_tick(
     lines: list[str] = []
     for strat in config.strats:
         with db.get_readonly_session() as session:
-            ticker_ts = ground_truth.latest_ticker_ts(session, strat.symbol)
-            reason = freshness_skip_reason(
-                ticker_ts, lag, threshold, now=now
-            ) or ground_truth.private_coverage_skip_reason(
-                session, run_id, account_id, strat.symbol, window
+            reason = _gate_skip_reason(
+                session, strat, run_id, account_id, window, lag, threshold,
+                now=now,
             )
         if reason is not None:
             lines.append(f"{strat.strat_id} SKIP: {reason}")
@@ -482,7 +493,11 @@ def cli() -> None:
     )
     parser.add_argument(
         "--lag", type=str, default=None,
-        help="Window end lag behind now (default from config, 2m)",
+        help=(
+            "Window end lag behind now (default from config, 2m). Must "
+            "exceed 85s (the private coverage checkpoint trail); values "
+            "just above it can still SKIP when a recorder flush is slow"
+        ),
     )
     parser.add_argument(
         "--config", "-c", type=str, default=None,

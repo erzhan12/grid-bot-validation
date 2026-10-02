@@ -221,3 +221,34 @@ class TestPrivateCoverageGate:
         args = SimpleNamespace(last="1h", lag="85s", per_fill=False, curve=False)
         with pytest.raises(ValueError, match="LIVENESS_MARGIN"):
             lc_main.run_single(live_check_config, args, db)
+
+    def test_shared_rejects_lag_below_checkpoint_trail(
+        self, db, seeded_run_account, live_check_config
+    ):
+        """--shared uses the same --lag floor."""
+        args = SimpleNamespace(last="1h", lag="85s", per_fill=False, curve=False)
+        with pytest.raises(ValueError, match="LIVENESS_MARGIN"):
+            lc_main.run_shared_single(live_check_config, args, db)
+
+    def test_watch_rejects_lag_below_checkpoint_trail(
+        self, db, seeded_run_account, live_check_config
+    ):
+        """--watch fails at startup instead of looping on SKIPs forever."""
+        args = SimpleNamespace(last="1h", lag="85s", watch="10m")
+        with pytest.raises(ValueError, match="LIVENESS_MARGIN"):
+            lc_main.run_watch(live_check_config, args, db)
+
+    def test_main_maps_lag_floor_to_exit_fail(
+        self, live_check_config, monkeypatch
+    ):
+        """A rejected --lag is a config error (exit 1), not a SKIP (exit 2)."""
+        monkeypatch.setattr(lc_main, "load_config", lambda _: live_check_config)
+        monkeypatch.setattr(
+            lc_main, "_resolve_run",
+            lambda db, run_id: ("run", "acc", datetime(2026, 7, 1)),
+        )
+        args = SimpleNamespace(
+            config=None, database_url=None, run_id=None, last="1h", lag="85s",
+            watch=None, shared=False, per_fill=False, curve=False,
+        )
+        assert lc_main.main(args) == lc_main.EXIT_FAIL
