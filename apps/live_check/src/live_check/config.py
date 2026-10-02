@@ -16,6 +16,8 @@ from pydantic import BaseModel, Field, field_validator
 
 from replay.config import ReplayStrategyConfig
 
+from live_check.window import parse_lag
+
 
 def _parse_decimal(v):
     """Convert string/numeric to Decimal for Pydantic field validators."""
@@ -180,6 +182,13 @@ class LiveCheckConfig(BaseModel):
             "exceed 85s, the private coverage checkpoint trail (0110 B2b)"
         ),
     )
+
+    @field_validator("lag")
+    @classmethod
+    def _lag_above_checkpoint_trail(cls, v: str) -> str:
+        """Reject a lag the coverage checkpoint can never reach at load time."""
+        parse_lag(v)
+        return v
     staleness_threshold: Optional[str] = Field(
         default=None,
         description="Freshness gate trip point for --watch; None derives "

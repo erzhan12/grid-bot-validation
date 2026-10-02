@@ -10,6 +10,16 @@ Plan: docs/features/0110_PLAN.md (Phase B2 steps 1, 3, 4 + lag floor)  |  Branch
 - [x] make test + make lint green
 - [x] rules (live-check, grid-db, event-saver) + plan as-built notes
 
+## Follow-ups
+- PR #289 review P1 (availability, fail-safe): after any gap, live-check
+  SKIPs every later window until each leg's size changes, because the
+  startup REST row (`exchange_ts = snapshot_ts`) stays the seed row of a
+  leg with no fill since recorder start (flat leg with no orders: until a
+  recorder restart). Remedy: the recorder writes a fresh REST position +
+  wallet snapshot when it closes a gap (`_handle_private_gap` /
+  `close_gap` path), so the anchor moves past the gap. Recorder change +
+  deploy; candidate for B2c or its own PR.
+
 # Feature 0110 Phase B2a — recorder position-data fitness (#271)
 
 Plan: docs/features/0110_PLAN.md (B2 split: B2a writer side, B2b coverage gate, B2c anchor fitness)  |  Branch: feature/0110-b2a-position-fitness

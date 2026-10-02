@@ -135,6 +135,14 @@ class TestSessionCoverage:
         _add_session(db, acc, middle, ts + timedelta(minutes=1))
         assert "not covered" in _reason(db, acc, window)
 
+    def test_later_session_alone_covering_passes(self, db, acc, ts):
+        """Any one session may cover the interval, not only the first."""
+        window = _window(ts)
+        _add_session(db, acc, ts - timedelta(days=2), ts - timedelta(days=1))
+        _add_session(db, acc, window.start - timedelta(minutes=1),
+                     ts + timedelta(minutes=1))
+        assert _reason(db, acc, window) is None
+
     def test_aware_utc_rows_compare_as_naive_utc(self, db, acc, ts):
         """The recorder writes aware UTC times; SQLite returns them naive."""
         window = _window(ts)
@@ -290,7 +298,7 @@ class TestSeedAnchors:
                  window.start - timedelta(minutes=5))
         _add_position(db, acc, "Sell", window.start - timedelta(minutes=30))
         reason = _reason(db, acc, window)
-        assert "only touches the seed rows" in reason
+        assert "only touch the seed rows" in reason
         assert "restart the recorder" in reason
 
     def test_wallet_seed_extends_interval(self, db, acc, ts):

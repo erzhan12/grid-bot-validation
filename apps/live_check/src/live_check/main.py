@@ -273,21 +273,9 @@ def run_shared_single(config: LiveCheckConfig, args, db: DatabaseFactory) -> int
     threshold = staleness_threshold(lag, override)
 
     with db.get_readonly_session() as session:
-        exec_counts = {
-            strat.symbol: ground_truth.live_exec_count(
-                session, run_id, strat.symbol, window.start, window.end
-            )
-            for strat in config.strats
-        }
         stale_reasons = {
             strat.strat_id: _gate_skip_reason(
                 session, strat, run_id, account_id, window, lag, threshold
-            )
-            for strat in config.strats
-        }
-        unknown_pnl = {
-            strat.strat_id: ground_truth.unknown_pnl_exec_ids(
-                session, run_id, strat.symbol, window.start, window.end
             )
             for strat in config.strats
         }
@@ -297,6 +285,19 @@ def run_shared_single(config: LiveCheckConfig, args, db: DatabaseFactory) -> int
             if reason is not None:
                 print(f"{strat.strat_id} ({strat.symbol}) — SKIP: {reason}")
         return EXIT_SKIP
+    with db.get_readonly_session() as session:
+        exec_counts = {
+            strat.symbol: ground_truth.live_exec_count(
+                session, run_id, strat.symbol, window.start, window.end
+            )
+            for strat in config.strats
+        }
+        unknown_pnl = {
+            strat.strat_id: ground_truth.unknown_pnl_exec_ids(
+                session, run_id, strat.symbol, window.start, window.end
+            )
+            for strat in config.strats
+        }
     if any(count == 0 for count in exec_counts.values()):
         for strat in config.strats:
             if exec_counts[strat.symbol] == 0:

@@ -16,6 +16,17 @@ class TestLoadConfig:
             load_config(str(empty))
 
 
+class TestLagValidation:
+    def test_config_lag_below_checkpoint_trail_rejected(self, strat):
+        """0110 B2b: a config `lag` at the 85 s floor fails at load time."""
+        with pytest.raises(ValidationError, match="LIVENESS_MARGIN"):
+            LiveCheckConfig(strats=[strat], lag="85s")
+
+    def test_default_lag_accepted(self, strat):
+        """The 2m default clears the floor."""
+        assert LiveCheckConfig(strats=[strat]).lag == "2m"
+
+
 class TestStratsValidation:
     def test_empty_strats_rejected(self):
         """An empty strat list is a config error, not a false-green run."""

@@ -37,7 +37,8 @@ from live_check.window import Window, to_naive_utc
 
 _ZERO = Decimal("0")
 # The wallet coin replay seeds from: live-check's runner never overrides
-# SeedConfig.wallet_coin, so the coverage gate follows its default.
+# SeedConfig.wallet_coin (--shared seeds from MultiSeedConfig.wallet_coin, a
+# separate field with the same "USDT" default), so the gate follows it.
 _WALLET_SEED_COIN = SeedConfig.model_fields["wallet_coin"].default
 
 
@@ -416,9 +417,10 @@ def private_coverage_skip_reason(
             # Only the seed stretch is hit: every later window of this run
             # reaches back to the same seed rows and SKIPs too.
             hint = (
-                "; the gap only touches the seed rows before the window — "
-                "positions are not backfilled, so restart the recorder for "
-                "a fresh run_id"
+                "; the overlapping gap(s) only touch the seed rows before the "
+                "window — positions are not backfilled, so later windows SKIP "
+                "until that leg's size changes; restart the recorder for a "
+                "fresh run_id"
             )
         return (
             f"private-stream gap {to_naive_utc(first.gap_start)}–{gap_end} "

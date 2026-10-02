@@ -384,3 +384,18 @@ Engines: codex (`gpt-5.6-sol`) + cursor. Rounds 2/4 → SUCCESS.
 | P3 | Memoise the table check. | Accepted gap (two cheap reads). |
 
 `make test` exit 0 (92%), `make lint` clean.
+
+## PR #289 claude-review (round 4, on 7b89efd) — APPROVED, P1 = availability (documented + follow-up)
+
+| Sev | Finding | Verdict |
+|---|---|---|
+| P1 | A flat hedge leg pins the seed anchor at the run-start REST row, so one WS blip SKIPs every later window. | Confirmed and broader: `updatedTime` moves only on a size change, so ANY leg with no fill since recorder start keeps the startup row (exchange_ts = snapshot_ts) as its seed row; SKIP lasts until that leg fills (flat leg with no orders: until restart). Fail-safe (SKIP, not PASS). Taken as the reviewer's option (b): plan Known limitations + rule + SKIP-reason wording; remedy (recorder REST resnapshot on gap close) recorded in `tasks/todo.md` Follow-ups — a recorder change + deploy. |
+| P2 | Config `lag` below the floor not rejected at load. | Fixed: `field_validator("lag")` → `parse_lag`; test added. |
+| P2 | `--shared` ran exec-count / unknown-PnL aggregates before the gate. | Fixed: gate first, aggregates only after it passes. |
+| P2 | `--shared` seeds from `MultiSeedConfig.wallet_coin`; `load_wallet_curve` hardcodes "USDT". | Comment notes the separate field (same default). The `load_wallet_curve` hardcode predates this PR — not changed. |
+| P2 | No test for a later session alone covering. | Test added. |
+| P3 | Hint wording singular. | Reworded ("gap(s) only touch"). |
+| P3 | Memoise the table check. | Accepted gap (third request; two cheap reads). |
+| P3 | Rule bullet too long. | Split into sub-bullets. |
+
+`make test` exit 0 (92%), `make lint` clean.
