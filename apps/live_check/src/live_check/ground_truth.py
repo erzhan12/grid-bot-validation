@@ -376,7 +376,9 @@ def private_coverage_skip_reason(
     start = _coverage_start(session, run_id, account_id, symbol, window)
     end = window.end
     # Gaps first: the recorder stops checkpointing while a gap is open, so
-    # the session check would hide the gap's bounds and status.
+    # the session check would hide the gap's bounds and status. Gap rows are
+    # per symbol: the recorder writes one per configured symbol for an
+    # account-wide outage, so this assumes the strat symbol is recorded.
     gaps = PrivateStreamGapRepository(session).list_overlapping(
         run_id, account_id, symbol, start, end
     )
@@ -386,9 +388,22 @@ def private_coverage_skip_reason(
             to_naive_utc(first.gap_end) if first.gap_end is not None else "open"
         )
         more = f" (+{len(gaps) - 1} more)" if len(gaps) > 1 else ""
+        hint = ""
+        if all(
+            g.gap_end is not None and to_naive_utc(g.gap_end) < window.start
+            for g in gaps
+        ):
+            # Only the seed stretch is hit: every later window of this run
+            # reaches back to the same seed rows and SKIPs too.
+            hint = (
+                "; the gap only touches the seed rows before the window — "
+                "positions are not backfilled, so restart the recorder for "
+                "a fresh run_id"
+            )
         return (
             f"private-stream gap {to_naive_utc(first.gap_start)}–{gap_end} "
-            f"(recovery {first.recovery_status}) overlaps {start}–{end}{more}"
+            f"(recovery {first.recovery_status}) overlaps {start}–{end}"
+            f"{hint}{more}"
         )
     sessions = PrivateStreamSessionRepository(session).list_for_run(
         run_id, account_id

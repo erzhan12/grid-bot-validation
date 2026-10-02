@@ -355,3 +355,17 @@ Engines: codex (`gpt-5.6-sol`) + cursor. Rounds 2/4 → SUCCESS.
 | P3 | `window.py` imports `event_saver.collectors` at module level. | Accepted gap (live-check already depends on gridbot/event_saver). |
 
 `make test` exit 0 (92%), `make lint` clean.
+
+## PR #289 claude-review (round 2, on 0b935d0) — APPROVED, P1 = observability
+
+| Sev | Finding | Verdict |
+|---|---|---|
+| P1 | A gap only in the seed stretch silently SKIPs every later window of the run. | Fixed: when every overlapping gap ended before `window.start`, the reason says it only touches the seed rows and to restart the recorder (no per-tick log line — the SKIP line already prints each tick). Test added. |
+| P2 | Move the constants to a dependency-free `event_saver/constants.py` to keep pybit out of live-check's import graph. | DECLINED — `event_saver/__init__.py` imports `main`, the reconciler, collectors and writers, so any `event_saver.*` import loads the package anyway; a real fix means moving the constants out of event_saver. The import has no side effects. |
+| P2 | `--shared` printed "no data in window" before the coverage reason. | Fixed: gate reasons first in all modes; test added. |
+| P2 | CLI-level tests only exercised the missing-session path. | Fixed: gap-path tests for `--once`, `--shared`, `--watch`. |
+| P2 | `(+N more)` branch untested. | Test added. |
+| P3 | Gate assumes the strat symbol is recorded (gap rows per configured symbol). | Comment added. |
+| P3 | `lag` config/YAML silent on the floor. | Field description + YAML comment. |
+
+`make test` exit 0 (92%), `make lint` clean.

@@ -190,6 +190,20 @@ class TestGaps:
         assert "open" in reason
         assert "pending" in reason
 
+    def test_several_gaps_report_oldest_and_count(self, db, acc, ts):
+        """Two overlapping gaps: the reason names the oldest and '(+1 more)'."""
+        first = ts - timedelta(minutes=50)
+        _add_gap(db, acc, ts - timedelta(minutes=20), ts - timedelta(minutes=19))
+        _add_gap(db, acc, first, first + timedelta(minutes=1))
+        reason = _reason(db, acc, _window(ts))
+        assert first.isoformat(sep=" ") in reason
+        assert reason.endswith("(+1 more)")
+
+    def test_gap_inside_window_has_no_restart_hint(self, db, acc, ts):
+        """A gap inside the window is an ordinary SKIP, no restart hint."""
+        _add_gap(db, acc, ts - timedelta(minutes=30), ts - timedelta(minutes=29))
+        assert "restart" not in _reason(db, acc, _window(ts))
+
     def test_gap_ending_exactly_at_interval_start_skips(self, db, acc, ts):
         """gap_end == interval start overlaps."""
         window = _window(ts)
@@ -254,6 +268,20 @@ class TestSeedAnchors:
         assert _reason(db, acc, window) is None  # no seed row yet
         _add_position(db, acc, "Sell", window.start - timedelta(minutes=30))
         assert _reason(db, acc, window) is not None
+
+    def test_gap_only_before_window_tells_operator_to_restart(
+        self, db, acc, ts
+    ):
+        """A gap wholly between a seed row and window.start SKIPs every later
+        window of the run; the reason says so and names the remedy."""
+        window = _window(ts)
+        _add_session(db, acc, ts - timedelta(days=1), ts + timedelta(minutes=1))
+        _add_gap(db, acc, window.start - timedelta(minutes=10),
+                 window.start - timedelta(minutes=5))
+        _add_position(db, acc, "Sell", window.start - timedelta(minutes=30))
+        reason = _reason(db, acc, window)
+        assert "only touches the seed rows" in reason
+        assert "restart the recorder" in reason
 
     def test_wallet_seed_extends_interval(self, db, acc, ts):
         """The USDT wallet seed row extends the interval too."""

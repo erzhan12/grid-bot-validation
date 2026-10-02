@@ -14,6 +14,8 @@ database_url: "sqlite:///data/recorder_ltcusdt_phase4.db"
 run_id: null
 
 last: "4h"
+# Must exceed 85s (private health probe 10s + LIVENESS_MARGIN 75s): the
+# recorder's coverage checkpoint trails real time by that much.
 lag: "2m"
 
 strats:

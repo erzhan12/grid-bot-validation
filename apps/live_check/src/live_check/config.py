@@ -175,7 +175,10 @@ class LiveCheckConfig(BaseModel):
     last: str = Field(default="4h", description="Default rolling window length")
     lag: str = Field(
         default="2m",
-        description="Window end lag behind now (lets recorder writes settle)",
+        description=(
+            "Window end lag behind now (lets recorder writes settle); must "
+            "exceed 85s, the private coverage checkpoint trail (0110 B2b)"
+        ),
     )
     staleness_threshold: Optional[str] = Field(
         default=None,

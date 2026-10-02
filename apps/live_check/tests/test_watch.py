@@ -188,6 +188,36 @@ class TestWatchPrivateCoverage:
         assert "SKIP" in lines[0]
         assert "no private-stream session" in lines[0]
 
+    def test_gap_renders_skip_line(
+        self, db, seeded_run_account, private_coverage, strat,
+        live_check_config, monkeypatch,
+    ):
+        """Covering session but an overlapping gap → gap SKIP line."""
+        _seed_window_data(db, _NOW)
+        with db.get_session() as session:
+            session.add(PrivateStreamGap(
+                run_id="test-run-id",
+                account_id=seeded_run_account.account_id,
+                symbol="LTCUSDT",
+                gap_start=_NOW - timedelta(minutes=40),
+                gap_end=None,
+                recovery_status="pending",
+                inserted=0,
+                duplicates=0,
+            ))
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("no verdict across a private-stream gap")
+
+        monkeypatch.setattr(lc_main.runner, "run_strat", _boom)
+        lines = lc_main.watch_tick(
+            live_check_config, db, seeded_run_account.run_id,
+            seeded_run_account.account_id, timedelta(hours=1), _LAG,
+            staleness_threshold(_LAG), now=_NOW,
+        )
+        assert len(lines) == 1
+        assert "private-stream gap" in lines[0]
+
     def test_missing_coverage_tables_skip_without_killing_watch(
         self, tmp_path, live_check_config, monkeypatch
     ):

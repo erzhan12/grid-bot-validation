@@ -12,7 +12,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from grid_db import PrivateExecution, RecordedDataQualityError, TickerSnapshot
+from grid_db import (
+    PrivateExecution,
+    PrivateStreamGap,
+    RecordedDataQualityError,
+    RecoveryStatus,
+    TickerSnapshot,
+)
 
 from live_check import main as lc_main
 
@@ -252,3 +258,61 @@ class TestPrivateCoverageGate:
             watch=None, shared=False, per_fill=False, curve=False,
         )
         assert lc_main.main(args) == lc_main.EXIT_FAIL
+
+    def _gap_in_window(self, db, account_id):
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        with db.get_session() as session:
+            session.add(PrivateStreamGap(
+                run_id="test-run-id",
+                account_id=account_id,
+                symbol="LTCUSDT",
+                gap_start=now_naive - timedelta(minutes=40),
+                gap_end=now_naive - timedelta(minutes=39),
+                recovery_status=RecoveryStatus.RECOVERED,
+                inserted=0,
+                duplicates=0,
+            ))
+
+    def test_once_gap_skips_before_replay(
+        self, db, seeded_run_account, private_coverage, live_check_config,
+        monkeypatch, capsys,
+    ):
+        """--once: covering session but an overlapping gap → gap SKIP."""
+        self._fresh(db)
+        self._gap_in_window(db, seeded_run_account.account_id)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("no verdict across a private-stream gap")
+
+        monkeypatch.setattr(lc_main, "check_strat", _boom)
+        rc = lc_main.run_single(live_check_config, _args(), db)
+        assert rc == lc_main.EXIT_SKIP
+        assert "private-stream gap" in capsys.readouterr().out
+
+    def test_shared_gap_skips_before_replay(
+        self, db, seeded_run_account, private_coverage, live_check_config,
+        monkeypatch, capsys,
+    ):
+        """--shared: covering session but an overlapping gap → gap SKIP."""
+        self._fresh(db)
+        self._gap_in_window(db, seeded_run_account.account_id)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("no verdict across a private-stream gap")
+
+        monkeypatch.setattr(lc_main.runner, "run_shared", _boom)
+        rc = lc_main.run_shared_single(live_check_config, _args(), db)
+        assert rc == lc_main.EXIT_SKIP
+        assert "private-stream gap" in capsys.readouterr().out
+
+    def test_shared_reports_coverage_before_empty_window(
+        self, db, seeded_run_account, live_check_config, capsys
+    ):
+        """--shared reports the gate reason first, like --once and --watch,
+        when the window is also empty."""
+        _add_ticker(db, datetime.now(timezone.utc).replace(tzinfo=None))
+        rc = lc_main.run_shared_single(live_check_config, _args(), db)
+        assert rc == lc_main.EXIT_SKIP
+        out = capsys.readouterr().out
+        assert "no private-stream session" in out
+        assert "no data in window" not in out

@@ -274,16 +274,16 @@ def run_shared_single(config: LiveCheckConfig, args, db: DatabaseFactory) -> int
             )
             for strat in config.strats
         }
-    if any(count == 0 for count in exec_counts.values()):
-        for strat in config.strats:
-            if exec_counts[strat.symbol] == 0:
-                print(f"{strat.strat_id} ({strat.symbol}) — SKIP: no data in window")
-        return EXIT_SKIP
     if any(reason is not None for reason in stale_reasons.values()):
         for strat in config.strats:
             reason = stale_reasons[strat.strat_id]
             if reason is not None:
                 print(f"{strat.strat_id} ({strat.symbol}) — SKIP: {reason}")
+        return EXIT_SKIP
+    if any(count == 0 for count in exec_counts.values()):
+        for strat in config.strats:
+            if exec_counts[strat.symbol] == 0:
+                print(f"{strat.strat_id} ({strat.symbol}) — SKIP: no data in window")
         return EXIT_SKIP
     if any(unknown_pnl.values()):
         for strat in config.strats:
