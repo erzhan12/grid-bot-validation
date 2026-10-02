@@ -312,3 +312,32 @@ All six findings applied inline.
 | P3 | Empty `updatedTime` could try frame `creationTime` before `local_ts`. | DEFERRED — V5 position frames carry `updatedTime`; `tasks/todo.md`. |
 
 `make test` exit 0 (92%), `make lint` clean.
+
+## Phase B2b — local staged review (review-fix-loop-staged, 2026-10-02)
+
+5 reviewers, 1 iteration → Ready to commit.
+
+| Sev | Finding | Verdict |
+|---|---|---|
+| CRITICAL (claimed) | Seed anchors should use `exchange_ts`, not `local_ts`. | REJECT — coverage is measured on the recorder clock; a push is a full snapshot as of receipt, and a quiet leg's push keeps a Bybit `updatedTime` that can predate the recorder start, which would SKIP permanently. Pinned by `test_seed_anchor_uses_receipt_time_not_exchange_time` + code comment. |
+| WARNING | Plan note cited a stale line number for the probe constant. | Fixed. |
+
+Security, performance, testing: no issues (all coverage queries index-backed).
+
+## Phase B2b — external review (ext-code-review)
+
+Engines: codex (`gpt-5.6-sol`) + cursor. Rounds 2/4 → SUCCESS.
+
+| Round | Engine | Sev | Finding | Verdict |
+|---|---|---|---|---|
+| 1 | codex | P2 | Session check ran before gaps; the recorder freezes the checkpoint while a gap is open, so a real open gap reported a generic "not covered" without bounds/status. | ACCEPT — gaps checked first; test `test_open_gap_reported_even_when_checkpoint_froze`. |
+| 1 | codex | P3 | Table presence inspected per call, not once per DB open. | Accepted gap (two cheap `sqlite_master` reads). |
+| 1 | codex | P3 | No aware-UTC test. | ACCEPT — `test_aware_utc_rows_compare_as_naive_utc`. |
+| 1 | cursor | — | NO P1/P2. P3: no back-to-back-sessions test; refused wallet row still extends the interval; reason quotes newest session. | Test added; the other two accepted (safe-direction SKIP / cosmetic). |
+| 2 | codex, cursor | — | NO P1/P2. P3: wallet `get_latest_before` lacks an `id` tie-break. | ACCEPT — tie-break + repository test. |
+| 2 | cursor | P3 | A lag of 86–~95 s can still SKIP when the checkpoint flush is slow (barrier taken before flush). | Accepted gap — plan formula; default 2 m clears it; failure mode is SKIP, not a false PASS. |
+
+## Final verification (B2b)
+
+- `make test`: exit 0, merged coverage 92%.
+- `make lint`: all checks passed.

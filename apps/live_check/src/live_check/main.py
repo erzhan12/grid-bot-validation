@@ -44,6 +44,7 @@ from live_check.window import (
     compute_window,
     freshness_skip_reason,
     parse_duration,
+    parse_lag,
     staleness_threshold,
     to_naive_utc,
 )
@@ -164,7 +165,7 @@ def run_single(config: LiveCheckConfig, args, db: DatabaseFactory) -> int:
     """--once / --per-fill / --curve: one window, one report, exit."""
     run_id, account_id, run_start = _resolve_run(db, config.run_id)
     last = parse_duration(args.last)
-    lag = parse_duration(args.lag)
+    lag = parse_lag(args.lag)
     window = compute_window(last, lag)
     check_post_0080_floors(window.start, run_start)
     # 0100: --once previously had NO freshness gate (watch-only) — a stopped
@@ -181,7 +182,11 @@ def run_single(config: LiveCheckConfig, args, db: DatabaseFactory) -> int:
     for strat in config.strats:
         with db.get_readonly_session() as session:
             ticker_ts = ground_truth.latest_ticker_ts(session, strat.symbol)
-        reason = freshness_skip_reason(ticker_ts, lag, threshold)
+            reason = freshness_skip_reason(
+                ticker_ts, lag, threshold
+            ) or ground_truth.private_coverage_skip_reason(
+                session, run_id, account_id, strat.symbol, window
+            )
         if reason is not None:
             outcomes.append("skip")
             print(f"{strat.strat_id} ({strat.symbol}) — SKIP: {reason}")
@@ -221,7 +226,7 @@ def run_shared_single(config: LiveCheckConfig, args, db: DatabaseFactory) -> int
     """Run one shared-wallet replay and account-level reconciliation."""
     run_id, account_id, run_start = _resolve_run(db, config.run_id)
     last = parse_duration(args.last)
-    lag = parse_duration(args.lag)
+    lag = parse_lag(args.lag)
     window = compute_window(last, lag)
     check_post_0080_floors(window.start, run_start)
     # 0100: freshness gate (see run_single). freshness_skip_reason(None, ...)
@@ -245,6 +250,8 @@ def run_shared_single(config: LiveCheckConfig, args, db: DatabaseFactory) -> int
                 ground_truth.latest_ticker_ts(session, strat.symbol),
                 lag,
                 threshold,
+            ) or ground_truth.private_coverage_skip_reason(
+                session, run_id, account_id, strat.symbol, window
             )
             for strat in config.strats
         }
@@ -346,7 +353,11 @@ def watch_tick(
     for strat in config.strats:
         with db.get_readonly_session() as session:
             ticker_ts = ground_truth.latest_ticker_ts(session, strat.symbol)
-        reason = freshness_skip_reason(ticker_ts, lag, threshold, now=now)
+            reason = freshness_skip_reason(
+                ticker_ts, lag, threshold, now=now
+            ) or ground_truth.private_coverage_skip_reason(
+                session, run_id, account_id, strat.symbol, window
+            )
         if reason is not None:
             lines.append(f"{strat.strat_id} SKIP: {reason}")
             continue
@@ -369,7 +380,7 @@ def run_watch(config: LiveCheckConfig, args, db: DatabaseFactory) -> int:
     run_id, account_id, run_start = _resolve_run(db, config.run_id)
     interval = parse_duration(args.watch)
     last = parse_duration(args.last)
-    lag = parse_duration(args.lag)
+    lag = parse_lag(args.lag)
     override = (
         parse_duration(config.staleness_threshold)
         if config.staleness_threshold is not None

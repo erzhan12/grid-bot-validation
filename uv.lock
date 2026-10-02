@@ -506,6 +506,7 @@ source = { editable = "apps/live_check" }
 dependencies = [
     { name = "backtest" },
     { name = "comparator" },
+    { name = "event-saver" },
     { name = "grid-db" },
     { name = "gridbot" },
     { name = "pydantic" },
@@ -517,6 +518,7 @@ dependencies = [
 requires-dist = [
     { name = "backtest", editable = "apps/backtest" },
     { name = "comparator", editable = "apps/comparator" },
+    { name = "event-saver", editable = "apps/event_saver" },
     { name = "grid-db", editable = "shared/db" },
     { name = "gridbot", editable = "apps/gridbot" },
     { name = "pydantic", specifier = ">=2.0" },

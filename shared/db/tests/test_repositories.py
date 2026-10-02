@@ -1599,6 +1599,33 @@ class TestSeedAwareReplayRepositoryMethods:
         )
         assert got is None
 
+    def test_wallet_get_latest_before_tie_takes_later_insert(
+        self, session, sample_account, sample_run
+    ):
+        """0110 B2b: wallet rows tied on exchange_ts resolve to the later
+        insert, so replay and the live-check coverage gate pick one row."""
+        from grid_db import WalletSnapshotRepository, WalletSnapshot
+        from decimal import Decimal
+
+        repo = WalletSnapshotRepository(session)
+        ts = datetime(2026, 5, 7, 10, 0, 0, tzinfo=UTC)
+        for balance in ("100", "200"):
+            repo.bulk_insert([
+                WalletSnapshot(
+                    run_id=sample_run.run_id,
+                    account_id=str(sample_account.account_id),
+                    exchange_ts=ts, local_ts=ts, coin="USDT",
+                    wallet_balance=Decimal(balance),
+                    available_balance=Decimal(balance),
+                ),
+            ])
+
+        got = repo.get_latest_before(
+            sample_run.run_id, str(sample_account.account_id), "USDT", ts,
+        )
+        assert got is not None
+        assert got.wallet_balance == Decimal("200")
+
     def test_wallet_get_latest_before_filters_by_coin_and_run(
         self, session, sample_account, sample_run
     ):

@@ -7,11 +7,19 @@ from types import SimpleNamespace
 import pytest
 
 from grid_db import DatabaseFactory, DatabaseSettings
-from grid_db.models import BybitAccount, Run, Strategy, User
+from grid_db.models import (
+    BybitAccount,
+    PrivateStreamSession,
+    Run,
+    Strategy,
+    User,
+)
 
 from live_check.config import LiveCheckConfig, StratCheckConfig
 
 RUN_ID = "test-run-id"
+# Checkpoint far enough ahead to cover windows computed from the real clock.
+_FAR_FUTURE = datetime(2099, 1, 1)
 
 
 @pytest.fixture
@@ -69,6 +77,18 @@ def seeded_run_account(db, ts):
         session.add(run)
         session.commit()
     return SimpleNamespace(account_id=account_id, run_id=RUN_ID)
+
+
+@pytest.fixture
+def private_coverage(db, seeded_run_account, ts):
+    """A private-stream session covering every test window (0110 B2b)."""
+    with db.get_session() as session:
+        session.add(PrivateStreamSession(
+            run_id=RUN_ID,
+            account_id=seeded_run_account.account_id,
+            connected_at=ts - timedelta(days=1),
+            last_checkpoint_ts=_FAR_FUTURE,
+        ))
 
 
 @pytest.fixture

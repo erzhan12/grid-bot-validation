@@ -24,7 +24,10 @@ from event_saver.collectors._startup import (
 logger = logging.getLogger(__name__)
 
 
-_PRIVATE_WS_HEALTH_CHECK_INTERVAL = 10.0
+# Seconds between private health probes. Public: live-check's --lag must
+# exceed this plus LIVENESS_MARGIN, the most the coverage checkpoint
+# trails real time (feature 0110 B2b).
+PRIVATE_WS_HEALTH_CHECK_INTERVAL = 10.0
 _PRIVATE_WS_RESET_TIMEOUT = 30.0
 _PRIVATE_WS_DISCONNECT_TIMEOUT = 5.0
 # Feature 0110 B1b: how long a reset waits for auth + subscription acks.
@@ -116,7 +119,7 @@ class PrivateCollector:
         on_gap_detected: Optional[Callable[[datetime, datetime], None]] = None,
         on_disconnect: Optional[Callable[[datetime], None]] = None,
         on_healthy_probe: Optional[Callable[[], Awaitable[None]]] = None,
-        ws_health_check_interval: float = _PRIVATE_WS_HEALTH_CHECK_INTERVAL,
+        ws_health_check_interval: float = PRIVATE_WS_HEALTH_CHECK_INTERVAL,
         ws_reset_timeout: float = _PRIVATE_WS_RESET_TIMEOUT,
         ws_disconnect_timeout: float = _PRIVATE_WS_DISCONNECT_TIMEOUT,
     ):

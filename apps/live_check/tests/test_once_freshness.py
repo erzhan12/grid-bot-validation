@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
+
 from grid_db import PrivateExecution, RecordedDataQualityError, TickerSnapshot
 
 from live_check import main as lc_main
@@ -81,7 +83,8 @@ class TestOnceFreshnessGate:
         assert "no ticker data" in capsys.readouterr().out
 
     def test_unknown_execution_pnl_skips_validation(
-        self, db, seeded_run_account, live_check_config, monkeypatch, capsys
+        self, db, seeded_run_account, private_coverage, live_check_config,
+        monkeypatch, capsys,
     ):
         """Fresh ticker + NULL closed_pnl in window → SKIP, no replay."""
         now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -99,7 +102,8 @@ class TestOnceFreshnessGate:
         assert "unknown closed_pnl" in out
 
     def test_shared_unknown_execution_pnl_skips_validation(
-        self, db, seeded_run_account, live_check_config, monkeypatch, capsys
+        self, db, seeded_run_account, private_coverage, live_check_config,
+        monkeypatch, capsys,
     ):
         """--shared: NULL closed_pnl in window → SKIP before shared replay."""
         now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -117,7 +121,8 @@ class TestOnceFreshnessGate:
         assert "unknown closed_pnl" in out
 
     def test_shared_late_unknown_pnl_during_replay_skips(
-        self, db, seeded_run_account, live_check_config, monkeypatch, capsys
+        self, db, seeded_run_account, private_coverage, live_check_config,
+        monkeypatch, capsys,
     ):
         """--shared: a NULL landing after the pre-check → SKIP, no crash."""
         now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -134,7 +139,8 @@ class TestOnceFreshnessGate:
         assert "recorded data quality" in capsys.readouterr().out
 
     def test_fresh_ticker_reaches_per_strat_check(
-        self, db, seeded_run_account, live_check_config, monkeypatch
+        self, db, seeded_run_account, private_coverage, live_check_config,
+        monkeypatch,
     ):
         """Fresh ticker → gate passes and check_strat IS invoked."""
         now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -150,3 +156,68 @@ class TestOnceFreshnessGate:
         rc = lc_main.run_single(live_check_config, _args(), db)
         assert called, "freshness gate must let a fresh window through"
         assert rc == lc_main.EXIT_SKIP  # sentinel outcome, not the gate
+
+
+class TestPrivateCoverageGate:
+    """0110 B2b: no verdict without private-stream coverage, in every mode,
+    and never after replay has started."""
+
+    def _fresh(self, db):
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        _add_ticker(db, now_naive)
+        _add_exec(db, now_naive - timedelta(minutes=30), closed_pnl=Decimal("0"))
+
+    def test_once_without_coverage_skips_before_replay(
+        self, db, seeded_run_account, live_check_config, monkeypatch, capsys
+    ):
+        """--once: no session row → SKIP, check_strat never called."""
+        self._fresh(db)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("no verdict without private coverage")
+
+        monkeypatch.setattr(lc_main, "check_strat", _boom)
+        rc = lc_main.run_single(live_check_config, _args(), db)
+        assert rc == lc_main.EXIT_SKIP
+        assert "no private-stream session" in capsys.readouterr().out
+
+    def test_shared_without_coverage_skips_before_replay(
+        self, db, seeded_run_account, live_check_config, monkeypatch, capsys
+    ):
+        """--shared: no session row → SKIP, shared replay never called."""
+        self._fresh(db)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("no verdict without private coverage")
+
+        monkeypatch.setattr(lc_main.runner, "run_shared", _boom)
+        rc = lc_main.run_shared_single(live_check_config, _args(), db)
+        assert rc == lc_main.EXIT_SKIP
+        out = capsys.readouterr().out
+        assert "LTCUSDT" in out
+        assert "no private-stream session" in out
+
+    def test_shared_with_coverage_reaches_replay(
+        self, db, seeded_run_account, private_coverage, live_check_config,
+        monkeypatch,
+    ):
+        """--shared: a covered window passes the gate and reaches replay."""
+        self._fresh(db)
+        called = []
+
+        def _sentinel(*args, **kwargs):
+            called.append(1)
+            raise RecordedDataQualityError("sentinel")
+
+        monkeypatch.setattr(lc_main.runner, "run_shared", _sentinel)
+        rc = lc_main.run_shared_single(live_check_config, _args(), db)
+        assert called
+        assert rc == lc_main.EXIT_SKIP  # sentinel outcome, not the gate
+
+    def test_once_rejects_lag_below_checkpoint_trail(
+        self, db, seeded_run_account, live_check_config
+    ):
+        """--lag 85s is a startup error, not a stream of SKIPs."""
+        args = SimpleNamespace(last="1h", lag="85s", per_fill=False, curve=False)
+        with pytest.raises(ValueError, match="LIVENESS_MARGIN"):
+            lc_main.run_single(live_check_config, args, db)

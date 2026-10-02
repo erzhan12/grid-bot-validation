@@ -262,7 +262,8 @@ class WalletSnapshotRepository(BaseRepository[WalletSnapshot]):
                 WalletSnapshot.coin == coin,
                 WalletSnapshot.exchange_ts <= at_ts,
             )
-            .order_by(WalletSnapshot.exchange_ts.desc())
+            # id breaks exchange_ts ties (one frame creationTime on several rows).
+            .order_by(WalletSnapshot.exchange_ts.desc(), WalletSnapshot.id.desc())
             .first()
         )
 

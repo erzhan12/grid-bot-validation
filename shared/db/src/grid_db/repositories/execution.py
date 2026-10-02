@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 from typing import Optional, List
 
-from sqlalchemy import func, tuple_, insert
+from sqlalchemy import func, or_, tuple_, insert
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
@@ -465,6 +465,45 @@ class PrivateStreamGapRepository(BaseRepository[PrivateStreamGap]):
         gap.gap_end = gap_end
         self.session.flush()
 
+    def list_overlapping(
+        self,
+        run_id: str,
+        account_id: str,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[PrivateStreamGap]:
+        """Gaps of one run/account/symbol that overlap ``[start, end]``.
+
+        An open gap (``gap_end`` NULL) overlaps once it started by ``end``.
+        Bounds are inclusive: a gap touching ``start`` or ``end`` overlaps.
+
+        Args:
+            run_id: Recording run.
+            account_id: Account of the private stream.
+            symbol: Symbol.
+            start: Interval start.
+            end: Interval end.
+
+        Returns:
+            Overlapping gaps, oldest first.
+        """
+        return (
+            self.session.query(PrivateStreamGap)
+            .filter(
+                PrivateStreamGap.run_id == str(run_id),
+                PrivateStreamGap.account_id == str(account_id),
+                PrivateStreamGap.symbol == symbol,
+                PrivateStreamGap.gap_start <= _naive_utc(end),
+                or_(
+                    PrivateStreamGap.gap_end.is_(None),
+                    PrivateStreamGap.gap_end >= _naive_utc(start),
+                ),
+            )
+            .order_by(PrivateStreamGap.gap_start, PrivateStreamGap.id)
+            .all()
+        )
+
     def _get_in_run(self, gap_id: int, run_id: str) -> PrivateStreamGap:
         gap = (
             self.session.query(PrivateStreamGap)
@@ -512,6 +551,28 @@ class PrivateStreamSessionRepository(BaseRepository[PrivateStreamSession]):
                 connected_at=connected_at,
                 last_checkpoint_ts=connected_at,
             )
+        )
+
+    def list_for_run(
+        self, run_id: str, account_id: str
+    ) -> list[PrivateStreamSession]:
+        """All sessions of one run/account, oldest first.
+
+        Args:
+            run_id: Recording run.
+            account_id: Account of the private stream.
+
+        Returns:
+            Session rows ordered by ``connected_at``.
+        """
+        return (
+            self.session.query(PrivateStreamSession)
+            .filter(
+                PrivateStreamSession.run_id == str(run_id),
+                PrivateStreamSession.account_id == str(account_id),
+            )
+            .order_by(PrivateStreamSession.connected_at, PrivateStreamSession.id)
+            .all()
         )
 
     def advance_checkpoint(

@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from live_check.main import check_strat
-from live_check.window import Window, compute_window, parse_duration
+from live_check.window import Window, compute_window, parse_duration, parse_lag
 
 
 class TestParseDuration:
@@ -25,6 +25,32 @@ class TestParseDuration:
         """Unparseable durations are a hard error."""
         with pytest.raises(ValueError, match="Invalid duration"):
             parse_duration(text)
+
+
+class TestParseLag:
+    """0110 B2b: the recorder's coverage checkpoint trails real time by up to
+    one private health probe (10 s) + LIVENESS_MARGIN (75 s) = 85 s."""
+
+    @pytest.mark.parametrize("text", ["85s", "30s", "1m"])
+    def test_lag_at_or_below_checkpoint_trail_rejected(self, text):
+        """A lag the checkpoint can never reach is a startup error."""
+        with pytest.raises(ValueError) as exc:
+            parse_lag(text)
+        assert "PRIVATE_WS_HEALTH_CHECK_INTERVAL" in str(exc.value)
+        assert "LIVENESS_MARGIN" in str(exc.value)
+
+    @pytest.mark.parametrize("text,expected", [
+        ("86s", timedelta(seconds=86)),
+        ("2m", timedelta(minutes=2)),
+    ])
+    def test_lag_above_checkpoint_trail_accepted(self, text, expected):
+        """Anything past the trail parses normally."""
+        assert parse_lag(text) == expected
+
+    def test_invalid_lag_still_rejected_as_duration(self):
+        """Unparseable input keeps the duration error."""
+        with pytest.raises(ValueError, match="Invalid duration"):
+            parse_lag("2 minutes")
 
 
 class TestComputeWindow:

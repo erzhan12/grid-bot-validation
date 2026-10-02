@@ -9,6 +9,7 @@ dependencies = [
     "backtest",
     "grid-db",
     "gridbot",
+    "event-saver",
     "pyyaml>=6.0",
     "pydantic>=2.0",
 ]
@@ -19,6 +20,7 @@ comparator = { workspace = true }
 backtest = { workspace = true }
 grid-db = { workspace = true }
 gridbot = { workspace = true }
+event-saver = { workspace = true }
 
 [project.scripts]
 live-check = "live_check.main:cli"

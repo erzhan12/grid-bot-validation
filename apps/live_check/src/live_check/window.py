@@ -11,12 +11,25 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from event_saver.collectors import (
+    LIVENESS_MARGIN,
+    PRIVATE_WS_HEALTH_CHECK_INTERVAL,
+)
+
 # Feature 0080 merged 2026-06-17: orderLinkId hashes are salted by strat_id.
 # event_follower matches by link_id, so replaying PRE-0080 data collapses
 # matching (954→44). Windows must never start before this cutoff.
 POST_0080_CUTOFF = datetime(2026, 6, 17, 23, 7, 0)
 
 _MIN_STALENESS_THRESHOLD = timedelta(minutes=5)
+
+# Feature 0110 B2b: the recorder publishes its private coverage checkpoint at
+# (last healthy probe − LIVENESS_MARGIN), so it trails real time by up to one
+# probe interval + LIVENESS_MARGIN. A --lag at or below that SKIPs every
+# window.
+_CHECKPOINT_TRAIL = (
+    timedelta(seconds=PRIVATE_WS_HEALTH_CHECK_INTERVAL) + LIVENESS_MARGIN
+)
 
 _DURATION_RE = re.compile(r"^(\d+)([smhd])$")
 
@@ -47,6 +60,32 @@ def parse_duration(text: str) -> timedelta:
         )
     count, unit = match.groups()
     return int(count) * _DURATION_UNITS[unit]
+
+
+def parse_lag(text: str) -> timedelta:
+    """Parse ``--lag`` and reject one the coverage checkpoint can never reach.
+
+    Args:
+        text: Duration string (see :func:`parse_duration`).
+
+    Returns:
+        The lag.
+
+    Raises:
+        ValueError: On unparseable input, or a lag at or below the recorder's
+            checkpoint trail (0110 B2b).
+    """
+    lag = parse_duration(text)
+    if lag <= _CHECKPOINT_TRAIL:
+        raise ValueError(
+            f"--lag {text} must exceed {_CHECKPOINT_TRAIL.total_seconds():.0f}s: "
+            "the recorder's private coverage checkpoint trails real time by "
+            f"up to PRIVATE_WS_HEALTH_CHECK_INTERVAL "
+            f"({PRIVATE_WS_HEALTH_CHECK_INTERVAL:.0f}s) + LIVENESS_MARGIN "
+            f"({LIVENESS_MARGIN.total_seconds():.0f}s), so every window would "
+            "SKIP"
+        )
+    return lag
 
 
 def to_naive_utc(dt: datetime) -> datetime:

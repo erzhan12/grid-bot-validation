@@ -1,3 +1,15 @@
+# Feature 0110 Phase B2b — live-check private-coverage gate (#271)
+
+Plan: docs/features/0110_PLAN.md (Phase B2 steps 1, 3, 4 + lag floor)  |  Branch: feature/0110-b2b-coverage-gate
+
+- [x] event_saver: public `PRIVATE_WS_HEALTH_CHECK_INTERVAL`; live_check depends on `event-saver` (+ uv.lock)
+- [x] window: `parse_lag` rejects lag <= probe interval + LIVENESS_MARGIN (85 s), used by all three `run_*`
+- [x] grid_db: `PrivateStreamSessionRepository.list_for_run`, `PrivateStreamGapRepository.list_overlapping`
+- [x] ground_truth: `private_coverage_skip_reason` (tables, session/checkpoint, gaps; interval from seed rows)
+- [x] main: gate in `run_single`, `run_shared_single`, `watch_tick`; conftest `private_coverage` fixture
+- [x] make test + make lint green
+- [x] rules (live-check, grid-db, event-saver) + plan as-built notes
+
 # Feature 0110 Phase B2a — recorder position-data fitness (#271)
 
 Plan: docs/features/0110_PLAN.md (B2 split: B2a writer side, B2b coverage gate, B2c anchor fitness)  |  Branch: feature/0110-b2a-position-fitness

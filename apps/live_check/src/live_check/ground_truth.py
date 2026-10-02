@@ -15,15 +15,20 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import func
+from sqlalchemy import func, inspect
 from sqlalchemy.orm import Session
 
 from grid_db import (
     PositionSnapshotRepository,
     PrivateExecution,
+    PrivateStreamGap,
+    PrivateStreamGapRepository,
+    PrivateStreamSession,
+    PrivateStreamSessionRepository,
     RecordedDataQualityError,
     Run,
     TickerSnapshot,
+    WalletSnapshotRepository,
 )
 
 from live_check.window import Window, to_naive_utc
@@ -291,3 +296,112 @@ def collect(
             session, run_id, symbol, window.start, window.end
         ),
     )
+
+
+PRE_0110_REASON = "recorder has no private-stream coverage (pre-0110)"
+
+
+def _coverage_tables_present(session: Session) -> bool:
+    """Whether the recorder DB has the 0110 coverage tables (never creates)."""
+    inspector = inspect(session.get_bind())
+    return all(
+        inspector.has_table(model.__tablename__)
+        for model in (PrivateStreamSession, PrivateStreamGap)
+    )
+
+
+def _coverage_start(
+    session: Session, run_id: str, account_id: str, symbol: str, window: Window
+) -> datetime:
+    """Earliest time the verdict depends on: window start or a seed row.
+
+    Replay seeds from the latest live position rows (Buy/Sell) and USDT wallet
+    row at-or-before ``window.start`` (same lookups as
+    ``replay.snapshot_loader``), so a gap after a seed row changes the seed.
+    Anchored on ``local_ts`` (the recorder clock coverage is measured on): a
+    push is a full snapshot as of receipt, while its ``exchange_ts`` (Bybit
+    ``updatedTime``) can predate the recorder start for a quiet leg.
+    """
+    times = [window.start]
+    positions = PositionSnapshotRepository(session)
+    for side in ("Buy", "Sell"):
+        row = positions.get_latest_before(
+            run_id=run_id,
+            account_id=account_id,
+            symbol=symbol,
+            side=side,
+            at_ts=window.start,
+            source="live",
+        )
+        if row is not None:
+            times.append(to_naive_utc(row.local_ts))
+    wallet = WalletSnapshotRepository(session).get_latest_before(
+        run_id, account_id, "USDT", window.start
+    )
+    if wallet is not None:
+        times.append(to_naive_utc(wallet.local_ts))
+    return min(times)
+
+
+def private_coverage_skip_reason(
+    session: Session,
+    run_id: str,
+    account_id: str,
+    symbol: str,
+    window: Window,
+) -> Optional[str]:
+    """SKIP reason unless the private stream covered the verdict's interval.
+
+    Feature 0110 B2b. The interval runs from the earliest of ``window.start``
+    and replay's seed rows to ``window.end``. It is covered when one recorder
+    session connected by its start and checkpointed by its end, and no gap
+    row of this run/account/symbol overlaps it — a recovered gap still SKIPs,
+    because orders and positions are not backfilled. Gaps are checked before
+    the session so the reason names the gap.
+
+    Args:
+        session: Read-only session on the recorder DB.
+        run_id: Recording run.
+        account_id: Account of the private stream.
+        symbol: Strat symbol (gap rows are per symbol).
+        window: Comparison window (naive UTC).
+
+    Returns:
+        Human-readable skip reason, or None when covered.
+    """
+    if not _coverage_tables_present(session):
+        return PRE_0110_REASON
+    start = _coverage_start(session, run_id, account_id, symbol, window)
+    end = window.end
+    # Gaps first: the recorder stops checkpointing while a gap is open, so
+    # the session check would hide the gap's bounds and status.
+    gaps = PrivateStreamGapRepository(session).list_overlapping(
+        run_id, account_id, symbol, start, end
+    )
+    if gaps:
+        first = gaps[0]
+        gap_end = (
+            to_naive_utc(first.gap_end) if first.gap_end is not None else "open"
+        )
+        more = f" (+{len(gaps) - 1} more)" if len(gaps) > 1 else ""
+        return (
+            f"private-stream gap {to_naive_utc(first.gap_start)}–{gap_end} "
+            f"(recovery {first.recovery_status}) overlaps {start}–{end}{more}"
+        )
+    sessions = PrivateStreamSessionRepository(session).list_for_run(
+        run_id, account_id
+    )
+    if not sessions:
+        return f"no private-stream session recorded for run {run_id}"
+    if not any(
+        to_naive_utc(s.connected_at) <= start
+        and to_naive_utc(s.last_checkpoint_ts) >= end
+        for s in sessions
+    ):
+        latest = sessions[-1]
+        return (
+            f"private stream not covered over {start}–{end} (latest session "
+            f"connected {to_naive_utc(latest.connected_at)}, checkpoint "
+            f"{to_naive_utc(latest.last_checkpoint_ts)})"
+        )
+    return None
