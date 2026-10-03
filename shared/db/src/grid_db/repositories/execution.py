@@ -221,6 +221,42 @@ class OrderRepository(BaseRepository[Order]):
         )
         return result[0] if result else None
 
+    def get_latest_by_order_ids(
+        self,
+        run_id: str,
+        account_id: str,
+        symbol: str,
+        order_ids: list[str],
+    ) -> dict[str, Order]:
+        """Latest row (by ``exchange_ts``, then ``id``) per order id.
+
+        Scoped by run/account/symbol: ``order_id`` is not unique across runs
+        or accounts in the schema (0110 B2c leg attribution).
+
+        Args:
+            run_id: Recorder run identifier.
+            account_id: Account ID.
+            symbol: Trading symbol.
+            order_ids: Bybit order ids to look up.
+
+        Returns:
+            ``{order_id: Order}``; ids without a row are absent.
+        """
+        if not order_ids:
+            return {}
+        rows = (
+            self.session.query(Order)
+            .filter(
+                Order.run_id == run_id,
+                Order.account_id == account_id,
+                Order.symbol == symbol,
+                Order.order_id.in_(order_ids),
+            )
+            .order_by(Order.exchange_ts, Order.id)
+            .all()
+        )
+        return {row.order_id: row for row in rows}  # last (latest) row wins
+
     def get_active_at(
         self,
         run_id: str,

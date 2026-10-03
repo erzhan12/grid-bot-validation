@@ -16,6 +16,17 @@ class TestLoadConfig:
             load_config(str(empty))
 
 
+class TestWalletCoinDefaults:
+    def test_single_and_shared_seed_wallet_coins_match(self):
+        """The coverage gate anchors on SeedConfig.wallet_coin's default;
+        --shared seeds from MultiSeedConfig.wallet_coin. Keep them equal."""
+        from replay.config import SeedConfig
+        from replay.multi_config import MultiSeedConfig
+
+        assert (SeedConfig.model_fields["wallet_coin"].default
+                == MultiSeedConfig.model_fields["wallet_coin"].default)
+
+
 class TestLagValidation:
     def test_config_lag_below_checkpoint_trail_rejected(self, strat):
         """0110 B2b: a config `lag` at the 85 s floor fails at load time."""

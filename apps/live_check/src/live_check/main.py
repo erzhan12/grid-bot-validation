@@ -175,7 +175,9 @@ def _gate_skip_reason(
 ) -> Optional[str]:
     """Pre-replay gate shared by every mode (one helper so they cannot drift).
 
-    Ticker freshness first, then private-stream coverage (0110 B2b).
+    Ticker freshness first, then private-stream coverage (0110 B2b), then
+    end-of-window anchor fitness (0110 B2c); the end anchors are looked up
+    once and shared by the last two.
 
     Args:
         session: Read-only session on the recorder DB.
@@ -190,11 +192,19 @@ def _gate_skip_reason(
     Returns:
         Human-readable skip reason, or None when the strat may be checked.
     """
-    return freshness_skip_reason(
+    reason = freshness_skip_reason(
         ground_truth.latest_ticker_ts(session, strat.symbol), lag, threshold,
         now=now,
-    ) or ground_truth.private_coverage_skip_reason(
-        session, run_id, account_id, strat.symbol, window
+    )
+    if reason is not None:
+        return reason
+    anchors = ground_truth.end_anchors(
+        session, run_id, account_id, strat.symbol, window.end
+    )
+    return ground_truth.private_coverage_skip_reason(
+        session, run_id, account_id, strat.symbol, window, anchors
+    ) or ground_truth.end_anchor_skip_reason(
+        session, run_id, strat.symbol, window, anchors
     )
 
 

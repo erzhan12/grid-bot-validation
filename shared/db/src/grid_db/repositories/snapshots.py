@@ -134,6 +134,46 @@ class PositionSnapshotRepository(BaseRepository[PositionSnapshot]):
             PositionSnapshot.exchange_ts.desc(), PositionSnapshot.id.desc()
         ).first()
 
+    def get_latest_received_before(
+        self,
+        run_id: str,
+        account_id: str,
+        symbol: str,
+        side: str,
+        at_ts: datetime,
+    ) -> Optional[PositionSnapshot]:
+        """Latest live row of a leg RECEIVED at-or-before ``at_ts`` (0110 B2c).
+
+        Ordered by ``local_ts``, then ``id`` — not by ``exchange_ts``: Bybit's
+        ``updatedTime`` only moves on a size change, so later pushes of a
+        quiet leg (newer unrealised) keep an older ``exchange_ts`` than the
+        startup REST row. No index ends in ``local_ts``; this scans the leg's
+        rows of the run.
+
+        Args:
+            run_id: Recorder run identifier.
+            account_id: Account ID.
+            symbol: Trading symbol.
+            side: 'Buy' (long) or 'Sell' (short).
+            at_ts: Inclusive upper bound on ``local_ts``.
+
+        Returns:
+            Latest received live PositionSnapshot, or None.
+        """
+        return (
+            self.session.query(PositionSnapshot)
+            .filter(
+                PositionSnapshot.run_id == run_id,
+                PositionSnapshot.account_id == account_id,
+                PositionSnapshot.symbol == symbol,
+                PositionSnapshot.side == side,
+                PositionSnapshot.source == "live",
+                PositionSnapshot.local_ts <= at_ts,
+            )
+            .order_by(PositionSnapshot.local_ts.desc(), PositionSnapshot.id.desc())
+            .first()
+        )
+
 
 class WalletSnapshotRepository(BaseRepository[WalletSnapshot]):
     """Repository for WalletSnapshot operations."""
@@ -205,7 +245,9 @@ class WalletSnapshotRepository(BaseRepository[WalletSnapshot]):
                 WalletSnapshot.exchange_ts >= start_ts,
                 WalletSnapshot.exchange_ts <= end_ts,
             )
-            .order_by(WalletSnapshot.exchange_ts)
+            # id breaks exchange_ts ties, as in get_latest_before, so a
+            # last-row-wins reader picks the same row.
+            .order_by(WalletSnapshot.exchange_ts, WalletSnapshot.id)
             .all()
         )
 

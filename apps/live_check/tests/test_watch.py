@@ -6,6 +6,7 @@ from decimal import Decimal
 from grid_db import (
     DatabaseFactory,
     DatabaseSettings,
+    PositionSnapshot,
     PrivateExecution,
     PrivateStreamGap,
     PrivateStreamSession,
@@ -52,7 +53,7 @@ def _seed_window_data(db, ts, closed_pnl=Decimal("0")):
 
 class TestWatchSeedMiss:
     def test_seed_miss_renders_skip_and_loop_continues(
-        self, db, seeded_run_account, private_coverage, strat,
+        self, db, seeded_run_account, private_coverage, fit_anchors, strat,
         live_check_config, monkeypatch,
     ):
         """SeedDataQualityError at window.start → SKIP line, no crash.
@@ -60,6 +61,7 @@ class TestWatchSeedMiss:
         Two consecutive ticks both complete — proves the watch loop survives
         a per-tick seed miss instead of dying on the exception.
         """
+        fit_anchors(_NOW - timedelta(minutes=5))
         _seed_window_data(db, _NOW)
 
         def _raise_seed_miss(*args, **kwargs):
@@ -79,10 +81,11 @@ class TestWatchSeedMiss:
             assert "seed miss" in lines[0]
 
     def test_unknown_execution_pnl_skips_validation(
-        self, db, seeded_run_account, private_coverage, strat,
+        self, db, seeded_run_account, private_coverage, fit_anchors, strat,
         live_check_config, monkeypatch,
     ):
         """NULL closed_pnl in the window → SKIP line, replay never invoked."""
+        fit_anchors(_NOW - timedelta(minutes=5))
         _seed_window_data(db, _NOW, closed_pnl=None)
 
         def _boom(*args, **kwargs):
@@ -100,10 +103,11 @@ class TestWatchSeedMiss:
         assert "LTCUSDT" in lines[0] or "ltcusdt_test" in lines[0]
 
     def test_late_unknown_pnl_during_replay_renders_skip(
-        self, db, seeded_run_account, private_coverage, strat,
+        self, db, seeded_run_account, private_coverage, fit_anchors, strat,
         live_check_config, monkeypatch,
     ):
         """A NULL landing after the pre-check → SKIP line, tick survives."""
+        fit_anchors(_NOW - timedelta(minutes=5))
         _seed_window_data(db, _NOW)
 
         def _raise_quality(*args, **kwargs):
@@ -120,10 +124,11 @@ class TestWatchSeedMiss:
         assert "recorded data quality" in lines[0]
 
     def test_unknown_pnl_in_ground_truth_after_replay_renders_skip(
-        self, db, seeded_run_account, private_coverage, strat,
+        self, db, seeded_run_account, private_coverage, fit_anchors, strat,
         live_check_config, monkeypatch,
     ):
         """Replay succeeds, then collect() meets a NULL → SKIP, tick survives."""
+        fit_anchors(_NOW - timedelta(minutes=5))
         _seed_window_data(db, _NOW)
 
         def _raise_quality(*args, **kwargs):
@@ -256,13 +261,72 @@ class TestWatchPrivateCoverage:
             ]
 
 
+class TestWatchEndAnchors:
+    """0110 B2c: end-of-window position anchors gate the verdict."""
+
+    def test_fresh_public_ticker_does_not_mask_stale_private_data(
+        self, db, seeded_run_account, private_coverage, strat,
+        live_check_config, monkeypatch,
+    ):
+        """Port of audit test_fresh_public_ticker_masks_stale_private_data
+        (cad63f4), inverted: a fresh ticker, day-old position rows and an
+        execution after them → SKIP, never a green mark. The run has a
+        covering session and no gaps, so only the stale anchor can SKIP."""
+        _seed_window_data(db, _NOW)  # exec e1 at now-30m, fresh ticker
+        old = _NOW - timedelta(hours=20)
+        with db.get_session() as session:
+            for side in ("Buy", "Sell"):
+                session.add(PositionSnapshot(
+                    run_id="test-run-id",
+                    account_id=seeded_run_account.account_id,
+                    symbol="LTCUSDT", exchange_ts=old, local_ts=old,
+                    side=side, size=Decimal("0"), entry_price=Decimal("0"),
+                    unrealised_pnl=Decimal("0"), source="live",
+                ))
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("no verdict on stale private data")
+
+        monkeypatch.setattr(lc_main.runner, "run_strat", _boom)
+        lines = lc_main.watch_tick(
+            live_check_config, db, seeded_run_account.run_id,
+            seeded_run_account.account_id, timedelta(hours=1), _LAG,
+            staleness_threshold(_LAG), now=_NOW,
+        )
+        assert len(lines) == 1
+        assert "SKIP" in lines[0]
+        assert "✓" not in lines[0]
+        assert "e1" in lines[0]
+
+    def test_missing_anchor_renders_skip_line(
+        self, db, seeded_run_account, private_coverage, strat,
+        live_check_config, monkeypatch,
+    ):
+        """Covered window but no position rows at all → SKIP line."""
+        _seed_window_data(db, _NOW)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("no verdict without end anchors")
+
+        monkeypatch.setattr(lc_main.runner, "run_strat", _boom)
+        lines = lc_main.watch_tick(
+            live_check_config, db, seeded_run_account.run_id,
+            seeded_run_account.account_id, timedelta(hours=1), _LAG,
+            staleness_threshold(_LAG), now=_NOW,
+        )
+        assert len(lines) == 1
+        assert "SKIP" in lines[0]
+        assert "position row" in lines[0]
+
+
 class TestWatchWindowOverride:
     def test_cli_last_reaches_reconcile_window(
-        self, db, seeded_run_account, private_coverage, strat,
+        self, db, seeded_run_account, private_coverage, fit_anchors, strat,
         live_check_config, monkeypatch,
     ):
         """The `last` passed into watch_tick sizes the window — a --last
         override must NOT be silently replaced by config.last (4h default)."""
+        fit_anchors(_NOW - timedelta(minutes=5))
         _seed_window_data(db, _NOW)
         captured = {}
 

@@ -40,14 +40,15 @@ def _insert_exec(db, *, exec_id, ts, symbol="LTCUSDT", side="Buy",
 
 
 def _insert_position(db, account_id, *, ts, side, unrealised,
-                     symbol="LTCUSDT", source="live", size="0.2"):
+                     symbol="LTCUSDT", source="live", size="0.2",
+                     local_ts=None):
     with db.get_session() as session:
         session.add(PositionSnapshot(
             run_id=RUN_ID,
             account_id=account_id,
             symbol=symbol,
             exchange_ts=ts,
-            local_ts=ts,
+            local_ts=local_ts if local_ts is not None else ts,
             side=side,
             size=Decimal(size),
             entry_price=Decimal("80"),
@@ -210,6 +211,7 @@ class TestNetUnrealised:
                          unrealised="2.0")
         _insert_position(db, acc, ts=ts + timedelta(minutes=30), side="Buy",
                          unrealised="99.0")
+        _insert_position(db, acc, ts=ts, side="Sell", unrealised=None, size="0")
         with db.get_readonly_session() as s:
             net = ground_truth.net_unrealised_per_pair(
                 s, RUN_ID, acc, "LTCUSDT", ts + timedelta(minutes=10)
@@ -230,10 +232,12 @@ class TestNetUnrealised:
             )
         assert net == Decimal("-0.4")
 
-    def test_null_unrealised_coerces_to_zero(self, db, seeded_run_account, ts):
-        """NULL unrealised_pnl on a leg counts as 0, not a crash."""
+    def test_flat_leg_with_null_unrealised_is_zero(
+        self, db, seeded_run_account, ts
+    ):
+        """A size-0 leg is a known 0 even when unrealised_pnl is NULL."""
         acc = seeded_run_account.account_id
-        _insert_position(db, acc, ts=ts, side="Buy", unrealised=None)
+        _insert_position(db, acc, ts=ts, side="Buy", unrealised=None, size="0")
         _insert_position(db, acc, ts=ts, side="Sell", unrealised="-0.3")
         with db.get_readonly_session() as s:
             net = ground_truth.net_unrealised_per_pair(
@@ -241,16 +245,56 @@ class TestNetUnrealised:
             )
         assert net == Decimal("-0.3")
 
+    def test_open_leg_with_null_unrealised_raises(
+        self, db, seeded_run_account, ts
+    ):
+        """0110 B2c: an open leg with unknown unrealised is never a 0."""
+        acc = seeded_run_account.account_id
+        _insert_position(db, acc, ts=ts, side="Buy", unrealised=None)
+        _insert_position(db, acc, ts=ts, side="Sell", unrealised="-0.3")
+        with db.get_readonly_session() as s:
+            with pytest.raises(RecordedDataQualityError, match="long"):
+                ground_truth.net_unrealised_per_pair(
+                    s, RUN_ID, acc, "LTCUSDT", ts + timedelta(minutes=1)
+                )
+
+    def test_missing_leg_raises(self, db, seeded_run_account, ts):
+        """0110 B2c: a missing leg raises instead of a partial sum."""
+        acc = seeded_run_account.account_id
+        _insert_position(db, acc, ts=ts, side="Buy", unrealised="1.0")
+        with db.get_readonly_session() as s:
+            with pytest.raises(RecordedDataQualityError, match="short"):
+                ground_truth.net_unrealised_per_pair(
+                    s, RUN_ID, acc, "LTCUSDT", ts + timedelta(minutes=1)
+                )
+
     def test_backtest_source_rows_excluded(self, db, seeded_run_account, ts):
-        """Only source='live' rows feed ground truth."""
+        """Only source='live' rows feed ground truth: backtest rows alone
+        leave both legs missing."""
         acc = seeded_run_account.account_id
         _insert_position(db, acc, ts=ts, side="Buy", unrealised="5.0",
                          source="backtest")
+        _insert_position(db, acc, ts=ts, side="Sell", unrealised="5.0",
+                         source="backtest")
+        with db.get_readonly_session() as s:
+            with pytest.raises(RecordedDataQualityError):
+                ground_truth.net_unrealised_per_pair(
+                    s, RUN_ID, acc, "LTCUSDT", ts + timedelta(minutes=1)
+                )
+
+    def test_selected_by_receipt_time(self, db, seeded_run_account, ts):
+        """0110 B2c: the latest RECEIVED row wins — a later push carrying an
+        older Bybit updatedTime beats the startup REST row."""
+        acc = seeded_run_account.account_id
+        _insert_position(db, acc, ts=ts, side="Buy", unrealised="1.0")
+        _insert_position(db, acc, ts=ts - timedelta(days=1), side="Buy",
+                         unrealised="2.0", local_ts=ts + timedelta(minutes=1))
+        _insert_position(db, acc, ts=ts, side="Sell", unrealised=None, size="0")
         with db.get_readonly_session() as s:
             net = ground_truth.net_unrealised_per_pair(
-                s, RUN_ID, acc, "LTCUSDT", ts + timedelta(minutes=1)
+                s, RUN_ID, acc, "LTCUSDT", ts + timedelta(minutes=2)
             )
-        assert net == Decimal("0")
+        assert net == Decimal("2.0")
 
 
 class TestProbes:
@@ -299,6 +343,7 @@ class TestCollect:
         acc = seeded_run_account.account_id
         _insert_exec(db, exec_id="e1", ts=ts, pnl="1.5", fee="0.01")
         _insert_position(db, acc, ts=ts, side="Buy", unrealised="0.7")
+        _insert_position(db, acc, ts=ts, side="Sell", unrealised=None, size="0")
         window = Window(start=ts - timedelta(hours=1), end=ts + timedelta(hours=1))
         with db.get_readonly_session() as s:
             truth = ground_truth.collect(s, RUN_ID, acc, "LTCUSDT", window)

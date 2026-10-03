@@ -1,6 +1,6 @@
 """Test fixtures for live_check package."""
 
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -9,6 +9,7 @@ import pytest
 from grid_db import DatabaseFactory, DatabaseSettings
 from grid_db.models import (
     BybitAccount,
+    PositionSnapshot,
     PrivateStreamSession,
     Run,
     Strategy,
@@ -89,6 +90,32 @@ def private_coverage(db, seeded_run_account, ts):
             connected_at=ts - timedelta(days=1),
             last_checkpoint_ts=_FAR_FUTURE,
         ))
+
+
+@pytest.fixture
+def fit_anchors(db, seeded_run_account):
+    """Factory: fit end-of-window anchors — both legs flat, received at
+    ``at`` with Bybit updatedTime ``at`` (0110 B2c). Place ``at`` after the
+    test's executions and before its window end."""
+
+    def _add(at):
+        updated = str(int(at.replace(tzinfo=UTC).timestamp() * 1000))
+        with db.get_session() as session:
+            for side in ("Buy", "Sell"):
+                session.add(PositionSnapshot(
+                    run_id=RUN_ID,
+                    account_id=seeded_run_account.account_id,
+                    symbol="LTCUSDT",
+                    exchange_ts=at,
+                    local_ts=at,
+                    side=side,
+                    size=Decimal("0"),
+                    entry_price=Decimal("0"),
+                    source="live",
+                    raw_json={"updatedTime": updated},
+                ))
+
+    return _add
 
 
 @pytest.fixture

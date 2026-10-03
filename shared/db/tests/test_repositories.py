@@ -1486,6 +1486,86 @@ class TestWalletSnapshotRepository:
         assert rows[-1].wallet_balance == Decimal("2")
 
 
+class TestEndAnchorReads:
+    """0110 B2c read side: get_latest_received_before / get_latest_by_order_ids."""
+
+    def test_latest_received_before_orders_by_receipt_then_id(
+        self, session, sample_account, sample_run
+    ):
+        """local_ts decides (not exchange_ts); ties go to the later insert;
+        rows after at_ts, other sides and backtest rows are excluded."""
+        from datetime import timedelta
+        from decimal import Decimal
+        from grid_db import PositionSnapshotRepository, PositionSnapshot
+
+        repo = PositionSnapshotRepository(session)
+        acc = str(sample_account.account_id)
+        t0 = datetime(2026, 5, 7, 10, 0, 0, tzinfo=UTC)
+
+        def row(size, exchange_ts, local_ts, side="Buy", source="live"):
+            return PositionSnapshot(
+                run_id=sample_run.run_id, account_id=acc, symbol="BTCUSDT",
+                exchange_ts=exchange_ts, local_ts=local_ts, side=side,
+                size=Decimal(size), entry_price=Decimal("0"), source=source,
+            )
+
+        repo.bulk_insert([row("1", t0, t0)])  # REST row: newest exchange_ts
+        repo.bulk_insert([row("2", t0 - timedelta(days=1),
+                              t0 + timedelta(minutes=1))])
+        repo.bulk_insert([row("3", t0 - timedelta(days=1),
+                              t0 + timedelta(minutes=1))])  # tie → later id
+        repo.bulk_insert([row("9", t0, t0 + timedelta(minutes=5))])  # too late
+        repo.bulk_insert([row("8", t0, t0 + timedelta(minutes=2), side="Sell")])
+        repo.bulk_insert([row("7", t0, t0 + timedelta(minutes=2),
+                              source="backtest")])
+
+        got = repo.get_latest_received_before(
+            sample_run.run_id, acc, "BTCUSDT", "Buy", t0 + timedelta(minutes=3)
+        )
+        assert got.size == Decimal("3")
+
+    def test_latest_by_order_ids_latest_row_and_scope(
+        self, session, sample_account, sample_run
+    ):
+        """Latest row per order id by exchange_ts (rows inserted out of
+        order); other accounts and unknown ids are absent; an empty id list
+        skips the query. (account, order_id, exchange_ts) is unique, so the
+        id tie-break never decides between rows of one order.)"""
+        from datetime import timedelta
+        from decimal import Decimal
+        from grid_db import OrderRepository
+        from grid_db.models import Order
+
+        acc = str(sample_account.account_id)
+        t0 = datetime(2026, 5, 7, 10, 0, 0, tzinfo=UTC)
+
+        def order(order_id, ts, status, account_id=acc):
+            return Order(
+                run_id=sample_run.run_id, account_id=account_id,
+                order_id=order_id, symbol="BTCUSDT", exchange_ts=ts,
+                local_ts=ts, status=status, side="Buy", price=Decimal("1"),
+                qty=Decimal("1"), leaves_qty=Decimal("0"), reduce_only=False,
+            )
+
+        session.add_all([
+            order("o1", t0, "New"),
+            order("o1", t0 + timedelta(seconds=2), "Filled"),
+            order("o1", t0 + timedelta(seconds=1), "PartiallyFilled"),
+            order("o2", t0, "New", account_id="other-account"),
+        ])
+        session.flush()
+
+        repo = OrderRepository(session)
+        got = repo.get_latest_by_order_ids(
+            sample_run.run_id, acc, "BTCUSDT", ["o1", "o2", "missing"]
+        )
+        assert set(got) == {"o1"}
+        assert got["o1"].status == "Filled"
+        assert repo.get_latest_by_order_ids(
+            sample_run.run_id, acc, "BTCUSDT", []
+        ) == {}
+
+
 class TestPrivateStreamCoverageReads:
     """0110 B2b read side: list_overlapping / list_for_run."""
 
@@ -1665,6 +1745,33 @@ class TestSeedAwareReplayRepositoryMethods:
             "BTCUSDT", "Buy", ts + timedelta(seconds=10),
         )
         assert got is None
+
+    def test_wallet_range_tie_agrees_with_latest_before(
+        self, session, sample_account, sample_run
+    ):
+        """0110 B2c: get_by_account_range orders ties by id, so the last row
+        for a timestamp is the one get_latest_before returns."""
+        from grid_db import WalletSnapshotRepository, WalletSnapshot
+        from decimal import Decimal
+
+        repo = WalletSnapshotRepository(session)
+        acc = str(sample_account.account_id)
+        ts = datetime(2026, 5, 7, 10, 0, 0, tzinfo=UTC)
+        for balance in ("100", "200"):
+            repo.bulk_insert([
+                WalletSnapshot(
+                    run_id=sample_run.run_id, account_id=acc,
+                    exchange_ts=ts, local_ts=ts, coin="USDT",
+                    wallet_balance=Decimal(balance),
+                    available_balance=Decimal(balance),
+                ),
+            ])
+
+        rows = repo.get_by_account_range(acc, "USDT", ts, ts)
+        latest = repo.get_latest_before(sample_run.run_id, acc, "USDT", ts)
+        assert [r.wallet_balance for r in rows] == [Decimal("100"),
+                                                     Decimal("200")]
+        assert rows[-1].id == latest.id
 
     def test_wallet_get_latest_before_tie_takes_later_insert(
         self, session, sample_account, sample_run

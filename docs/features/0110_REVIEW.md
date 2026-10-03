@@ -399,3 +399,28 @@ Engines: codex (`gpt-5.6-sol`) + cursor. Rounds 2/4 → SUCCESS.
 | P3 | Rule bullet too long. | Split into sub-bullets. |
 
 `make test` exit 0 (92%), `make lint` clean.
+
+## Phase B2c — plan review (codex `gpt-6-astra`, medium, 2026-10-03)
+
+No P1. Accepted: anchor time from Bybit `updatedTime` in `raw_json` (a REST row's `exchange_ts` is the local fetch time); end anchors looked up once per check; extra tests (end-anchor-only gap, clamping, executions outside the window, late order row, latest-order ordering, market close, same-millisecond fills, clock skew). Documented, not fixed: missing `reduceOnly` coerced to `False` by the normalizer shared with the live gridbot; market fills have no order row; same-millisecond fills rely on the second push. D1–D4 agreed (D2 with anchor reuse; codex measured ≈0.21 s per million-row leg).
+
+## Phase B2c — local staged review (review-fix-loop-staged)
+
+5 reviewers, 1 iteration → Ready to commit. Four findings tagged CRITICAL, none confirmed:
+
+| Claim | Verdict |
+|---|---|
+| Executions not filtered by `account_id`. | Downgraded — a recorder run is one account; `sum_realized` / `live_exec_count` use the same run + symbol scope; worst case a false SKIP. |
+| No `(run_id, symbol, exchange_ts)` index on `private_executions`. | Downgraded to INFO — would need a migration; the window sums already query this way. |
+| `_anchor_update_time` fallback untested; new repository methods untested. | Tests added (4 fallback cases; `TestEndAnchorReads`). |
+| "All modes" RED test missing. | Covered by the per-mode SKIP tests. |
+
+## Phase B2c — external review (ext-code-review)
+
+Engines: codex (`gpt-5.6-sol`) — round 1: NO P1/P2, no P3 (213 focused tests passed). Cursor: dropped for this run after two failures (network "Connection stalled repeatedly", then no output at the 600 s limit). Result: SUCCESS on codex alone.
+
+## Final verification (B2c)
+
+- `make test`: exit 0, merged coverage 92%.
+- `make lint`: all checks passed.
+- Mutation checks: 4/4 caught (fill boundary, Bybit-clock anchor time, leg attribution, `empty_response` unfit).

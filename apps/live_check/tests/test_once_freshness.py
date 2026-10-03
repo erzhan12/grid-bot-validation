@@ -89,10 +89,14 @@ class TestOnceFreshnessGate:
         assert "no ticker data" in capsys.readouterr().out
 
     def test_unknown_execution_pnl_skips_validation(
-        self, db, seeded_run_account, private_coverage, live_check_config,
+        self, db, seeded_run_account, private_coverage, fit_anchors, live_check_config,
         monkeypatch, capsys,
     ):
         """Fresh ticker + NULL closed_pnl in window → SKIP, no replay."""
+        fit_anchors(
+            datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(minutes=5)
+        )
         now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
         _add_ticker(db, now_naive)
         _add_exec(db, now_naive - timedelta(minutes=30), closed_pnl=None)
@@ -108,10 +112,14 @@ class TestOnceFreshnessGate:
         assert "unknown closed_pnl" in out
 
     def test_shared_unknown_execution_pnl_skips_validation(
-        self, db, seeded_run_account, private_coverage, live_check_config,
+        self, db, seeded_run_account, private_coverage, fit_anchors, live_check_config,
         monkeypatch, capsys,
     ):
         """--shared: NULL closed_pnl in window → SKIP before shared replay."""
+        fit_anchors(
+            datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(minutes=5)
+        )
         now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
         _add_ticker(db, now_naive)
         _add_exec(db, now_naive - timedelta(minutes=30), closed_pnl=None)
@@ -127,10 +135,14 @@ class TestOnceFreshnessGate:
         assert "unknown closed_pnl" in out
 
     def test_shared_late_unknown_pnl_during_replay_skips(
-        self, db, seeded_run_account, private_coverage, live_check_config,
+        self, db, seeded_run_account, private_coverage, fit_anchors, live_check_config,
         monkeypatch, capsys,
     ):
         """--shared: a NULL landing after the pre-check → SKIP, no crash."""
+        fit_anchors(
+            datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(minutes=5)
+        )
         now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
         _add_ticker(db, now_naive)
         _add_exec(db, now_naive - timedelta(minutes=30),
@@ -145,10 +157,14 @@ class TestOnceFreshnessGate:
         assert "recorded data quality" in capsys.readouterr().out
 
     def test_fresh_ticker_reaches_per_strat_check(
-        self, db, seeded_run_account, private_coverage, live_check_config,
+        self, db, seeded_run_account, private_coverage, fit_anchors, live_check_config,
         monkeypatch,
     ):
         """Fresh ticker → gate passes and check_strat IS invoked."""
+        fit_anchors(
+            datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(minutes=5)
+        )
         now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
         _add_ticker(db, now_naive)
 
@@ -204,10 +220,14 @@ class TestPrivateCoverageGate:
         assert "no private-stream session" in out
 
     def test_shared_with_coverage_reaches_replay(
-        self, db, seeded_run_account, private_coverage, live_check_config,
+        self, db, seeded_run_account, private_coverage, fit_anchors, live_check_config,
         monkeypatch,
     ):
         """--shared: a covered window passes the gate and reaches replay."""
+        fit_anchors(
+            datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(minutes=5)
+        )
         self._fresh(db)
         called = []
 
@@ -316,3 +336,91 @@ class TestPrivateCoverageGate:
         out = capsys.readouterr().out
         assert "no private-stream session" in out
         assert "no data in window" not in out
+
+
+class TestEndAnchorGate:
+    """0110 B2c: end anchors in every mode, and the full positive path."""
+
+    def _now(self):
+        return datetime.now(timezone.utc).replace(tzinfo=None)
+
+    def _fresh(self, db, pnl="0"):
+        now = self._now()
+        _add_ticker(db, now)
+        _add_exec(db, now - timedelta(minutes=30), closed_pnl=Decimal(pnl))
+
+    def test_once_without_anchors_skips_before_replay(
+        self, db, seeded_run_account, private_coverage, live_check_config,
+        monkeypatch, capsys,
+    ):
+        """--once: covered window, no position rows → SKIP, no replay."""
+        self._fresh(db)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("no verdict without end anchors")
+
+        monkeypatch.setattr(lc_main, "check_strat", _boom)
+        rc = lc_main.run_single(live_check_config, _args(), db)
+        assert rc == lc_main.EXIT_SKIP
+        assert "position row" in capsys.readouterr().out
+
+    def test_shared_without_anchors_skips_before_replay(
+        self, db, seeded_run_account, private_coverage, live_check_config,
+        monkeypatch, capsys,
+    ):
+        """--shared: same SKIP before the shared replay."""
+        self._fresh(db)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("no verdict without end anchors")
+
+        monkeypatch.setattr(lc_main.runner, "run_shared", _boom)
+        rc = lc_main.run_shared_single(live_check_config, _args(), db)
+        assert rc == lc_main.EXIT_SKIP
+        assert "position row" in capsys.readouterr().out
+
+    @staticmethod
+    def _replay(realized, commission, unrealised):
+        """A finalized replay result as evaluate() reads it."""
+        return SimpleNamespace(
+            session=SimpleNamespace(metrics=SimpleNamespace(
+                total_realized_pnl=Decimal(realized),
+                total_commission=Decimal(commission),
+                total_unrealized_pnl=Decimal(unrealised),
+            )),
+            match_result=SimpleNamespace(
+                live_only=[], backtest_only=[], matched=[]
+            ),
+        )
+
+    def test_complete_private_evidence_passes_gate(
+        self, db, seeded_run_account, private_coverage, fit_anchors,
+        live_check_config, monkeypatch,
+    ):
+        """Real gate + real evidence: covering session, no gaps, both legs
+        fit (pushed after the last execution) → numeric verdict, PASS on
+        matching data. Guards against a gate that always SKIPs."""
+        self._fresh(db)
+        fit_anchors(self._now() - timedelta(minutes=5))
+        monkeypatch.setattr(
+            lc_main.runner, "run_strat",
+            lambda *a, **k: self._replay("0", "0.01", "0"),
+        )
+        assert lc_main.run_single(live_check_config, _args(), db) == (
+            lc_main.EXIT_PASS
+        )
+
+    def test_complete_data_with_pnl_mismatch_still_fails(
+        self, db, seeded_run_account, private_coverage, fit_anchors,
+        live_check_config, monkeypatch,
+    ):
+        """Complete evidence with a realized mismatch reaches FAIL."""
+        self._fresh(db)
+        fit_anchors(self._now() - timedelta(minutes=5))
+        monkeypatch.setattr(
+            lc_main.runner, "run_strat",
+            lambda *a, **k: self._replay("5", "0.01", "0"),
+        )
+        assert lc_main.run_single(live_check_config, _args(), db) == (
+            lc_main.EXIT_FAIL
+        )

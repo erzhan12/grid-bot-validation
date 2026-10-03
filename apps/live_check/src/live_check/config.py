@@ -182,13 +182,6 @@ class LiveCheckConfig(BaseModel):
             "exceed 85s, the private coverage checkpoint trail (0110 B2b)"
         ),
     )
-
-    @field_validator("lag")
-    @classmethod
-    def _lag_above_checkpoint_trail(cls, v: str) -> str:
-        """Reject a lag the coverage checkpoint can never reach at load time."""
-        parse_lag(v)
-        return v
     staleness_threshold: Optional[str] = Field(
         default=None,
         description="Freshness gate trip point for --watch; None derives "
@@ -198,6 +191,13 @@ class LiveCheckConfig(BaseModel):
         default_factory=VerdictThresholds,
         description="Verdict pass/fail deltas",
     )
+
+    @field_validator("lag")
+    @classmethod
+    def _lag_above_checkpoint_trail(cls, v: str) -> str:
+        """Reject a lag the coverage checkpoint can never reach at load time."""
+        parse_lag(v)
+        return v
 
 
 def load_config(config_path: Optional[str] = None) -> LiveCheckConfig:

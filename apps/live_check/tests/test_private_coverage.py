@@ -352,6 +352,40 @@ class TestSeedAnchors:
             ))
         assert _reason(db, acc, window) is None
 
+    def test_gap_reached_only_by_an_end_anchor_skips(self, db, acc, ts):
+        """0110 B2c: the end anchor (latest row RECEIVED by window.end) also
+        extends the interval — here a row stamped by Bybit after
+        window.start (so not a seed row) but received before it."""
+        window = _window(ts)
+        _add_session(db, acc, ts - timedelta(days=1), ts + timedelta(minutes=1))
+        _add_gap(db, acc, window.start - timedelta(minutes=10),
+                 window.start - timedelta(minutes=5))
+        assert _reason(db, acc, window) is None
+        with db.get_session() as session:
+            session.add(PositionSnapshot(
+                run_id=RUN_ID, account_id=acc, symbol=_SYMBOL,
+                exchange_ts=window.start + timedelta(seconds=1),
+                local_ts=window.start - timedelta(minutes=30),
+                side="Buy", size=Decimal("0"), entry_price=Decimal("0"),
+                source="live",
+            ))
+        assert _reason(db, acc, window) is not None
+
+    def test_end_anchor_before_session_is_clamped(self, db, acc, ts):
+        """End anchors are clamped to the run's first connected_at too."""
+        window = _window(ts)
+        connected = window.start - timedelta(minutes=5)
+        _add_session(db, acc, connected, ts + timedelta(minutes=1))
+        with db.get_session() as session:
+            session.add(PositionSnapshot(
+                run_id=RUN_ID, account_id=acc, symbol=_SYMBOL,
+                exchange_ts=window.start + timedelta(seconds=1),
+                local_ts=connected - timedelta(milliseconds=300),
+                side="Buy", size=Decimal("0"), entry_price=Decimal("0"),
+                source="live",
+            ))
+        assert _reason(db, acc, window) is None
+
     def test_seed_row_after_window_start_is_not_a_seed(self, db, acc, ts):
         """A row inside the window is not a seed row and does not extend it."""
         window = _window(ts)

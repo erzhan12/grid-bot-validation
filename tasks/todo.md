@@ -1,3 +1,15 @@
+# Feature 0110 Phase B2c — end-of-window anchor fitness (#271)
+
+Plan: docs/features/0110_PLAN.md (Phase B2 steps 2, 3, 6, 7)  |  Branch: feature/0110-b2c-anchor-fitness
+
+- [x] grid_db: `PositionSnapshotRepository.get_latest_received_before`; `OrderRepository.get_latest_by_order_ids`; wallet `get_by_account_range` id tie-break
+- [x] ground_truth: `end_anchors`, `end_anchor_skip_reason` (placeholders, NULL unrealised, executions after anchor via orders join), end anchors in the coverage interval
+- [x] ground_truth: `net_unrealised_per_pair` raises instead of a partial sum
+- [x] main: end anchors looked up once in `_gate_skip_reason`, fitness after coverage
+- [x] tests: fitness rules, audit port, positive path PASS/FAIL, all modes; existing tests get `fit_anchors`; carry-overs
+- [x] make test + make lint green; mutation checks (4/4 caught)
+- [x] rules (live-check, grid-db) + plan as-built notes and Known limitations
+
 # Feature 0110 Phase B2b — live-check private-coverage gate (#271)
 
 Plan: docs/features/0110_PLAN.md (Phase B2 steps 1, 3, 4 + lag floor)  |  Branch: feature/0110-b2b-coverage-gate
