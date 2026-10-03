@@ -16,8 +16,10 @@ from bybit_adapter.ws_client import (
 from bybit_adapter.rest_client import BybitRestClient
 from bybit_adapter.rate_limiter import RateLimiter, RateLimitConfig
 from bybit_adapter.error_codes import ORDER_QTY_TRUNCATED_TO_ZERO
+from bybit_adapter.position_utils import leg_side
 
 __all__ = [
+    "leg_side",
     "BybitNormalizer",
     "ConnectionState",
     "PublicWebSocketClient",

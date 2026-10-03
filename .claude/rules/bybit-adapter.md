@@ -13,6 +13,7 @@ paths:
 - `ws_client.py` — Public/Private WebSocket clients with heartbeat watchdog
 - `rest_client.py` — REST API with rate limiting
 - `rate_limiter.py` — Sliding window with exponential backoff
+- `position_utils.py` — `leg_side(pos)`: side of a Bybit position row; a flat hedge leg (`side=""`) resolves via `positionIdx` 1/2 → `Buy`/`Sell`, one-way (`positionIdx` 0) stays `""`, never raises. Used by the recorder (`event_saver.writers` re-exports it); gridbot's `position_fetcher` adopts it in 0111 PR-b (issue #292)
 
 ### Event Normalization
 
