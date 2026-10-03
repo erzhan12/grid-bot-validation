@@ -452,9 +452,9 @@ def private_coverage_skip_reason(
             # reaches back to the same seed rows and SKIPs too.
             hint = (
                 "; the overlapping gap(s) only touch the seed rows before the "
-                "window — positions are not backfilled, so later windows SKIP "
-                "until that leg's size changes; restart the recorder for a "
-                "fresh run_id"
+                "window — the recorder's post-gap snapshot did not land, and "
+                "positions are not backfilled, so later windows SKIP until "
+                "that leg's size changes or the recorder restarts"
             )
         return (
             f"private-stream gap {to_naive_utc(first.gap_start)}–{gap_end} "

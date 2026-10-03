@@ -1,3 +1,15 @@
+# Feature 0110 Phase B3 — post-gap REST snapshot (#271 follow-up)
+
+Plan: docs/features/0110_PLAN.md ("Phase B3 implementation notes")  |  Branch: feature/0110-b3-gap-resnapshot
+
+- [x] recorder: `_schedule_post_gap_snapshot` at the end of `_recover_private_gap` (one in flight + one rerun; cancelled on stop)
+- [x] recorder: `_snapshot_positions(evidence_only=True)` writes nothing for failed / empty / malformed symbols; labels in log lines
+- [x] live-check: SKIP hint no longer says "restart the recorder" first
+- [x] tests: fresh rows after gap_end, no placeholders, absent_side kept, coalescing, stop, lost-write gap; live-check interval moves past the gap
+- [x] make test + make lint green; mutation checks (3/3 caught)
+- [x] rules (recorder, live-check) + plan notes / Known limitations
+- [ ] deploy the recorder on the VPS (after merge, with sign-off)
+
 # Feature 0110 Phase B2c — end-of-window anchor fitness (#271)
 
 Plan: docs/features/0110_PLAN.md (Phase B2 steps 2, 3, 6, 7)  |  Branch: feature/0110-b2c-anchor-fitness
@@ -23,14 +35,7 @@ Plan: docs/features/0110_PLAN.md (Phase B2 steps 1, 3, 4 + lag floor)  |  Branch
 - [x] rules (live-check, grid-db, event-saver) + plan as-built notes
 
 ## Follow-ups
-- PR #289 review P1 (availability, fail-safe): after any gap, live-check
-  SKIPs every later window until each leg's size changes, because the
-  startup REST row (`exchange_ts = snapshot_ts`) stays the seed row of a
-  leg with no fill since recorder start (flat leg with no orders: until a
-  recorder restart). Remedy: the recorder writes a fresh REST position +
-  wallet snapshot when it closes a gap (`_handle_private_gap` /
-  `close_gap` path), so the anchor moves past the gap. Recorder change +
-  deploy; candidate for B2c or its own PR.
+- ~~PR #289 review P1: post-gap SKIP until a leg fills~~ — done in 0110 B3 (post-gap REST snapshot).
 
 # Feature 0110 Phase B2a — recorder position-data fitness (#271)
 

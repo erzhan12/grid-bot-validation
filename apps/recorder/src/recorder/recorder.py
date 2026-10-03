@@ -64,6 +64,11 @@ logger = logging.getLogger(__name__)
 # not stay un-reset.
 _MAX_OPEN_GAP_FAILURES = 3
 
+_INITIAL_SNAPSHOT = "Initial snapshot"
+_POST_GAP_SNAPSHOT = "Post-gap snapshot"
+# Placeholders that do not prove a leg's state (0110 B2a markers).
+_UNPROVEN_SYNTHETIC = frozenset({"rest_failure", "malformed", "empty_response"})
+
 
 def _is_flat_position_row(pos: dict) -> bool:
     """True when a REST position row's size is zero (``""`` counts as 0)."""
@@ -127,6 +132,11 @@ class Recorder:
         self._open_gap_start: Optional[datetime] = None
         self._open_gap_failures = 0
         self._pending_gap_writes: list[tuple[Callable[[], object], str]] = []
+        # 0110 B3: at most one post-gap REST snapshot in flight; a gap that
+        # closes meanwhile asks for one more run.
+        self._post_gap_snapshot_future: Optional[Future] = None
+        self._post_gap_snapshot_running = False
+        self._post_gap_snapshot_again = False
         self._run_id: Optional[UUID] = None
         self._health_check_complete = asyncio.Event()
 
@@ -172,6 +182,9 @@ class Recorder:
             self._open_gap_start = None
             self._open_gap_failures = 0
             self._pending_gap_writes = []
+            self._post_gap_snapshot_future = None
+            self._post_gap_snapshot_running = False
+            self._post_gap_snapshot_again = False
 
             logger.info("Starting Recorder...")
             self._start_time = datetime.now(UTC)
@@ -458,12 +471,13 @@ class Recorder:
         run_id: str,
         account_id: str,
         snapshot_ts: datetime,
+        label: str = _INITIAL_SNAPSHOT,
     ) -> int:
         """REST-fetch wallet balance and write one row per coin. Returns row count."""
         try:
             result = await asyncio.to_thread(client.get_wallet_balance, "UNIFIED")
         except Exception as e:
-            logger.error(f"Initial snapshot: get_wallet_balance failed: {e}")
+            logger.error(f"{label}: get_wallet_balance failed: {e}")
             return 0
 
         # Bybit V5 shape: result["list"][0]["coin"] = list of per-coin dicts.
@@ -485,7 +499,7 @@ class Recorder:
                 account_mm_rate = decimal_or_zero(acct.get("accountMMRate"))
             except Exception as e:
                 logger.warning(
-                    f"Initial snapshot: skipped malformed wallet account row: {e}"
+                    f"{label}: skipped malformed wallet account row: {e}"
                 )
                 continue
 
@@ -519,7 +533,7 @@ class Recorder:
                     )
                 except Exception as e:
                     logger.warning(
-                        f"Initial snapshot: skipped malformed wallet coin row: {e}"
+                        f"{label}: skipped malformed wallet coin row: {e}"
                     )
                     continue
 
@@ -529,7 +543,7 @@ class Recorder:
         try:
             await asyncio.to_thread(self._bulk_insert_wallet_snapshots, snapshots)
         except Exception as e:
-            logger.error(f"Initial snapshot: wallet bulk_insert failed: {e}")
+            logger.error(f"{label}: wallet bulk_insert failed: {e}")
             return 0
         return len(snapshots)
 
@@ -543,6 +557,8 @@ class Recorder:
         run_id: str,
         account_id: str,
         snapshot_ts: datetime,
+        label: str = _INITIAL_SNAPSHOT,
+        evidence_only: bool = False,
     ) -> tuple[int, int]:
         """REST-fetch positions and write BOTH sides per configured symbol.
 
@@ -558,6 +574,12 @@ class Recorder:
         that is logged at INFO; if it is open, both synthesised legs are
         ``malformed`` and the symbol counts as failed.
 
+        With ``evidence_only`` (post-gap snapshot, 0110 B3) a symbol whose
+        fetch failed, came back empty or had a malformed / unresolvable row
+        writes NOTHING: after a gap such a placeholder would become replay's
+        seed (read as flat) and live-check's unfit end anchor, which is worse
+        than keeping the older rows. ``absent_side`` is still written.
+
         Returns:
             ``(rows_written, failed_symbols)`` — a symbol fails when
             ``get_positions`` raised, an open row's leg is unknown, or a
@@ -571,7 +593,7 @@ class Recorder:
                 positions = await asyncio.to_thread(client.get_positions, symbol)
             except Exception as e:
                 logger.error(
-                    f"Initial snapshot: get_positions({symbol}) failed: {e}"
+                    f"{label}: get_positions({symbol}) failed: {e}"
                 )
                 # Still write zero-rows for both sides so the loader's
                 # "exactly one side missing" check doesn't fire on a
@@ -593,7 +615,7 @@ class Recorder:
                     by_side[side] = pos
                     continue
                 unresolved = (
-                    f"Initial snapshot: position row for {symbol} skipped, "
+                    f"{label}: position row for {symbol} skipped, "
                     f"side could not be resolved (side={pos.get('side')!r}, "
                     f"positionIdx={pos.get('positionIdx')!r}, "
                     f"size={pos.get('size')!r})"
@@ -614,7 +636,7 @@ class Recorder:
                 failures += 1
             elif symbol_rows == 0:
                 logger.warning(
-                    f"Initial snapshot: get_positions({symbol}) returned no "
+                    f"{label}: get_positions({symbol}) returned no "
                     "position row (check category=linear settleCoin=USDT "
                     "scope / API-key permissions); legs marked empty_response"
                 )
@@ -623,12 +645,13 @@ class Recorder:
                 synthetic_default = "absent_side"
 
             row_malformed = False
+            symbol_snapshots: list[PositionSnapshot] = []
             for side in ("Buy", "Sell"):
                 pos = by_side.get(side)
                 synthetic = synthetic_default
                 if pos is not None:
                     try:
-                        snapshots.append(
+                        symbol_snapshots.append(
                             PositionSnapshot(
                                 run_id=run_id,
                                 account_id=account_id,
@@ -693,13 +716,13 @@ class Recorder:
                         continue
                     except Exception as e:
                         logger.warning(
-                            f"Initial snapshot: malformed position row "
+                            f"{label}: malformed position row "
                             f"({symbol} {side}); writing zero-row: {e}"
                         )
                         synthetic = "malformed"
                         row_malformed = True
                 # Absent (or malformed): write the contract zero-row.
-                snapshots.append(
+                symbol_snapshots.append(
                     PositionSnapshot(
                         run_id=run_id,
                         account_id=account_id,
@@ -726,6 +749,14 @@ class Recorder:
             # symbol fails (counted once with an unresolved open row).
             if row_malformed and not open_row_unresolved:
                 failures += 1
+            unproven = "malformed" if row_malformed else synthetic_default
+            if evidence_only and unproven in _UNPROVEN_SYNTHETIC:
+                logger.warning(
+                    f"{label}: {symbol} skipped ({unproven}); its earlier "
+                    "position rows stay the seed"
+                )
+                continue
+            snapshots.extend(symbol_snapshots)
 
         if not snapshots:
             return 0, failures
@@ -733,7 +764,7 @@ class Recorder:
         try:
             await asyncio.to_thread(self._bulk_insert_position_snapshots, snapshots)
         except Exception as e:
-            logger.error(f"Initial snapshot: position bulk_insert failed: {e}")
+            logger.error(f"{label}: position bulk_insert failed: {e}")
             return 0, failures
         return len(snapshots), failures
 
@@ -851,6 +882,12 @@ class Recorder:
             except asyncio.CancelledError:
                 pass
             self._health_task = None
+
+        # A post-gap snapshot is best effort: never wait for it on stop.
+        if self._post_gap_snapshot_future is not None:
+            self._post_gap_snapshot_future.cancel()
+            self._post_gap_snapshot_future = None
+        self._post_gap_snapshot_running = False
 
         # Stop collectors
         if self._public_collector:
@@ -1371,9 +1408,81 @@ class Recorder:
                 if gap_id is not None:
                     fut.add_done_callback(self._persist_gap_outcome(gap_id, symbol))
                 futures.append(fut)
+            self._schedule_post_gap_snapshot()
         if not self._open_gap_ids:
             self._open_gap_start = None
         return futures
+
+    def _schedule_post_gap_snapshot(self) -> None:
+        """Re-snapshot wallet + positions over REST after a gap (0110 B3).
+
+        Replay seeds from the latest rows at a window's start, and live-check
+        requires gap-free coverage from those rows on. A leg whose size has
+        not changed keeps an old seed row, so without a fresh snapshot every
+        later window would reach back over the gap and SKIP. At most one
+        snapshot is in flight; a gap closing meanwhile asks for one more run,
+        so the last snapshot always postdates the last gap.
+
+        Runs on the event loop (gap paths are loop callbacks). "In flight"
+        is ``_post_gap_snapshot_running``, cleared by the coroutine itself in
+        the same step as its last rerun check — not the future's ``done()``,
+        which a later loop callback sets, so a gap in between would be lost.
+        """
+        if self._post_gap_snapshot_running:
+            self._post_gap_snapshot_again = True
+            return
+        self._post_gap_snapshot_running = True
+        self._post_gap_snapshot_future = asyncio.run_coroutine_threadsafe(
+            self._post_gap_snapshots(), self._event_loop
+        )
+        self._post_gap_snapshot_future.add_done_callback(
+            self._log_post_gap_snapshot_error
+        )
+
+    @staticmethod
+    def _log_post_gap_snapshot_error(future: Future) -> None:
+        if not future.cancelled() and (exc := future.exception()) is not None:
+            logger.error("Post-gap snapshot failed: %s", exc)
+
+    async def _post_gap_snapshots(self) -> None:
+        try:
+            while self._running:
+                self._post_gap_snapshot_again = False
+                await self._write_post_gap_snapshot()
+                if not self._post_gap_snapshot_again:
+                    return
+        finally:
+            self._post_gap_snapshot_running = False
+
+    async def _write_post_gap_snapshot(self) -> None:
+        """One REST snapshot of wallet + positions, evidence only.
+
+        No ``RECORDER_SNAPSHOT_*`` sentinel (those are the launcher's startup
+        contract) and no position placeholders (see ``_snapshot_positions``).
+        """
+        try:
+            client = BybitRestClient(
+                api_key=self._config.account.api_key.get_secret_value(),
+                api_secret=self._config.account.api_secret.get_secret_value(),
+                testnet=self._config.testnet,
+            )
+        except Exception as e:
+            logger.error(f"{_POST_GAP_SNAPSHOT}: REST client failed: {e}")
+            return
+        run_id = str(self._run_id)
+        account_id = str(self._account_id)
+        snapshot_ts = datetime.now(UTC)
+        wallet_count = await self._snapshot_wallet(
+            client, run_id, account_id, snapshot_ts, label=_POST_GAP_SNAPSHOT
+        )
+        position_count, _ = await self._snapshot_positions(
+            client, run_id, account_id, snapshot_ts,
+            label=_POST_GAP_SNAPSHOT, evidence_only=True,
+        )
+        logger.info(
+            f"{_POST_GAP_SNAPSHOT}: wallet={wallet_count} coins, "
+            f"positions={position_count} rows"
+        )
 
     def _record_private_gap(
         self, symbol: str, gap_start: datetime, gap_end: datetime

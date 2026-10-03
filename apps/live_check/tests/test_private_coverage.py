@@ -215,7 +215,7 @@ class TestGaps:
             start = window.start - timedelta(minutes=minutes)
             _add_gap(db, acc, start, start + timedelta(minutes=1))
         reason = _reason(db, acc, window)
-        assert reason.index("(+1 more)") < reason.index("restart the recorder")
+        assert reason.index("(+1 more)") < reason.index("post-gap snapshot")
 
     def test_gap_inside_window_has_no_restart_hint(self, db, acc, ts):
         """A gap inside the window is an ordinary SKIP, no restart hint."""
@@ -299,7 +299,27 @@ class TestSeedAnchors:
         _add_position(db, acc, "Sell", window.start - timedelta(minutes=30))
         reason = _reason(db, acc, window)
         assert "only touch the seed rows" in reason
-        assert "restart the recorder" in reason
+        assert "post-gap snapshot did not land" in reason
+        assert "recorder restarts" in reason
+
+    def test_post_gap_snapshot_moves_the_interval_past_the_gap(
+        self, db, acc, ts
+    ):
+        """0110 B3: the recorder's post-gap REST rows (exchange_ts = local_ts
+        = snapshot time, after gap_end) become the seed of later windows, so
+        those are covered again; a window starting before them still SKIPs."""
+        window = _window(ts)
+        _add_session(db, acc, ts - timedelta(days=1), ts + timedelta(minutes=1))
+        gap_end = window.start - timedelta(minutes=5)
+        _add_gap(db, acc, window.start - timedelta(minutes=10), gap_end)
+        _add_position(db, acc, "Sell", window.start - timedelta(minutes=30))
+        assert _reason(db, acc, window) is not None
+        snapshot = gap_end + timedelta(seconds=2)
+        _add_position(db, acc, "Sell", snapshot)
+        _add_wallet(db, acc, snapshot)
+        assert _reason(db, acc, window) is None
+        early = Window(start=gap_end + timedelta(seconds=1), end=ts)
+        assert _reason(db, acc, early) is not None
 
     def test_wallet_seed_extends_interval(self, db, acc, ts):
         """The USDT wallet seed row extends the interval too."""

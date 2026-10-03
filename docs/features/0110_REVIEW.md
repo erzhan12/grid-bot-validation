@@ -435,3 +435,25 @@ Engines: codex (`gpt-5.6-sol`) — round 1: NO P1/P2, no P3 (213 focused tests p
 | P3 | `get_latest_received_before` run/account scope untested. | Foreign-account row added to the repository test. |
 
 `make test` exit 0 (92%), `make lint` clean.
+
+## Phase B3 — local staged review (review-fix-loop-staged, 2026-10-03)
+
+5 reviewers, 1 iteration → Ready to commit.
+
+| Claim | Verdict |
+|---|---|
+| CRITICAL: `_post_gap_snapshot_again` written from the WS thread (data race). | REJECT — every gap path is an event-loop callback (collector `_handle_reconnect` inside `_ws_health_check_once`; lost-write gap via `call_soon_threadsafe`). But the review exposed a REAL lost-rerun window: the `run_coroutine_threadsafe` future is marked done by a later loop callback, so a gap handled after the coroutine returned saw "in flight", set the flag and was never rerun. Fixed: `_post_gap_snapshot_running`, owned by the coroutine (cleared in its `finally`); RED test `test_gap_right_after_the_last_run_is_not_lost`. |
+| CRITICAL: `BybitRestClient` constructed on the loop. | Downgraded — pybit `HTTP()` init does no network I/O; the startup snapshot does the same. |
+| Missing tests: REST client failure; one-of-many symbols failing. | Client-failure test added; multi-symbol not added (per-symbol `continue`). |
+
+Security, docs: no issues.
+
+## Phase B3 — external review (ext-code-review)
+
+Codex (`gpt-5.6-sol`), round 1: NO P1/P2; P3 (stop duration unbounded in the test) → `stop()` now asserted < 2 s with REST blocked. Cursor: no output at the 600 s limit (its third failure this session) — not restarted. Result: SUCCESS on codex.
+
+## Final verification (B3)
+
+- `make test`: exit 0, merged coverage 92%.
+- `make lint`: all checks passed.
+- Mutation checks: 3/3 caught (placeholders after a gap, no coalescing, no rerun).
