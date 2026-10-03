@@ -12,7 +12,7 @@ from grid_db import (
     RecoveryStatus,
     WalletSnapshot,
 )
-from grid_db.models import Run
+from grid_db.models import Order, Run
 
 from live_check import ground_truth
 from live_check.window import Window
@@ -270,6 +270,53 @@ class TestGaps:
         _add_gap(db, acc, ts - timedelta(minutes=30),
                  ts - timedelta(minutes=29), run_id="other-run")
         assert _reason(db, acc, _window(ts)) is None
+
+
+def _add_active_order(db, account_id, order_id, ts):
+    with db.get_session() as session:
+        session.add(Order(
+            run_id=RUN_ID, account_id=account_id, order_id=order_id,
+            symbol=_SYMBOL, exchange_ts=ts, local_ts=ts, status="New",
+            side="Buy", price=Decimal("80"), qty=Decimal("0.2"),
+            leaves_qty=Decimal("0.2"), reduce_only=False,
+        ))
+
+
+class TestOrdersAcrossAGap:
+    """PR #291 review: B3 moves the position/wallet seeds past a gap, but
+    orders are not backfilled — an active order that last updated before an
+    earlier gap's end may have filled or been cancelled during it."""
+
+    def _post_gap(self, db, acc, ts):
+        window = _window(ts)
+        _add_session(db, acc, ts - timedelta(days=1), ts + timedelta(minutes=1))
+        gap_end = window.start - timedelta(minutes=10)
+        _add_gap(db, acc, window.start - timedelta(minutes=15), gap_end)
+        snapshot = gap_end + timedelta(seconds=2)
+        for side in ("Buy", "Sell"):
+            with db.get_session() as session:
+                session.add(PositionSnapshot(
+                    run_id=RUN_ID, account_id=acc, symbol=_SYMBOL,
+                    exchange_ts=snapshot, local_ts=snapshot, side=side,
+                    size=Decimal("0"), entry_price=Decimal("0"), source="live",
+                ))
+        _add_wallet(db, acc, snapshot)
+        return window, gap_end
+
+    def test_order_resting_across_a_gap_skips(self, db, acc, ts):
+        """Post-gap position rows, but an active order last updated before
+        the gap ended → SKIP naming the order."""
+        window, gap_end = self._post_gap(db, acc, ts)
+        _add_active_order(db, acc, "o-old", gap_end - timedelta(minutes=30))
+        reason = _reason(db, acc, window)
+        assert reason is not None
+        assert "o-old" in reason
+
+    def test_orders_placed_after_the_gap_pass(self, db, acc, ts):
+        """Every active order updated after the gap → covered."""
+        window, gap_end = self._post_gap(db, acc, ts)
+        _add_active_order(db, acc, "o-new", gap_end + timedelta(seconds=5))
+        assert _reason(db, acc, window) is None
 
 
 class TestSeedAnchors:

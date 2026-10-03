@@ -10,6 +10,11 @@ Plan: docs/features/0110_PLAN.md ("Phase B3 implementation notes")  |  Branch: f
 - [x] rules (recorder, live-check) + plan notes / Known limitations
 - [ ] deploy the recorder on the VPS (after merge, with sign-off)
 
+## Follow-ups
+- PR #291 review P3: `_UNPROVEN_SYNTHETIC` (recorder) duplicates live-check `_UNFIT_SYNTHETIC` — move to `grid_db` or pin equal with a test.
+- PR #291 review P3: one long-lived REST client for post-gap snapshots (shared mainnet REST budget with the live gridbot during flapping).
+- Orders after a gap: a post-gap open-orders resnapshot + marking DB-active orders absent from REST as gone would remove the `_order_resting_across_gap` SKIPs (part of #274).
+
 # Feature 0110 Phase B2c — end-of-window anchor fitness (#271)
 
 Plan: docs/features/0110_PLAN.md (Phase B2 steps 2, 3, 6, 7)  |  Branch: feature/0110-b2c-anchor-fitness

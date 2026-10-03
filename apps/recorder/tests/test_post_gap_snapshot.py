@@ -21,6 +21,7 @@ from recorder.recorder import Recorder
 _WALLET = {
     "list": [{
         "accountType": "UNIFIED",
+        "totalEquity": "1000",
         "coin": [{"coin": "USDT", "walletBalance": "1000"}],
     }]
 }
@@ -56,6 +57,7 @@ def _reconciler(mock_reconciler_cls):
     reconciler.reconcile_executions = AsyncMock(
         return_value=ExecutionRecoveryResult(RecoveryStatus.RECOVERED)
     )
+    reconciler.reconcile_public_trades = AsyncMock(return_value=0)
     reconciler.get_stats.return_value = {}
     mock_reconciler_cls.return_value = reconciler
 
@@ -83,30 +85,30 @@ async def _close_gap(recorder):
 def started(config_with_account, db, db_with_gridbot_seed):
     """Factory: start a Recorder with mocked collectors / reconciler and a
     REST stub; returns (recorder, stub). Stops it after the test."""
-    recorders = []
     patches = [
         patch("recorder.recorder.GapReconciler"),
         patch("recorder.recorder.PrivateCollector"),
         patch("recorder.recorder.PublicCollector"),
         patch("recorder.recorder.BybitRestClient"),
     ]
+    mock_reconciler_cls, mock_priv_cls, mock_pub_cls, mock_rest_cls = (
+        p.start() for p in patches
+    )
 
     async def _start():
-        mock_reconciler_cls, mock_priv_cls, mock_pub_cls, mock_rest_cls = (
-            p.start() for p in patches
-        )
         _collectors(mock_pub_cls, mock_priv_cls)
         _reconciler(mock_reconciler_cls)
         stub = _rest_stub()
         mock_rest_cls.return_value = stub
         recorder = Recorder(config=config_with_account, db=db)
         await recorder.start()
-        recorders.append(recorder)
         return recorder, stub
 
-    yield _start
-    for p in patches:
-        p.stop()
+    try:
+        yield _start
+    finally:
+        for p in patches:
+            p.stop()
 
 
 class TestPostGapSnapshot:
@@ -175,24 +177,28 @@ class TestPostGapSnapshot:
         """Gaps closing while a snapshot runs coalesce into ONE more run."""
         recorder, stub = await started()
         release = threading.Event()
+        entered = threading.Event()
         calls = []
 
         def _slow_wallet(*args):
             calls.append(1)
+            entered.set()
             release.wait(5)
             return _WALLET
 
         stub.get_wallet_balance.side_effect = _slow_wallet
         try:
             gap_end = datetime.now(UTC)
-            for i in range(3):
+            recorder._handle_private_gap(gap_end - timedelta(seconds=30), gap_end)
+            # The first snapshot is inside its REST call: later gaps coalesce.
+            assert await asyncio.to_thread(entered.wait, 5)
+            for i in (1, 2):
                 recorder._handle_private_gap(
                     gap_end - timedelta(seconds=30), gap_end + timedelta(seconds=i)
                 )
-                await asyncio.sleep(0.05)
             future = recorder._post_gap_snapshot_future
             release.set()
-            await asyncio.wrap_future(future)
+            await asyncio.wait_for(asyncio.wrap_future(future), 5)
             assert len(calls) == 2
         finally:
             release.set()
@@ -204,6 +210,7 @@ class TestPostGapSnapshot:
         recorder, _ = await started()
         loop = asyncio.get_running_loop()
         runs = []
+        second_run = asyncio.Event()
 
         async def _fake_write():
             runs.append(1)
@@ -211,12 +218,13 @@ class TestPostGapSnapshot:
                 # Runs after the coroutine returns, before the future's
                 # done-callback: the window where a gap used to be lost.
                 loop.call_soon(recorder._schedule_post_gap_snapshot)
+            else:
+                second_run.set()
 
         recorder._write_post_gap_snapshot = _fake_write
         try:
             recorder._schedule_post_gap_snapshot()
-            for _ in range(20):
-                await asyncio.sleep(0.01)
+            await asyncio.wait_for(second_run.wait(), 5)
             assert len(runs) == 2
         finally:
             await recorder.stop()
@@ -267,5 +275,61 @@ class TestPostGapSnapshot:
             )
             await asyncio.wrap_future(recorder._post_gap_snapshot_future)
             assert len(_rows(db, recorder, PositionSnapshot)) == before + 2
+        finally:
+            await recorder.stop()
+
+
+class TestPostGapSnapshotAnchorsMoveTogether:
+    """PR #291 review: the wallet seed moves past a gap only together with
+    the position seed, and only on a real reading."""
+
+    async def test_no_wallet_row_when_positions_did_not_land(
+        self, started, db, caplog
+    ):
+        """A position fetch failure skips the wallet too, and the empty
+        snapshot is a WARNING, not an INFO success line."""
+        recorder, stub = await started()
+        try:
+            before = len(_rows(db, recorder, WalletSnapshot))
+            stub.get_positions.side_effect = RuntimeError("timeout")
+            with caplog.at_level(logging.INFO, logger="recorder.recorder"):
+                await _close_gap(recorder)
+            assert len(_rows(db, recorder, WalletSnapshot)) == before
+            nothing = [r for r in caplog.records if "wrote nothing" in r.message]
+            assert [r.levelno for r in nothing] == [logging.WARNING]
+        finally:
+            await recorder.stop()
+
+    @pytest.mark.parametrize("wallet", [
+        {"list": [{"accountType": "UNIFIED", "totalEquity": "1000",
+                   "coin": [{"coin": "USDT", "walletBalance": ""}]}]},
+        {"list": [{"accountType": "UNIFIED", "totalEquity": "",
+                   "coin": [{"coin": "USDT", "walletBalance": "1000"}]}]},
+        {"list": [{"accountType": "UNIFIED", "totalEquity": "1000",
+                   "coin": [{"coin": "SOL", "walletBalance": "2"}]}]},
+    ])
+    async def test_degenerate_wallet_reading_is_not_written(
+        self, started, db, wallet
+    ):
+        """Empty USDT walletBalance / totalEquity, or no USDT row, would be
+        coerced to 0 and become the newest wallet seed: skipped."""
+        recorder, stub = await started()
+        try:
+            before = len(_rows(db, recorder, WalletSnapshot))
+            stub.get_wallet_balance.return_value = wallet
+            await _close_gap(recorder)
+            assert len(_rows(db, recorder, WalletSnapshot)) == before
+        finally:
+            await recorder.stop()
+
+    async def test_public_gap_does_not_resnapshot(self, started):
+        """Only private-stream gaps move the private seed rows."""
+        recorder, _ = await started()
+        try:
+            now = datetime.now(UTC)
+            recorder._handle_public_gap(
+                "BTCUSDT", now - timedelta(seconds=30), now
+            )
+            assert recorder._post_gap_snapshot_future is None
         finally:
             await recorder.stop()

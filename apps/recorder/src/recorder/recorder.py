@@ -66,6 +66,8 @@ _MAX_OPEN_GAP_FAILURES = 3
 
 _INITIAL_SNAPSHOT = "Initial snapshot"
 _POST_GAP_SNAPSHOT = "Post-gap snapshot"
+# The coin replay seeds its wallet from (replay SeedConfig.wallet_coin default).
+_WALLET_SEED_COIN = "USDT"
 # Placeholders that do not prove a leg's state (0110 B2a markers).
 _UNPROVEN_SYNTHETIC = frozenset({"rest_failure", "malformed", "empty_response"})
 
@@ -472,8 +474,15 @@ class Recorder:
         account_id: str,
         snapshot_ts: datetime,
         label: str = _INITIAL_SNAPSHOT,
+        evidence_only: bool = False,
     ) -> int:
-        """REST-fetch wallet balance and write one row per coin. Returns row count."""
+        """REST-fetch wallet balance and write one row per coin. Returns row count.
+
+        With ``evidence_only`` (post-gap snapshot, 0110 B3) nothing is written
+        unless the reading carries a USDT ``walletBalance`` and the account's
+        ``totalEquity``: an empty field is coerced to 0 (pitfall 14) and the
+        row would become the newest wallet seed.
+        """
         try:
             result = await asyncio.to_thread(client.get_wallet_balance, "UNIFIED")
         except Exception as e:
@@ -483,6 +492,7 @@ class Recorder:
         # Bybit V5 shape: result["list"][0]["coin"] = list of per-coin dicts.
         accounts = result.get("list") or []
         snapshots: list[WalletSnapshot] = []
+        proven = False
         for acct in accounts:
             try:
                 account_raw = {
@@ -509,6 +519,12 @@ class Recorder:
                     # some non-USDT coins on cross-margin still surface only
                     # `availableBalance`. Prefer the v5 field, fall back to
                     # the legacy field when v5 is absent or empty.
+                    if (
+                        coin_data.get("coin") == _WALLET_SEED_COIN
+                        and coin_data.get("walletBalance") not in (None, "")
+                        and acct.get("totalEquity") not in (None, "")
+                    ):
+                        proven = True
                     coin_available = coin_data.get("availableToWithdraw")
                     if coin_available in (None, "") and "availableBalance" in coin_data:
                         coin_available = coin_data.get("availableBalance")
@@ -537,6 +553,12 @@ class Recorder:
                     )
                     continue
 
+        if evidence_only and not proven:
+            logger.warning(
+                f"{label}: wallet reading has no {_WALLET_SEED_COIN} "
+                "walletBalance / totalEquity; earlier wallet rows stay the seed"
+            )
+            return 0
         if not snapshots:
             return 0
 
@@ -1458,7 +1480,8 @@ class Recorder:
         """One REST snapshot of wallet + positions, evidence only.
 
         No ``RECORDER_SNAPSHOT_*`` sentinel (those are the launcher's startup
-        contract) and no position placeholders (see ``_snapshot_positions``).
+        contract), no position placeholders (see ``_snapshot_positions``), and
+        the wallet only when every symbol's positions landed.
         """
         try:
             client = BybitRestClient(
@@ -1472,17 +1495,29 @@ class Recorder:
         run_id = str(self._run_id)
         account_id = str(self._account_id)
         snapshot_ts = datetime.now(UTC)
-        wallet_count = await self._snapshot_wallet(
-            client, run_id, account_id, snapshot_ts, label=_POST_GAP_SNAPSHOT
-        )
-        position_count, _ = await self._snapshot_positions(
+        position_count, failed_symbols = await self._snapshot_positions(
             client, run_id, account_id, snapshot_ts,
             label=_POST_GAP_SNAPSHOT, evidence_only=True,
         )
-        logger.info(
-            f"{_POST_GAP_SNAPSHOT}: wallet={wallet_count} coins, "
-            f"positions={position_count} rows"
-        )
+        # The wallet seed moves past the gap only together with the
+        # positions: a post-gap wallet paired with pre-gap positions would be
+        # an inconsistent replay seed.
+        wallet_count = 0
+        if position_count and not failed_symbols:
+            wallet_count = await self._snapshot_wallet(
+                client, run_id, account_id, snapshot_ts,
+                label=_POST_GAP_SNAPSHOT, evidence_only=True,
+            )
+        if position_count or wallet_count:
+            logger.info(
+                f"{_POST_GAP_SNAPSHOT}: wallet={wallet_count} coins, "
+                f"positions={position_count} rows"
+            )
+        else:
+            logger.warning(
+                f"{_POST_GAP_SNAPSHOT}: wrote nothing; later live-check windows "
+                "SKIP until a leg's size changes or the recorder restarts"
+            )
 
     def _record_private_gap(
         self, symbol: str, gap_start: datetime, gap_end: datetime

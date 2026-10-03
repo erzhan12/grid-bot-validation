@@ -389,6 +389,42 @@ def _coverage_start(
     return min([window.start, *times])
 
 
+def _order_resting_across_gap(
+    session: Session,
+    run_id: str,
+    account_id: str,
+    symbol: str,
+    window: Window,
+) -> Optional[str]:
+    """SKIP reason when replay would seed an order that rested across a gap.
+
+    Replay seeds the active orders at ``window.start``
+    (``OrderRepository.get_active_at``). Orders are not backfilled after a
+    private-stream gap, so an order whose last update predates a gap's end
+    may have filled or been cancelled during it and would be seeded as a
+    phantom resting order (whole-order reconciliation is #274).
+    """
+    orders = OrderRepository(session).get_active_at(
+        run_id, account_id, symbol, window.start
+    )
+    if not orders:
+        return None
+    oldest = min(orders, key=lambda o: to_naive_utc(o.exchange_ts))
+    gaps = PrivateStreamGapRepository(session).list_overlapping(
+        run_id, account_id, symbol, to_naive_utc(oldest.exchange_ts), window.start
+    )
+    if not gaps:
+        return None
+    gap = gaps[-1]
+    gap_end = to_naive_utc(gap.gap_end) if gap.gap_end is not None else "open"
+    return (
+        f"active order {oldest.order_id} (last update "
+        f"{to_naive_utc(oldest.exchange_ts)}) rested across private-stream "
+        f"gap {to_naive_utc(gap.gap_start)}–{gap_end}; orders are not "
+        "backfilled, so it may have filled or been cancelled during it"
+    )
+
+
 def private_coverage_skip_reason(
     session: Session,
     run_id: str,
@@ -404,7 +440,10 @@ def private_coverage_skip_reason(
     session connected by its start and checkpointed by its end, and no gap
     row of this run/account/symbol overlaps it — a recovered gap still SKIPs,
     because orders and positions are not backfilled. Gaps are checked before
-    the session so the reason names the gap.
+    the session so the reason names the gap. The recorder re-snapshots
+    positions and wallet after a gap (0110 B3) but not orders, so a window
+    also SKIPs while an active order it seeds last updated before an earlier
+    gap ended (:func:`_order_resting_across_gap`).
 
     Args:
         session: Read-only session on the recorder DB.
@@ -461,6 +500,11 @@ def private_coverage_skip_reason(
             f"(recovery {first.recovery_status}) overlaps {start}–{end}"
             f"{more}{hint}"
         )
+    resting = _order_resting_across_gap(
+        session, run_id, account_id, symbol, window
+    )
+    if resting is not None:
+        return resting
     if not sessions:
         return f"no private-stream session recorded for run {run_id}"
     if not any(

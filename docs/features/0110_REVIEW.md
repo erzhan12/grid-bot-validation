@@ -457,3 +457,17 @@ Codex (`gpt-5.6-sol`), round 1: NO P1/P2; P3 (stop duration unbounded in the tes
 - `make test`: exit 0, merged coverage 92%.
 - `make lint`: all checks passed.
 - Mutation checks: 3/3 caught (placeholders after a gap, no coalescing, no rerun).
+
+## PR #291 claude-review (round 1) — CHANGES REQUESTED, one P1
+
+| Sev | Finding | Verdict |
+|---|---|---|
+| P1 | Post-gap seeds un-SKIP windows whose active-order seed is still stale (orders not backfilled; before B3 the stale position seed incidentally covered it). | Fixed: `ground_truth._order_resting_across_gap` SKIPs a window whose seeded active order last updated before an earlier gap ended; coverage docstring updated; tests (order resting across the gap → SKIP, orders after the gap → pass). |
+| P2 | Wallet written even when positions did not land (inconsistent seed pair). | Fixed: positions first, wallet only when rows were written and no symbol failed. |
+| P2 | Degenerate wallet reading (empty USDT `walletBalance` / `totalEquity` → 0) becomes the newest seed. | Fixed: wallet `evidence_only` guard; 3 parametrized tests. |
+| P2 | An empty post-gap snapshot logged at INFO. | Fixed: WARNING `wrote nothing`. |
+| P2 | No test that a public gap does not re-snapshot. | Added. |
+| P3 | Timing-dependent tests; patchers started inside the factory. | Fixed: event-driven waits; patchers started before `yield` with `try/finally`. |
+| P3 | Duplicate synthetic-marker sets; per-snapshot REST client. | Deferred to `tasks/todo.md`. |
+
+`make test` exit 0 (92%), `make lint` clean.
