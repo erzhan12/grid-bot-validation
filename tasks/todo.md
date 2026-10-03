@@ -8,11 +8,12 @@ Plan: docs/features/0110_PLAN.md ("Phase B3 implementation notes")  |  Branch: f
 - [x] tests: fresh rows after gap_end, no placeholders, absent_side kept, coalescing, stop, lost-write gap; live-check interval moves past the gap
 - [x] make test + make lint green; mutation checks (3/3 caught)
 - [x] rules (recorder, live-check) + plan notes / Known limitations
-- [ ] deploy the recorder on the VPS (after merge, with sign-off)
+- [x] ~~deploy the recorder on the VPS~~ — dropped 2026-10-04: no VPS recorder (the 1 GB droplet runs only the live gridbot); the recorder runs on the laptop per validation session
 
 ## Follow-ups
 - PR #291 review P3: one long-lived REST client for post-gap snapshots (shared mainnet REST budget with the live gridbot during flapping).
-- Orders after a gap: call `_snapshot_open_orders` from `_write_post_gap_snapshot` (REST-confirmed resting orders get a fresh row past the gap; filled/cancelled ones keep their stale row and keep SKIPping). Removes the long-resting-order SKIP and the created-during-gap blind spot (PR #291 round 4 P2; part of #274).
+- DEFERRED 2026-10-04 — orders after a gap (PR #291 round 4 P2; part of #274). Workaround: restart the recorder after a gap (new run, full REST snapshot; live-check picks the latest run).
+  Calling `_snapshot_open_orders` from `_write_post_gap_snapshot` alone is NOT enough: an order filled/cancelled during the gap keeps its stale `New` row, stays in `get_active_at` and keeps SKIPping — and on a laptop recorder a gap is usually hours of sleep with grid fills. A real fix must also write the terminal status of every seeded-active order missing from the open list (`BybitRestClient.get_order_history`), REST failure → write nothing. Revisit if the recorder ever runs 24/7.
 
 # Feature 0110 Phase B2c — end-of-window anchor fitness (#271)
 
