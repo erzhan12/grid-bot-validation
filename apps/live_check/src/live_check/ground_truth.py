@@ -403,25 +403,31 @@ def _order_resting_across_gap(
     private-stream gap, so an order whose last update predates a gap's end
     may have filled or been cancelled during it and would be seeded as a
     phantom resting order (whole-order reconciliation is #274).
+
+    The seed set is selected on ``exchange_ts`` (as replay does), but the
+    comparison with the gap uses the order row's ``local_ts``: gap bounds are
+    recorder-clock values, like every other bound in this gate.
     """
     orders = OrderRepository(session).get_active_at(
         run_id, account_id, symbol, window.start
     )
     if not orders:
         return None
-    oldest = min(orders, key=lambda o: to_naive_utc(o.exchange_ts))
+    oldest = min(orders, key=lambda o: to_naive_utc(o.local_ts))
     gaps = PrivateStreamGapRepository(session).list_overlapping(
-        run_id, account_id, symbol, to_naive_utc(oldest.exchange_ts), window.start
+        run_id, account_id, symbol, to_naive_utc(oldest.local_ts), window.start
     )
     if not gaps:
         return None
     gap = gaps[-1]
     gap_end = to_naive_utc(gap.gap_end) if gap.gap_end is not None else "open"
     return (
-        f"active order {oldest.order_id} (last update "
-        f"{to_naive_utc(oldest.exchange_ts)}) rested across private-stream "
+        f"active order {oldest.order_id} (recorded "
+        f"{to_naive_utc(oldest.local_ts)}) rested across private-stream "
         f"gap {to_naive_utc(gap.gap_start)}–{gap_end}; orders are not "
-        "backfilled, so it may have filled or been cancelled during it"
+        "backfilled, so it may have filled or been cancelled during it. Later "
+        "windows of this run SKIP until that order is updated or replaced, or "
+        "the recorder restarts (whole-order reconciliation after a gap is #274)"
     )
 
 

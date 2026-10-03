@@ -480,8 +480,9 @@ class Recorder:
 
         With ``evidence_only`` (post-gap snapshot, 0110 B3) nothing is written
         unless the reading carries a USDT ``walletBalance`` and the account's
-        ``totalEquity``: an empty field is coerced to 0 (pitfall 14) and the
-        row would become the newest wallet seed.
+        ``totalEquity`` and ``totalAvailableBalance``: an empty field is
+        coerced to 0 (pitfall 14), the row would become the newest wallet
+        seed, and replay refuses to seed from a zero balance.
         """
         try:
             result = await asyncio.to_thread(client.get_wallet_balance, "UNIFIED")
@@ -515,16 +516,17 @@ class Recorder:
 
             for coin_data in acct.get("coin") or []:
                 try:
-                    # UTA v5 returns `availableToWithdraw`; legacy UTA 1.0 and
-                    # some non-USDT coins on cross-margin still surface only
-                    # `availableBalance`. Prefer the v5 field, fall back to
-                    # the legacy field when v5 is absent or empty.
                     if (
                         coin_data.get("coin") == _WALLET_SEED_COIN
                         and coin_data.get("walletBalance") not in (None, "")
                         and acct.get("totalEquity") not in (None, "")
+                        and acct.get("totalAvailableBalance") not in (None, "")
                     ):
                         proven = True
+                    # UTA v5 returns `availableToWithdraw`; legacy UTA 1.0 and
+                    # some non-USDT coins on cross-margin still surface only
+                    # `availableBalance`. Prefer the v5 field, fall back to
+                    # the legacy field when v5 is absent or empty.
                     coin_available = coin_data.get("availableToWithdraw")
                     if coin_available in (None, "") and "availableBalance" in coin_data:
                         coin_available = coin_data.get("availableBalance")
@@ -556,7 +558,8 @@ class Recorder:
         if evidence_only and not proven:
             logger.warning(
                 f"{label}: wallet reading has no {_WALLET_SEED_COIN} "
-                "walletBalance / totalEquity; earlier wallet rows stay the seed"
+                "walletBalance / totalEquity / totalAvailableBalance; earlier "
+                "wallet rows stay the seed"
             )
             return 0
         if not snapshots:

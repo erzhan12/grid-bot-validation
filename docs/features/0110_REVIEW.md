@@ -471,3 +471,14 @@ Codex (`gpt-5.6-sol`), round 1: NO P1/P2; P3 (stop duration unbounded in the tes
 | P3 | Duplicate synthetic-marker sets; per-snapshot REST client. | Deferred to `tasks/todo.md`. |
 
 `make test` exit 0 (92%), `make lint` clean.
+
+## PR #291 claude-review (round 2) — APPROVED, one P1
+
+| Sev | Finding | Verdict |
+|---|---|---|
+| P1 | Post-gap wallet guard omits `totalAvailableBalance`; an empty one is stored as 0, becomes the newest seed and `load_wallet_seed_full` refuses it. | Fixed: added to the `proven` predicate (guard moved above the `availableToWithdraw` comment it had split); parametrized case added. |
+| P2 | `_order_resting_across_gap` reason has no remedy; the SKIP can last long. | Fixed: reason says later windows SKIP until the order is updated/replaced or the recorder restarts; #274. |
+| P2 | Orders created during a gap are invisible to the order check. | Documented in Known limitations + `live-check.md` (#274; symptom is FAIL, not PASS). |
+| P2 | Multi-symbol veto (`position_count and not failed_symbols`) untested. | Added: second symbol fails → first symbol's rows written, no wallet row. |
+| P3 | Order check compared `exchange_ts` with recorder-clock gap bounds. | Fixed: seed set by `exchange_ts`, gap comparison on `local_ts`. |
+| P3 | Pin recorder constants to live-check/replay; long-lived REST client. | Deferred (already in `tasks/todo.md`). |

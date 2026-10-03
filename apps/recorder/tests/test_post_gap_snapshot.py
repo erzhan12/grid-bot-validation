@@ -22,6 +22,7 @@ _WALLET = {
     "list": [{
         "accountType": "UNIFIED",
         "totalEquity": "1000",
+        "totalAvailableBalance": "900",
         "coin": [{"coin": "USDT", "walletBalance": "1000"}],
     }]
 }
@@ -95,12 +96,15 @@ def started(config_with_account, db, db_with_gridbot_seed):
         p.start() for p in patches
     )
 
-    async def _start():
+    async def _start(symbols=None):
         _collectors(mock_pub_cls, mock_priv_cls)
         _reconciler(mock_reconciler_cls)
         stub = _rest_stub()
         mock_rest_cls.return_value = stub
-        recorder = Recorder(config=config_with_account, db=db)
+        config = config_with_account
+        if symbols is not None:
+            config = config.model_copy(update={"symbols": symbols})
+        recorder = Recorder(config=config, db=db)
         await recorder.start()
         return recorder, stub
 
@@ -302,17 +306,24 @@ class TestPostGapSnapshotAnchorsMoveTogether:
 
     @pytest.mark.parametrize("wallet", [
         {"list": [{"accountType": "UNIFIED", "totalEquity": "1000",
+                   "totalAvailableBalance": "900",
                    "coin": [{"coin": "USDT", "walletBalance": ""}]}]},
         {"list": [{"accountType": "UNIFIED", "totalEquity": "",
+                   "totalAvailableBalance": "900",
                    "coin": [{"coin": "USDT", "walletBalance": "1000"}]}]},
         {"list": [{"accountType": "UNIFIED", "totalEquity": "1000",
+                   "totalAvailableBalance": "",
+                   "coin": [{"coin": "USDT", "walletBalance": "1000"}]}]},
+        {"list": [{"accountType": "UNIFIED", "totalEquity": "1000",
+                   "totalAvailableBalance": "900",
                    "coin": [{"coin": "SOL", "walletBalance": "2"}]}]},
     ])
     async def test_degenerate_wallet_reading_is_not_written(
         self, started, db, wallet
     ):
-        """Empty USDT walletBalance / totalEquity, or no USDT row, would be
-        coerced to 0 and become the newest wallet seed: skipped."""
+        """Empty USDT walletBalance / totalEquity / totalAvailableBalance, or
+        no USDT row, would be coerced to 0 and become the newest wallet seed:
+        skipped."""
         recorder, stub = await started()
         try:
             before = len(_rows(db, recorder, WalletSnapshot))
@@ -331,5 +342,35 @@ class TestPostGapSnapshotAnchorsMoveTogether:
                 "BTCUSDT", now - timedelta(seconds=30), now
             )
             assert recorder._post_gap_snapshot_future is None
+        finally:
+            await recorder.stop()
+
+    async def test_one_failed_symbol_keeps_the_wallet_seed(self, started, db):
+        """Two symbols, the second's fetch fails: the first symbol's rows are
+        written, the failed one's are not, and no wallet row moves past the
+        gap (the position and wallet seeds must not split)."""
+        recorder, stub = await started(symbols=["BTCUSDT", "ETHUSDT"])
+        try:
+            wallets_before = len(_rows(db, recorder, WalletSnapshot))
+            positions_before = len(_rows(db, recorder, PositionSnapshot))
+
+            def _positions(symbol):
+                if symbol == "ETHUSDT":
+                    raise RuntimeError("timeout")
+                return [_position("Buy"), _position("Sell")]
+
+            stub.get_positions.side_effect = _positions
+            await _close_gap(recorder)
+            with db.get_session() as session:
+                new = (
+                    session.query(PositionSnapshot)
+                    .filter(PositionSnapshot.run_id == str(recorder._run_id))
+                    .order_by(PositionSnapshot.id)
+                    .all()[positions_before:]
+                )
+                assert sorted((r.symbol, r.side) for r in new) == [
+                    ("BTCUSDT", "Buy"), ("BTCUSDT", "Sell"),
+                ]
+            assert len(_rows(db, recorder, WalletSnapshot)) == wallets_before
         finally:
             await recorder.stop()
