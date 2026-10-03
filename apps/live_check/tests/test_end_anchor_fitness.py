@@ -88,7 +88,7 @@ def _reason(db, acc, window):
             session, RUN_ID, acc, _SYMBOL, window.end
         )
         return ground_truth.end_anchor_skip_reason(
-            session, RUN_ID, _SYMBOL, window, anchors
+            session, RUN_ID, acc, _SYMBOL, window, anchors
         )
 
 
@@ -271,6 +271,14 @@ class TestExecutionsAfterAnchor:
                    reduce_only=False)
         _add_exec(db, acc, "e1", fill, order_id="o1", side="Sell")
         assert "long" in _reason(db, acc, _window(ts))
+
+    def test_execution_of_another_account_is_ignored(self, db, acc, ts):
+        """Executions are tenant-scoped: another account's fill in the same
+        run does not make this account's anchors unfit."""
+        at = ts - timedelta(minutes=5)
+        _flat_pair(db, acc, at)
+        _add_exec(db, "other-account", "e1", at + timedelta(seconds=1))
+        assert _reason(db, acc, _window(ts)) is None
 
     def test_latest_order_row_decides(self, db, acc, ts):
         """Several rows for one order: the latest (exchange_ts, id) decides."""

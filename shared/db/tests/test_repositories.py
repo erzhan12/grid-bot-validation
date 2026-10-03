@@ -1518,6 +1518,9 @@ class TestEndAnchorReads:
         repo.bulk_insert([row("8", t0, t0 + timedelta(minutes=2), side="Sell")])
         repo.bulk_insert([row("7", t0, t0 + timedelta(minutes=2),
                               source="backtest")])
+        foreign = row("6", t0, t0 + timedelta(minutes=2))
+        foreign.account_id = "other-account"
+        repo.bulk_insert([foreign])
 
         got = repo.get_latest_received_before(
             sample_run.run_id, acc, "BTCUSDT", "Buy", t0 + timedelta(minutes=3)
@@ -1564,6 +1567,38 @@ class TestEndAnchorReads:
         assert repo.get_latest_by_order_ids(
             sample_run.run_id, acc, "BTCUSDT", []
         ) == {}
+
+    def test_latest_by_order_ids_chunks_long_id_lists(
+        self, session, sample_account, sample_run
+    ):
+        """More ids than one SQL statement may bind: the lookup is chunked
+        and still returns the latest row of every order."""
+        from datetime import timedelta
+        from decimal import Decimal
+        from grid_db import OrderRepository
+        from grid_db.models import Order
+
+        acc = str(sample_account.account_id)
+        t0 = datetime(2026, 5, 7, 10, 0, 0, tzinfo=UTC)
+        ids = [f"o{i}" for i in range(1200)]
+        for offset, status in ((1, "Filled"), (0, "New")):  # latest first
+            session.add_all([
+                Order(
+                    run_id=sample_run.run_id, account_id=acc, order_id=oid,
+                    symbol="BTCUSDT", exchange_ts=t0 + timedelta(seconds=offset),
+                    local_ts=t0, status=status, side="Buy", price=Decimal("1"),
+                    qty=Decimal("1"), leaves_qty=Decimal("0"),
+                    reduce_only=False,
+                )
+                for oid in ids
+            ])
+        session.flush()
+
+        got = OrderRepository(session).get_latest_by_order_ids(
+            sample_run.run_id, acc, "BTCUSDT", ids
+        )
+        assert len(got) == 1200
+        assert {row.status for row in got.values()} == {"Filled"}
 
 
 class TestPrivateStreamCoverageReads:

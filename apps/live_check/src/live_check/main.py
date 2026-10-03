@@ -204,7 +204,7 @@ def _gate_skip_reason(
     return ground_truth.private_coverage_skip_reason(
         session, run_id, account_id, strat.symbol, window, anchors
     ) or ground_truth.end_anchor_skip_reason(
-        session, run_id, strat.symbol, window, anchors
+        session, run_id, account_id, strat.symbol, window, anchors
     )
 
 

@@ -242,20 +242,24 @@ class OrderRepository(BaseRepository[Order]):
         Returns:
             ``{order_id: Order}``; ids without a row are absent.
         """
-        if not order_ids:
-            return {}
-        rows = (
-            self.session.query(Order)
-            .filter(
-                Order.run_id == run_id,
-                Order.account_id == account_id,
-                Order.symbol == symbol,
-                Order.order_id.in_(order_ids),
+        latest: dict[str, Order] = {}
+        # Chunked: the id list can span a long run, and older SQLite builds
+        # bind at most 999 variables per statement.
+        for i in range(0, len(order_ids), _ORDER_ID_CHUNK):
+            rows = (
+                self.session.query(Order)
+                .filter(
+                    Order.run_id == run_id,
+                    Order.account_id == account_id,
+                    Order.symbol == symbol,
+                    Order.order_id.in_(order_ids[i:i + _ORDER_ID_CHUNK]),
+                )
+                .order_by(Order.exchange_ts, Order.id)
+                .all()
             )
-            .order_by(Order.exchange_ts, Order.id)
-            .all()
-        )
-        return {row.order_id: row for row in rows}  # last (latest) row wins
+            # Each id lives in one chunk; within it the last (latest) row wins.
+            latest.update((row.order_id, row) for row in rows)
+        return latest
 
     def get_active_at(
         self,
@@ -401,6 +405,8 @@ class OrderRepository(BaseRepository[Order]):
 
 
 _GAP_REASON_MAX_LEN = 500
+# Order ids per IN (...) in get_latest_by_order_ids (SQLite's old 999 cap).
+_ORDER_ID_CHUNK = 500
 
 
 def _naive_utc(ts: datetime) -> datetime:

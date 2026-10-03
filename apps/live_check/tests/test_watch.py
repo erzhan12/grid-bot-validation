@@ -22,12 +22,12 @@ _NOW = datetime(2026, 7, 1, 12, 0, 0)
 _LAG = timedelta(minutes=2)
 
 
-def _seed_window_data(db, ts, closed_pnl=Decimal("0")):
+def _seed_window_data(db, ts, closed_pnl=Decimal("0"), account_id="acc1"):
     """One exec + one fresh ticker so the tick reaches the seed path."""
     with db.get_session() as session:
         session.add(PrivateExecution(
             run_id="test-run-id",
-            account_id="acc1",
+            account_id=account_id,
             symbol="LTCUSDT",
             exec_id="e1",
             order_id="o1",
@@ -272,7 +272,8 @@ class TestWatchEndAnchors:
         (cad63f4), inverted: a fresh ticker, day-old position rows and an
         execution after them → SKIP, never a green mark. The run has a
         covering session and no gaps, so only the stale anchor can SKIP."""
-        _seed_window_data(db, _NOW)  # exec e1 at now-30m, fresh ticker
+        # exec e1 at now-30m on the run's account, fresh ticker
+        _seed_window_data(db, _NOW, account_id=seeded_run_account.account_id)
         old = _NOW - timedelta(hours=20)
         with db.get_session() as session:
             for side in ("Buy", "Sell"):

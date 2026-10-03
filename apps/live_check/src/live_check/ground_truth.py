@@ -10,7 +10,6 @@ realized/commission/count query here filters by ``symbol`` IN ADDITION to
 symbol filter and would commingle SOL and LTC — do not use it for sums.
 """
 
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -517,25 +516,19 @@ def _anchor_update_time(row: PositionSnapshot) -> datetime:
 def _execution_legs(
     session: Session,
     run_id: str,
+    account_id: str,
     symbol: str,
     executions: list[PrivateExecution],
 ) -> dict[str, frozenset[str]]:
     """Leg(s) of each execution via its latest order row (run/account/symbol
     scoped). No order row — only Limit orders are recorded — or a NULL
     ``reduce_only`` → both legs."""
-    order_ids: dict[str, set[str]] = defaultdict(set)
-    for execution in executions:
-        order_ids[execution.account_id].add(execution.order_id)
-    orders = {}
-    repo = OrderRepository(session)
-    for account_id, ids in order_ids.items():
-        for order_id, row in repo.get_latest_by_order_ids(
-            run_id, account_id, symbol, sorted(ids)
-        ).items():
-            orders[(account_id, order_id)] = row
+    orders = OrderRepository(session).get_latest_by_order_ids(
+        run_id, account_id, symbol, sorted({e.order_id for e in executions})
+    )
     legs = {}
     for execution in executions:
-        row = orders.get((execution.account_id, execution.order_id))
+        row = orders.get(execution.order_id)
         leg = (
             _LEG_BY_SIDE_REDUCE.get((row.side, row.reduce_only))
             if row is not None and row.reduce_only is not None
@@ -548,6 +541,7 @@ def _execution_legs(
 def end_anchor_skip_reason(
     session: Session,
     run_id: str,
+    account_id: str,
     symbol: str,
     window: Window,
     anchors: dict[str, Optional[PositionSnapshot]],
@@ -565,6 +559,7 @@ def end_anchor_skip_reason(
     Args:
         session: Read-only session on the recorder DB.
         run_id: Recording run.
+        account_id: Account whose executions and orders are judged.
         symbol: Strat symbol.
         window: Comparison window (naive UTC).
         anchors: :func:`end_anchors` at ``window.end``.
@@ -592,6 +587,7 @@ def end_anchor_skip_reason(
         session.query(PrivateExecution)
         .filter(
             PrivateExecution.run_id == run_id,
+            PrivateExecution.account_id == account_id,
             PrivateExecution.symbol == symbol,
             PrivateExecution.exchange_ts > min(updated.values()),
             PrivateExecution.exchange_ts <= window.end,
@@ -599,7 +595,7 @@ def end_anchor_skip_reason(
         .order_by(PrivateExecution.exchange_ts, PrivateExecution.exec_id)
         .all()
     )
-    legs = _execution_legs(session, run_id, symbol, executions)
+    legs = _execution_legs(session, run_id, account_id, symbol, executions)
     for side, anchor_time in updated.items():
         late = [
             e for e in executions

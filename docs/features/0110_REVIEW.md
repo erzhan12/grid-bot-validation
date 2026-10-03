@@ -424,3 +424,14 @@ Engines: codex (`gpt-5.6-sol`) — round 1: NO P1/P2, no P3 (213 focused tests p
 - `make test`: exit 0, merged coverage 92%.
 - `make lint`: all checks passed.
 - Mutation checks: 4/4 caught (fill boundary, Bybit-clock anchor time, leg attribution, `empty_response` unfit).
+
+## PR #290 claude-review (round 1, on the B2c commit) — APPROVED, no P0/P1
+
+| Sev | Finding | Verdict |
+|---|---|---|
+| P2 | Executions query lacks `account_id` (tenant rule in `grid-db.md`; `_execution_legs` already keys by account). | Fixed — supersedes the local-review downgrade: `end_anchor_skip_reason(..., account_id, ...)`, executions filtered by account, one order lookup; test that another account's fill is ignored. The audit-port test now seeds its execution on the run's account. |
+| P2 | `IN (...)` over an unbounded id list (old SQLite 999-variable cap). | Fixed: `get_latest_by_order_ids` chunks by 500; 1200-id test. |
+| P2 | `net_unrealised_per_pair` re-runs the end-anchor lookup instead of reusing the gate's rows. | DEFERRED — the gate and `collect` sit on either side of a multi-second replay in separate sessions; threading ORM rows across needs a `main` restructure. The race needs a recorder flush later than the 2 m lag. |
+| P3 | `get_latest_received_before` run/account scope untested. | Foreign-account row added to the repository test. |
+
+`make test` exit 0 (92%), `make lint` clean.
