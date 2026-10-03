@@ -420,6 +420,8 @@ def _order_resting_across_gap(
     if not gaps:
         return None
     gap = gaps[-1]
+    # Defensive: an open gap already SKIPs in the overlapping-gap check that
+    # runs first, so it cannot reach here unless that order changes.
     gap_end = to_naive_utc(gap.gap_end) if gap.gap_end is not None else "open"
     return (
         f"active order {oldest.order_id} (recorded "

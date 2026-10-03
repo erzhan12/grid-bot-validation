@@ -516,13 +516,6 @@ class Recorder:
 
             for coin_data in acct.get("coin") or []:
                 try:
-                    if (
-                        coin_data.get("coin") == _WALLET_SEED_COIN
-                        and coin_data.get("walletBalance") not in (None, "")
-                        and acct.get("totalEquity") not in (None, "")
-                        and acct.get("totalAvailableBalance") not in (None, "")
-                    ):
-                        proven = True
                     # UTA v5 returns `availableToWithdraw`; legacy UTA 1.0 and
                     # some non-USDT coins on cross-margin still surface only
                     # `availableBalance`. Prefer the v5 field, fall back to
@@ -549,6 +542,13 @@ class Recorder:
                             raw_json={**coin_data, "_account": account_raw},
                         )
                     )
+                    if (
+                        coin_data.get("coin") == _WALLET_SEED_COIN
+                        and coin_data.get("walletBalance") not in (None, "")
+                        and acct.get("totalEquity") not in (None, "")
+                        and acct.get("totalAvailableBalance") not in (None, "")
+                    ):
+                        proven = True
                 except Exception as e:
                     logger.warning(
                         f"{label}: skipped malformed wallet coin row: {e}"
@@ -608,7 +608,8 @@ class Recorder:
         Returns:
             ``(rows_written, failed_symbols)`` — a symbol fails when
             ``get_positions`` raised, an open row's leg is unknown, or a
-            real row failed conversion.
+            real row failed conversion; with ``evidence_only`` every skipped
+            symbol fails (an empty response too).
         """
         snapshots: list[PositionSnapshot] = []
         failures = 0
@@ -776,6 +777,8 @@ class Recorder:
                 failures += 1
             unproven = "malformed" if row_malformed else synthetic_default
             if evidence_only and unproven in _UNPROVEN_SYNTHETIC:
+                if unproven == "empty_response":
+                    failures += 1  # rest_failure / malformed already counted
                 logger.warning(
                     f"{label}: {symbol} skipped ({unproven}); its earlier "
                     "position rows stay the seed"

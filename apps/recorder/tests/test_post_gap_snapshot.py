@@ -374,3 +374,50 @@ class TestPostGapSnapshotAnchorsMoveTogether:
             assert len(_rows(db, recorder, WalletSnapshot)) == wallets_before
         finally:
             await recorder.stop()
+
+    async def test_empty_symbol_keeps_the_wallet_seed(self, started, db):
+        """Two symbols, the second comes back empty: the first symbol's rows
+        are written, the empty one writes nothing, and no wallet row moves
+        past the gap."""
+        recorder, stub = await started(symbols=["BTCUSDT", "ETHUSDT"])
+        try:
+            wallets_before = len(_rows(db, recorder, WalletSnapshot))
+            positions_before = len(_rows(db, recorder, PositionSnapshot))
+            stub.get_positions.side_effect = lambda symbol: (
+                [] if symbol == "ETHUSDT"
+                else [_position("Buy"), _position("Sell")]
+            )
+            await _close_gap(recorder)
+            with db.get_session() as session:
+                new = (
+                    session.query(PositionSnapshot)
+                    .filter(PositionSnapshot.run_id == str(recorder._run_id))
+                    .order_by(PositionSnapshot.id)
+                    .all()[positions_before:]
+                )
+                assert sorted((r.symbol, r.side) for r in new) == [
+                    ("BTCUSDT", "Buy"), ("BTCUSDT", "Sell"),
+                ]
+            assert len(_rows(db, recorder, WalletSnapshot)) == wallets_before
+        finally:
+            await recorder.stop()
+
+    async def test_malformed_usdt_row_writes_no_wallet(self, started, db):
+        """A USDT row that fails conversion is skipped; the remaining SOL row
+        alone does not prove the reading, so nothing is written."""
+        recorder, stub = await started()
+        try:
+            before = len(_rows(db, recorder, WalletSnapshot))
+            stub.get_wallet_balance.return_value = {"list": [{
+                "accountType": "UNIFIED", "totalEquity": "1000",
+                "totalAvailableBalance": "900",
+                "coin": [
+                    {"coin": "USDT", "walletBalance": "1000",
+                     "availableToWithdraw": "x"},
+                    {"coin": "SOL", "walletBalance": "2"},
+                ],
+            }]}
+            await _close_gap(recorder)
+            assert len(_rows(db, recorder, WalletSnapshot)) == before
+        finally:
+            await recorder.stop()

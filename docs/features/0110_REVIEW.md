@@ -482,3 +482,13 @@ Codex (`gpt-5.6-sol`), round 1: NO P1/P2; P3 (stop duration unbounded in the tes
 | P2 | Multi-symbol veto (`position_count and not failed_symbols`) untested. | Added: second symbol fails → first symbol's rows written, no wallet row. |
 | P3 | Order check compared `exchange_ts` with recorder-clock gap bounds. | Fixed: seed set by `exchange_ts`, gap comparison on `local_ts`. |
 | P3 | Pin recorder constants to live-check/replay; long-lived REST client. | Deferred (already in `tasks/todo.md`). |
+
+## PR #291 claude-review (round 3) — APPROVED, no P0/P1
+
+| Sev | Finding | Verdict |
+|---|---|---|
+| P2 | An `empty_response` symbol was skipped but not counted as failed, so a multi-symbol post-gap snapshot still wrote the wallet. | Fixed: under `evidence_only` every skipped symbol counts as failed; test (second symbol empty → no wallet row). |
+| P2 | `proven` was set before the USDT row was built; a USDT row that failed conversion left a non-USDT-only batch "proven". | Fixed: set after the append; test (malformed USDT + good SOL → nothing written). |
+| P2 | `_order_resting_across_gap` scoping untested. | Added: other symbol / account / run → no SKIP. |
+| P3 | Unreachable open-gap branch. | Kept, commented as defensive. |
+| P3 | Pin `_WALLET_SEED_COIN` / `_UNPROVEN_SYNTHETIC`. | Added `tests/integration/test_recorder_seed_contract.py`; follow-up removed. |

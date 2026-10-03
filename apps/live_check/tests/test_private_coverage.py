@@ -272,11 +272,12 @@ class TestGaps:
         assert _reason(db, acc, _window(ts)) is None
 
 
-def _add_active_order(db, account_id, order_id, ts):
+def _add_active_order(db, account_id, order_id, ts, *, run_id=RUN_ID,
+                      symbol=_SYMBOL):
     with db.get_session() as session:
         session.add(Order(
-            run_id=RUN_ID, account_id=account_id, order_id=order_id,
-            symbol=_SYMBOL, exchange_ts=ts, local_ts=ts, status="New",
+            run_id=run_id, account_id=account_id, order_id=order_id,
+            symbol=symbol, exchange_ts=ts, local_ts=ts, status="New",
             side="Buy", price=Decimal("80"), qty=Decimal("0.2"),
             leaves_qty=Decimal("0.2"), reduce_only=False,
         ))
@@ -316,6 +317,29 @@ class TestOrdersAcrossAGap:
         """Every active order updated after the gap → covered."""
         window, gap_end = self._post_gap(db, acc, ts)
         _add_active_order(db, acc, "o-new", gap_end + timedelta(seconds=5))
+        assert _reason(db, acc, window) is None
+
+    @pytest.mark.parametrize("scope", [
+        {"symbol": "BTCUSDT"}, {"account_id": "other-account"},
+        {"run_id": "other-run"},
+    ])
+    def test_order_of_other_scope_is_ignored(self, db, acc, ts, scope):
+        """An old active order of another symbol / account / run does not
+        SKIP this run's window."""
+        window, gap_end = self._post_gap(db, acc, ts)
+        with db.get_session() as session:
+            run = session.get(Run, RUN_ID)
+            session.add(Run(
+                run_id="other-run", user_id=run.user_id,
+                account_id=run.account_id, strategy_id=run.strategy_id,
+                run_type="recording", start_ts=run.start_ts,
+            ))
+        account_id = scope.get("account_id", acc)
+        _add_active_order(
+            db, account_id, "o-other", gap_end - timedelta(minutes=30),
+            run_id=scope.get("run_id", RUN_ID),
+            symbol=scope.get("symbol", _SYMBOL),
+        )
         assert _reason(db, acc, window) is None
 
 
