@@ -12,7 +12,7 @@ Plan: docs/features/0110_PLAN.md ("Phase B3 implementation notes")  |  Branch: f
 
 ## Follow-ups
 - PR #291 review P3: one long-lived REST client for post-gap snapshots (shared mainnet REST budget with the live gridbot during flapping).
-- Orders after a gap: a post-gap open-orders resnapshot + marking DB-active orders absent from REST as gone would remove the `_order_resting_across_gap` SKIPs (part of #274).
+- Orders after a gap: call `_snapshot_open_orders` from `_write_post_gap_snapshot` (REST-confirmed resting orders get a fresh row past the gap; filled/cancelled ones keep their stale row and keep SKIPping). Removes the long-resting-order SKIP and the created-during-gap blind spot (PR #291 round 4 P2; part of #274).
 
 # Feature 0110 Phase B2c — end-of-window anchor fitness (#271)
 

@@ -508,13 +508,13 @@ def private_coverage_skip_reason(
             f"(recovery {first.recovery_status}) overlaps {start}–{end}"
             f"{more}{hint}"
         )
+    if not sessions:
+        return f"no private-stream session recorded for run {run_id}"
     resting = _order_resting_across_gap(
         session, run_id, account_id, symbol, window
     )
     if resting is not None:
         return resting
-    if not sessions:
-        return f"no private-stream session recorded for run {run_id}"
     if not any(
         to_naive_utc(s.connected_at) <= start
         and to_naive_utc(s.last_checkpoint_ts) >= end

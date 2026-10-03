@@ -479,10 +479,10 @@ class Recorder:
         """REST-fetch wallet balance and write one row per coin. Returns row count.
 
         With ``evidence_only`` (post-gap snapshot, 0110 B3) nothing is written
-        unless the reading carries a USDT ``walletBalance`` and the account's
-        ``totalEquity`` and ``totalAvailableBalance``: an empty field is
-        coerced to 0 (pitfall 14), the row would become the newest wallet
-        seed, and replay refuses to seed from a zero balance.
+        unless the reading carries a USDT ``walletBalance`` and a positive
+        account ``totalEquity`` and ``totalAvailableBalance``: replay's
+        ``load_wallet_seed_full`` refuses a zero one (an empty field is
+        coerced to 0, pitfall 14), and the row would become the newest seed.
         """
         try:
             result = await asyncio.to_thread(client.get_wallet_balance, "UNIFIED")
@@ -545,8 +545,8 @@ class Recorder:
                     if (
                         coin_data.get("coin") == _WALLET_SEED_COIN
                         and coin_data.get("walletBalance") not in (None, "")
-                        and acct.get("totalEquity") not in (None, "")
-                        and acct.get("totalAvailableBalance") not in (None, "")
+                        and total_equity > 0
+                        and total_available_balance > 0
                     ):
                         proven = True
                 except Exception as e:
@@ -558,8 +558,8 @@ class Recorder:
         if evidence_only and not proven:
             logger.warning(
                 f"{label}: wallet reading has no {_WALLET_SEED_COIN} "
-                "walletBalance / totalEquity / totalAvailableBalance; earlier "
-                "wallet rows stay the seed"
+                "walletBalance, or a zero or missing totalEquity / "
+                "totalAvailableBalance; earlier wallet rows stay the seed"
             )
             return 0
         if not snapshots:

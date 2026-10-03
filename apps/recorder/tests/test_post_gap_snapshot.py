@@ -317,13 +317,19 @@ class TestPostGapSnapshotAnchorsMoveTogether:
         {"list": [{"accountType": "UNIFIED", "totalEquity": "1000",
                    "totalAvailableBalance": "900",
                    "coin": [{"coin": "SOL", "walletBalance": "2"}]}]},
+        {"list": [{"accountType": "UNIFIED", "totalEquity": "0",
+                   "totalAvailableBalance": "900",
+                   "coin": [{"coin": "USDT", "walletBalance": "1000"}]}]},
+        {"list": [{"accountType": "UNIFIED", "totalEquity": "1000",
+                   "totalAvailableBalance": "0",
+                   "coin": [{"coin": "USDT", "walletBalance": "1000"}]}]},
     ])
     async def test_degenerate_wallet_reading_is_not_written(
         self, started, db, wallet
     ):
-        """Empty USDT walletBalance / totalEquity / totalAvailableBalance, or
-        no USDT row, would be coerced to 0 and become the newest wallet seed:
-        skipped."""
+        """Empty USDT walletBalance, zero or empty totalEquity /
+        totalAvailableBalance (replay refuses those), or no USDT row: skipped
+        rather than written as the newest wallet seed."""
         recorder, stub = await started()
         try:
             before = len(_rows(db, recorder, WalletSnapshot))

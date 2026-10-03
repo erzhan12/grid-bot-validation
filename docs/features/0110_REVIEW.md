@@ -492,3 +492,14 @@ Codex (`gpt-5.6-sol`), round 1: NO P1/P2; P3 (stop duration unbounded in the tes
 | P2 | `_order_resting_across_gap` scoping untested. | Added: other symbol / account / run → no SKIP. |
 | P3 | Unreachable open-gap branch. | Kept, commented as defensive. |
 | P3 | Pin `_WALLET_SEED_COIN` / `_UNPROVEN_SYNTHETIC`. | Added `tests/integration/test_recorder_seed_contract.py`; follow-up removed. |
+
+## PR #291 claude-review (round 4) — APPROVED, one P1
+
+| Sev | Finding | Verdict |
+|---|---|---|
+| P1 | Wallet guard checked only empty, not zero; replay refuses `totalEquity` / `totalAvailableBalance` <= 0. | Fixed: positive values required (reusing the parsed Decimals); two zero cases added. A zero USDT `walletBalance` is NOT refused by replay (collateral can back the account), so it stays allowed. |
+| P2 | `run_coroutine_threadsafe` on a closed loop latches the running flag. | Rejected: every caller is a callback on that same running loop (the bot's own summary confirms it), so the loop cannot be closed there. |
+| P2 | `_order_resting_across_gap` SKIPs for days on a long-resting grid order. | Deferred: B3 decision 1 is positions + wallet only; spelled out in Known limitations; post-gap `_snapshot_open_orders` follow-up in `tasks/todo.md`. |
+| P3 | Long-lived REST client. | Deferred (already in follow-ups). |
+| P3 | Guard `_write_post_gap_snapshot` against no account / run. | Rejected: the single caller already checks both (no impossible-case handling). |
+| P3 | Missing session should be reported before the order SKIP. | Fixed: order check moved after the no-session return. |
